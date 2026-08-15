@@ -1,0 +1,31 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "qt6-debug",
+            "displayName": "Qt6 MSVC x64 Debug",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64",
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "qt6-release",
+            "displayName": "Qt6 MSVC x64 Release",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64", "strategy": "set" },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "qt6-debug",   "configurePreset": "qt6-debug",   "configuration": "Debug" },
+        { "name": "qt6-release", "configurePreset": "qt6-release", "configuration": "Release" }
+    ]
+}

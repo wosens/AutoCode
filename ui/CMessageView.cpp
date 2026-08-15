@@ -1,0 +1,136 @@
+﻿#include "CMessageView.h"
+
+#include <QWidget>
+#include <QVBoxLayout>
+#include <QScrollBar>
+#include <QTimer>
+
+#include "CMessageBlock.h"
+
+namespace {
+const int k_iMaxBlocks = 1500;   // 上限保护：超过则从顶部丢弃最旧
+}
+
+CMessageView::CMessageView(QWidget* a_pParent)
+    : QScrollArea(a_pParent) {
+    setFrameShape(QFrame::NoFrame);
+    setWidgetResizable(true);
+    // 助手/任务日志区：关闭横向滚动条，内容按视口宽度自动换行（CMessageBlock 内文本控件
+    //   均已开 wordWrap / WidgetWidth，无需横向滚动）。
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    setStyleSheet(QStringLiteral("QScrollArea { background: #ffffff; border: none; }"
+                                 "QScrollBar:vertical { width: 10px; }"));
+
+    m_pContent = new QWidget(this);
+    m_pContent->setStyleSheet(QStringLiteral("background: #ffffff;"));
+    m_pLayout = new QVBoxLayout(m_pContent);
+    m_pLayout->setContentsMargins(12, 12, 12, 12);
+    m_pLayout->setSpacing(10);
+    m_pLayout->addStretch(1);   // 顶部对齐：底部弹簧把内容顶到上沿
+
+    setWidget(m_pContent);
+
+    connect(verticalScrollBar(), &QScrollBar::valueChanged,
+            this, &CMessageView::slotScrolled);
+}
+
+void CMessageView::AddBlock(CMessageBlock* a_pBlock, bool a_bBatch) {
+    if (a_pBlock == nullptr) {
+        return;
+    }
+    // 插在 stretch 之前（末尾追加新块，stretch 始终在最后）
+    const int iIdx = m_pLayout->count() - 1;   // stretch 的位置
+    m_pLayout->insertWidget(iIdx, a_pBlock);
+
+    // 上限保护：丢弃最旧的（第一个非 stretch 项）
+    // 非空 block 数 = count - 1（去掉 stretch）
+    while (m_pLayout->count() - 1 > k_iMaxBlocks) {
+        QLayoutItem* pItem = m_pLayout->takeAt(0);
+        if (pItem != nullptr && pItem->widget() != nullptr) {
+            pItem->widget()->deleteLater();
+        }
+        delete pItem;
+    }
+
+    if (m_bFollow && !a_bBatch) {
+        ScrollToBottom();
+    }
+}
+
+void CMessageView::Clear() {
+    while (m_pLayout->count() > 1) {   // 保留末尾 stretch
+        QLayoutItem* pItem = m_pLayout->takeAt(0);
+        if (pItem != nullptr && pItem->widget() != nullptr) {
+            pItem->widget()->deleteLater();
+        }
+        delete pItem;
+    }
+}
+
+void CMessageView::ScrollToBottom() {
+    // FR-4（重建路径修复）：先强制同步布局使 verticalScrollBar()->maximum() 反映新内容，
+    // 再立即 setValue 滚到底，最后保留一次 singleShot(0) 兜底吸收极少数排队 layout。
+    // 注意（R5）：不用 QCoreApplication::processEvents，避免重入 queued 事件；adjustSize 已能
+    // 触发内容 widget 的同步尺寸重算。
+    if (m_pContent != nullptr) {
+        m_pContent->adjustSize();
+    }
+    QScrollBar* pBar = verticalScrollBar();
+    if (pBar != nullptr) {
+        pBar->setValue(pBar->maximum());
+    }
+    QTimer::singleShot(0, this, [this]() {
+        QScrollBar* pBar2 = verticalScrollBar();
+        if (pBar2 != nullptr) {
+            pBar2->setValue(pBar2->maximum());
+        }
+    });
+}
+
+void CMessageView::ScrollToBottomRobust() {
+    // 重建路径（批量恢复/切任务）专用：Markdown 块高度异步收敛，分多帧滚动覆盖各 layout
+    // 完成时刻，确保真正滚到最底。流式 AddBlock 仍用单帧 ScrollToBottom，避免定时器堆积。
+    auto fnBottom = [this]() {
+        if (m_pContent != nullptr) {
+            m_pContent->adjustSize();   // 同步内容尺寸，使 maximum() 反映真实高度
+        }
+        QScrollBar* pBar = verticalScrollBar();
+        if (pBar != nullptr) {
+            pBar->setValue(pBar->maximum());
+        }
+    };
+    fnBottom();
+    QTimer::singleShot(0, this, fnBottom);
+    QTimer::singleShot(30, this, fnBottom);
+    QTimer::singleShot(120, this, fnBottom);
+}
+
+void CMessageView::ScrollBlockToTop(CMessageBlock* a_pBlock) {
+    // FR-3：把指定块滚到视口最上方，横纵滚动条位置归零（水平归零）。
+    // 块是 m_pContent 的孙级 widget（经布局托管），mapTo(m_pContent) 得到块顶在内容坐标的 y。
+    if (a_pBlock == nullptr || m_pContent == nullptr) {
+        return;
+    }
+    m_pContent->adjustSize();   // 强制同步布局，使滚动条 maximum 反映真实内容尺寸
+    const int iY = a_pBlock->mapTo(m_pContent, QPoint(0, 0)).y();
+    auto fnScroll = [this, iY]() {
+        QScrollBar* pV = verticalScrollBar();
+        if (pV != nullptr) {
+            pV->setValue(qBound(pV->minimum(), iY, pV->maximum()));
+        }
+        QScrollBar* pH = horizontalScrollBar();
+        if (pH != nullptr) {
+            pH->setValue(0);   // FR-3：横纵滚动条位置为 0
+        }
+        m_bFollow = false;   // 手动跳转后停止跟随，避免下一块到达又滚到底
+    };
+    fnScroll();
+    QTimer::singleShot(0, this, fnScroll);   // 兜底吸收排队 layout
+}
+
+void CMessageView::slotScrolled(int a_iValue) {
+    const QScrollBar* pBar = verticalScrollBar();
+    const int iMax = pBar->maximum();
+    // 接近底部（容差）→ 恢复跟随；否则停止跟随
+    m_bFollow = (iMax - a_iValue) <= 24;
+}

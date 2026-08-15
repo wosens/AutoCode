@@ -1,0 +1,259 @@
+﻿#pragma once
+
+#include <QObject>
+#include <QString>
+#include <QDateTime>
+#include <QProcess>
+#include <QPointer>
+#include <QList>
+#include <QPair>
+#include <QSet>
+#include <QHash>
+#include <QJsonArray>
+#include <thread>
+
+#include "core/TaskTypes.h"
+
+class CTaskInfo;
+class CClaudeRunner;
+class CProjectManager;
+struct SStageDef;
+
+// 任务编排器：持有 ClaudeRunner，按状态机逐阶段驱动任务，
+// 解析评审决策（Pass/Reject）、控制迭代上限、落盘 record.md、处理暂停/停止。
+//
+// MVP：单任务串行（m_pCurTask）。多任务并发为后续 Phase。
+class CTaskOrchestrator : public QObject {
+    Q_OBJECT
+
+public:
+    explicit CTaskOrchestrator(CProjectManager* a_pPm, QObject* a_pParent = nullptr);
+    ~CTaskOrchestrator() override;   // join 后台预备/备份线程（退出时防崩溃）
+
+    void StartTask(CTaskInfo* a_pTask);   // 开始 / 从暂停恢复
+    void PauseTask(CTaskInfo* a_pTask);   // 阶段边界暂停
+    void StopTask(CTaskInfo* a_pTask);    // 终止当前阶段
+    // 需求3：右键「再次执行」——仅重跑指定阶段，完成后停在该阶段（Paused），不推进后续、不判死。
+    //   用于阶段表右键：重生成该阶段产物，不动后续已生成的产物、不自动往下跑。
+    void RunSingleStage(CTaskInfo* a_pTask, EStage a_eStage);
+
+    // FR-7 最低验收：停止当前任务 runner + 编译门并置空 m_pCurTask，
+    // 使 OnRunnerFinished 早返回（不再回调到将被 delete 的任务），从而让
+    // CMainWindow::ClearTasks 的 delete pTask 不触发悬垂访问。不阻塞 UI（不等进程退出）。
+    void StopAll();
+
+    // 是否有任务 runner 正在运行（MVP 单 runner 语义=全工程无并发）。
+    // 用于 OnStartTask 堵抢占口子：A 运行中时拒绝启动 B，避免 m_pCurTask 被覆盖导致回调串扰。
+    // 注：阶段二接入评审并行 runner 后，此处需扩展为「主 runner 忙 或 评审 runner 集合非空」。
+    bool IsRunnerBusy() const;
+
+    // —— 提示词 agent（独立于状态机的常驻助手会话，#1/#2/#3/#4）——
+    // 向助手投递一条指令；a_bReadOnly=true 时仅 Read/Grep/Glob（无 Edit/Write/Bash）。
+    //   a_sTaskId 非空 = 当前选中任务：注入该任务 memory.md 经验 + 非只读轮附追加规则（记忆跟着任务走）。
+    void SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, const QString& a_sTaskId = QString());
+    // 撤销最后一条提问（fork-session sid 链 O(1) 回退，#4）。
+    void UndoAdhoc();
+    // 手动压缩上下文（摘要→开新会话重播种，#3）。
+    void CompactAdhoc();
+    // 停止当前助手调用（不影响任务 runner）。
+    void StopAdhoc();
+    bool IsAdhocRunning() const;
+
+    // 设置评审阶段并行视角数（1=串行回退；>1=多视角并行 fan-out/fan-in）。
+    void SetReviewParallel(int a_iN);
+
+    // 2026.08.15 (联网开关) 设置阶段联网检索开关（config.ini [Agent] WebSearch）。
+    //   false 时 LaunchStage 在 --disallowedTools 追加 WebSearch,WebFetch（全阶段生效）。
+    void SetWebSearch(bool a_bOn) { m_bWebSearch = a_bOn; }
+
+    // FR-3：向「当前运行中」的任务注入一条用户指令（Q2 默认=a 追加用户消息）。
+    //   Running → runner->InjectUserTurn + StageEvent("injected")（对话流可见反馈）；
+    //   非 Running → StageEvent("inject_ignored")（不静默丢弃）。确定性 C++ 路由（NFR-7）。
+    void InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_sText);
+
+    // —— 助手会话链持久化（#1）：sid + (prompt,sid) 撤销栈的存取 ——
+    QString AdhocSid() const { return m_sAdhocSid; }
+    QString AdhocGuideHash() const { return m_sLastGuideHash; }   // 上次投喂 guide.md 的内容哈希
+    void    SetAdhocGuideHash(const QString& a_sHash) { m_sLastGuideHash = a_sHash; }
+    QJsonArray AdhocStackToJson() const;
+    void LoadAdhocState(const QString& a_sSid, const QJsonArray& a_aStack);   // 恢复（不发信号）
+
+signals:
+    void sigTaskChanged(CTaskInfo* a_pTask);
+    void sigStageLog(CTaskInfo* a_pTask, const QString& a_sLine);       // 原始/系统日志流
+    void sigStageEvent(CTaskInfo* a_pTask, const QString& a_sKind,     // 结构化事件(阶段生命周期)
+                       const QString& a_sText);
+    // 结构化对话流信号(携带完整内容,由 UI 决定折叠/截断)——
+    // 用于把日志区渲染成 Claude Code 风格(Markdown 助手块 + 可折叠工具卡 + 事件徽章)
+    // 末尾 a_sViewId 为评审多视角并行时的视角标识（v1/v2/...）；空=单 runner 串行路径（向后兼容）。
+    void sigAssistantText(CTaskInfo* a_pTask, const QString& a_sText,           // 助手文本(全文)
+                          const QString& a_sViewId = QString());
+    void sigToolUse(CTaskInfo* a_pTask, const QString& a_sTool,                 // 工具调用(全文入参)
+                    const QString& a_sInputJson, const QString& a_sViewId = QString());
+    void sigToolResult(CTaskInfo* a_pTask, const QString& a_sResult,            // 工具结果(全文)
+                       const QString& a_sViewId = QString());
+    void sigTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
+
+    // —— 提示词 agent 专属信号（不经任务，路由到「助手」Tab）——
+    void sigAdhocLog(const QString& a_sLine);                          // 原始/系统日志
+    void sigAdhocAssistantText(const QString& a_sText);                // 助手文本
+    void sigAdhocToolUse(const QString& a_sTool, const QString& a_sInput);
+    void sigAdhocToolResult(const QString& a_sResult);
+    void sigAdhocEvent(const QString& a_sKind, const QString& a_sText);  // 结构化事件徽章
+    void sigAdhocContext(qint64 a_iFill);                              // 上下文占用（token）；-1=未知
+    void sigAdhocModel(const QString& a_sModel);                       // 助手所用模型名（供面板查上下文窗口）
+    void sigAdhocUndo();                                               // 撤销最后一条提问（面板清尾块）
+    void sigAdhocFinished();                                           // 一次助手调用结束（启用输入栏）
+    void sigAdhocStateChanged();                                       // sid/撤销栈变化（#1 存盘触发）
+
+private slots:
+    void OnRunnerInfo(const QString& a_sLine);
+    void OnRunnerAssistantText(const QString& a_sText);
+    void OnRunnerToolUse(const QString& a_sTool, const QString& a_sInput);
+    void OnRunnerToolResult(const QString& a_sResult);
+    void OnRunnerFinished(bool a_bOk, const QString& a_sResult,
+                          qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
+
+    // —— 提示词 agent 槽：仅 emit sigAdhoc*，不触碰 m_pCurTask、不调 Advance ——
+    void OnAdhocInfo(const QString& a_sLine);
+    void OnAdhocAssistantText(const QString& a_sText);
+    void OnAdhocToolUse(const QString& a_sTool, const QString& a_sInput);
+    void OnAdhocToolResult(const QString& a_sResult);
+    void OnAdhocFinished(bool a_bOk, const QString& a_sResult,
+                         qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
+
+private:
+    void RunCurrentStage(CTaskInfo* a_pTask);
+    // 阶段实际启动（组装 prompt + 起 runner）：RunCurrentStage 在改码阶段会先异步备份，
+    // 备份完成后再回调到这里；非改码阶段直接调用。
+    void LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef);
+    void Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sResult);
+    QString BuildPrompt(CTaskInfo* a_pTask, const SStageDef& a_stDef);
+    void RecordSummary(CTaskInfo* a_pTask, EStage a_eStage, bool bOk, const QString& a_sSummary);
+    // FR-1：Verify 阶段额外向 record.md 写一条「验证结论：…」行（与 RecordSummary 并存）。
+    // 结论来源优先取 verify.md 的「最终验证结论」行；缺失回退 a_sResult / m_sLastAssistantText。
+    void RecordVerifySummary(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sResult);
+    EReviewDecision ParseReviewDecision(CTaskInfo* a_pTask, EStage a_eReview, const QString& a_sRaw);
+    // 2026.08.12 (修驳回死循环) 取最近一次评审输出(cr.md 等)的阻塞项摘要，供驳回/熔断事件文本带出。
+    QString ExtractRejectDigest(CTaskInfo* a_pTask);
+    // 2026.08.12 (修驳回死循环) 熔断时把驳回焦点 + 阶段历史写进 escalation.md，供用户接管决策。
+    void WriteEscalationReport(CTaskInfo* a_pTask, EStage a_eBack);
+    void EnsureRunner();
+
+    // FR-6（Q6 默认=a 复用阶段摘要）：阶段成功结束时把摘要回填到本次备份版本（非首次版本）。
+    //   （改码前备份已移入 RunCurrentStage 的后台线程路径，序号 m_iCurBackupSeq 在其 continuation 记录。）
+    void MaybeBackfillBackupSummary(CTaskInfo* a_pTask, EStage a_eStage, const QString& a_sSummary);
+
+    // 写一条带时间戳/分类的流水到任务私有 .autodev/tasks/<id>/run.log（#6 完整日志归档）。
+    void WriteRunLog(CTaskInfo* a_pTask, const QString& a_sCategory, const QString& a_sText);
+    // 同时落日志 + 发阶段事件信号（统一入口，避免每个 emit 处重复写日志）。
+    void StageEvent(CTaskInfo* a_pTask, const QString& a_sKind, const QString& a_sText);
+    // 阶段输入自愈（#5）：检查阶段声明输入是否存在，缺失则回退到生产阶段重跑。
+    // 返回 true=输入就绪可继续；false=已回退并安排重跑，调用方应立即 return。
+    bool EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a_stDef);
+
+    // —— 开发可靠性：续跑 / 编译门 / 动态预算 ——
+    // 2026.08.15 策略参数配置化：原 static constexpr 常量改读 config.ini [Policy] 段
+    //   （m_pPm 现读，设置对话框保存后即生效；m_pPm 为空时回退内置默认）。
+    int MaxIter() const;          // 单阶段最大迭代（驳回重跑熔断阈值，默认 3）
+    int MaxResume() const;        // 单阶段 --resume 续跑封顶（默认 3）
+    int ReviewResume() const;     // (C) 轻量评审 max-turns 续跑封顶（默认 1，仅续跑 1 次即降级）
+    void ReRunResume(CTaskInfo* a_pTask, const QString& a_sCont);      // --resume 续跑本阶段（带针对性 prompt）
+    void ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResult);  // 成功后推进：评审处理 + 下一阶段
+
+    // —— 评审多视角并行（fan-out / fan-in）——
+    // 启动 N 个只读评审 runner（同构多投票），各写独立 <out>_v<k>.md；全部完成 fan-in 聚合。
+    void StartReviewParallel(CTaskInfo* a_pTask, const SStageDef& a_stDef, const QString& a_sPrompt);
+    // 2026.08.15 (流程档位) 本轮评审实际视角数：简单档 CodeReview=1（串行路径），其余=全局配置。
+    //   LaunchStage 分支与 StartReviewParallel 启动数都取它，防档位与配置打架。
+    int ReviewViewCount(const CTaskInfo* a_pTask, EStage a_eStage) const;
+    // 单视角 runner 完成：缓存结果，待完成集合空时 fan-in。不碰 m_pCurTask、不直接调 Advance（并发安全）。
+    void OnReviewViewFinished(CTaskInfo* a_pTask, const QString& a_sViewId, bool a_bOk, const QString& a_sResult,
+                              qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
+    // 全部视角完成：聚合决策（严格档一票 Reject 即 Reject；标准/简单档多数决）、
+    //   合并正文写回 sOutput（保 cr.md 回灌闭环；少数派驳回意见以专段携带）、推进。
+    void FanInReview(CTaskInfo* a_pTask);
+    // 评审阶段推进：Pass→NextStage；Reject→IncStageIter/RejectTarget/熔断（抽自 ProceedToNext 评审分支）。
+    void FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_eDec);
+    // 终止所有评审 runner（Stop/StopAll 调用，防泄漏进程）。
+    void StopReviewRunners();
+    void RunCompileGate(CTaskInfo* a_pTask);                           // 异步跑构建校验（不阻塞 UI）
+    void OnBuildFinished(int a_iExitCode);                             // 构建结束续接流程
+    QString ResolveBuildCommand(CTaskInfo* a_pTask) const;             // 解析构建命令（build.txt → CMakePresets → .sln）
+    // (A) 编译门结论持久化：落 build_verdict.md，供 CodeReview/Test 的 BuildPrompt 直读，
+    //   消除 agent 自行 grep run.log 推断构建状态的自我怀疑（be3fd900 根因之一）。
+    void WriteBuildVerdict(CTaskInfo* a_pTask, const QString& a_sStatus,
+                           int a_iExitCode, const QString& a_sCmd, const QString& a_sTail);
+    QString ReadBuildVerdict(CTaskInfo* a_pTask) const;
+    QString LocateMsBuild() const;                                     // 定位 msbuild（PATH → vswhere）
+    int EstimateDevTurns(CTaskInfo* a_pTask) const;                    // 按 plan.md 任务数估算开发轮次
+
+    static bool IsReviewStage(EStage a_eStage);
+    static bool IsResumeEligible(EStage a_eStage);   // 该阶段命中 max-turns 时可 --resume 续跑
+    static bool IsLightReviewStage(EStage a_eStage);  // (C) 轻量评审（不含 Test）—— max-turns 降级而非判死
+    // 2026.08.15 (流程档位) 任务的生效阶段流：ResolveFlow(type, task.flowStages)——
+    //   清单为空即完整规范流（旧任务兼容）。编排器内所有流转/输入过滤/意见携带统一走它。
+    static QList<EStage> TaskFlow(const CTaskInfo* a_pTask);
+    // 2026.08.15 (评审多数决) 上游评审的少数派驳回意见段（不阻断）→ 下一生产阶段的软注入块。
+    //   当前阶段在流中前一阶段是评审、且其产物含「## 少数派驳回意见」标记时返回非空。
+    QString MinorityFeedbackBlock(CTaskInfo* a_pTask, const SStageDef& a_stDef);
+    QString ReviewResumeHint(CTaskInfo* a_pTask, EStage a_eStage);  // (C) 评审续跑提示：催落盘结论
+    // 2026.08.15 (驳回差异化引导) 生产阶段 → 驳回它的评审产物文件名（相对任务目录；非生产阶段返回空）。
+    static QString RejectFeedbackFile(EStage a_eStage);
+    // 2026.08.15 (驳回差异化引导) 按迭代次数递进的策略文本：每轮回炉给不同引导，防同思路死循环。
+    static QString IterationStrategyHint(int a_iIter);
+    int  MaxTurnsFor(CTaskInfo* a_pTask, EStage a_eStage) const;
+    QString StageNameZh(EStage a_eStage) const;
+
+    // —— 提示词 agent 内部 ——
+    void EnsureAdhocRunner();                          // 懒创建 m_pAdhocRunner 并连信号
+    void StartAdhocStage(const QString& a_sPrompt);    // 按 m_sAdhocSid/m_bAdhocReadOnly 组装 argv 起一次
+
+    // 提示词 agent 运行模式：Idle=空闲；Submitting=用户提问中；
+    // CompactSummarize=压缩第一步（生成摘要）；CompactReseed=压缩第二步（摘要投新会话）。
+    enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed };
+
+    CProjectManager* m_pPm;
+    CClaudeRunner*   m_pRunner  = nullptr;
+    CTaskInfo*       m_pCurTask = nullptr;
+    QString          m_sLastAssistantText;  // 缓存最新助手文本，用作摘要来源
+    bool             m_bSingleStageRerun = false;  // 需求3：单阶段重跑标志（Advance 完成后停原阶段，不推进）
+    QDateTime        m_dtStageStart;        // 本轮阶段启动时刻，用于判定评审输出文件是否本轮更新
+    int              m_iCurBackupSeq = 0;   // FR-6 本轮阶段改码前备份的版本序号（0=未备份，stage_done 回填摘要后清零）
+    QProcess*        m_pBuildProc = nullptr;  // 编译门专用进程（异步跑 msbuild，不阻塞 UI）
+    QByteArray       m_bufBuild;             // 编译门 stdout+stderr 累积缓冲
+    QString          m_sLastBuildCmd;        // (A) 本轮编译门命令（RunCompileGate 解析，OnBuildFinished 写 verdict 用）
+
+    // —— 启动路径重活后台线程化（防「启动/继续」点击卡死 UI）——
+    // 启动预备（guide 指纹增量同步 + 任务目录初始化）与改码前全量备份均为纯文件 IO、
+    // 可达秒级（千级文件扫描 / 整目录 zstd 拷贝），移出 UI 线程，完成后回主线程续跑。
+    std::thread      m_thStartPrep;          // StartTask 预备线程（同时刻至多一个，guards 保证不重叠）
+    std::thread      m_thBackup;             // RunCurrentStage 改码备份线程（同上）
+
+    // —— 提示词 agent 状态 ——
+    CClaudeRunner* m_pAdhocRunner = nullptr;                       // 第二个 runner 实例（独立 QProcess）
+    QString        m_sAdhocSid;                                    // 当前助手会话 sid（首条前为空）
+    QString        m_sLastGuideHash;                               // 上次投喂 guide.md 的 SHA256（变更检测基线）
+    bool           m_bAdhocReadOnly = false;                       // 本轮只读开关（决定 deny 黑名单内容）
+    EAdhocMode     m_eAdhocMode = Idle;                            // 异步流程状态机
+    QString        m_sAdhocPendingPrompt;                          // Submitting 模式记当前 prompt（压栈用）
+    QString        m_sAdhocSummary;                                // CompactSummarize 产出、CompactReseed 投递
+    QList<QPair<QString, QString>> m_aAdhocStack;                  // (prompt, sid) 链；撤销=弹栈回 m_sAdhocSid
+
+    // —— 评审多视角并行（fan-out / fan-in）状态 ——
+    struct SViewResult {       // 单视角评审 runner 的完成结果
+        bool            bOk    = false;
+        EReviewDecision eDec   = EReviewDecision::Pass;  // 该视角决策（复用 ParseReviewDecision Tier1 正则）
+        QString         sSummary;                        // 该视角摘要正文（fan-in 合并用）
+        QString         sSid;
+        double          dCost = 0.0;
+        qint64          iIn   = 0;
+        qint64          iOut  = 0;
+    };
+    int                         m_iReviewParallel = 3;     // 评审并行视角数（1=串行回退；默认 3）
+    int                         m_iCurReviewViews = 0;     // 本轮 fan-out 实际视角数（档位可低于全局配置；fan-in 按它聚合）
+    bool                        m_bWebSearch = true;       // 阶段联网检索开关（config.ini [Agent] WebSearch，默认开）
+    QList<CClaudeRunner*>       m_aReviewRunners;         // fan-out 视角 runner（parent=this，Qt 托管生命周期）
+    QSet<QString>               m_aPendingViews;          // 待完成视角集合（空→全部完成 fan-in）
+    QHash<QString, SViewResult> m_aViewResults;           // viewId → 完成结果
+};

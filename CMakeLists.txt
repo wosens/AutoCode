@@ -1,0 +1,302 @@
+﻿cmake_minimum_required(VERSION 3.21)
+
+# 提示：若 CMake 找不到 Qt6，使用 CMakePresets.json 的 "qt6" preset，
+# 或显式 -DCMAKE_PREFIX_PATH=D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64
+if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED ENV{CMAKE_PREFIX_PATH})
+    set(QT6_HINT "D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64")
+    if(EXISTS "${QT6_HINT}")
+        list(APPEND CMAKE_PREFIX_PATH "${QT6_HINT}")
+    endif()
+endif()
+
+project(AutoCode VERSION 0.1.0 LANGUAGES CXX C)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Unicode / UTF-8 执行字符集（源码以 UTF-8 with BOM 保存）
+if(MSVC)
+    add_compile_options(/utf-8 /W3)
+    add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+find_package(Qt6 6.5 COMPONENTS Core Gui Widgets Network Test REQUIRED)
+enable_testing()
+
+qt_standard_project_setup()
+
+qt_add_executable(AutoCode WIN32
+    main.cpp
+    core/TaskTypes.h
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CMcpAskServer.h
+    agent/CMcpAskServer.cpp
+    orch/CTaskOrchestrator.h
+    orch/CTaskOrchestrator.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    ui/CMainWindow.h
+    ui/CMainWindow.cpp
+    ui/CTaskListPanel.h
+    ui/CTaskListPanel.cpp
+    ui/CExecutionPanel.h
+    ui/CExecutionPanel.cpp
+    ui/CTitleBar.h
+    ui/CTitleBar.cpp
+    ui/CArtifactView.h
+    ui/CArtifactView.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CRecentProjectsDialog.h
+    ui/CRecentProjectsDialog.cpp
+    ui/CAskUserDialog.h
+    ui/CAskUserDialog.cpp
+    ui/CNewTaskDialog.h
+    ui/CNewTaskDialog.cpp
+    ui/CSettingsDialog.h
+    ui/CSettingsDialog.cpp
+    ui/CProjectExplorerPanel.h
+    ui/CProjectExplorerPanel.cpp
+    ui/CRollbackDialog.h
+    ui/CRollbackDialog.cpp
+    # SQLite 历史库层（纯 C API，直接编 sqlite3.c）
+    db/CTaskHistoryDB.h
+    db/CTaskHistoryDB.cpp
+    sqlite3.h
+    sqlite3.c
+    # FR-10 应用图标资源：.qrc（经 AUTORCC 编入，运行期 QIcon(":/icons/app.ico")）
+    # 与 .rc（Windows exe 资源图标，资源管理器显示）。
+    resources/app.qrc
+    resources/app.rc
+)
+
+# sqlite3.c 是官方 amalgamation 单文件：必须按 C 编译（C++ 编译会让定义得到 C++ 改名，
+# 与 sqlite3.h 里 extern "C" 的 C 链接声明不匹配 → 链接报无法解析的外部符号）。
+# 同时 /W0 抑制其海量无害警告。
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES
+        LANGUAGE C COMPILE_FLAGS "/W0")
+endif()
+
+# zstd 静态库（备份压缩，#2）：第三方预编译静态库 libzstd_static.lib（x64/MSVC）。
+# 头文件位于 third_party/zstd；CProjectManager.cpp 调用其 C API 做逐文件压缩/解压。
+# CProjectManager.cpp 同时被 AutoCode / test_projectmanager / test_rollback 编译，
+# 三者均需此 include 目录与静态库（否则链接缺 ZSTD_* 符号）。
+set(ZSTD_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd)
+set(ZSTD_LIB ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zstd/libzstd_static.lib)
+
+target_include_directories(AutoCode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/db
+    ${ZSTD_INCLUDE_DIR}
+)
+
+target_link_libraries(AutoCode PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network dwmapi ${ZSTD_LIB})
+
+# 输出到原 Execute 目录，沿用旧习惯
+# VS 是 multi-config 生成器，默认会在 RUNTIME_OUTPUT_DIRECTORY 下加 <CONFIG> 子目录；
+# 这里用 per-config 属性把 Release 直出 Execute/ 根（Debug 仍落 Execute/Debug/）。
+set_target_properties(AutoCode PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY         ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# 环境安装脚本随 exe 输出到 Execute 目录（功能菜单 → 环境安装 调用）
+add_custom_command(TARGET AutoCode POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_env.bat"
+        "$<TARGET_FILE_DIR:AutoCode>/install_env.bat"
+    COMMENT "Copy install_env.bat to output dir"
+)
+
+# 2026.08.15 prompts 模板同步到 Execute 目录：源保留在工程根（便于编辑/版本管理），
+# 构建后同步到 exe 同级 prompts/；运行期 GetPromptsDir 只读 exe 目录（便携原则，
+# Execute 整目录拷走即自包含）。
+add_custom_command(TARGET AutoCode POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/prompts"
+        "$<TARGET_FILE_DIR:AutoCode>/prompts"
+    COMMENT "Sync prompts/ to output dir"
+)
+
+# ---- 单元测试（CProjectManager 最近打开历史 MRU 逻辑）----
+# 仅测试业务逻辑，不依赖 GUI；config.ini 落在测试 exe 同级，用例内自行清理。
+qt_add_executable(test_projectmanager
+    tests/test_projectmanager.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(test_projectmanager PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${ZSTD_INCLUDE_DIR}
+)
+target_link_libraries(test_projectmanager PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test ${ZSTD_LIB})
+set_target_properties(test_projectmanager PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_projectmanager COMMAND test_projectmanager)
+
+# ---- 单元测试（CTaskHistoryDB：SQLite 历史库 Upsert/LoadAll/Delete 往返）----
+qt_add_executable(test_historydb
+    tests/test_historydb.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    db/CTaskHistoryDB.h
+    db/CTaskHistoryDB.cpp
+    sqlite3.h
+    sqlite3.c
+)
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES
+        LANGUAGE C COMPILE_FLAGS "/W0")
+endif()
+target_include_directories(test_historydb PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/db
+)
+target_link_libraries(test_historydb PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(test_historydb PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_historydb COMMAND test_historydb)
+
+# ---- 单元测试（be3fd900：Verify 阶段定义/流程编入 + guide 指纹扫描器纯逻辑）----
+# 覆盖 AC2.1/2.2/2.4、AC-N1、AC1.2/1.4/1.5。纯逻辑 + 临时文件系统，不依赖 GUI / Claude。
+qt_add_executable(test_verify_flow
+    tests/test_verify_flow.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp
+    core/TaskTypes.h
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+)
+target_include_directories(test_verify_flow PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+)
+target_link_libraries(test_verify_flow PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(test_verify_flow PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_verify_flow COMMAND test_verify_flow)
+
+# ---- 单元测试（96931df4 / FR-1 验证结论落盘前置不变量）----
+# 覆盖 AC-1.1/1.2/1.3 的稳定前置：Verify 在 Feature/Bugfix 流程内位置正确、
+# sOutput=="verify.md"、结论提取正则容忍全/半角冒号+空白、统一行与验证结论行可由前缀区分。
+# 纯逻辑（core 阶段定义 + 正则），不依赖 GUI / Claude / 私有方法 RecordVerifySummary。
+qt_add_executable(test_record_verify
+    tests/test_record_verify.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp
+    core/TaskTypes.h
+)
+target_include_directories(test_record_verify PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+target_link_libraries(test_record_verify PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(test_record_verify PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_record_verify COMMAND test_record_verify)
+
+# ---- 单元测试（FR-6 代码回退：备份 / 恢复 / 版本清单）----
+# 覆盖 AC-6.1/6.2、AC-6.4、AC-N。纯逻辑 + 临时文件系统，不依赖 GUI / Claude。
+qt_add_executable(test_rollback
+    tests/test_rollback.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp   # StageDef 的 ResolveFlow 引用 GetFlowStages（2026.08.15 流程档位）
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(test_rollback PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${ZSTD_INCLUDE_DIR}
+)
+target_link_libraries(test_rollback PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test ${ZSTD_LIB})
+set_target_properties(test_rollback PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_rollback COMMAND test_rollback)
+
+# ---- 一次性 / 批量导入工具（把工程 .autodev/tasks 灌进全局历史库 history.db）----
+# 开发期辅助工具，非测试、非主程序；仅 CMake 目标，不入 vcxproj。
+qt_add_executable(import_tasks
+    tools/import_tasks.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    db/CTaskHistoryDB.h
+    db/CTaskHistoryDB.cpp
+    sqlite3.h
+    sqlite3.c
+)
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES
+        LANGUAGE C COMPILE_FLAGS "/W0")
+endif()
+target_include_directories(import_tasks PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/db
+)
+target_link_libraries(import_tasks PRIVATE Qt6::Core)
+set_target_properties(import_tasks PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)

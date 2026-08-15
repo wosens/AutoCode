@@ -1,0 +1,101 @@
+﻿#pragma once
+
+#include <QWidget>
+#include <QList>
+
+class QTabWidget;
+class QListWidget;
+class QListWidgetItem;
+class QTreeWidget;
+class QTreeWidgetItem;
+class QPushButton;
+class QHBoxLayout;
+class QPoint;
+class QResizeEvent;
+class CTaskInfo;
+class CProjectExplorerPanel;
+class QTimer;
+
+// 左侧任务列表面板：用 Tab 分「当前任务」(未终结) 与「历史任务」(全局 SQLite 库，多列)。
+// 每行显示 名称[类型]·阶段·状态·创建时间。任务对象所有权在 CMainWindow，本面板仅持弱引用。
+//
+// 两表数据来源不同：
+//   - 当前表(m_pListCur)：本工程内存中的非终态任务，由 SetTasks 填充；
+//   - 历史表(m_pTreeHis)：全局 SQLite history.db 的终态任务(Done/Failed)，由 SetHistoryTasks 填充。
+class CTaskListPanel : public QWidget {
+    Q_OBJECT
+
+public:
+    explicit CTaskListPanel(QWidget* a_pParent = nullptr);
+
+    // 设置「当前任务」表（本工程非终态任务）。
+    void SetTasks(const QList<CTaskInfo*>& a_aTasks);
+    // 设置「历史任务」表（过滤由 CMainWindow::ReloadHistory 完成，面板直接展示传入列表）。
+    void SetHistoryTasks(const QList<CTaskInfo*>& a_aTasks);
+    void RefreshTask(CTaskInfo* a_pTask);   // 状态变化时重建当前表（任务可能迁出当前表）
+    // 在当前表查找并选中指定任务（启动任务时自动选中，使其日志立即显示）。
+    void SelectTask(CTaskInfo* a_pTask);
+    CTaskInfo* CurrentTask() const { return m_pCur; }
+
+    // FR-3：暴露顶部菜单条容器布局，供 CMainWindow::CreateMenus 注入「工程(&P)」「功能(&F)」菜单。
+    // 菜单下沉到左栏顶部，替代原窗口顶部 menuBar()。
+    QHBoxLayout* MenuBarLayout() { return m_pMenuLayout; }
+
+    // FR-3：切换工程资源管理器根目录（OpenProjectDir 成功后调用）；空串=清空树。
+    void SetProjectRoot(const QString& a_sDir);
+
+signals:
+    void sigNewTask();
+    void sigStartTask(CTaskInfo* a_pTask);
+    void sigPauseTask(CTaskInfo* a_pTask);
+    void sigStopTask(CTaskInfo* a_pTask);
+    void sigDeleteTask(CTaskInfo* a_pTask);
+    void sigTaskSelected(CTaskInfo* a_pTask);
+    void sigReviveTask(CTaskInfo* a_pTask);   // 失败任务加回当前栏续跑（#6）
+    void sigRemoveTask(CTaskInfo* a_pTask);   // 当前任务移除到历史（#3）
+    void sigViewTask(CTaskInfo* a_pTask);     // FR-5 右键「查看任务内容」→ 只读展示
+    // FR-6：停止按钮右侧「回退」按钮 → 主窗口弹历史版本对话框。
+    void sigRollback(CTaskInfo* a_pTask);
+    // FR-3：资源管理器「添加到聊天框」→ 注入 adhoc 助手输入框（Q1 默认）。
+    void sigAddToChat(const QString& a_sText, const QString& a_sKind);
+    // FR-9：任务列表（Tab）底部相对本 widget 顶部的 y 变化 → 供执行面板同步阶段表高度，
+    //       使「阶段表底部」与「任务列表底部」（不含按钮行）对齐，随字体/DPI 自适应。
+    void sigTaskListBottom(int a_iBottomY);
+
+protected:
+    bool eventFilter(QObject* a_pWatched, QEvent* a_pEvent) override;   // 粘性选择（#5）
+    void resizeEvent(QResizeEvent* a_pEvent) override;   // FR-9 上报任务列表底部 y
+
+private slots:
+    void OnSelectionChanged(QListWidgetItem* a_pCur, QListWidgetItem* a_pPrev);          // 当前表
+    void OnHistorySelectionChanged(QTreeWidgetItem* a_pCur, QTreeWidgetItem* a_pPrev);   // 历史表
+    void OnElapsedTimer();   // 2026.08.15 运行中每秒刷新当前表选中项的耗时文本
+
+private:
+    void PopulateCurrent();                   // 重建当前表（只放非终态）
+    void RestoreSelection(CTaskInfo* a_pTarget);   // 重建后在两表中找回指定任务选中
+    void UpdateButtons();                     // 按当前任务状态刷新启动/暂停/停止按钮
+    static QString FormatTokens(qint64 a_iTokens);  // K/M/G 缩写
+    // 2026.08.15 当前表行文本：名称 [类型] · 阶段 · 状态 [· 耗时] · 创建时间（PopulateCurrent 与秒级刷新共用）。
+    static QString MakeTaskText(const CTaskInfo* a_pTask);
+    static CTaskInfo* TaskOf(QListWidgetItem* a_pItem);
+    static CTaskInfo* TaskOf(QTreeWidgetItem* a_pItem);
+    void OnHistoryContextMenu(const QPoint& a_pos);   // 历史表右键「再次执行」（#6）
+    void OnCurrentContextMenu(const QPoint& a_pos);   // 当前表右键「移除」（#3）
+
+    QTabWidget*   m_pTab      = nullptr;
+    QHBoxLayout*  m_pMenuLayout = nullptr;  // FR-3 顶部菜单条容器（供主窗口注入菜单）
+    QListWidget*  m_pListCur  = nullptr;   // 当前任务（未终结：Pending/Running/Paused/Stopped）
+    QTreeWidget*  m_pTreeHis  = nullptr;   // 历史任务（全局 DB，终态：Done/Failed，多列）
+    CProjectExplorerPanel* m_pExplorer = nullptr;   // FR-3 工程资源管理器（占列表下方剩余空间）
+    QPushButton*  m_pBtnNew   = nullptr;
+    QPushButton*  m_pBtnStart = nullptr;
+    QPushButton*  m_pBtnPause = nullptr;
+    QPushButton*  m_pBtnStop  = nullptr;
+    QPushButton*  m_pBtnRollback = nullptr;   // FR-6 停止按钮右侧「回退」
+    QList<CTaskInfo*> m_aTasks;            // 当前表数据源（本工程非终态）
+    QTimer*       m_pElapsedTimer = nullptr;   // 2026.08.15 运行耗时 1s 刷新（当前任务 Running 时跑）
+    CTaskInfo*    m_pCur      = nullptr;
+    bool          m_bAllowDeselect = false;  // 粘性选择：仅空白点击才允许取消（#5）
+    bool          m_bSyncing  = false;        // 互斥同步中（程序清对方表防重入）
+};

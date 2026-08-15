@@ -1,0 +1,6 @@
+// AutoCode application icon resource (Windows exe icon).
+// ASCII-only, no BOM (per CLAUDE.md fixed-encoding rule for .rc files).
+// CMake embeds this .rc into the executable so Explorer shows the app icon.
+#include <windows.h>
+
+IDI_ICON1 ICON "app.ico"
