@@ -73,6 +73,7 @@ bool CTaskInfo::SaveToFile(const QString& a_sFilePath) const {
     oRoot["cost"]        = m_dCost;
     oRoot["inTok"]       = m_iInTok;    // Qt6 QJsonValue 原生支持 qint64
     oRoot["outTok"]      = m_iOutTok;
+    oRoot["reqCount"]    = m_iReqCount;   // 2026.08.15 API 请求数（assistant 消息条数）
     oRoot["err"]         = m_sErr;
     oRoot["pauseReq"]    = m_bPauseReq;
     oRoot["stopReq"]     = m_bStopReq;
@@ -115,6 +116,7 @@ void CTaskInfo::ResetForRevive() {
     m_dCost          = 0.0;
     m_iInTok         = 0;
     m_iOutTok        = 0;
+    m_iReqCount      = 0;   // 2026.08.15 请求数随累计一并清零
     m_sLastSessionId.clear();
     m_iResumeCount   = 0;
     m_sResumeGuidance.clear();
@@ -161,6 +163,7 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
     m_dCost        = o.value("cost").toDouble();
     m_iInTok       = o.value("inTok").toInteger();
     m_iOutTok      = o.value("outTok").toInteger();
+    m_iReqCount    = o.value("reqCount").toInt();   // 2026.08.15 API 请求数
     m_sErr         = o.value("err").toString();
     m_bPauseReq    = o.value("pauseReq").toBool();
     m_bStopReq     = o.value("stopReq").toBool();

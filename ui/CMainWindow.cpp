@@ -42,6 +42,8 @@
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QSet>
+#include <QAbstractNativeEventFilter>
+#include <functional>
 
 // Win32 ShellExecuteW（"runas" 动词触发 UAC 提权，启动环境安装脚本）
 #ifndef NOMINMAX
@@ -63,17 +65,94 @@
 #include "CTaskOrchestrator.h"
 #include "CClaudeRunner.h"
 #include "CTaskInfo.h"
+#include "core/StageDef.h"   // 2026.08.17 FindStage：中断恢复提示里显示阶段中文名
 #include "TaskTypes.h"
+#include <core/CVersion.h>
 #include "CStageMachine.h"   // 2026.08.15 流程档位：GetFlowStages（新建任务全勾判定）
 #include "CRecentProjectsDialog.h"
 #include "CSettingsDialog.h"
 #include "CAskUserDialog.h"
+#include "CAboutDialog.h"
 #include "CNewTaskDialog.h"
 #include "CTaskHistoryDB.h"
 
+// 应用级原生消息过滤器：先于 Qt 内部消息处理看到所有 Win32 消息（QWidget::nativeEvent
+// 之前），Qt 内部即便特殊处理/吞掉 WM_NCLBUTTONDOWN 也拦不到这里——图标弹系统菜单
+// 的可靠触发通道。主 HWND 之外的消息一概放行。
+class CTitleBarMsgFilter : public QAbstractNativeEventFilter {
+public:
+    // a_fnMenu(锚点)：弹系统菜单；a_fnCapRClick(光标)：标题栏空白右键弹同一菜单；
+    // a_fnSysCmd：接管 SC_MAXIMIZE/SC_RESTORE/SC_MINIMIZE/SC_CLOSE（图标态同步）。
+    CTitleBarMsgFilter(HWND a_hMain,
+                       std::function<void(const QPoint&)> a_fnMenu,
+                       std::function<void(const QPoint&)> a_fnCapRClick,
+                       std::function<void(unsigned int)> a_fnSysCmd)
+        : m_hMain(a_hMain), m_fnMenu(std::move(a_fnMenu)),
+          m_fnCapRClick(std::move(a_fnCapRClick)), m_fnSysCmd(std::move(a_fnSysCmd)) {}
+
+    bool nativeEventFilter(const QByteArray& a_sType, void* a_pMsg, qintptr* a_piRes) override {
+        if (a_sType != "windows_generic_MSG" || a_pMsg == nullptr) {
+            return false;
+        }
+        MSG* pMsg = static_cast<MSG*>(a_pMsg);
+        if (pMsg->hwnd != m_hMain) {
+            return false;   // 只处理主窗口（对话框等其它窗口放行）
+        }
+        const auto fnCursor = []() -> QPoint {
+            POINT stPt;
+            GetCursorPos(&stPt);
+            return QPoint(stPt.x, stPt.y);
+        };
+        // 图标区（HTSYSMENU）左/右键 → 弹系统菜单（锚点=图标左下角由 CMainWindow 决定）
+        if ((pMsg->message == WM_NCLBUTTONDOWN || pMsg->message == WM_NCRBUTTONDOWN) &&
+            pMsg->wParam == HTSYSMENU && m_fnMenu != nullptr) {
+            m_fnMenu(QPoint());   // 空点=让 OnTitleIconClicked 取图标锚点
+            if (a_piRes != nullptr) {
+                *a_piRes = 0;
+            }
+            return true;   // 已处理，阻止 DefWindowProc 再弹一份
+        }
+        // 标题栏空白（HTCAPTION）右键 → 在光标处弹同一菜单（Windows 原生行为）
+        if (pMsg->message == WM_NCRBUTTONDOWN && pMsg->wParam == HTCAPTION &&
+            m_fnCapRClick != nullptr) {
+            m_fnCapRClick(fnCursor());
+            if (a_piRes != nullptr) {
+                *a_piRes = 0;
+            }
+            return true;
+        }
+        // 接管四项窗口命令（图标菜单/任务栏菜单/Alt+F4 统一入口）：交 CMainWindow 走
+        // 自有路径（最大化/还原经 OnMaximizeToggle，图标态单一来源永不错位）。
+        if (pMsg->message == WM_SYSCOMMAND && m_fnSysCmd != nullptr) {
+            const unsigned int uCmd = static_cast<unsigned int>(pMsg->wParam & 0xFFF0);
+            switch (uCmd) {
+                case SC_MAXIMIZE:
+                case SC_RESTORE:
+                case SC_MINIMIZE:
+                case SC_CLOSE:
+                    m_fnSysCmd(uCmd);
+                    if (a_piRes != nullptr) {
+                        *a_piRes = 0;
+                    }
+                    return true;   // 已接管，阻断 DefWindowProc 重复动作
+                default:
+                    return false;  // SC_MOVE/SC_SIZE 等 → 系统默认（模态拖动/缩放循环）
+            }
+        }
+        return false;
+    }
+
+private:
+    HWND m_hMain = nullptr;
+    std::function<void(const QPoint&)> m_fnMenu;
+    std::function<void(const QPoint&)> m_fnCapRClick;
+    std::function<void(unsigned int)> m_fnSysCmd;
+};
+
 CMainWindow::CMainWindow(QWidget* a_pParent)
     : QMainWindow(a_pParent) {
-    setWindowTitle(QStringLiteral("AutoCode — 全自动开发编排器"));
+    // 窗口标题带三段式版本号（自绘标题栏上的版本显示见 CTitleBar）。
+    setWindowTitle(QStringLiteral("AutoCode — 全自动开发编排器 ") + AutoCodeVersionText());
     resize(1240, 780);
 
     // FR-3：去掉系统原生标题栏，统一用自绘 CTitleBar（避免系统标题栏与自绘标题栏重复）。
@@ -123,6 +202,8 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 2026.08.15 Agent 运行参数回填（[Agent] ClaudeCmd / AskTimeoutSec；进程级静态配置）。
     CClaudeRunner::SetClaudeCmd(m_pPm->LoadClaudeCmd());
     CClaudeRunner::SetAskTimeoutSec(m_pPm->LoadAskTimeoutSec());
+    // 2026.08.17 停滞检测阈值回填（[Agent] StallMinutes，默认 10 分钟）。
+    CClaudeRunner::SetStallMinutes(m_pPm->LoadStallMinutes());
     // 2026.08.15 扫描排除目录回填（[Scan] ExcludeDirs；空=内置默认）。
     {
         const QString sScanDirs = m_pPm->LoadScanExcludeDirs();
@@ -167,6 +248,9 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 面板输入栏 → 编排器（经本窗口转发）
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocSubmit,
             this, &CMainWindow::OnAdhocSubmit);
+    // 2026.08.15 助手消耗归集：一次成功调用 → 当前档任务（费用/输入/输出/耗时）。
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocUsage,
+            this, &CMainWindow::OnAdhocUsage);
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocUndo,
             this, &CMainWindow::OnAdhocUndo);
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocCompact,
@@ -213,10 +297,36 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 启动 ask_user 提问服务：监听 AutoCodeMcpAsk-<PID>，供孙进程 MCP server 转发提问。
     StartAskServer();
 
+    // 图标/标题栏右键弹系统菜单：应用级原生消息过滤器（先于 Qt 内部处理，见类注释）。
+    const HWND hWndMain = reinterpret_cast<HWND>(winId());
+    m_pMsgFilter = new CTitleBarMsgFilter(
+        hWndMain,
+        [this](const QPoint& a_stAt) { OnTitleIconClicked(a_stAt); },
+        [this](const QPoint& a_stAt) { OnTitleIconClicked(a_stAt); },
+        [this](unsigned int a_uCmd) { OnSysCommand(a_uCmd); });
+    QCoreApplication::instance()->installNativeEventFilter(m_pMsgFilter);
+
+    // 任务栏点图标最小化硬伤：frameless 窗口是 WS_POPUP，天生无 WS_MINIMIZEBOX/
+    // WS_MAXIMIZEBOX —— shell 判定窗口不可最小化，前台时点任务栏图标直接不发命令
+    // （恢复不受影响，走的是激活路径）。补上样式即可；无标题栏时不画 min/max 按钮，
+    // 无视觉副作用，样式只影响 shell 的行为判定。随后任务栏点图标 → shell 发
+    // SC_MINIMIZE → 过滤器统一接管 → showMinimized()，与标题栏按钮同一出口。
+    if (hWndMain != nullptr) {
+        const LONG_PTR lStyle = GetWindowLongPtr(hWndMain, GWL_STYLE);
+        SetWindowLongPtr(hWndMain, GWL_STYLE,
+                         lStyle | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+    }
+
     SetStatus(QStringLiteral("请打开或新建一个工程目录"));
 }
 
 CMainWindow::~CMainWindow() {
+    // 卸载并释放原生消息过滤器（先于 qApp 析构，防悬垂）
+    if (m_pMsgFilter != nullptr) {
+        QCoreApplication::instance()->removeNativeEventFilter(m_pMsgFilter);
+        delete m_pMsgFilter;
+        m_pMsgFilter = nullptr;
+    }
     // 兜底落盘：sigChanged 已即时保存，此处防异常退出漏盘
     if (m_pPm != nullptr && !m_pPm->ProjectDir().isEmpty()) {
         for (CTaskInfo* pTask : m_aTasks) {
@@ -245,20 +355,11 @@ void CMainWindow::CreateUi() {
     // 自绘标题栏（固定一行高）。三按钮信号连系统操作。
     m_pTitleBar = new CTitleBar(pCentral);
     connect(m_pTitleBar, &CTitleBar::sigMinimize, this, &QWidget::showMinimized);
-    connect(m_pTitleBar, &CTitleBar::sigMaximizeToggle, this, [this]() {
-        // 需求6：按「图标态」判翻转方向（图标与动作同源，永远自洽；图标状态只由按钮掌管，无异步回滚）：
-        //   - 图标是还原图标 □（m_bMaximized==true，即窗口已最大化）→ 还原窗口 + 图标改最大化 ❐
-        //   - 图标是最大化图标 ❐（未最大化）→ 最大化窗口 + 图标改还原 □
-        if (m_pTitleBar == nullptr) { return; }
-        if (m_pTitleBar->IsMaxState()) {        // 当前图标=还原 □（已最大化）
-            showNormal();
-            m_pTitleBar->SetMaximized(false);   // 图标 → 最大化 ❐
-        } else {                                // 当前图标=最大化 ❐（未最大化）
-            showMaximized();
-            m_pTitleBar->SetMaximized(true);    // 图标 → 还原 □
-        }
-    });
+    // 最大化/还原：按钮与标题栏双击（nativeEvent WM_NCLBUTTONDBLCLK）共用 OnMaximizeToggle，
+    // 图标态与窗口动作永远同源（见该槽注释）。
+    connect(m_pTitleBar, &CTitleBar::sigMaximizeToggle, this, &CMainWindow::OnMaximizeToggle);
     connect(m_pTitleBar, &CTitleBar::sigClose, this, &QWidget::close);
+    // 左上角图标点击弹系统菜单：走 nativeEvent 的 HTSYSMENU 原生路径（见 OnTitleIconClicked）。
     pV->addWidget(m_pTitleBar);
 
     auto* pSplit = new QSplitter(Qt::Horizontal, pCentral);
@@ -327,7 +428,7 @@ void CMainWindow::CreateMenus() {
 
     auto* pMenu = m_pMenuBar->addMenu(QStringLiteral("工程(&P)"));
 
-    auto* pActNew = pMenu->addAction(QStringLiteral("新建工程目录..."));
+    auto* pActNew = pMenu->addAction(QStringLiteral("新建工程..."));
     connect(pActNew, &QAction::triggered, this, &CMainWindow::OnNewProject);
 
     auto* pActOpen = pMenu->addAction(QStringLiteral("打开工程目录..."));
@@ -377,13 +478,40 @@ bool CMainWindow::nativeEvent(const QByteArray& a_sType, void* a_pMsg, qintptr* 
 #ifdef Q_OS_WIN
     if (a_sType == "windows_generic_MSG" && a_pMsg != nullptr && a_piRes != nullptr) {
         MSG* pMsg = static_cast<MSG*>(a_pMsg);
+        // 图标区（HTSYSMENU）左键/右键按下 → 弹系统菜单（全原生路径，不经 Qt 鼠标事件）。
+        if (m_pTitleBar != nullptr && pMsg->wParam == HTSYSMENU &&
+            (pMsg->message == WM_NCLBUTTONDOWN || pMsg->message == WM_NCRBUTTONDOWN)) {
+            OnTitleIconClicked();
+            *a_piRes = 0;
+            return true;   // 拦掉默认（DefWindowProc 对 frameless 无系统菜单默认行为）
+        }
+        // 图标区双击：Windows 原生默认 = 关闭窗口（SC_CLOSE），对本程序太危险，直接吞掉。
+        if (pMsg->message == WM_NCLBUTTONDBLCLK && pMsg->wParam == HTSYSMENU) {
+            *a_piRes = 0;
+            return true;
+        }
+        if (pMsg->message == WM_NCLBUTTONDBLCLK && m_pTitleBar != nullptr) {
+            // 标题栏空白双击 = 点最大化按钮：与按钮共用 OnMaximizeToggle（图标态同源翻转）；
+            // 拦掉 DefWindowProc 默认（native 路径不同步按钮图标，会造成两边状态打架）。
+            const QPoint stDb(QPoint(GET_X_LPARAM(pMsg->lParam),
+                                     GET_Y_LPARAM(pMsg->lParam)));
+            if (m_pTitleBar->HitTest(stDb) == CTitleBar::HitCaption) {
+                OnMaximizeToggle();
+                *a_piRes = 0;
+                return true;
+            }
+            return false;   // 边缘等区域双击交系统默认
+        }
         if (pMsg->message == WM_NCHITTEST && m_pTitleBar != nullptr) {
             const QPoint stGlobal(QPoint(GET_X_LPARAM(pMsg->lParam),
                                          GET_Y_LPARAM(pMsg->lParam)));
-            // 先判标题栏：按钮区交还 Qt，空白区返回 Caption。
+            // 先判标题栏：按钮区交还 Qt，图标区返回 HTSYSMENU，空白区返回 Caption。
             switch (m_pTitleBar->HitTest(stGlobal)) {
                 case CTitleBar::HitButton:
                     return false;   // 让 Qt 把 click 送到按钮（否则按钮点不动）
+                case CTitleBar::HitIcon:
+                    *a_piRes = HTSYSMENU;   // 系统菜单区：随后的 WM_NCLBUTTONDOWN 弹菜单
+                    return true;
                 case CTitleBar::HitCaption:
                     *a_piRes = HTCAPTION;
                     return true;    // 可拖拽 + 双击最大化
@@ -418,6 +546,111 @@ bool CMainWindow::nativeEvent(const QByteArray& a_sType, void* a_pMsg, qintptr* 
     Q_UNUSED(a_sType); Q_UNUSED(a_pMsg); Q_UNUSED(a_piRes);
 #endif
     return QMainWindow::nativeEvent(a_sType, a_pMsg, a_piRes);
+}
+
+// 需求6：按「图标态」判最大化/还原翻转方向（图标与动作同源，永远自洽；图标状态只由
+// 本槽掌管，无异步回滚）。标题栏双击（nativeEvent 的 WM_NCLBUTTONDBLCLK）与最大化
+// 按钮共用此入口，保证双击后按钮图标同样翻转。
+void CMainWindow::OnMaximizeToggle() {
+    if (m_pTitleBar == nullptr) {
+        return;
+    }
+    if (m_pTitleBar->IsMaxState()) {        // 当前图标=还原 □（已最大化）
+        showNormal();
+        m_pTitleBar->SetMaximized(false);   // 图标 → 最大化 ❐
+    } else {                                // 当前图标=最大化 ❐（未最大化）
+        showMaximized();
+        m_pTitleBar->SetMaximized(true);    // 图标 → 还原 □
+    }
+}
+
+// 标题栏图标点击 → 弹系统菜单样式弹出菜单（还原/移动/大小/最小化/最大化/关闭）。
+// 触发路径全原生：WM_NCHITTEST 图标区返回 HTSYSMENU → 应用级消息过滤器截获
+// WM_NCLBUTTONDOWN(wParam=HTSYSMENU) 调本函数（Qt 鼠标事件分发路径不可靠，弃用）。
+// 硬伤修复（v1.0.12）：Qt frameless 窗口无 WS_SYSMENU 样式 → GetSystemMenu 恒返 NULL，
+// 拿不到系统菜单副本；改为 CreatePopupMenu 自建菜单（同为原生弹出控件，外观一致），
+// 菜单项 ID 直接用 SC_*，选中后 PostMessage(WM_SYSCOMMAND) —— 过滤器再统一接管。
+void CMainWindow::OnTitleIconClicked(const QPoint& a_stAt) {
+#ifdef Q_OS_WIN
+    const HWND hWnd = reinterpret_cast<HWND>(winId());
+    if (hWnd == nullptr) {
+        return;
+    }
+    // 自建菜单（绕开 GetSystemMenu NULL 硬伤）。置灰规则与系统一致：
+    // 最大化态 → 还原可用、移动/大小/最大化灰；正常态反之。
+    HMENU hMenu = CreatePopupMenu();
+    if (hMenu == nullptr) {
+        return;
+    }
+    const BOOL bZoomed = IsZoomed(hWnd);
+    const UINT uFlagRest = bZoomed ? MF_ENABLED : MF_GRAYED;    // 最大化态才可还原
+    const UINT uFlagNorm = bZoomed ? MF_GRAYED : MF_ENABLED;    // 移动/大小/最大化仅正常态
+    AppendMenu(hMenu, MF_STRING | uFlagRest, SC_RESTORE, L"还原(&R)");
+    AppendMenu(hMenu, MF_STRING | uFlagNorm, SC_MOVE,    L"移动(&M)");
+    AppendMenu(hMenu, MF_STRING | uFlagNorm, SC_SIZE,    L"大小(&S)");
+    AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenu(hMenu, MF_STRING, SC_MINIMIZE, L"最小化(&N)");
+    AppendMenu(hMenu, MF_STRING | uFlagNorm, SC_MAXIMIZE, L"最大化(&X)");
+    AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenu(hMenu, MF_STRING, SC_CLOSE, L"关闭(&C)    Alt+F4");
+
+    // 锚点：优先调用方给定（标题栏右键=光标处）；空点 → 图标左下角（原生样式）；
+    // 取不到图标则退回鼠标位置。
+    QPoint stPos = a_stAt;
+    if (stPos.isNull()) {
+        stPos = (m_pTitleBar != nullptr) ? m_pTitleBar->IconPopupPos() : QPoint();
+    }
+    if (stPos.isNull()) {
+        POINT stPt;
+        GetCursorPos(&stPt);
+        stPos = QPoint(stPt.x, stPt.y);
+    }
+    // SetForegroundWindow 是 TrackPopupMenu 点击菜单外区域自动关闭的前提。
+    SetForegroundWindow(hWnd);
+    const INT iCmd = TrackPopupMenu(hMenu,
+                                    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
+                                    stPos.x(), stPos.y(), 0, hWnd, nullptr);
+    DestroyMenu(hMenu);                 // 弹出菜单用毕即毁（TPM_RETURNCMD 不自动销毁）
+    PostMessage(hWnd, WM_NULL, 0, 0);   // 配合上面的前台切换，确保菜单随后能正常收尾
+    if (iCmd != 0) {
+        PostMessage(hWnd, WM_SYSCOMMAND, static_cast<WPARAM>(iCmd), 0);
+    }
+#endif
+}
+
+// 系统命令统一入口（图标菜单/任务栏菜单/Alt+F4 都汇到这里）：
+// 最大化/还原经 OnMaximizeToggle —— 与按钮、标题栏双击同一翻转原语，图标态单一来源永不错位；
+// 最小化/关闭直接走 Qt 路径。SC_MOVE/SC_SIZE 不到这里（过滤器已放行交系统模态循环）。
+// SC_RESTORE 语义二分（修复：最小化后点任务栏无法恢复——此前只看图标态，最小化时图标态
+// 恒为「非最大化」导致 no-op 且拦截了系统默认动作，窗口永远起不来）：
+//   窗口最小化（IsIconic）→ SC_RESTORE 是「从最小化恢复」：ShowWindow(SW_RESTORE) 恢复到
+//     最小化前的状态（含最大化），图标由 showEvent 按 IsZoomed 校准，不能走 OnMaximizeToggle
+//     （那会强制 showNormal，把「最大化+最小化」错误还原成普通态）；
+//   窗口最大化（未最小化）→ SC_RESTORE 是「还原到普通态」：走 OnMaximizeToggle。
+void CMainWindow::OnSysCommand(unsigned int a_uCmd) {
+    const HWND hWnd = reinterpret_cast<HWND>(winId());
+    switch (a_uCmd) {
+        case SC_MAXIMIZE:
+            if (m_pTitleBar != nullptr && !m_pTitleBar->IsMaxState()) {
+                OnMaximizeToggle();
+            }
+            return;
+        case SC_RESTORE:
+            if (hWnd != nullptr && IsIconic(hWnd)) {
+                ShowWindow(hWnd, SW_RESTORE);   // 从最小化恢复（保留原最大化态），showEvent 校准图标
+            } else if (m_pTitleBar != nullptr && m_pTitleBar->IsMaxState()) {
+                OnMaximizeToggle();             // 最大化 → 普通态
+            }
+            return;
+        case SC_MINIMIZE:
+            showMinimized();
+            return;
+        case SC_CLOSE:
+            close();
+            return;
+        default:
+            return;
+    }
 }
 
 // 需求6：最大化图标态只由按钮掌管；showEvent 仅负责首帧/从最小化恢复时按真实态(IsZoomed)初始化图标。
@@ -496,6 +729,7 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
 
     // 加载该工程的全部历史任务（持久化恢复：终止后可从上次阶段继续）
     ClearTasks();
+    QList<CTaskInfo*> aInterrupted;   // 2026.08.17 上次会话仍在运行的任务（异常退出残留）
     for (CTaskInfo* pTask : m_pPm->LoadAllTasks()) {
         pTask->SetProjectDir(m_pPm->ProjectDir());   // 以当前工程路径为准
         // 终态任务（Done/Failed）不进活跃列表——只入库归档，由历史表展示。
@@ -516,6 +750,7 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
         // Running 是易失运行态（进程已不存在），回退 Paused 以便「启动/继续」接续
         if (pTask->Status() == ETaskStatus::Running) {
             pTask->SetStatus(ETaskStatus::Paused);   // 触发 sigChanged → 即时落盘修正
+            aInterrupted.append(pTask);              // 2026.08.17 记入中断清单供恢复提示
         }
         m_aTasks.append(pTask);
         // 导入全局历史库（幂等：主键 id，UUID 不撞；=.autodev/tasks 进 DB）
@@ -527,6 +762,32 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
     // FR-3：刷新资源管理器文件树根为新工程目录。
     m_pTaskPanel->SetProjectRoot(m_pPm->ProjectDir());
     ReloadHistory();   // 刷新全局历史页（含本次导入 + 其它工程历史）
+
+    // 2026.08.17 异常退出恢复提示：task.json 里残留 Running = 上次会话未正常收尾（崩溃/断电/
+    //   强杀）。已全部转 Paused（上文），此处主动询问是否立即续跑第一个——编排器 LaunchStage
+    //   对带 lastSessionId 的任务走 --resume 断点续跑（会话上下文保留，不整阶段重跑）。
+    //   正常切工程路径会先 StopAll（任务落 Stopped），不会触发本提示。
+    if (!aInterrupted.isEmpty()) {
+        QStringList aNames;
+        for (const CTaskInfo* pTask : aInterrupted) {
+            const SStageDef* pDef = FindStage(pTask->CurrentStage());
+            aNames << QStringLiteral("· %1（阶段：%2）")
+                          .arg(pTask->Name(),
+                               pDef ? pDef->sNameZh : QStringLiteral("?"));
+        }
+        const QMessageBox::StandardButton eAns = QMessageBox::question(
+            this, QStringLiteral("恢复中断任务"),
+            QStringLiteral("检测到 %1 个任务在上次会话结束时仍在运行"
+                           "（AutoCode 可能异常退出）：\n\n%2\n\n"
+                           "已全部转为「暂停」。是否立即续跑第一个任务？"
+                           "（其余可在任务列表中手动启动）")
+                .arg(aInterrupted.size())
+                .arg(aNames.join(QLatin1Char('\n'))),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        if (eAns == QMessageBox::Yes) {
+            OnStartTask(aInterrupted.first());   // 内部自带选中+busy+guide 校验
+        }
+    }
 
     const bool bHasGuide = m_pPm->HasGuide();
     SetStatus(QStringLiteral("工程：%1  |  guide.md：%2 | 已载入 %3 个任务")
@@ -614,7 +875,11 @@ void CMainWindow::OnGuideFinished(bool a_bOk, const QString& a_sMsg) {
         pPending->SetStatus(ETaskStatus::Paused);
         if (!a_bOk) {
             m_pExecPanel->AppendEvent(pPending->Id(), QStringLiteral("init_guide"),
-                QStringLiteral("初始任务：guide.md 生成失败，任务已暂停，请重新启动重试"));
+                // 2026.08.17 详细原因并入事件持久化（chat.json）：a_sMsg 形如
+                //   "guide.md 生成失败：<真因>"，此前后半段只进状态栏转瞬即逝，
+                //   异机部署失败无从排查（飞机大战 16:37 实测：7 秒即败、真因丢失）。
+                QStringLiteral("初始任务：%1，任务已暂停，请重新启动重试")
+                    .arg(a_sMsg.left(200)));
             OnTaskChanged(pPending);
             return;
         }
@@ -736,9 +1001,9 @@ void CMainWindow::OnHelp() {
 }
 
 void CMainWindow::OnAbout() {
-    // FR-9 关于：固定文案（作者 + 开发时间，用户指定）。
-    ExecMsgBox(QMessageBox::Information, QStringLiteral("关于"),
-               QStringLiteral("梅文海 2026.8"), this);
+    // FR-9 关于：正式版式对话框（图标/应用名/版本/简介/作者/版权）。
+    CAboutDialog dlg(this);
+    dlg.exec();
 }
 
 void CMainWindow::RebuildRecentMenu() {
@@ -1101,6 +1366,14 @@ void CMainWindow::OnTaskSelected(CTaskInfo* a_pTask) {
                 if (a_pTask->Status() == ETaskStatus::Running) {
                     a_pTask->SetStatus(ETaskStatus::Paused);   // 易失运行态回退（与打开工程时一致）
                 }
+                // 回填全局库 run_ms/费用等列（幂等）+ 原地刷新历史行耗时列，
+                // 使历史表「耗时」列不必等下一次 ReloadHistory 才有值。
+                if (m_pHistoryDb) {
+                    m_pHistoryDb->Upsert(a_pTask);
+                }
+                if (m_pTaskPanel) {
+                    m_pTaskPanel->UpdateTaskRow(a_pTask);
+                }
             }
         }
     }
@@ -1300,6 +1573,35 @@ void CMainWindow::OnAdhocUndo() {
 void CMainWindow::OnAdhocCompact() {
     if (m_pOrch != nullptr) {
         m_pOrch->CompactAdhoc();
+    }
+}
+
+void CMainWindow::OnAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost,
+                               qint64 a_iElapsedMs, int a_iReqs) {
+    // 2026.08.15 助手消耗归集到当前档任务（助手档按任务分档，消耗跟随档走）：
+    //   费用/输入/输出/请求数并入任务累计；耗时只在任务非运行态累加（运行时段已含助手时间，防双计）。
+    //   工程级档（未选任务）无任务可挂，跳过。
+    if (m_pCur == nullptr) {
+        return;
+    }
+    // m_pCur 可能指向历史表 DB 副本——ReloadHistory 会整批 delete 重建，先校验指针仍有效。
+    if (!m_aTasks.contains(m_pCur) && !m_aHistoryTasks.contains(m_pCur)) {
+        return;
+    }
+    const bool bActive = m_aTasks.contains(m_pCur);
+    m_pCur->AddUsage(a_dCost, a_iIn, a_iOut);
+    m_pCur->AddRequests(a_iReqs);
+    if (m_pCur->Status() != ETaskStatus::Running) {
+        m_pCur->AddRunElapsedMs(a_iElapsedMs);
+    }
+    if (!bActive) {
+        SaveTask(m_pCur);   // 历史副本无 sigChanged 连接，显式落盘（task.json + 历史库）
+    }
+    if (m_pTaskPanel) {
+        m_pTaskPanel->UpdateTaskRow(m_pCur);   // 历史行费用/Token/耗时列即时刷新
+    }
+    if (m_pExecPanel) {
+        m_pExecPanel->RefreshTask(m_pCur);     // 费用栏（含耗时）刷新
     }
 }
 
@@ -1597,9 +1899,14 @@ void CMainWindow::ClearTasks() {
     if (m_pOrch != nullptr) {
         m_pOrch->StopAdhoc();
     }
+    // 2026.08.15 两表清空 + 选中复位：旧任务对象随后 delete，若面板 m_pCur 悬垂，
+    //   可能命中回收地址误匹配新工程任务（幽灵选中，携带旧阶段表/产物显示）。须在 delete 前。
+    if (m_pTaskPanel != nullptr) {
+        m_pTaskPanel->ClearAll();
+    }
     if (m_pExecPanel != nullptr) {
         m_pExecPanel->SetAdhocEnabled(false);
-        m_pExecPanel->SetCurrentTask(nullptr);
+        m_pExecPanel->SetCurrentTask(nullptr);   // 阶段表/阶段产物/日志/费用栏全清
         m_pExecPanel->ClearAllBlocks();   // #6 清空旧工程对话流（任务 + 助手），防新旧混淆
     }
     for (CTaskInfo* pTask : m_aTasks) {

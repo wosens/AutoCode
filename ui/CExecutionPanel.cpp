@@ -417,15 +417,16 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
 }
 
 void CExecutionPanel::UpdateCostLabel() {
-    // 底部费用/状态栏：[费用|token|状态|耗时]。无任务 / 从未运行过 → 不带耗时段。
+    // 底部费用/状态栏：[费用|token|请求|状态|耗时]。无任务 / 从未运行过 → 不带耗时段。
     if (m_pCurTask == nullptr) {
-        m_pLblCost->setText(QStringLiteral("费用: $0.00 | 输入:0 输出:0"));
+        m_pLblCost->setText(QStringLiteral("费用: $0.00 | 输入:0 输出:0 | 请求:0"));
         return;
     }
-    QString sText = QStringLiteral("费用: $%1 | 输入:%2 输出:%3 | %4")
+    QString sText = QStringLiteral("费用: $%1 | 输入:%2 输出:%3 | 请求:%4 | %5")
         .arg(m_pCurTask->TotalCost(), 0, 'f', 2)
         .arg(FormatTokens(m_pCurTask->TotalInTokens()))
         .arg(FormatTokens(m_pCurTask->TotalOutTokens()))
+        .arg(m_pCurTask->RequestCount())
         .arg(ToString(m_pCurTask->Status()));
     // 运行过（有累计或正在跑）才显示耗时；纯待执行任务不显示 00:00 噪音。
     if (m_pCurTask->Status() == ETaskStatus::Running || m_pCurTask->RunElapsedMs() > 0) {
@@ -904,6 +905,12 @@ void CExecutionPanel::OnAdhocFinished() {
 
 void CExecutionPanel::SetAdhocContext(qint64 a_iFill) {
     // <0 表示撤销后未知；否则显示 当前占用 / 窗口。记录 fill，交由 UpdateContextButton 统一出文案。
+    // 2026.08.15 旧档脏值钳制：历史存档可能带有远超窗口的假占用（result 累计兜底/中转脏 usage
+    //   产物，7ce53172 实测 1.9M）。还原或收到此类值时按未知（—）处理，不再显示「1.9M（异常）」
+    //   满档——否则每次落盘又把脏值写回 assistant.json，形成还原→显示→再落盘的黏住循环。
+    if (a_iFill > 0 && m_iContextLimit > 0 && a_iFill > m_iContextLimit) {
+        a_iFill = -1;
+    }
     m_iLastContextFill = a_iFill;
     UpdateContextButton();
 }

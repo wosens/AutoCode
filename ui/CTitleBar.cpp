@@ -7,6 +7,8 @@
 #include <QIcon>
 #include <QPoint>
 #include <QRect>
+#include <QMouseEvent>
+#include <core/CVersion.h>
 
 CTitleBar::CTitleBar(QWidget* a_pParent)
     : QWidget(a_pParent) {
@@ -34,6 +36,15 @@ CTitleBar::CTitleBar(QWidget* a_pParent)
     fntTitle.setBold(true);
     m_pLblTitle->setFont(fntTitle);
     pH->addWidget(m_pLblTitle);
+
+    // 版本号：标题右侧灰色小字（v主.次.编译号，构建期生成）。
+    m_pLblVersion = new QLabel(AutoCodeVersionText(), this);
+    QFont fntVer = m_pLblVersion->font();
+    fntVer.setPointSize(10);
+    m_pLblVersion->setFont(fntVer);
+    m_pLblVersion->setStyleSheet(QStringLiteral("color: #8a8a8a;"));   // 弱化，别抢主标题
+    pH->addSpacing(8);
+    pH->addWidget(m_pLblVersion);
     pH->addStretch(1);
 
     const auto fnMakeBtn = [this](const QString& a_sText, const QString& a_sTip) {
@@ -92,7 +103,8 @@ void CTitleBar::SetMaximized(bool a_bMaximized) {
 
 CTitleBar::EHitZone CTitleBar::HitTest(const QPoint& a_stScreenPos) const {
     // FR-3：标题栏屏幕坐标矩形判定。先排除整体不在标题栏；再排按钮区（return false 交还 Qt）；
-    //        其余空白为 Caption（可拖拽 + 双击最大化）。只做坐标比较，无 widget 树遍历。
+    //        图标区为系统菜单区（HTSYSMENU）；其余空白为 Caption（可拖拽 + 双击最大化）。
+    //        只做坐标比较，无 widget 树遍历。
     if (!rect().contains(mapFromGlobal(a_stScreenPos))) {
         return HitNone;
     }
@@ -103,5 +115,16 @@ CTitleBar::EHitZone CTitleBar::HitTest(const QPoint& a_stScreenPos) const {
     if (fnInBtn(m_pBtnMin) || fnInBtn(m_pBtnMax) || fnInBtn(m_pBtnClose)) {
         return HitButton;
     }
+    if (m_pIcon != nullptr && m_pIcon->rect().contains(m_pIcon->mapFromGlobal(a_stScreenPos))) {
+        return HitIcon;
+    }
     return HitCaption;
+}
+
+QPoint CTitleBar::IconPopupPos() const {
+    // 图标左下角（屏幕坐标）：系统菜单从这里向下展开（Windows 原生样式）。
+    if (m_pIcon == nullptr) {
+        return QPoint();
+    }
+    return m_pIcon->mapToGlobal(QPoint(0, m_pIcon->height()));
 }

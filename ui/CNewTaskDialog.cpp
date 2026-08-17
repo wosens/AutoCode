@@ -284,10 +284,11 @@ void CNewTaskDialog::SetTask(const CTaskInfo* a_pTask) {
     m_pLblStatus->setText(ToString(a_pTask->Status()));
     const SStageDef* pDef = FindStage(a_pTask->CurrentStage());
     m_pLblStage->setText(pDef ? pDef->sNameZh : QStringLiteral("?"));
-    m_pLblCost->setText(QStringLiteral("$%1 | 输入:%2 输出:%3")
+    m_pLblCost->setText(QStringLiteral("$%1 | 输入:%2 输出:%3 | 请求:%4")
                             .arg(QString::number(a_pTask->TotalCost(), 'f', 2))
                             .arg(a_pTask->TotalInTokens())
-                            .arg(a_pTask->TotalOutTokens()));
+                            .arg(a_pTask->TotalOutTokens())
+                            .arg(a_pTask->RequestCount()));
     m_pLblCreated->setText(a_pTask->CreatedAt().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
     // 2026.08.15 运行耗时：<1h 为 mm:ss，≥1h 为 h:mm:ss；未运行过显示 -。
     {

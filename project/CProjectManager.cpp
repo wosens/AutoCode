@@ -822,6 +822,18 @@ int CProjectManager::LoadAskTimeoutSec() {
     return (iSec >= 30 && iSec <= 86400) ? iSec : 600;
 }
 
+int CProjectManager::LoadStallMinutes() {
+    // 2026.08.17 [Agent] StallMinutes：无 config.ini/缺键 → 默认 10 分钟；非法值（<1 或 >120）
+    //   兜底回 10。阈值下限保护长工具执行（如分钟级构建）不误杀；上限防配置手误致任务假死半天。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return 10;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iMin = GetPrivateProfileIntW(L"Agent", L"StallMinutes", 10, wsPath.c_str());
+    return (iMin >= 1 && iMin <= 120) ? iMin : 10;
+}
+
 bool CProjectManager::SaveScanExcludeDirs(const QString& a_sDirs) {
     // 落 [Scan] ExcludeDirs（逗号分隔目录名清单）；空串=写空（回退内置默认）；失败不抛。
     const QString sPath = ConfigFilePath();

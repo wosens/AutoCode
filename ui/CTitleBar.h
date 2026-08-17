@@ -4,6 +4,7 @@
 
 class QLabel;
 class QToolButton;
+class QMouseEvent;
 
 // FR-3 自绘标题栏：一行高 widget，左侧软件标题 + 右侧最小化/最大化·还原/关闭三按钮。
 // 自身不处理拖拽/缩放——交由 CMainWindow::nativeEvent 拦 WM_NCHITTEST 统一判定
@@ -25,10 +26,14 @@ public:
     //        的 WM_NCHITTEST 做低成本命中（只做坐标比较，内部直接用成员指针，不遍历 widget 树）。
     enum EHitZone {
         HitNone,     // 非标题栏区
-        HitButton,   // 三按钮之一（应 return false 让 Qt 派发 click）
+        HitButton,   // 三按钮区（应 return false 让 Qt 派发 click）
+        HitIcon,     // 左上角图标区（应返回 HTSYSMENU，系统菜单区，由 nativeEvent 弹菜单）
         HitCaption   // 标题栏空白（应返回 HTCAPTION 可拖拽 + 双击最大化）
     };
     EHitZone HitTest(const QPoint& a_stScreenPos) const;
+
+    // 系统菜单弹出锚点：图标左下角（菜单从图标下方展开，Windows 原生样式）。
+    QPoint IconPopupPos() const;
 
 signals:
     void sigMinimize();       // 最小化按钮
@@ -38,6 +43,7 @@ signals:
 private:
     QLabel*      m_pIcon     = nullptr;   // FR-10 左上角应用图标
     QLabel*      m_pLblTitle  = nullptr;
+    QLabel*      m_pLblVersion = nullptr; // 标题右侧灰色小字版本号（v主.次.编译号）
     QToolButton* m_pBtnMin    = nullptr;
     QToolButton* m_pBtnMax    = nullptr;
     QToolButton* m_pBtnClose  = nullptr;

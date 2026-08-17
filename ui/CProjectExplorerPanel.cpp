@@ -20,9 +20,11 @@
 #include <QModelIndex>
 #include <QFont>
 #include <QVariant>
+#include <QProcess>
 
 const QStringList& CProjectExplorerPanel::HiddenDirs() {
     // Q1 默认：隐藏常见生成目录（后续可由 FR-8 设置调）。
+    // 生效方式：rowsInserted 钩子 → HideGeneratedDirs 逐行隐藏（2026-08-17 接通，此前未挂接）。
     static const QStringList s_aHidden {
         QStringLiteral(".autodev"), QStringLiteral("build"),
         QStringLiteral("Execute"), QStringLiteral(".git"),
@@ -65,12 +67,10 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
 
     m_pModel = new QFileSystemModel(this);
     m_pModel->setFilter(QDir::AllDirs | QDir::Files | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-    // 过滤常见生成目录里的中间产物文件（目录级隐藏见上注释，本轮取文件级过滤）。
-    m_pModel->setNameFilters({
-        QStringLiteral("*.o"), QStringLiteral("*.obj"), QStringLiteral("*.exe"),
-        QStringLiteral("*.pdb"), QStringLiteral("*.ilk"), QStringLiteral("*.lib")
-    });
-    m_pModel->setNameFilterDisables(false);   // 命中过滤器直接隐藏（非禁用）
+    // 文件不做类型过滤、全部显示（2026-08-17 修正：旧 setNameFilters(*.o 等)+
+    // setNameFilterDisables(false) 的真实语义是「只显示匹配项」，曾导致源码/文档
+    // 全部被隐藏、树里只剩构建产物，与意图相反）。生成目录（build/Execute/.git 等）
+    // 仍由 HiddenDirs 按目录整体隐藏。
 
     m_pTree = new QTreeView(this);
     m_pTree->setModel(m_pModel);
@@ -93,18 +93,68 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
             this, &CProjectExplorerPanel::OnCustomContextMenu);
     connect(m_pTree, &QTreeView::doubleClicked,
             this, &CProjectExplorerPanel::OnDoubleClicked);
+    // 父目录行随模型异步陆续插入：新到的兄弟行若非工程根则继续隐藏（见 SetRoot）；
+    // 同时做目录级隐藏——命中 HiddenDirs 清单的目录（build/Execute/.git 等）整棵不显示。
+    connect(m_pModel, &QFileSystemModel::rowsInserted, this,
+            [this](const QModelIndex& a_stParent, int a_iFirst, int a_iLast) {
+        HideGeneratedDirs(a_stParent, a_iFirst, a_iLast);
+        if (!m_stRootIdx.isValid() || a_stParent != m_stRootIdx.parent()) {
+            return;
+        }
+        HideSiblingRows(a_stParent, a_iFirst, a_iLast);
+    });
     pV->addWidget(m_pTree);
 }
 
 void CProjectExplorerPanel::SetRoot(const QString& a_sDir) {
     m_sRootDir = a_sDir;
+    m_stRootIdx = QPersistentModelIndex();
     if (a_sDir.isEmpty()) {
         m_pTree->setRootIndex(QModelIndex());
         return;
     }
-    // setRootPath 后模型异步加载（NFR-6 不阻塞）：不主动 fetchMore 全量展开。
+    // 工程目录作为树的可见根节点（而不是把它的子目录直接铺在顶层）：
+    // 视图根设为工程目录的父目录，再把父目录里除工程目录外的兄弟行全部隐藏，
+    // 树顶层即只剩工程目录一项，随后自动展开。
+    // setRootPath 后模型异步加载（NFR-6 不阻塞）：不主动 fetchMore 全量展开；
+    // 父目录里迟到的兄弟行由构造里连接的 rowsInserted 钩子继续隐藏。
     const QModelIndex stRoot = m_pModel->setRootPath(a_sDir);
-    m_pTree->setRootIndex(stRoot);
+    m_stRootIdx = QPersistentModelIndex(stRoot);
+    m_pTree->setRootIndex(stRoot.parent());
+    HideSiblingRows(stRoot.parent(), 0, m_pModel->rowCount(stRoot.parent()) - 1);
+    m_pTree->expand(stRoot);
+}
+
+void CProjectExplorerPanel::HideSiblingRows(const QModelIndex& a_stParent,
+                                            int a_iFirst, int a_iLast) {
+    if (!a_stParent.isValid()) {
+        return;
+    }
+    const int iFirst = a_iFirst < 0 ? 0 : a_iFirst;
+    const int iCount = m_pModel->rowCount(a_stParent);
+    for (int iRow = iFirst; iRow <= a_iLast && iRow < iCount; ++iRow) {
+        // 工程根行恢复可见、其余隐藏（同时覆盖同父目录下切工程的场景）。
+        m_pTree->setRowHidden(iRow, a_stParent,
+                              m_pModel->index(iRow, 0, a_stParent) != m_stRootIdx);
+    }
+}
+
+void CProjectExplorerPanel::HideGeneratedDirs(const QModelIndex& a_stParent,
+                                              int a_iFirst, int a_iLast) {
+    if (!a_stParent.isValid()) {
+        return;
+    }
+    const int iFirst = a_iFirst < 0 ? 0 : a_iFirst;
+    const int iCount = m_pModel->rowCount(a_stParent);
+    for (int iRow = iFirst; iRow <= a_iLast && iRow < iCount; ++iRow) {
+        const QModelIndex stRow = m_pModel->index(iRow, 0, a_stParent);
+        if (stRow == m_stRootIdx || !m_pModel->isDir(stRow)) {
+            continue;   // 工程根本身与文件不走目录隐藏
+        }
+        if (HiddenDirs().contains(m_pModel->fileName(stRow))) {
+            m_pTree->setRowHidden(iRow, a_stParent, true);
+        }
+    }
 }
 
 QString CProjectExplorerPanel::SelectedAbsPath() const {
@@ -144,7 +194,7 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
     const bool bUnderRoot = IsUnderRoot(sSel);
 
     QMenu menu(this);
-    QAction* pActOpen      = menu.addAction(QStringLiteral("打开"));
+    QAction* pActExplorer  = menu.addAction(QStringLiteral("通过资源管理器打开"));
     QAction* pActCut       = menu.addAction(QStringLiteral("剪切"));
     QAction* pActCopy      = menu.addAction(QStringLiteral("复制"));
     QAction* pActPaste     = menu.addAction(QStringLiteral("粘贴"));
@@ -161,7 +211,8 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
     if (!bUnderRoot) {
         // 选中根外节点：禁用所有写操作与路径操作（NFR-7）。
         for (QAction* pA : {pActCut, pActCopy, pActPaste, pActRename,
-                            pActDelete, pActCopyPath, pActCopyRel, pActAddChat, pActOpen}) {
+                            pActDelete, pActCopyPath, pActCopyRel, pActAddChat,
+                            pActExplorer}) {
             pA->setEnabled(false);
         }
     }
@@ -170,7 +221,7 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
     if (pSel == nullptr) {
         return;
     }
-    if      (pSel == pActOpen)     { OnDoubleClicked(stIdx); }
+    if      (pSel == pActExplorer) { OpenInExplorer(); }
     else if (pSel == pActCut)      { DoCut(); }
     else if (pSel == pActCopy)     { DoCopy(); }
     else if (pSel == pActPaste)    { DoPaste(); }
@@ -328,4 +379,19 @@ void CProjectExplorerPanel::AddToChat() {
     }
     // Q1 默认：注入路径（kind="path"）到 adhoc 助手输入框。
     emit sigAddToChat(QDir::toNativeSeparators(sPath), QStringLiteral("path"));
+}
+
+void CProjectExplorerPanel::OpenInExplorer() {
+    // 用 explorer.exe 打开：目录直接打开该目录；文件打开所在目录并选中该文件。
+    const QString sPath = SelectedAbsPath();
+    if (!IsUnderRoot(sPath)) {
+        return;
+    }
+    QStringList aArgs;
+    if (QFileInfo(sPath).isDir()) {
+        aArgs << QDir::toNativeSeparators(sPath);
+    } else {
+        aArgs << QStringLiteral("/select,") + QDir::toNativeSeparators(sPath);
+    }
+    QProcess::startDetached(QStringLiteral("explorer.exe"), aArgs);
 }

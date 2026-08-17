@@ -9,7 +9,7 @@ if(NOT DEFINED CMAKE_PREFIX_PATH AND NOT DEFINED ENV{CMAKE_PREFIX_PATH})
     endif()
 endif()
 
-project(AutoCode VERSION 0.1.0 LANGUAGES CXX C)
+project(AutoCode VERSION 1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,6 +33,7 @@ qt_standard_project_setup()
 qt_add_executable(AutoCode WIN32
     main.cpp
     core/TaskTypes.h
+    core/CVersion.h
     core/StageDef.h
     core/StageDef.cpp
     core/CTaskInfo.h
@@ -75,6 +76,8 @@ qt_add_executable(AutoCode WIN32
     ui/CProjectExplorerPanel.cpp
     ui/CRollbackDialog.h
     ui/CRollbackDialog.cpp
+    ui/CAboutDialog.h
+    ui/CAboutDialog.cpp
     # SQLite 历史库层（纯 C API，直接编 sqlite3.c）
     db/CTaskHistoryDB.h
     db/CTaskHistoryDB.cpp
@@ -110,9 +113,24 @@ target_include_directories(AutoCode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${CMAKE_CURRENT_SOURCE_DIR}/db
     ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen   # AutoCodeVersion.h（PRE_BUILD 生成，见下方版本号段）
 )
 
 target_link_libraries(AutoCode PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network dwmapi ${ZSTD_LIB})
+
+# ---- 三段式版本号 v主.次.编译号（如 v1.0.345）----
+# 主/次版本取自上方 project(VERSION)；编译号每次编译自动 +1（计数落
+# build/autocode_build_number.txt，删 build 目录会归 1）。生成的 AutoCodeVersion.h
+# 供 core/CVersion.h 包含，标题栏/窗口标题经 AutoCodeVersionText() 显示。
+add_custom_command(TARGET AutoCode PRE_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DVER_MAJOR=${PROJECT_VERSION_MAJOR}
+        -DVER_MINOR=${PROJECT_VERSION_MINOR}
+        -DSTAMP_FILE=${CMAKE_BINARY_DIR}/autocode_build_number.txt
+        -DGEN_DIR=${CMAKE_BINARY_DIR}/gen
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/GenVersion.cmake
+    COMMENT "Generate AutoCodeVersion.h (bump build number)"
+)
 
 # 输出到原 Execute 目录，沿用旧习惯
 # VS 是 multi-config 生成器，默认会在 RUNTIME_OUTPUT_DIRECTORY 下加 <CONFIG> 子目录；
@@ -138,6 +156,15 @@ add_custom_command(TARGET AutoCode POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/prompts"
         "$<TARGET_FILE_DIR:AutoCode>/prompts"
     COMMENT "Sync prompts/ to output dir"
+)
+
+# 2026.08.17 帮助文档同步到 Execute 目录：正本在工程根 help/（版本管理），
+# 构建后同步到 exe 同级 help/；「帮助」菜单打开 exe 同级 help/使用说明.html。
+add_custom_command(TARGET AutoCode POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/help"
+        "$<TARGET_FILE_DIR:AutoCode>/help"
+    COMMENT "Sync help/ to output dir"
 )
 
 # ---- 单元测试（CProjectManager 最近打开历史 MRU 逻辑）----

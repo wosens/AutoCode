@@ -97,9 +97,9 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     setPt11(m_pListCur);
     m_pListCur->viewport()->installEventFilter(this);   // 粘性选择（#5）
 
-    // 历史任务：多列 QTreeWidget（任务名称|类型|阶段|状态|费用|输入|输出|耗时|创建时间）
+    // 历史任务：多列 QTreeWidget（任务名称|类型|阶段|状态|费用|输入|输出|请求|耗时|创建时间）
     m_pTreeHis = new QTreeWidget(this);
-    m_pTreeHis->setColumnCount(9);
+    m_pTreeHis->setColumnCount(10);
     m_pTreeHis->setHeaderLabels(QStringList()
         << QStringLiteral("任务名称")
         << QStringLiteral("类型")
@@ -108,6 +108,7 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
         << QStringLiteral("费用")
         << QStringLiteral("输入")
         << QStringLiteral("输出")
+        << QStringLiteral("请求")
         << QStringLiteral("耗时")
         << QStringLiteral("创建时间"));
     m_pTreeHis->setRootIsDecorated(false);          // 无父节点层级，去掉展开箭头
@@ -126,7 +127,8 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     pHdr->resizeSection(4, 70);    // 费用
     pHdr->resizeSection(5, 70);    // 输入
     pHdr->resizeSection(6, 70);    // 输出
-    pHdr->resizeSection(7, 60);    // 耗时
+    pHdr->resizeSection(7, 50);    // 请求
+    pHdr->resizeSection(8, 60);    // 耗时
     setPt11(m_pTreeHis);
     setPt11(m_pTreeHis->header());
     m_pTreeHis->viewport()->installEventFilter(this);   // 粘性选择（#5）
@@ -232,6 +234,7 @@ void CTaskListPanel::PopulateCurrent() {
     // 置空并 emit sigTaskSelected(nullptr)，从而清空执行面板日志（阶段切换时复现）。
     // 因此先保存 m_pCur，用 QSignalBlocker 屏蔽整个 clear+重建期间的选中信号，再用
     // 保存的指针恢复选中（不依赖可能已被信号清空的 m_pCur）。
+    ReconcileCur();   // 2026.08.17 重建前先对账：任务已 delete（不在两表数据源）则清 m_pCur
     CTaskInfo* pPrevCur = m_pCur;
     {
         QSignalBlocker blk(m_pListCur);
@@ -343,7 +346,37 @@ void CTaskListPanel::SetTasks(const QList<CTaskInfo*>& a_aTasks) {
     PopulateCurrent();
 }
 
+void CTaskListPanel::ClearAll() {
+    // 2026.08.15 切工程：两表清空 + 选中复位（屏蔽 clear 触发的选中信号，防误清执行面板外的状态）。
+    // 数据源 m_aTasks 由 CMainWindow::ClearTasks 随后整体 delete，此处同步置空防悬垂。
+    {
+        QSignalBlocker blkList(m_pListCur);
+        QSignalBlocker blkTree(m_pTreeHis);
+        m_pListCur->clear();
+        m_pTreeHis->clear();
+    }
+    m_aTasks.clear();
+    m_aHis.clear();   // 2026.08.17 历史源副本一并清
+    m_pCur = nullptr;
+    UpdateButtons();
+}
+
+void CTaskListPanel::ReconcileCur() {
+    // 2026.08.17 悬垂对账：任务对象由 CMainWindow 统一 delete（终态回收 / ReloadHistory
+    //   整批重建历史副本），删除后两表 Set* 重建是唯一的同步通知点。m_pCur 不在新数据源
+    //   里即已悬垂——立即置空，防止 1s 耗时定时器（OnElapsedTimer 读 m_pCur->Status()）和
+    //   UpdateButtons 解引用已释放内存（d7f99cac 01:32:53 崩溃，0xc0000005）。
+    if (m_pCur != nullptr && !m_aTasks.contains(m_pCur) && !m_aHis.contains(m_pCur)) {
+        m_pCur = nullptr;
+        UpdateButtons();
+    }
+}
+
 void CTaskListPanel::SetHistoryTasks(const QList<CTaskInfo*>& a_aTasks) {
+    // 2026.08.17 记录历史表数据源副本（悬垂对账用），重建后对账清 m_pCur
+    //   （ReloadHistory 会整批 delete 旧历史副本，选中项若是旧副本即成悬垂）。
+    m_aHis = a_aTasks;
+    ReconcileCur();
     // 屏蔽 clear+重建期间的 currentItemChanged(nullptr)，避免误清 m_pCur（与 PopulateCurrent 对称）。
     QSignalBlocker blkTree(m_pTreeHis);
     m_pTreeHis->clear();
@@ -359,14 +392,17 @@ void CTaskListPanel::SetHistoryTasks(const QList<CTaskInfo*>& a_aTasks) {
         pItem->setText(4, QString::number(pTask->TotalCost(), 'f', 2));
         pItem->setText(5, FormatTokens(pTask->TotalInTokens()));
         pItem->setText(6, FormatTokens(pTask->TotalOutTokens()));
-        pItem->setText(7, pTask->RunElapsedMs() > 0
+        pItem->setText(7, pTask->RequestCount() > 0
+            ? QString::number(pTask->RequestCount()) : QStringLiteral("-"));
+        pItem->setText(8, pTask->RunElapsedMs() > 0
             ? FormatElapsed(pTask->RunElapsedMs()) : QStringLiteral("-"));
-        pItem->setText(8, sDate);
+        pItem->setText(9, sDate);
         // 数值列右对齐
         pItem->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(5, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(6, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(7, Qt::AlignRight | Qt::AlignVCenter);
+        pItem->setTextAlignment(8, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setData(0, Qt::UserRole, reinterpret_cast<quintptr>(pTask));
         pItem->setToolTip(0, pTask->Name());   // 名称显示不全时 tooltip 兜底
         m_pTreeHis->addTopLevelItem(pItem);   // 调用方已按创建时间倒序，保持原序
@@ -380,9 +416,44 @@ void CTaskListPanel::RefreshTask(CTaskInfo* /*a_pTask*/) {
     PopulateCurrent();
 }
 
+void CTaskListPanel::UpdateTaskRow(CTaskInfo* a_pTask) {
+    // 2026.08.15 轻量数值刷新：只 setText 匹配行，不重建、不动选中（避免触发选中连锁）。
+    if (a_pTask == nullptr) {
+        return;
+    }
+    // 当前表：整行文本（含耗时段）
+    for (int i = 0; i < m_pListCur->count(); ++i) {
+        QListWidgetItem* pItem = m_pListCur->item(i);
+        if (TaskOf(pItem) == a_pTask) {
+            const QString sText = MakeTaskText(a_pTask);
+            pItem->setText(sText);
+            pItem->setToolTip(sText);
+            break;
+        }
+    }
+    // 历史表：费用/输入/输出/请求/耗时列（与 SetHistoryTasks 列定义一致）
+    const int iCount = m_pTreeHis->topLevelItemCount();
+    for (int i = 0; i < iCount; ++i) {
+        QTreeWidgetItem* pItem = m_pTreeHis->topLevelItem(i);
+        if (TaskOf(pItem) == a_pTask) {
+            pItem->setText(4, QString::number(a_pTask->TotalCost(), 'f', 2));
+            pItem->setText(5, FormatTokens(a_pTask->TotalInTokens()));
+            pItem->setText(6, FormatTokens(a_pTask->TotalOutTokens()));
+            pItem->setText(7, a_pTask->RequestCount() > 0
+                ? QString::number(a_pTask->RequestCount()) : QStringLiteral("-"));
+            pItem->setText(8, a_pTask->RunElapsedMs() > 0
+                ? FormatElapsed(a_pTask->RunElapsedMs()) : QStringLiteral("-"));
+            break;
+        }
+    }
+}
+
 void CTaskListPanel::OnElapsedTimer() {
     // 2026.08.15 当前任务运行中 → 每秒重写当前表对应行文本（只 setText，不动选中/不重建）。
-    if (m_pCur == nullptr || m_pCur->Status() != ETaskStatus::Running) {
+    // 2026.08.17 双保险：m_pCur 必须仍在当前表数据源里才解引用（运行中任务必属 m_aTasks；
+    //   历史/已回收任务即便指针漏清也不至于踩已释放内存——此为 01:32:53 崩溃点）。
+    if (m_pCur == nullptr || !m_aTasks.contains(m_pCur)
+        || m_pCur->Status() != ETaskStatus::Running) {
         return;
     }
     for (int i = 0; i < m_pListCur->count(); ++i) {

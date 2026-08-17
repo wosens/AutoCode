@@ -14,6 +14,7 @@ class CExecutionPanel;
 class CTaskHistoryDB;
 class CTaskInfo;
 class CTitleBar;
+class CTitleBarMsgFilter;
 class QMenuBar;
 class QSplitter;
 class QLabel;
@@ -88,6 +89,8 @@ private slots:
     void OnAdhocSubmit(const QString& a_sText, bool a_bReadOnly);
     void OnAdhocUndo();
     void OnAdhocCompact();
+    // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
+    void OnAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs, int a_iReqs);
 
     // FR-3 任务运行中介入：面板介入栏 → 找任务 → 编排器 InjectTaskMessage。
     void OnTaskInject(const QString& a_sTaskId, const QString& a_sText);
@@ -95,6 +98,14 @@ private slots:
     // ask_user MCP：本地管道提问服务（孙进程 MCP server → 本窗口弹窗）
     void OnAskConnection();
     void OnAskReadyRead();
+
+    // 标题栏图标按下/标题栏右键 → 弹 Win32 系统菜单（还原/移动/大小/最小化/最大化/关闭）。
+    // a_stAt=菜单锚点（屏幕坐标）；传空点 → 自动取图标左下角。
+    void OnTitleIconClicked(const QPoint& a_stAt = QPoint());
+    void OnMaximizeToggle();     // 最大化/还原翻转（按钮与标题栏双击共用；图标态同源掌管）
+    // 系统命令统一入口（图标菜单/任务栏菜单/Alt+F4）：最大化/还原走 OnMaximizeToggle
+    // 保持图标态同步；最小化/关闭走 Qt 路径。参数取 SC_*（wParam & 0xFFF0）。
+    void OnSysCommand(unsigned int a_uCmd);
 
 private:
     void CreateUi();
@@ -137,6 +148,8 @@ private:
     CTaskListPanel*    m_pTaskPanel = nullptr;
     CExecutionPanel*   m_pExecPanel = nullptr;
     CTitleBar*         m_pTitleBar  = nullptr;   // FR-3 自绘标题栏
+    // 应用级原生消息过滤器（图标/标题栏右键弹系统菜单；比 nativeEvent 更底层，Qt 吞不掉消息）
+    CTitleBarMsgFilter* m_pMsgFilter = nullptr;
     QMenuBar*          m_pMenuBar   = nullptr;   // FR-3 菜单下沉到左栏顶部的菜单条
     QSplitter*         m_pMainSplit = nullptr;   // FR-4 左右主分隔条（比例持久化）
     QLabel*            m_pLblStatus = nullptr;

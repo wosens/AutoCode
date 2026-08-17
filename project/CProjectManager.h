@@ -153,6 +153,9 @@ public:
     // ask_user 提问等待超时秒数（默认 600；合法 30..86400，经 mcp-config env 传给 AskServer 子进程）。
     bool SaveAskTimeoutSec(int a_iSec);
     int  LoadAskTimeoutSec();
+    // 2026.08.17 停滞检测阈值分钟数（[Agent] StallMinutes，默认 10；合法 1..120）：
+    //   claude 进程活着但持续零输出达到阈值 → 判挂起，kill 后按会话断点自动续跑。
+    int  LoadStallMinutes();
 
     // ---- 扫描排除目录（config.ini 的 [Scan] ExcludeDirs，逗号分隔）----
     // 空 = 用内置默认清单（.autodev/build/Execute/.git/.vs/node_modules/doc）。

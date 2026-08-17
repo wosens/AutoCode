@@ -219,8 +219,17 @@ void CTaskOrchestrator::StopTask(CTaskInfo* a_pTask) {
         return;
     }
     a_pTask->SetStopRequested(true);
-    if (m_pRunner && m_pRunner->IsRunning() && m_pCurTask == a_pTask) {
+    // 2026.08.15 主动停止即时收尾：runner Stop 已改静默（不再借 kill 触发的 Crashed→sigFinished
+    //   收尾——旧路径把用户停止误报成「claude 进程崩溃 + 阶段失败」），任务终态在此直接落 Stopped；
+    //   崩溃宽限期（IsGraceActive）/ 快速失败重试等待（IsRetryPending）同样要停，
+    //   否则停止请求会被其后的自动续跑/重试覆盖。
+    if (m_pRunner && m_pCurTask == a_pTask
+        && (m_pRunner->IsRunning() || m_pRunner->IsGraceActive()
+            || m_pRunner->IsRetryPending())) {
         m_pRunner->Stop();
+        a_pTask->SetStatus(ETaskStatus::Stopped);
+        StageEvent(a_pTask, QStringLiteral("stopped"), QStringLiteral("任务已停止"));
+        emit sigTaskFinished(a_pTask, false);
     }
     // 评审并行 runner（若本任务正在评审并行中）一并终止。
     if (m_pCurTask == a_pTask) {
@@ -238,8 +247,8 @@ void CTaskOrchestrator::StopAll() {
     // OnRunnerFinished 首行已判 m_pCurTask==nullptr 早返回，故 runner 即便随后异步
     // 投递 finished 信号也不会访问到将被 ClearTasks delete 的任务对象。
     // 不 waitForFinished：避免阻塞 UI；竞态由 m_pCurTask 置空 + 早返回兜住。
-    if (m_pRunner != nullptr && m_pRunner->IsRunning()) {
-        m_pRunner->Stop();
+    if (m_pRunner != nullptr && (m_pRunner->IsRunning() || m_pRunner->IsGraceActive())) {
+        m_pRunner->Stop();   // 2026.08.15 崩溃宽限期一并终止
     }
     StopReviewRunners();   // 评审并行 runner 一并终止，防切工程泄漏进程
     if (m_pBuildProc != nullptr && m_pBuildProc->state() != QProcess::NotRunning) {
@@ -251,11 +260,16 @@ void CTaskOrchestrator::StopAll() {
 
 bool CTaskOrchestrator::IsRunnerBusy() const {
     // 主 runner 在跑 或 任一评审并行 runner 在跑 → 全工程忙（堵抢占口子用）。
-    if (m_pRunner != nullptr && m_pRunner->IsRunning()) {
+    // 2026.08.15 崩溃宽限期/快速失败重试等待期间 IsRunning()==false 但 runner 仍被占用，一并计入。
+    if (m_pRunner != nullptr
+        && (m_pRunner->IsRunning() || m_pRunner->IsGraceActive()
+            || m_pRunner->IsRetryPending())) {
         return true;
     }
     for (CClaudeRunner* pRunner : m_aReviewRunners) {
-        if (pRunner != nullptr && pRunner->IsRunning()) {
+        if (pRunner != nullptr
+            && (pRunner->IsRunning() || pRunner->IsGraceActive()
+                || pRunner->IsRetryPending())) {
             return true;
         }
     }
@@ -289,8 +303,8 @@ void CTaskOrchestrator::StopReviewRunners() {
     // 终止所有评审并行 runner。不 delete（parent=this 托管）；
     // 清 pending 防 OnReviewViewFinished 在 stop 后仍触发 fan-in。
     for (CClaudeRunner* pRunner : m_aReviewRunners) {
-        if (pRunner != nullptr && pRunner->IsRunning()) {
-            pRunner->Stop();
+        if (pRunner != nullptr && (pRunner->IsRunning() || pRunner->IsGraceActive())) {
+            pRunner->Stop();   // 2026.08.15 崩溃宽限期一并终止（否则宽限收尾仍会触发 fan-in）
         }
     }
     m_aPendingViews.clear();
@@ -365,11 +379,12 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
         connect(pRunner,
                 qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
                     &CClaudeRunner::sigFinished),
-                this, [this, a_pTask, sViewId](bool a_bOk, const QString& a_sResult,
+                this, [this, a_pTask, sViewId, pRunner](bool a_bOk, const QString& a_sResult,
                                                qint64 a_iIn, qint64 a_iOut,
                                                double a_dCost, const QString& a_sSid) {
                     OnReviewViewFinished(a_pTask, sViewId, a_bOk, a_sResult,
-                                         a_iIn, a_iOut, a_dCost, a_sSid);
+                                         a_iIn, a_iOut, a_dCost, a_sSid,
+                                         pRunner->LastReqCount());
                 });
 
         // 视角 prompt：基础 prompt + 独立评审员提示 + 输出文件覆盖（避免覆盖其他视角报告）
@@ -389,7 +404,8 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
 void CTaskOrchestrator::OnReviewViewFinished(CTaskInfo* a_pTask, const QString& a_sViewId,
                                              bool a_bOk, const QString& a_sResult,
                                              qint64 a_iIn, qint64 a_iOut,
-                                             double a_dCost, const QString& a_sSid) {
+                                             double a_dCost, const QString& a_sSid,
+                                             int a_iReqs) {
     if (a_pTask == nullptr || !m_aPendingViews.contains(a_sViewId)) {
         return;   // 已被 StopReviewRunners 清理或无任务 → 丢弃（防悬垂 / 防重复 fan-in）
     }
@@ -397,6 +413,7 @@ void CTaskOrchestrator::OnReviewViewFinished(CTaskInfo* a_pTask, const QString& 
 
     // 累加该视角 cost（每视角一次；fan-in 不重复累加）
     a_pTask->AddUsage(a_dCost, a_iIn, a_iOut);
+    a_pTask->AddRequests(a_iReqs);   // 2026.08.15 该视角 API 请求数
 
     // 读该视角独立输出文件，复用 Tier1 行锚定正则提取决策
     const SStageDef* pDef = FindStage(a_pTask->CurrentStage());
@@ -697,6 +714,15 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
     // 2026.08.15 (流程档位) 视角数按档位取：简单档 CodeReview=1 → 落串行路径。
     if (ReviewViewCount(a_pTask, a_stDef.eStage) > 1 && IsLightReviewStage(a_stDef.eStage)) {
         StartReviewParallel(a_pTask, a_stDef, sPrompt);
+    } else if (!a_pTask->LastSessionId().isEmpty()) {
+        // 2026.08.17 中断续跑：任务带 lastSessionId（异常退出残留 / 失败任务再次执行）→
+        //   不整阶段从头重跑，--resume 续会话 + 短续跑指令。全量阶段 prompt 重复注入会
+        //   诱发重做已完成工作（token 翻倍）；ProceedToNext 推进阶段时已清 sid，
+        //   正常顺序启动不受影响。
+        m_pRunner->StartStage(a_pTask->ProjectDir(),
+            QStringLiteral("继续完成本阶段未完成的工作，从上次中断处接着做；不要重复已完成的改动。"),
+            sTools, MaxTurnsFor(a_pTask, a_stDef.eStage),
+            a_pTask->LastSessionId());
     } else {
         m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt, sTools,
                               MaxTurnsFor(a_pTask, a_stDef.eStage));
@@ -920,6 +946,9 @@ void CTaskOrchestrator::OnRunnerFinished(bool a_bOk, const QString& a_sResult,
         pTask->SetLastSessionId(a_sSid);
     }
     pTask->AddUsage(a_dCost, a_iIn, a_iOut);
+    if (m_pRunner != nullptr) {
+        pTask->AddRequests(m_pRunner->LastReqCount());   // 2026.08.15 本阶段 API 请求数
+    }
     Advance(pTask, a_bOk, a_sResult);
 }
 
@@ -950,6 +979,23 @@ void CTaskOrchestrator::Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a
                        .arg(a_bOk ? QStringLiteral("✔") : QStringLiteral("✗"))
                        .arg(pDef ? pDef->sNameZh : StageNameZh(eCur)));
         emit sigTaskChanged(a_pTask);
+        return;
+    }
+
+    // 2026.08.17 停滞自动续跑：runner 停滞检测命中（subtype=stall，长时间零输出疑似网络/
+    //   中继挂起，进程已被 watchdog 终止）。非真错误——已做工作都在会话里，--resume 接着跑；
+    //   与 max-turns 续跑共享本阶段预算（MaxResume），耗尽走正常失败路径（消息含停滞原因）。
+    if (!a_bOk && m_pRunner != nullptr && m_pRunner->LastWasStall()
+        && !a_pTask->LastSessionId().isEmpty()
+        && a_pTask->ResumeCount() < MaxResume()) {
+        a_pTask->IncResumeCount();
+        StageEvent(a_pTask, QStringLiteral("stall_resume"),
+            QStringLiteral("⚠ %1 长时间无输出（疑似网络/中继挂起），已终止并自动续跑（第 %2/%3 次）")
+                .arg(pDef ? pDef->sNameZh : QString())
+                .arg(a_pTask->ResumeCount())
+                .arg(MaxResume()));
+        ReRunResume(a_pTask, QStringLiteral(
+            "继续完成本阶段未完成的工作，从上次中断处接着做；不要重复已完成的改动。"));
         return;
     }
 
@@ -1780,6 +1826,7 @@ void CTaskOrchestrator::StartAdhocStage(const QString& a_sPrompt) {
     //   窗口优先 [Adhoc] ContextLimit 用户覆盖、未设按助手最近所用模型探测（替代旧千 token 档位）。
     const int iAutoCompactK = m_pPm
         ? m_pPm->AutoCompactKFor(m_pAdhocRunner->LastModel()) : 150;
+    m_dtAdhocStart = QDateTime::currentDateTime();   // 2026.08.15 耗时归集：本次调用起点
     m_pAdhocRunner->StartStage(sWorkDir, a_sPrompt, sTools, 40,
                                m_sAdhocSid, bFork, iAutoCompactK, /*a_bEnableAskUser=*/true);
 }
@@ -1821,7 +1868,11 @@ void CTaskOrchestrator::InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_s
 }
 
 void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, const QString& a_sTaskId) {
-    if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+    // 2026.08.15 忙判定补崩溃宽限/重试等待中：此时 IsRunning()==false 但 runner 仍被占用，
+    //   放行会在宽限轮询/延迟重拉落地时与新提问互相踩。
+    if (m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending())) {
         emit sigAdhocEvent(QStringLiteral("warn"),
             QStringLiteral("助手正在处理上一条指令，请稍候"));
         return;
@@ -1835,6 +1886,7 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
         return;
     }
     m_bAdhocReadOnly = a_bReadOnly;
+    m_iAdhocResume = 0;   // 2026.08.15 新提问：max-turns 自动续跑计数清零
     m_eAdhocMode = Submitting;
     m_sAdhocPendingPrompt = a_sText;   // 原始提问入栈（注入内容不进撤销栈，保持用户可见语义）
 
@@ -1938,7 +1990,10 @@ void CTaskOrchestrator::LoadAdhocState(const QString& a_sSid, const QJsonArray& 
 }
 
 void CTaskOrchestrator::CompactAdhoc() {
-    if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+    // 2026.08.15 占用判定含宽限/重试等待（与 SubmitAdhoc 同口径）。
+    if (m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending())) {
         emit sigAdhocEvent(QStringLiteral("warn"),
             QStringLiteral("助手运行中，无法压缩"));
         return;
@@ -1960,7 +2015,11 @@ void CTaskOrchestrator::CompactAdhoc() {
 
 void CTaskOrchestrator::StopAdhoc() {
     // #4 用户主动停止：先发「已停止」事件（⏹）再 kill 进程，让助手流留下停止痕迹。
-    if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+    // 2026.08.15 崩溃宽限期（IsGraceActive）一并终止；重试等待中（IsRetryPending）也须 Stop()
+    //   清掉延迟重拉标志，否则停止后 5 秒被 RelaunchStage 复活。
+    if (m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending())) {
         emit sigAdhocEvent(QStringLiteral("stopped"),
             QStringLiteral("⏹ 已停止"));
         m_pAdhocRunner->Stop();
@@ -1971,7 +2030,10 @@ void CTaskOrchestrator::StopAdhoc() {
 }
 
 bool CTaskOrchestrator::IsAdhocRunning() const {
-    return m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning();
+    // 2026.08.15 占用判定含宽限/重试等待：此时进程未跑但 runner 仍被占用（UI 停止按钮等依此判定）。
+    return m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending());
 }
 
 void CTaskOrchestrator::OnAdhocInfo(const QString& a_sLine) {
@@ -1995,11 +2057,48 @@ void CTaskOrchestrator::OnAdhocToolResult(const QString& a_sResult) {
 }
 
 void CTaskOrchestrator::OnAdhocFinished(bool a_bOk, const QString& a_sResult,
-                                        qint64 /*a_iIn*/, qint64 /*a_iOut*/,
-                                        double /*a_dCost*/, const QString& a_sSid) {
+                                        qint64 a_iIn, qint64 a_iOut,
+                                        double a_dCost, const QString& a_sSid) {
+    // 2026.08.15 助手消耗归集：成功调用即上报（提问/压缩两步都算助手消耗，输入已含缓存读/写）。
+    //   归集到哪个任务由 CMainWindow 按当前档决定（编排器不持有 UI 选中态）。
+    if (a_bOk) {
+        const qint64 iElapsedMs = m_dtAdhocStart.isValid()
+            ? m_dtAdhocStart.msecsTo(QDateTime::currentDateTime()) : 0;
+        emit sigAdhocUsage(a_iIn, a_iOut, a_dCost, iElapsedMs,
+                           m_pAdhocRunner ? m_pAdhocRunner->LastReqCount() : 0);
+    }
+    m_dtAdhocStart = QDateTime();
+
     switch (m_eAdhocMode) {
     case Submitting: {
         if (!a_bOk) {
+            // 2026.08.15 ad-hoc max-turns 误报修复（7ce53172 实测）：--max-turns 40 打满时
+            //   is_error=true 且 result 为空 → 旧代码显示「✗ 助手调用失败：」空白，且丢弃断点
+            //   sid（用户「继续」只能从旧 sid fork，丢掉已跑的轮次）。max-turns 非真错误：
+            //   先自动 --resume 续跑（上限 2 次）；耗尽也不判死——压栈保住断点，提示发「继续」接续。
+            if (m_pAdhocRunner != nullptr && m_pAdhocRunner->LastWasMaxTurns()
+                && !a_sSid.isEmpty()) {
+                m_sAdhocSid = a_sSid;   // 链基点推进到断点 sid：后续 fork 从断点续，不丢已完成轮次
+                if (m_iAdhocResume < 2) {
+                    ++m_iAdhocResume;
+                    emit sigAdhocEvent(QStringLiteral("resume"),
+                        QStringLiteral("⚠ 达到轮次上限，已完成部分已落盘，自动续跑（第 %1/2 次）")
+                            .arg(m_iAdhocResume));
+                    StartAdhocStage(QStringLiteral(
+                        "继续完成未完成的工作，从上次中断处接着做；不要重复已完成的改动。"));
+                    return;   // 保持 Submitting 模式与 pendingPrompt，续跑成功后正常压栈
+                }
+                // 续跑预算耗尽：压栈断点（本条提问至此告一段落），交还用户接续
+                m_aAdhocStack.append({ m_sAdhocPendingPrompt, a_sSid });
+                emit sigAdhocStateChanged();   // 链推进 → 存盘
+                m_eAdhocMode = Idle;
+                m_sAdhocPendingPrompt.clear();
+                emit sigAdhocEvent(QStringLiteral("stage_failed"),
+                    QStringLiteral("⚠ 达到轮次上限，已自动续跑 2 次仍未收敛；会话已保留，发送「继续」可接着做"));
+                emit sigAdhocContext(-1);
+                emit sigAdhocFinished();
+                return;
+            }
             emit sigAdhocEvent(QStringLiteral("stage_failed"),
                 QStringLiteral("✗ 助手调用失败：%1").arg(a_sResult.left(200)));
             // #6 失败（崩溃/异常退出/返回 is_error）时也刷新上下文按钮：发 -1 显示「—」，

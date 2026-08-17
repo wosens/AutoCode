@@ -69,6 +69,7 @@ bool CTaskHistoryDB::Open() {
         "  cost         REAL,"
         "  in_tok       INTEGER,"
         "  out_tok      INTEGER,"
+        "  req_count    INTEGER,"
         "  err          TEXT,"
         "  created_at   TEXT,"
         "  updated_at   TEXT,"
@@ -81,8 +82,11 @@ bool CTaskHistoryDB::Open() {
         m_pDb = nullptr;
         return false;
     }
-    // 2026.08.15 旧库迁移：补 run_ms 列（列已存在时 ALTER 报错，忽略即可）。
+    // 2026.08.15 旧库迁移：补 run_ms / req_count 列（列已存在时 ALTER 报错，忽略即可）。
     sqlite3_exec(m_pDb, "ALTER TABLE tasks ADD COLUMN run_ms INTEGER DEFAULT 0",
+                 nullptr, nullptr, &szErr);
+    sqlite3_free(szErr);
+    sqlite3_exec(m_pDb, "ALTER TABLE tasks ADD COLUMN req_count INTEGER DEFAULT 0",
                  nullptr, nullptr, &szErr);
     sqlite3_free(szErr);
     return true;
@@ -104,8 +108,8 @@ bool CTaskHistoryDB::Upsert(const CTaskInfo* a_pTask) {
     const char* szSql =
         "INSERT OR REPLACE INTO tasks "
         "(id, name, user_request, type, status, project_dir, cur_stage, stage_iter, "
-        " cost, in_tok, out_tok, err, created_at, updated_at, run_ms) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        " cost, in_tok, out_tok, req_count, err, created_at, updated_at, run_ms) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
     sqlite3_stmt* pStmt = nullptr;
     if (sqlite3_prepare_v2(m_pDb, szSql, -1, &pStmt, nullptr) != SQLITE_OK) {
@@ -124,10 +128,11 @@ bool CTaskHistoryDB::Upsert(const CTaskInfo* a_pTask) {
     sqlite3_bind_double(pStmt, 9,  a_pTask->TotalCost());
     sqlite3_bind_int64(pStmt, 10, a_pTask->TotalInTokens());
     sqlite3_bind_int64(pStmt, 11, a_pTask->TotalOutTokens());
-    BindText(pStmt, 12, a_pTask->LastError());
-    BindText(pStmt, 13, a_pTask->CreatedAt().toString(Qt::ISODate));
-    BindText(pStmt, 14, QDateTime::currentDateTime().toString(Qt::ISODate));
-    sqlite3_bind_int64(pStmt, 15, a_pTask->RunElapsedMs());   // 2026.08.15 运行耗时（含运行中段至今）
+    sqlite3_bind_int(pStmt, 12, a_pTask->RequestCount());   // 2026.08.15 API 请求数
+    BindText(pStmt, 13, a_pTask->LastError());
+    BindText(pStmt, 14, a_pTask->CreatedAt().toString(Qt::ISODate));
+    BindText(pStmt, 15, QDateTime::currentDateTime().toString(Qt::ISODate));
+    sqlite3_bind_int64(pStmt, 16, a_pTask->RunElapsedMs());   // 2026.08.15 运行耗时（含运行中段至今）
 
     const int iRc = sqlite3_step(pStmt);
     sqlite3_finalize(pStmt);
@@ -142,7 +147,7 @@ QList<CTaskInfo*> CTaskHistoryDB::LoadAll() const {
 
     const char* szSql =
         "SELECT id, name, user_request, type, status, project_dir, cur_stage, stage_iter, "
-        "       cost, in_tok, out_tok, err, created_at, updated_at, run_ms "
+        "       cost, in_tok, out_tok, req_count, err, created_at, updated_at, run_ms "
         "FROM tasks ORDER BY created_at DESC";
 
     sqlite3_stmt* pStmt = nullptr;
@@ -163,13 +168,14 @@ QList<CTaskInfo*> CTaskHistoryDB::LoadAll() const {
         pTask->SetUsage(sqlite3_column_double(pStmt, 8),
                         sqlite3_column_int64(pStmt, 9),
                         sqlite3_column_int64(pStmt, 10));
-        pTask->SetLastError(QString::fromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 11))));
+        pTask->SetRequestCount(sqlite3_column_int(pStmt, 11));   // 2026.08.15 API 请求数
+        pTask->SetLastError(QString::fromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 12))));
 
-        const char* szCreated = reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 12));
+        const char* szCreated = reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 13));
         if (szCreated != nullptr) {
             pTask->SetCreatedAt(QDateTime::fromString(QString::fromUtf8(szCreated), Qt::ISODate));
         }
-        pTask->SetRunElapsedMs(sqlite3_column_int64(pStmt, 14));   // 2026.08.15 历史表耗时列
+        pTask->SetRunElapsedMs(sqlite3_column_int64(pStmt, 15));   // 2026.08.15 历史表耗时列
         aResult.append(pTask);
     }
 

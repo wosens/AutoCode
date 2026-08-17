@@ -1,0 +1,558 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoCode 使用说明</title>
+<style>
+  :root {
+    --c-primary: #2b6cb0;
+    --c-primary-dark: #1a4e8a;
+    --c-bg: #f7f9fc;
+    --c-card: #ffffff;
+    --c-border: #dde5ee;
+    --c-text: #2d3748;
+    --c-text-light: #718096;
+    --c-green: #2f9e63;
+    --c-orange: #d97b2c;
+    --c-red: #c53a3a;
+    --c-purple: #7048ba;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: var(--c-text);
+    background: var(--c-bg);
+    line-height: 1.7;
+  }
+  /* ===== 顶部横幅 ===== */
+  .hero {
+    background: linear-gradient(135deg, #1a4e8a 0%, #2b6cb0 55%, #4299e1 100%);
+    color: #fff;
+    padding: 44px 24px 40px;
+    text-align: center;
+  }
+  .hero h1 { margin: 0 0 10px; font-size: 34px; letter-spacing: 2px; }
+  .hero p { margin: 0; font-size: 16px; opacity: .92; }
+  .hero .ver { display: inline-block; margin-top: 14px; font-size: 12px;
+    background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.35);
+    border-radius: 20px; padding: 3px 16px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px 60px; }
+
+  /* ===== 目录 ===== */
+  nav.toc {
+    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 10px;
+    margin: -26px auto 34px; max-width: 860px; padding: 18px 26px;
+    box-shadow: 0 4px 14px rgba(20,40,80,.08);
+    display: flex; flex-wrap: wrap; gap: 8px 22px; justify-content: center;
+  }
+  nav.toc a { color: var(--c-primary); text-decoration: none; font-size: 14px; }
+  nav.toc a:hover { text-decoration: underline; }
+
+  h2.sec {
+    font-size: 24px; margin: 52px 0 6px; padding-left: 14px;
+    border-left: 6px solid var(--c-primary); color: var(--c-primary-dark);
+  }
+  h2.sec .no { color: var(--c-text-light); font-size: 15px; font-weight: normal; margin-left: 8px; }
+  h3 { font-size: 18px; margin: 30px 0 8px; color: var(--c-primary-dark); }
+  p.lead { color: var(--c-text-light); margin: 4px 0 20px; padding-left: 20px; }
+
+  /* ===== 亮点卡片 ===== */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 18px; margin: 22px 0; }
+  .card {
+    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 12px;
+    padding: 20px 22px 16px; box-shadow: 0 2px 8px rgba(20,40,80,.05);
+    border-top: 4px solid var(--c-primary);
+  }
+  .card:nth-child(2) { border-top-color: var(--c-green); }
+  .card:nth-child(3) { border-top-color: var(--c-orange); }
+  .card:nth-child(4) { border-top-color: var(--c-purple); }
+  .card:nth-child(5) { border-top-color: var(--c-red); }
+  .card:nth-child(6) { border-top-color: #0d8f9e; }
+  .card .ico { font-size: 26px; }
+  .card b.t { display: block; font-size: 16px; margin: 6px 0 6px; }
+  .card span.d { font-size: 13.5px; color: var(--c-text-light); }
+
+  /* ===== 快速上手步骤 ===== */
+  .steps { counter-reset: step; margin: 18px 0; }
+  .step {
+    position: relative; background: var(--c-card); border: 1px solid var(--c-border);
+    border-radius: 10px; padding: 14px 18px 14px 66px; margin-bottom: 12px;
+  }
+  .step::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+    width: 34px; height: 34px; border-radius: 50%; background: var(--c-primary);
+    color: #fff; font-weight: bold; font-size: 17px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step b { color: var(--c-primary-dark); }
+  .step .hint { font-size: 13px; color: var(--c-text-light); }
+
+  /* ===== 图片 ===== */
+  figure { margin: 18px 0; text-align: center; }
+  figure img {
+    max-width: 100%; border: 1px solid var(--c-border); border-radius: 8px;
+    box-shadow: 0 3px 12px rgba(20,40,80,.10); background: #fff;
+  }
+  figure figcaption { font-size: 13px; color: var(--c-text-light); margin-top: 8px; }
+  figure.narrow { max-width: 720px; margin-left: auto; margin-right: auto; }
+
+  /* 界面分区标注表 */
+  table.zones { width: 100%; border-collapse: collapse; margin: 14px 0 8px; background: var(--c-card); }
+  table.zones th, table.zones td { border: 1px solid var(--c-border); padding: 8px 12px; font-size: 14px; text-align: left; vertical-align: top; }
+  table.zones th { background: #eef3fa; color: var(--c-primary-dark); }
+  .badge {
+    display: inline-flex; width: 22px; height: 22px; border-radius: 50%; align-items: center;
+    justify-content: center; background: var(--c-orange); color: #fff; font-size: 13px;
+    font-weight: bold; margin-right: 4px;
+  }
+
+  /* ===== 阶段流程 chips ===== */
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 14px 0 6px; }
+  .chip {
+    border-radius: 8px; color: #fff; padding: 5px 13px; font-size: 13.5px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.15); white-space: nowrap;
+  }
+  .chip small { opacity: .85; font-size: 11px; margin-left: 4px; }
+  .chip.g  { background: var(--c-green); }    /* 需求 */
+  .chip.b  { background: var(--c-primary); }  /* 设计 */
+  .chip.p  { background: var(--c-purple); }   /* 计划 */
+  .chip.o  { background: var(--c-orange); }   /* 实现 */
+  .chip.r  { background: var(--c-red); }      /* 质检 */
+  .chip.gr { background: #8a97a8; }           /* bugfix 专属 */
+  .arrow { color: #a0aec0; font-size: 15px; font-weight: bold; }
+  .legend { font-size: 12.5px; color: var(--c-text-light); margin-bottom: 10px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin: 0 4px 0 12px; }
+
+  /* ===== 通用表格 ===== */
+  table.tbl { width: 100%; border-collapse: collapse; margin: 14px 0; background: var(--c-card); font-size: 14px; }
+  table.tbl th, table.tbl td { border: 1px solid var(--c-border); padding: 7px 12px; text-align: left; }
+  table.tbl th { background: #eef3fa; color: var(--c-primary-dark); }
+  table.tbl tr:nth-child(even) { background: #fbfcfe; }
+  code, .path {
+    font-family: Consolas, "Courier New", monospace; font-size: 13px;
+    background: #eef2f7; border-radius: 4px; padding: 1px 6px; color: #c0341d;
+  }
+  .tree {
+    background: #20293a; color: #cfe3ff; border-radius: 10px; padding: 16px 22px;
+    font-family: Consolas, monospace; font-size: 13.5px; line-height: 1.9;
+    overflow-x: auto; margin: 14px 0; white-space: pre;
+  }
+  .tree .c { color: #7ee2a8; }
+  .tree .d { color: #ffd479; }
+
+  /* ===== 提示框 ===== */
+  .tip, .warn {
+    border-radius: 10px; padding: 12px 18px; margin: 16px 0; font-size: 14px;
+  }
+  .tip  { background: #e8f6ef; border: 1px solid #bce4cf; }
+  .tip::before  { content: "💡 "; }
+  .warn { background: #fdf0e7; border: 1px solid #f3d3b5; }
+  .warn::before { content: "⚠️ "; }
+
+  /* ===== FAQ ===== */
+  details {
+    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 9px;
+    padding: 12px 18px; margin-bottom: 10px;
+  }
+  details summary { font-weight: bold; font-size: 15px; cursor: pointer; color: var(--c-primary-dark); }
+  details p { font-size: 14px; margin: 10px 0 2px; }
+
+  footer {
+    text-align: center; color: var(--c-text-light); font-size: 13px;
+    padding: 28px 0 10px; border-top: 1px solid var(--c-border); margin-top: 50px;
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>AutoCode 使用说明</h1>
+  <p>基于 Claude Code 的全自动软件开发编排器 —— 从需求到交付，一条流水线跑到底</p>
+  <span class="ver">C++ / Qt 6 · 绿色便携 · 版本号见标题栏（v主.次.编译号）</span>
+</div>
+
+<nav class="toc">
+  <a href="#highlights">✨ 亮点速览</a>
+  <a href="#quick">🚀 30 秒上手</a>
+  <a href="#ui">🖥️ 界面总览</a>
+  <a href="#workflow">🔁 工作流与阶段</a>
+  <a href="#detail">🧩 功能详解</a>
+  <a href="#intervene">🤝 人工介入</a>
+  <a href="#faq">❓ 常见问题</a>
+</nav>
+
+<div class="wrap">
+
+<!-- ================= 亮点 ================= -->
+<h2 class="sec" id="highlights">亮点速览</h2>
+<p class="lead">先看最值得知道的六件事</p>
+
+<div class="cards">
+  <div class="card">
+    <span class="ico">🏭</span>
+    <b class="t">全流程自动编排</b>
+    <span class="d">需求收集 → 需求确认 → 评审 → 设计 → 计划 → 开发 → 代码审查 → 测试，每个阶段自动调度 Claude 执行，全程无需人工盯守。</span>
+  </div>
+  <div class="card">
+    <span class="ico">🔀</span>
+    <b class="t">双工作流：Feature / Bugfix</b>
+    <span class="d">新功能走「设计-计划-开发」主线；修缺陷走「根因分析-核实-修复」专线，互不拖累，各走各的最短路径。</span>
+  </div>
+  <div class="card">
+    <span class="ico">🔄</span>
+    <b class="t">评审驳回自动迭代</b>
+    <span class="d">内置三道评审关卡，不通过自动打回上游阶段重做；每阶段最多重跑 3 次，超过则暂停并升级给用户，绝不无限空转。</span>
+  </div>
+  <div class="card">
+    <span class="ico">📊</span>
+    <b class="t">过程全透明</b>
+    <span class="d">阶段进度表实时刷新；日志页完整呈现 Claude 的每句话、每次工具调用；底部实时统计费用与 token 消耗，花销一目了然。</span>
+  </div>
+  <div class="card">
+    <span class="ico">🧠</span>
+    <b class="t">工程记忆 guide.md</b>
+    <span class="d">打开工程时自动扫描代码库生成架构总览，后续每次改动追加流水记录并支持一键同步，Claude 越干越懂你的项目。</span>
+  </div>
+  <div class="card">
+    <span class="ico">📦</span>
+    <b class="t">绿色便携 · 随手可用</b>
+    <span class="d">单文件夹即整软件，配置随程序走；首次使用「环境安装」一键装齐 Git / Node.js / Claude Code CLI。</span>
+  </div>
+</div>
+
+<!-- ================= 快速上手 ================= -->
+<h2 class="sec" id="quick">30 秒上手</h2>
+<p class="lead">四步跑通第一个任务</p>
+
+<div class="steps">
+  <div class="step">
+    <b>装环境（仅首次）</b> — 菜单 <code>功能(F) → 环境安装...</code>，授权后自动安装 Git、Node.js 与 Claude Code CLI。
+    <div class="hint">已装过可跳过；脚本位于程序目录 install_env.bat，也可右键以管理员身份手动运行。</div>
+  </div>
+  <div class="step">
+    <b>打开工程</b> — 菜单 <code>工程(P) → 打开工程目录...</code> 选择你的代码目录（或「新建工程目录...」从零开始）。
+    <div class="hint">首次打开会自动扫描代码库生成 .autodev/guide.md（工程架构记忆），需几分钟；下次打开自动恢复上次工程。</div>
+  </div>
+  <div class="step">
+    <b>新建任务</b> — 左栏 <code>新建</code> 按钮：填任务名称、选类型（Feature / Bugfix）、写需求描述，勾选「立刻启动任务」点确定。
+    <div class="hint">不勾立刻启动，则之后选中任务点「继续」再启动。</div>
+  </div>
+  <div class="step">
+    <b>看结果</b> — 右栏阶段表逐个点亮；「日志」页看执行过程，「阶段产物」页看每阶段生成的 .md 文档，完成后工程代码即已修改。
+    <div class="hint">需要纠偏时：任务运行中可在日志页下方「介入指令」框留言；要立即生效则先「暂停」改完再继续（详见「人工介入」一节）。</div>
+  </div>
+</div>
+
+<!-- ================= 界面总览 ================= -->
+<h2 class="sec" id="ui">界面总览</h2>
+<p class="lead">一屏读懂：左管任务，右看执行</p>
+
+<figure>
+  <img src="images/main-window.png" alt="AutoCode 主界面" width="1030">
+  <figcaption>主界面：左栏 = 工程与任务管理，右栏 = 阶段进度与执行过程</figcaption>
+</figure>
+
+<table class="zones">
+  <tr><th style="width:90px">区域</th><th>名称</th><th>作用</th></tr>
+  <tr>
+    <td><span class="badge">1</span></td><td><b>菜单栏</b></td>
+    <td><code>工程(P)</code> 新建/打开工程、最近打开、同步 Guide；<code>功能(F)</code> 设置、环境安装；<code>帮助(H)</code> 本说明、关于。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">2</span></td><td><b>任务列表</b>（当前 / 历史 Tab）</td>
+    <td>「当前任务」列本工程进行中的任务；「历史任务」列全局数据库中已完成/失败的全部任务，支持右键「再次执行」。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">3</span></td><td><b>任务控制按钮</b></td>
+    <td>新建 / 继续 / 暂停 / 停止 / 回退，按钮随所选任务状态自动启用禁用。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">4</span></td><td><b>工程资源管理器</b></td>
+    <td>以工程目录为根节点浏览工程内<b>全部文件</b>（自动隐藏 .autodev/build/Execute/.git 等生成目录）；双击用系统默认程序打开，右键支持剪切/复制/粘贴/删除/改名/复制路径/「通过资源管理器打开」/「添加到聊天框」等。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">5</span></td><td><b>阶段进度表</b></td>
+    <td>当前任务的阶段清单与状态（已完成/进行中/等待），右键某阶段可「再次执行」（仅重跑该阶段）。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">6</span></td><td><b>日志 / 阶段产物 / 助手</b>三页签</td>
+    <td>日志=任务执行对话流；阶段产物=各阶段生成的 .md 文档；助手=独立于任务的问答助手。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">7</span></td><td><b>费用 / Token 统计</b></td>
+    <td>当前任务累计费用（美元）与输入/输出 token 数。</td>
+  </tr>
+  <tr>
+    <td><span class="badge">8</span></td><td><b>状态栏</b></td>
+    <td>当前工程路径、guide.md 状态、已载入任务数。</td>
+  </tr>
+</table>
+
+<h3>标题栏与窗口操作</h3>
+<table class="tbl">
+  <tr><th style="width:220px">操作</th><th>效果</th></tr>
+  <tr><td>点击左上角<b>应用图标</b> / 右键点<b>标题栏空白处</b></td><td>弹出系统菜单（还原 / 移动 / 大小 / 最小化 / 最大化 / 关闭），与标准窗口一致。</td></tr>
+  <tr><td>双击<b>标题栏空白处</b></td><td>最大化 / 还原切换，效果同最大化按钮。</td></tr>
+  <tr><td>点击<b>任务栏图标</b></td><td>前台时最小化，最小化时恢复窗口（最大化状态保持）。</td></tr>
+  <tr><td>标题栏右侧的灰色小字</td><td>三段式版本号 <code>v主.次.编译号</code>（如 v1.0.25），编译号每次构建自动 +1。</td></tr>
+</table>
+
+<!-- ================= 工作流 ================= -->
+<h2 class="sec" id="workflow">工作流与阶段</h2>
+<p class="lead">AutoCode 的核心：两条流水线 + 三道评审关卡</p>
+
+<h3>① Feature 流程（新功能，10 个阶段）</h3>
+<div class="flow">
+  <span class="chip g">需求收集<small>1</small></span><span class="arrow">→</span>
+  <span class="chip g">确认需求<small>2</small></span><span class="arrow">→</span>
+  <span class="chip g">需求评审<small>3</small></span><span class="arrow">→</span>
+  <span class="chip b">设计<small>4</small></span><span class="arrow">→</span>
+  <span class="chip b">设计评审<small>5</small></span><span class="arrow">→</span>
+  <span class="chip p">计划<small>6</small></span><span class="arrow">→</span>
+  <span class="chip p">计划评审<small>7</small></span><span class="arrow">→</span>
+  <span class="chip o">开发<small>8</small></span><span class="arrow">→</span>
+  <span class="chip r">代码审查<small>9</small></span><span class="arrow">→</span>
+  <span class="chip r">测试<small>10</small></span><span class="arrow">→</span>
+  <span class="chip" style="background:#2d3748">✅ 完成</span>
+</div>
+
+<h3>② Bugfix 流程（修缺陷，8 个阶段）</h3>
+<div class="flow">
+  <span class="chip g">需求收集<small>1</small></span><span class="arrow">→</span>
+  <span class="chip g">确认需求<small>2</small></span><span class="arrow">→</span>
+  <span class="chip gr">根因分析<small>11</small></span><span class="arrow">→</span>
+  <span class="chip gr">根因核实<small>12</small></span><span class="arrow">→</span>
+  <span class="chip o">修复<small>13</small></span><span class="arrow">→</span>
+  <span class="chip r">代码审查<small>9</small></span><span class="arrow">→</span>
+  <span class="chip r">测试<small>10</small></span><span class="arrow">→</span>
+  <span class="chip" style="background:#2d3748">✅ 完成</span>
+</div>
+<div class="legend">
+  分组：
+  <i style="background:var(--c-green)"></i>需求
+  <i style="background:var(--c-primary)"></i>设计
+  <i style="background:var(--c-purple)"></i>计划
+  <i style="background:var(--c-orange)"></i>实现
+  <i style="background:var(--c-red)"></i>质检
+  <i style="background:#8a97a8"></i>缺陷专线
+</div>
+
+<h3>③ 评审驳回 → 自动打回重做</h3>
+<figure>
+<svg viewBox="0 0 900 210" style="max-width:900px;width:100%" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <polygon points="0 0, 8 3.5, 0 7" fill="#c53a3a"/>
+    </marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <polygon points="0 0, 8 3.5, 0 7" fill="#2f9e63"/>
+    </marker>
+  </defs>
+  <!-- 生产阶段 -->
+  <g font-size="14" text-anchor="middle">
+    <rect x="30"  y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="95"  y="85" fill="#fff">需求确认</text>
+    <rect x="330" y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="395" y="85" fill="#fff">设计</text>
+    <rect x="630" y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="695" y="85" fill="#fff">计划</text>
+    <rect x="630" y="140" width="130" height="40" rx="9" fill="#d97b2c"/><text x="695" y="165" fill="#fff">开发</text>
+    <!-- 评审关卡 -->
+    <rect x="180" y="60" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="235" y="78" fill="#c53a3a" font-size="13">🔒 评审关卡</text><text x="235" y="94" fill="#c53a3a" font-size="12">需求评审</text>
+    <rect x="480" y="60" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="535" y="78" fill="#c53a3a" font-size="13">🔒 评审关卡</text><text x="535" y="94" fill="#c53a3a" font-size="12">设计评审</text>
+    <rect x="480" y="140" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="535" y="158" fill="#c53a3a" font-size="13">🔒 代码审查</text><text x="535" y="174" fill="#c53a3a" font-size="12">/ 测试</text>
+  </g>
+  <!-- 通过箭头 -->
+  <g stroke="#2f9e63" stroke-width="2.2" fill="none">
+    <line x1="160" y1="80" x2="176" y2="80" marker-end="url(#ag)"/>
+    <line x1="290" y1="80" x2="326" y2="80" marker-end="url(#ag)"/>
+    <line x1="460" y1="80" x2="476" y2="80" marker-end="url(#ag)"/>
+    <line x1="590" y1="80" x2="626" y2="80" marker-end="url(#ag)"/>
+  </g>
+  <text x="450" y="40" fill="#2f9e63" font-size="13" text-anchor="middle">✔ 评审通过 → 进入下一阶段</text>
+  <!-- 驳回回路 -->
+  <g stroke="#c53a3a" stroke-width="2.2" fill="none">
+    <path d="M 235 100 C 235 128, 120 118, 96 102" marker-end="url(#ar)"/>
+    <path d="M 535 100 C 535 126, 420 116, 397 102" marker-end="url(#ar)"/>
+    <path d="M 535 140 C 535 126, 660 122, 693 102" marker-end="url(#ar)"/>
+  </g>
+  <text x="180" y="145" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 不通过</text>
+  <text x="420" y="145" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 打回重做</text>
+  <text x="750" y="132" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 打回重做</text>
+  <text x="450" y="200" fill="#718096" font-size="12.5" text-anchor="middle">同一阶段最多重跑 3 次，超过则任务暂停并升级给用户处理</text>
+</svg>
+<figcaption>评审关卡机制：只读评审阶段在 CLI 层硬性限制为只读（Read/Grep/Glob），不通过自动路由回上游生产阶段</figcaption>
+</figure>
+
+<h3>④ 任务状态一览</h3>
+<table class="tbl">
+  <tr><th style="width:110px">状态</th><th>含义</th><th>可执行操作</th></tr>
+  <tr><td>🟡 Pending</td><td>已创建未启动</td><td>继续（启动）</td></tr>
+  <tr><td>🔵 Running</td><td>执行中</td><td>暂停、停止、介入指令</td></tr>
+  <tr><td>⏸ Paused</td><td>暂停（含迭代超限自动升级）</td><td>继续（从下一阶段恢复）</td></tr>
+  <tr><td>⏹ Stopped</td><td>被手动终止</td><td>继续（续跑）、回退</td></tr>
+  <tr><td>✅ Done</td><td>全部阶段完成（转入历史）</td><td>右键「再次执行」</td></tr>
+  <tr><td>❌ Failed</td><td>执行失败（转入历史）</td><td>右键「再次执行」重试</td></tr>
+</table>
+<div class="tip">「暂停」是<b>阶段边界暂停</b>：当前阶段会跑完，在进入下一阶段前停下 —— 不会产生半截产物。</div>
+
+<!-- ================= 功能详解 ================= -->
+<h2 class="sec" id="detail">功能详解</h2>
+
+<h3>🛠 工程管理</h3>
+<figure class="narrow">
+  <img src="images/panel-left.png" alt="左栏：任务与工程管理">
+  <figcaption>左栏一览：菜单 → 任务列表 → 控制按钮 → 工程资源管理器</figcaption>
+</figure>
+<table class="tbl">
+  <tr><th style="width:180px">操作</th><th>说明</th></tr>
+  <tr><td>新建工程目录...</td><td>选一个空目录新建工程，自动初始化 .autodev 并生成 guide.md。</td></tr>
+  <tr><td>打开工程目录...</td><td>打开已有代码目录；首次打开自动扫描生成 guide.md（耗时数分钟）。</td></tr>
+  <tr><td>最近打开</td><td>最近工程一键直达（子菜单最多 10 条，末尾「...」打开全量历史对话框）；启动时自动恢复上次工程。</td></tr>
+  <tr><td>同步 Guide</td><td>按 record.md 中的改动流水增量更新 guide.md（任务完成后也会自动触发，此处为手动入口）。</td></tr>
+  <tr><td>任务右键菜单</td><td>当前任务：查看任务内容 / 移除；历史任务：查看任务内容 / 再次执行。</td></tr>
+  <tr><td>回退按钮</td><td>弹出历史版本对话框，把工程文件回退到任务边界版本。</td></tr>
+</table>
+
+<h3>📂 工程资源管理器</h3>
+<p>左栏底部的文件树：<b>工程目录本身就是根节点</b>（打开后自动展开），显示工程内<b>全部文件</b>；生成目录（<code>.autodev</code>、<code>build</code>、<code>Execute</code>、<code>.git</code>、<code>node_modules</code>）自动整目录隐藏，保持树面干净。</p>
+<table class="tbl">
+  <tr><th style="width:180px">操作</th><th>说明</th></tr>
+  <tr><td>双击文件 / 目录</td><td>用系统默认程序打开（目录则用资源管理器打开）。</td></tr>
+  <tr><td>通过资源管理器打开</td><td>目录直接打开该目录；文件则打开所在目录并定位选中该文件。</td></tr>
+  <tr><td>剪切 / 复制 / 粘贴</td><td>工程内文件与目录的移动复制（粘贴有同名冲突提示）。</td></tr>
+  <tr><td>删除 / 改名</td><td>删除有二次确认；改名弹输入框，目标已存在会拦截。</td></tr>
+  <tr><td>复制路径 / 复制相对路径</td><td>绝对路径 / 相对工程根的路径写入剪贴板（Windows 原生分隔符）。</td></tr>
+  <tr><td>添加到聊天框</td><td>把选中文件的路径插入「助手」提问框，向 Claude 提问时直接引用该文件。</td></tr>
+</table>
+
+<h3>📁 工程数据都存在哪？—— .autodev 目录</h3>
+<p>所有任务产物都落在<b>工程自己的</b> <code>.autodev/</code> 目录里，随工程走、可提交进版本库：</p>
+<div class="tree">&lt;工程根&gt;/
+└── .autodev/
+    ├── <span class="c">guide.md</span>          <span class="d">← 工程架构总览（Claude 的“项目记忆”，自动生成）</span>
+    ├── <span class="c">record.md</span>         <span class="d">← 全局修改流水（每次改动追加）</span>
+    └── tasks/
+        └── &lt;task-id&gt;/     <span class="d">← 每个任务一个私有目录，互不干扰</span>
+            ├── intake.md / requirements.md / design.md / plan.md ...
+            ├── cr.md  root_cause.md
+            └── meta.json     <span class="d">← 阶段进度 / 迭代次数 / 费用</span></div>
+
+<h3>📊 执行面板（右栏）</h3>
+<figure class="narrow">
+  <img src="images/panel-stages.png" alt="阶段进度表">
+  <figcaption>阶段进度表：当前任务的阶段清单与完成状态，右键某阶段可单独「再次执行」</figcaption>
+</figure>
+
+<table class="tbl">
+  <tr><th style="width:130px">页签</th><th>内容</th></tr>
+  <tr><td><b>日志</b></td><td>任务执行的完整对话流：Claude 的分析文本、每次工具调用（Read/Edit/Bash...）及结果，底部可发「介入指令」中途纠偏（仅任务运行中可用）。</td></tr>
+  <tr><td><b>阶段产物</b></td><td>按阶段列出 .autodev/tasks/&lt;id&gt;/ 下生成的 .md 文档（需求书、设计书、计划书、审查报告...），右侧直接渲染阅读。</td></tr>
+  <tr><td><b>助手</b></td><td>独立于任务的问答助手：问代码、查问题、做小修改都行，不影响任务流水线。</td></tr>
+</table>
+
+<h3>💬 两个输入框，用途不同</h3>
+<figure class="narrow">
+  <img src="images/panel-input.png" alt="介入指令与助手输入框">
+  <figcaption>上：任务介入指令（运行中纠偏）；下：助手问答（随时可用）</figcaption>
+</figure>
+<table class="tbl">
+  <tr><th style="width:150px"></th><th>介入指令（日志页下方）</th><th>助手输入（助手页下方）</th></tr>
+  <tr><td><b>对象</b></td><td>正在运行的任务</td><td>独立助手会话</td></tr>
+  <tr><td><b>时机</b></td><td>仅任务 Running 时可用</td><td>打开工程后随时可用</td></tr>
+  <tr><td><b>典型用途</b></td><td>「测试不用跑 XX」「换个方案实现」</td><td>「这个函数干嘛的」「帮我加个注释」</td></tr>
+  <tr><td><b>附属功能</b></td><td>—</td><td><b>只读</b>开关（禁止改文件）、<b>↶ 回退</b>（撤销上一轮）、上下文条（绿≤70%/红&gt;70%，右键可手动压缩/设窗口上限）</td></tr>
+</table>
+
+<h3 id="intervene">🤝 人工介入：时机与注意事项</h3>
+<p>全自动不等于放任不管。AutoCode 提供四种介入通道，可靠程度各不相同 —— <b>真正可靠的介入点是「阶段边界」和「熔断升级后」</b>，运行中途的实时插话受底层协议限制基本不生效（见下）。</p>
+
+<table class="tbl">
+  <tr><th style="width:200px">通道</th><th>说明</th><th style="width:110px">可靠程度</th></tr>
+  <tr>
+    <td><b>① 介入输入栏</b><br>（日志页下方）</td>
+    <td>任务运行中输入指令（Ctrl+Enter 发送），指令记入对话流。<b>仅当前正在运行的任务可用</b>，其他状态输入栏自动禁用（不会静默丢弃）。<br>
+    <b style="color:var(--c-red)">⚠️ 已知限制：</b>阶段子进程启动后输入通道即关闭，中途插话<b>多数情况不会真正送达</b>——指令会被记录（injected 事件）供后续阶段参考，但<b>无法打断正在跑的阶段</b>。要立即纠偏请用 ②。</td>
+    <td>⚠️ 仅记录</td>
+  </tr>
+  <tr>
+    <td><b>② 阶段边界介入</b></td>
+    <td>子进程无法真正中途挂起，所以「暂停」= 当前阶段<b>跑完</b>、进入下一阶段前停下（不会产生半截产物）—— 这正是你的介入窗口。<br>
+    <b>推荐套路：</b>暂停 → 手动修改产物或代码（如直接编辑 requirements.md / design.md）→ 「继续」从下一阶段恢复，或阶段表右键「再次执行」只重跑该阶段（跑完停住，不推进后续）。</td>
+    <td>✅ 最可靠</td>
+  </tr>
+  <tr>
+    <td><b>③ 熔断升级</b><br>（系统主动请你）</td>
+    <td>两种触发：同一阶段被驳回超过 3 次仍不通过，或上游输入多次生成失败 → 任务自动<b>暂停</b>并提示「已暂停并升级到用户处理」。<br>
+    处置：打开 <code>.autodev/tasks/&lt;任务id&gt;/escalation.md</code>（含驳回焦点、最近阶段历史与处置建议），三选一：<b>直接改代码后重跑</b> / <b>调整任务描述再继续</b> / <b>放宽验收要求</b>。</td>
+    <td>✅ 可靠</td>
+  </tr>
+  <tr>
+    <td><b>④ 助手反向提问</b><br>（ask_user）</td>
+    <td>「助手」页问答时，Claude 若缺关键信息会<b>主动弹窗向你提问</b>——是它来找你，不影响任务流水线。选项列表末尾有「<b>其他（自行输入）</b>」，不在列表里的问题可自由输入。</td>
+    <td>✅ 按需回答</td>
+  </tr>
+</table>
+
+<h3>介入能力速查</h3>
+<table class="tbl">
+  <tr><th>场景</th><th style="width:170px">能否介入</th><th style="width:300px">方式</th></tr>
+  <tr><td>阶段运行中实时插话</td><td>⚠️ 名义能，实际仅记录</td><td>介入输入栏（已知限制）</td></tr>
+  <tr><td>阶段边界</td><td>✅ 能</td><td>暂停 → 手改产物/代码 → 继续或右键重跑该阶段</td></tr>
+  <tr><td>熔断升级后</td><td>✅ 能（就是请你来）</td><td>看 escalation.md → 三选一处置后恢复</td></tr>
+  <tr><td>任务非 Running 状态</td><td>❌ 不能</td><td>介入栏已禁用（指令不丢失、不静默忽略）</td></tr>
+  <tr><td>非当前任务</td><td>❌ 不能</td><td>执行层单任务串行，注入只认当前任务</td></tr>
+  <tr><td>人工审批闸门（如设计须确认后才继续）</td><td>❌ 尚未实现</td><td>已列入后续规划</td></tr>
+</table>
+<div class="warn">一句话记住：<b>想纠偏，先暂停</b>。暂停永远停在阶段边界，改完东西再继续或单阶段重跑，比指望运行中插话靠谱得多。</div>
+
+<h3>⚙️ 设置与环境安装</h3>
+<p><b>设置</b> — 菜单 <code>功能(F) → 设置...</code>：集中编辑全部可调参数（运行策略、Agent 参数、评审与助手行为、目录排除等），保存到 exe 同级 <code>config.ini</code>，确定后立即生效——软件保持绿色便携，配置随程序走。</p>
+<p><b>环境安装</b> — 菜单 <code>功能(F) → 环境安装...</code>：以管理员权限自动安装 Claude Code 运行所需环境 —— Git、Node.js、Claude Code CLI。装一次即可，之后可重复运行修复环境。</p>
+
+<!-- ================= FAQ ================= -->
+<h2 class="sec" id="faq">常见问题</h2>
+
+<details>
+  <summary>点「新建任务」提示"请先打开工程目录"？</summary>
+  <p>AutoCode 的所有任务都依附于工程。先通过 <code>工程(P) → 打开工程目录...</code> 打开一个代码目录（或新建工程目录），再创建任务。</p>
+</details>
+<details>
+  <summary>任务显示 Paused（暂停），怎么回事？</summary>
+  <p>两种可能：① 你点了「暂停」——阶段边界正常停下，点「继续」从下一阶段恢复；② 同一阶段迭代超过 3 次仍不通过——系统主动暂停并升级，请查看日志页末尾的评审意见，修改需求描述或处理后点「继续」。</p>
+</details>
+<details>
+  <summary>首次打开工程很慢 / 状态栏一直显示 guide 生成中？</summary>
+  <p>首次打开会调用 Claude 完整扫描代码库生成 guide.md，大工程需几分钟，属正常现象。仅首次较慢，之后增量更新。若生成失败，菜单「同步 Guide」可重试。</p>
+</details>
+<details>
+  <summary>怎么中途修改 Claude 的做法？</summary>
+  <p>任务运行中，可在日志页下方的<b>介入指令</b>框输入要求（如「不要动 ui 目录」「补上单元测试」），Ctrl+Enter 发送，指令会记入对话流供后续阶段参考；但<b>正在运行的阶段无法被打断</b>（已知限制）。要立即纠偏，推荐：点「暂停」（当前阶段跑完即停）→ 手动修改产物/代码 → 「继续」或右键单阶段「再次执行」。详见「人工介入」一节。</p>
+</details>
+<details>
+  <summary>任务失败了，代码改了一半怎么办？</summary>
+  <p>三个工具：① 历史任务右键「再次执行」整体重跑；② 阶段表右键「再次执行」只重跑某一阶段；③ 左栏「回退」按钮把工程文件回退到任务开始前的版本。</p>
+</details>
+<details>
+  <summary>费用在哪看？会超支吗？</summary>
+  <p>右栏底部实时显示当前任务费用与 token 消耗；任务详情（右键「查看任务内容」）可看单任务累计费用。所有历史记录保存在程序目录 history.db。</p>
+</details>
+<details>
+  <summary>能同时跑多个任务吗？</summary>
+  <p>当前版本执行层为单任务串行（保证工程文件不被并发写坏）；新任务可先建好排队，当前任务结束后依次执行。</p>
+</details>
+<details>
+  <summary>标题栏的版本号三个数字是什么意思？</summary>
+  <p>三段式 <code>v主.次.编译号</code>（如 v1.0.25）：主版本 = 架构级大改版，次版本 = 功能迭代，编译号 = 每次构建自动 +1，用于精确对应某个 exe。</p>
+</details>
+
+<footer>
+  AutoCode · 梅文海 2026.8 · 本文档由「帮助(H) → 帮助」打开，位于程序目录 help\使用说明.html
+</footer>
+
+</div>
+</body>
+</html>

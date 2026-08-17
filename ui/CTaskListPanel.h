@@ -30,9 +30,15 @@ public:
 
     // 设置「当前任务」表（本工程非终态任务）。
     void SetTasks(const QList<CTaskInfo*>& a_aTasks);
+    // 2026.08.15 切工程：清空两表并复位 m_pCur——旧任务对象即将 delete，若不复位，
+    //   悬垂指针可能命中回收地址误匹配新任务（幽灵选中），且 UpdateButtons 每次解引用。
+    void ClearAll();
     // 设置「历史任务」表（过滤由 CMainWindow::ReloadHistory 完成，面板直接展示传入列表）。
     void SetHistoryTasks(const QList<CTaskInfo*>& a_aTasks);
     void RefreshTask(CTaskInfo* a_pTask);   // 状态变化时重建当前表（任务可能迁出当前表）
+    // 2026.08.15 原地刷新指定任务在两表中的行（当前表整行文本；历史表费用/Token/耗时列），
+    //   不重建列表、不动选中——供助手消耗归集/历史耗时回填等轻量数值更新。
+    void UpdateTaskRow(CTaskInfo* a_pTask);
     // 在当前表查找并选中指定任务（启动任务时自动选中，使其日志立即显示）。
     void SelectTask(CTaskInfo* a_pTask);
     CTaskInfo* CurrentTask() const { return m_pCur; }
@@ -75,6 +81,10 @@ private:
     void PopulateCurrent();                   // 重建当前表（只放非终态）
     void RestoreSelection(CTaskInfo* a_pTarget);   // 重建后在两表中找回指定任务选中
     void UpdateButtons();                     // 按当前任务状态刷新启动/暂停/停止按钮
+    // 2026.08.17 悬垂对账：m_pCur 不在两表数据源里（任务对象已被 CMainWindow delete）则置空。
+    //   各 Set* 重建是删除后唯一的同步通知点，必须在此拦住，否则 1s 定时器/按钮刷新会
+    //   解引用已释放内存（d7f99cac 01:32:53 崩溃：OnElapsedTimer 读 m_pCur->Status()）。
+    void ReconcileCur();
     static QString FormatTokens(qint64 a_iTokens);  // K/M/G 缩写
     // 2026.08.15 当前表行文本：名称 [类型] · 阶段 · 状态 [· 耗时] · 创建时间（PopulateCurrent 与秒级刷新共用）。
     static QString MakeTaskText(const CTaskInfo* a_pTask);
@@ -94,6 +104,7 @@ private:
     QPushButton*  m_pBtnStop  = nullptr;
     QPushButton*  m_pBtnRollback = nullptr;   // FR-6 停止按钮右侧「回退」
     QList<CTaskInfo*> m_aTasks;            // 当前表数据源（本工程非终态）
+    QList<CTaskInfo*> m_aHis;              // 2026.08.17 历史表数据源副本（悬垂对账用）
     QTimer*       m_pElapsedTimer = nullptr;   // 2026.08.15 运行耗时 1s 刷新（当前任务 Running 时跑）
     CTaskInfo*    m_pCur      = nullptr;
     bool          m_bAllowDeselect = false;  // 粘性选择：仅空白点击才允许取消（#5）

@@ -273,3 +273,26 @@
 [2026-08-15] 历史任务回看阶段表按执行时状态标注(选中DB副本从task.json懒加载阶段历史;当前阶段区分进行中/失败/未完成) + 功能菜单设置与环境安装调换位置 - CMainWindow.cpp, CExecutionPanel.cpp
 
 [2026-08-15] 编排提效三件套：流程档位+阶段勾选清单(简单/标准/严格,task.json 持久化 tier/flowStages,缺文档阶段按实际资料推进)、评审多数决(标准档 2/3 驳回才驳回,少数派意见随产物与后续 prompt 携带,严格档保持一票否决)、轻量评审瘦身禁穷尽核查+限 turns(标准 18/简单 12) - TaskTypes.h CTaskInfo StageDef CStageMachine CTaskOrchestrator CNewTaskDialog CMainWindow CExecutionPanel CMakeLists prompts/03 05 07
+[2026-08-15] 输入token口径补缓存读/写(与账单一致) + 助手消耗(费用/输入/输出/耗时)归集到当前档任务 + 历史任务选中时回填run_ms并刷新耗时列 - CClaudeRunner.cpp, CTaskOrchestrator.cpp, CTaskInfo.h, CMainWindow.cpp, CTaskListPanel.cpp
+[2026-08-15] 任务统计增加API请求数(assistant消息条数): 阶段/评审视角/助手调用各自累加, task.json与history.db(req_count列)持久化, 费用栏/查看任务/历史表(新列)显示 - CClaudeRunner.cpp, CTaskOrchestrator.cpp, CTaskInfo.cpp, CTaskHistoryDB.cpp, CMainWindow.cpp, CExecutionPanel.cpp, CNewTaskDialog.cpp, CTaskListPanel.cpp
+[2026-08-15] claude调用失败诊断修复: stderr捕获落run.log+失败消息附带尾部(exit 1真因不再丢失)、cmd崩溃误报改宽限期轮询transcript识别孤儿node的max_turns收敛转自动续跑、用户停止改静默收尾不再误报崩溃(StopTask直接落Stopped) - CClaudeRunner.cpp CClaudeRunner.h CTaskOrchestrator.cpp
+[2026-08-15] 打开工程时彻底清空阶段表/阶段产物/任务列表并复位面板选中(修旧任务delete后悬垂m_pCur回收地址误匹配致幽灵选中) - CMainWindow.cpp, CTaskListPanel.cpp
+[2026-08-15] ad-hoc 助手 max-turns 误报修复：40 轮打满被报「助手调用失败」且原因为空、断点 sid 丢失；现自动续跑 2 次、耗尽保会话提示接续；失败 result 为空时以 subtype 兜底原因；Submit/Compact/Stop 占用判定补宽限与重试 - CClaudeRunner.cpp CTaskOrchestrator.cpp/h
+[2026-08-15] 助手提问对话框: 选项列表字体改11号, 末尾新增“其他（自行输入）”项(选中显示输入框, 空输入不关闭, 双击聚焦输入) - CAskUserDialog.cpp, CAskUserDialog.h
+[2026-08-15] 助手上下文假占用 1.9M 修复：result 累计兜底加窗口上限、逐条 usage 超 2 倍窗口判脏丢弃、旧档还原脏值钳为未知（—）断开黏住循环 - CClaudeRunner.cpp CExecutionPanel.cpp
+[2026-08-17] [v1.0.15] d7f99cac 双故障修复：①任务续跑竞态——StartStage 收尾等待移至 Reset() 之前，防旧进程 finished 信号被误判为新进程失败（退出码=1 假失败+真进程变孤儿）；②任务列表悬垂指针崩溃——两表重建时对账清 m_pCur、耗时定时器加数据源成员校验，修 OnElapsedTimer UAF(0xc0000005) - CClaudeRunner.cpp CTaskListPanel.cpp CTaskListPanel.h
+[2026-08-17] 工程资源管理器: 树根改为工程目录节点本身并自动展开(视图根=父目录+隐藏兄弟行); 右键新增「通过资源管理器打开」(explorer.exe, 文件用/select选中); 新增三段式版本号 v主.次.编译号(主/次=CMakeLists project(VERSION), 编译号每次编译自动+1, 自绘标题栏+窗口标题显示) - CProjectExplorerPanel.cpp/h, CTitleBar.cpp/h, CMainWindow.cpp, CVersion.h(新), scripts/GenVersion.cmake(新), CMakeLists.txt
+[2026-08-17] 资源管理器右键去掉「打开」项(与「通过资源管理器打开」功能重复) - CProjectExplorerPanel.cpp/h
+[2026-08-17] 资源管理器接通目录级隐藏(此前HiddenDirs清单未挂接): build/Execute/.git/.autodev/node_modules 目录整棵不显示, 文件级过滤(*.o/obj/exe/pdb/ilk/lib)保留 - CProjectExplorerPanel.cpp/h
+[2026-08-17] 标题栏左上角图标点击弹 Win32 系统菜单(还原/移动/大小/最小化/最大化/关闭, 按窗口态置灰, 选中走 WM_SYSCOMMAND) - CTitleBar.cpp/h, CMainWindow.cpp/h
+[2026-08-17] 修复标题栏图标点击无反应(菜单改在鼠标释放时弹, 按下时弹会被释放事件竞态点掉); 标题栏空白双击=点最大化按钮(与按钮共用 OnMaximizeToggle, 图标态同源翻转) - CTitleBar.cpp/h, CMainWindow.cpp/h
+[2026-08-17] 修复图标点击弹系统菜单不触发: QLabel 吞鼠标事件(重写handler既不accept也不ignore不向父级传播), 图标加 WA_TransparentForMouseEvents 直通父级 - CTitleBar.cpp
+[2026-08-17] 图标系统菜单改全原生路径: NCHITTEST 图标区返回 HTSYSMENU, WM_NCLBUTTON/RBUTTONDOWN(HTSYSMENU)弹菜单(锚点=图标左下角), 图标双击吞掉防误关, 弃用不可靠的 Qt 鼠标事件链 - CTitleBar.cpp/h, CMainWindow.cpp
+[2026-08-17] [v1.0.15] 健壮性①停滞检测+启动恢复：runner 30s 巡检零输出超阈值([Agent]StallMinutes 默认10分钟)判挂起 kill→subtype=stall 自动 --resume 续跑(共享 MaxResume 预算)；LaunchStage 带 lastSessionId 改断点续跑不再整阶段重跑；打开工程检测 Running 残留→转 Paused+提示一键续跑 - CClaudeRunner.cpp/h CTaskOrchestrator.cpp CMainWindow.cpp CProjectManager.cpp/h
+[2026-08-17] 图标菜单改应用级原生消息过滤器(QAbstractNativeEventFilter, 先于Qt内部处理) + 标题栏空白右键弹同一菜单(Windows原生行为) + 排障日志titlebar_debug.log(定位后删) - CMainWindow.cpp/h
+[2026-08-17] 定位图标菜单硬伤: frameless窗口无WS_SYSMENU致GetSystemMenu恒NULL; 改CreatePopupMenu自建系统菜单(项ID=SC_*) + 过滤器接管WM_SYSCOMMAND(最大化/还原统一走OnMaximizeToggle保图标态同步, 任务栏菜单/Alt+F4同路) - CMainWindow.cpp/h
+[2026-08-17] 清除图标菜单排障日志(titlebar_debug.log); 修复最小化后点任务栏无法恢复(SC_RESTORE先判IsIconic走ShowWindow(SW_RESTORE), 未最小化才走OnMaximizeToggle) - CMainWindow.cpp/h
+[2026-08-17] 修复前台时点任务栏图标无法最小化(frameless窗口WS_POPUP缺WS_MINIMIZEBOX/MAXIMIZEBOX, 补样式无视觉副作用) - CMainWindow.cpp
+[2026-08-17] 关于对话框改正式版式(新增CAboutDialog: 图标/应用名/版本/简介/作者/日期/版权+确定按钮) - ui/CAboutDialog.h/cpp CMakeLists.txt CMainWindow.cpp
+[2026-08-17] 资源管理器改为显示全部文件(旧nameFilters语义反了,曾致源码全隐藏); 帮助文档提为仓库正本help/并构建同步, 更新(设置/标题栏操作/资源管理器详解/最近打开10条/ask_user其他输入/版本号FAQ/页脚年份) - CProjectExplorerPanel.cpp CMakeLists.txt help/使用说明.html
+[2026-08-17] [v1.0.17] guide 生成失败真因并入任务事件持久化（此前只进状态栏转瞬即逝，异机失败无从排查） - CMainWindow.cpp

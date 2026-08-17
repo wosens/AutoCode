@@ -83,12 +83,26 @@ public:
     // 绝对值设置累计用量（用于从 SQLite 历史库恢复，非累加）
     void SetUsage(double a_dCost, qint64 a_iIn, qint64 a_iOut);
 
+    // —— API 请求数（2026.08.15，task.json 与 history.db 均持久化）——
+    // 每条 assistant 消息 = 一次 API 调用（runner 统计，阶段/评审视角/助手调用各自累加）。
+    int RequestCount() const { return m_iReqCount; }
+    void AddRequests(int a_iN) { if (a_iN > 0) { m_iReqCount += a_iN; emit sigChanged(); } }
+    // 绝对值回填（SQLite 历史库加载用；不发 sigChanged，避免加载触发回写）
+    void SetRequestCount(int a_iN) { m_iReqCount = a_iN; }
+
     // —— 运行耗时（2026.08.15，task.json 与 history.db 均持久化）——
     // SetStatus 进/出 Running 自动打点累计（暂停/停止冻结、继续累加，跨段求和）；
     // 状态栏「运行中」后显示；列表/查看任务时一并展示。
     qint64 RunElapsedMs() const;
     // 绝对值回填（SQLite 历史库加载用；不发 sigChanged，避免加载触发回写）
     void SetRunElapsedMs(qint64 a_iMs) { m_iRunMs = a_iMs; }
+    // 2026.08.15 外部时段累加（助手调用耗时归集）：任务运行中的时段已含助手时间，勿重复调。
+    void AddRunElapsedMs(qint64 a_iMs) {
+        if (a_iMs > 0) {
+            m_iRunMs += a_iMs;
+            emit sigChanged();
+        }
+    }
 
     // —— 历史 ——
     const QList<SStageRun>& History() const { return m_aHistory; }
@@ -155,6 +169,7 @@ private:
     double      m_dCost      = 0.0;
     qint64      m_iInTok     = 0;
     qint64      m_iOutTok    = 0;
+    int         m_iReqCount  = 0;    // 2026.08.15 API 请求数累计（assistant 消息条数）
     QList<SStageRun> m_aHistory;
     QString     m_sErr;
     bool        m_bPauseReq  = false;

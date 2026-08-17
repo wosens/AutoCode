@@ -105,6 +105,10 @@ signals:
     void sigAdhocUndo();                                               // 撤销最后一条提问（面板清尾块）
     void sigAdhocFinished();                                           // 一次助手调用结束（启用输入栏）
     void sigAdhocStateChanged();                                       // sid/撤销栈变化（#1 存盘触发）
+    // 2026.08.15 一次成功助手调用的消耗（输入含缓存读/写，与账单同口径）+ 本次调用耗时（ms）
+    //   + API 请求数，由 CMainWindow 归集到当前档任务（助手档按任务分档，消耗跟随档走）。
+    void sigAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs,
+                       int a_iReqs);
 
 private slots:
     void OnRunnerInfo(const QString& a_sLine);
@@ -169,7 +173,8 @@ private:
     int ReviewViewCount(const CTaskInfo* a_pTask, EStage a_eStage) const;
     // 单视角 runner 完成：缓存结果，待完成集合空时 fan-in。不碰 m_pCurTask、不直接调 Advance（并发安全）。
     void OnReviewViewFinished(CTaskInfo* a_pTask, const QString& a_sViewId, bool a_bOk, const QString& a_sResult,
-                              qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
+                              qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid,
+                              int a_iReqs);
     // 全部视角完成：聚合决策（严格档一票 Reject 即 Reject；标准/简单档多数决）、
     //   合并正文写回 sOutput（保 cr.md 回灌闭环；少数派驳回意见以专段携带）、推进。
     void FanInReview(CTaskInfo* a_pTask);
@@ -239,6 +244,8 @@ private:
     QString        m_sAdhocPendingPrompt;                          // Submitting 模式记当前 prompt（压栈用）
     QString        m_sAdhocSummary;                                // CompactSummarize 产出、CompactReseed 投递
     QList<QPair<QString, QString>> m_aAdhocStack;                  // (prompt, sid) 链；撤销=弹栈回 m_sAdhocSid
+    QDateTime      m_dtAdhocStart;                                 // 2026.08.15 本次助手调用起点（耗时归集用）
+    int            m_iAdhocResume = 0;                             // 2026.08.15 本条提问 max-turns 已自动续跑次数（上限 2，新提问清零）
 
     // —— 评审多视角并行（fan-out / fan-in）状态 ——
     struct SViewResult {       // 单视角评审 runner 的完成结果
