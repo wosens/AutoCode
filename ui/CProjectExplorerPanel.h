@@ -28,12 +28,19 @@ signals:
     // 「添加到聊天框」（Q1 默认）：把所选路径投到 adhoc 助手输入框。
     // a_sKind: "path" | "content"；本轮默认注入路径。
     void sigAddToChat(const QString& a_sText, const QString& a_sKind);
+    // 2026.08.18 双击文本文件：请求在执行面板「助手」右侧 Tab 内嵌显示内容。
+    //   仅文本文件发出（判定见 OnDoubleClicked）；其他文件保持系统默认程序打开。
+    void sigFileOpen(const QString& a_sAbsPath);
 
 private slots:
     void OnCustomContextMenu(const QPoint& a_stPos);   // 8 项菜单
-    void OnDoubleClicked(const QModelIndex& a_stIdx);  // Q1 默认：调系统默认程序打开
+    void OnDoubleClicked(const QModelIndex& a_stIdx);  // 文本文件→sigFileOpen；其他→系统默认程序打开
 
 private:
+    // 2026.08.18 文本文件判定：扩展名白名单（源码/文档/配置）命中即文本；
+    //   未知扩展名再嗅探前 4KB 含 \0 判二进制。双击文本文件进内嵌 Tab 用。
+    static bool IsTextFile(const QString& a_sAbsPath);
+
     // 8 项操作（均含工程根越界校验）
     void DoCut();
     void DoCopy();

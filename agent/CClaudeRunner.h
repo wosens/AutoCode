@@ -1,0 +1,141 @@
+﻿#pragma once
+
+#include <QObject>
+#include <QProcess>
+#include <QByteArray>
+#include <QTimer>
+#include <QElapsedTimer>
+#include <QStringList>
+
+#include "CAgentRunnerBase.h"
+
+// 封装单次 `claude` 进程调用：通过 stdin 投递 prompt，
+// 流式解析 stream-json 输出，转为 Qt 信号上抛。
+//
+// 2026.08.18 改继承 CAgentRunnerBase（多后端支持）：6 信号、Last* 元信息 getter
+// 与状态成员上移基类，本类只保留 claude CLI 专属实现（进程参数/解析/宽限/重试）。
+//
+// 生命周期：一次 StartStage() 对应一次 claude 进程；Finished 后对象可复用或丢弃。
+class CClaudeRunner : public CAgentRunnerBase {
+    Q_OBJECT
+
+public:
+    explicit CClaudeRunner(QObject* a_pParent = nullptr);
+    ~CClaudeRunner() override;
+
+    // —— 进程级全局配置（config.ini [Agent] ClaudeCmd；所有 runner 实例共享）——
+    // 2026.08.15：claude 命令名可配（默认 "claude"，依赖 PATH）。换特定版本/网关时改
+    //   config.ini 即可，无需改码。空串回退默认。
+    static void SetClaudeCmd(const QString& a_sCmd);
+    static QString ClaudeCmd();
+
+    // 2026.08.15 [Agent] AskTimeoutSec：ask_user 等用户作答的超时（秒，默认 600）。
+    //   MCP ask 服务跑在独立子进程（--mcp-ask-server），经环境变量 AUTOCODE_ASK_TIMEOUT_SEC
+    //   传递（挂载 ask_user 的 StartStage 启动时注入）；非正数回退默认。
+    static void SetAskTimeoutSec(int a_iSec);
+    static int  AskTimeoutSec();
+    // 2026.08.17 [Agent] StallMinutes：停滞检测阈值（分钟，默认 10）——进程活着但持续
+    //   零输出（疑似网络/中继挂起）达到阈值 → kill 并以 subtype="stall" 报失败，
+    //   上层凭 lastSessionId 自动续跑。挂载 ask_user 的调用（交互式）不启用停滞检测。
+    static void SetStallMinutes(int a_iMin);
+    static int  StallMinutes();
+
+    // 模型名 → 上下文窗口 token 上限（未命中回退 200K）。2026.08.15 从
+    //   CExecutionPanel::ContextLimitForModel 下沉到 agent 层：编排器计算
+    //   自动压缩比例阈值也要用（面板委托到此处，单一实现）。
+    static qint64 ContextWindowForModel(const QString& a_sModel);
+
+    QString BackendName() const override { return QStringLiteral("claude"); }
+
+    // 启动一次阶段执行
+    //   a_sWorkDir       claude 的工作目录（工程根），相对路径 .autodev/... 落在此处
+    //   a_sPrompt        投递给 claude 的完整 prompt（经 stdin 传入）
+    //   a_sDisallowedTools  --disallowedTools 参数（deny 黑名单），如 "Bash,Edit"
+    //   a_iMaxTurns      --max-turns 兜底
+    // （默认参数在基类声明处，经基类指针调用时取基类默认值）
+    void StartStage(const QString& a_sWorkDir,
+                    const QString& a_sPrompt,
+                    const QString& a_sDisallowedTools,
+                    int a_iMaxTurns,
+                    const QString& a_sResumeSid,
+                    bool a_bFork,            // --fork-session：建新 sid 分支（ad-hoc 撤销链用）
+                    int a_iAutocompactK,     // >0 → --autocompact <n>k 自动压缩阈值（ad-hoc 用）
+                    bool a_bEnableAskUser) override;  // true → 挂载 ask_user MCP server（ad-hoc 运行时提问）
+
+    // 终止当前执行（kill 进程）
+    void Stop() override;
+
+    bool IsRunning() const override;
+
+    // 2026.08.15 崩溃宽限期进行中（cmd.exe 已死、孤儿 node 落盘判定中）：
+    // 此时 IsRunning()==false 但仍需 Stop/停止判定覆盖（否则停止请求会被宽限期后的自动续跑覆盖）。
+    bool IsGraceActive() const override { return m_bGraceActive; }
+
+    // 2026.08.15 快速失败重试等待中（5 秒延迟未到）：同上，IsRunning()==false 但仍占用 runner。
+    bool IsRetryPending() const override { return m_bRetryPending; }
+
+    // FR-3：向当前运行中的 claude 进程 stdin 追加一条用户轮次（Q2 默认=a「追加用户消息」）。
+    //   仅 IsRunning() 时尝试写入；因 -p 一次性模式 prompt 投递后已 closeWriteChannel，
+    //   实际能否作为新一轮 user turn 生效取决于协议（R1 已知限制）。返回是否写入成功。
+    //   未运行或写入失败时安全 no-op，返回 false（不抛、不影响运行）。
+    bool InjectUserTurn(const QString& a_sText) override;
+
+private slots:
+    void slotOnStdOut();
+    void slotOnStdErr();
+    void slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus);
+    void slotOnErrorOccurred(QProcess::ProcessError a_eError);
+
+private:
+    void HandleLine(const QByteArray& a_sLine);
+    void EmitFailed(const QString& a_sMsg);
+    void Reset();
+    // 2026.08.17 停滞检测巡检（30s 一拍）：进程活着但距上次收到任何输出超过阈值 →
+    //   kill 并以 subtype="stall" 发 sigFinished（上层凭 lastSessionId 自动续跑）。
+    void CheckStall();
+    // 2026.08.15 崩溃误报修复：cmd.exe 被硬杀（QProcess::Crashed）时 node 可能仍在以孤儿进程
+    //   运行并最终以 max-turns 正常收敛（a0c96b4d 验证阶段实测：cmd 死后 90 秒 node 仍在写
+    //   transcript）。此时启动宽限定时器轮询 transcript 新增内容里的 max_turns_reached 标记，
+    //   命中则按「达到轮次上限」发 sigFinished（上层自动 --resume 续跑），超时才真正判死。
+    void BeginOrphanGrace(const QString& a_sWhy);
+    void PollOrphanTranscript();
+    QString FindTranscriptPath();   // 按 sid 定位 ~/.claude/projects/*/<sid>.jsonl（命中缓存）
+    // 2026.08.15 快速失败自动重试：进程在短时间内非零退出且未收到 result（max-turns 后 0 秒间隔
+    //   立即 --resume 的场景实测两次瞬态 exit 1：03:19 七秒死 / 12:39 一秒死；隔一段时间手动
+    //   同参数续跑均成功——疑似上一进程会话清理/后台任务收尾未完）。原参数延迟重拉。
+    void RelaunchStage();
+    // 2026.08.19 运行中介入：把一段用户文本编码成 stream-json 输入帧（user message）
+    //   写入 stdin（+换行）。--input-format stream-json 模式下 stdin 全程保持打开，
+    //   运行中追加 user 帧 = claude 在当前轮内收到新的用户输入（转向/补充指令）。
+    void WriteUserFrame(const QString& a_sText);
+
+    QStringList m_aLastArgs;       // 最近一次启动的完整参数（重试用）
+    QString     m_sLastPrompt;     // 最近一次投递的 prompt（重试用）
+    QString     m_sLastWorkDir;    // 最近一次工作目录（重试用）
+    QElapsedTimer m_uptime;        // 本次进程存活计时（判快速失败）
+    int         m_iFastRetry = 0;  // 本次 StartStage 已自动重试次数（上限 2）
+    bool        m_bRetryPending = false;  // 快速失败重试等待中（Stop/抢占判定覆盖用）
+
+    QProcess*  m_pProc     = nullptr;
+    QByteArray m_buf;          // 跨 readyRead 的行缓冲
+    bool       m_bFinished = false;  // 是否已发 sigFinished（防重复）
+    // 2026.08.19 进程代次（Reset 时 +1）：result 行收尾要在 emit sigFinished **之后**才关
+    //   stdin（让 claude 收到 EOF 干净退出），而 emit 是同步的——上层槽可能在槽内同步
+    //   StartStage（max-turns 自动续跑）已拉起新进程；凭代次守卫确保只关旧进程的 stdin。
+    int        m_iProcEpoch = 0;
+    // m_sLastSubtype / m_sLastSessionId / m_iLastContextFill / m_iLastReqCount /
+    // m_sLastModel 已上移 CAgentRunnerBase（protected，Reset 时清零）
+    QString    m_sMcpConfigPath;  // ask_user 模式下生成的 --mcp-config 临时文件（Reset 清理）
+    QTimer*    m_pGraceTimer = nullptr;   // 崩溃宽限定时器（3s 一轮，上限 80 轮 = 240s）
+    bool       m_bGraceActive = false;    // 宽限期进行中（抑制重复失败 / Stop 静默收尾用）
+    int        m_iGraceTicks = 0;         // 宽限期已轮询次数
+    qint64     m_iTranscriptSeen = 0;     // transcript 已读到的字节偏移（基线 = StartStage 时文件大小）
+    QString    m_sTranscriptPath;         // 会话 transcript 路径缓存（首次命中后固定）
+    QStringList m_aStderrTail;            // 最近若干条 stderr 行（失败消息附带，防真因丢失）
+    // 2026.08.17 停滞检测：m_actClock 在每次收到 stdout/stderr 字节时重启，30s 巡检一次，
+    //   超阈值且进程仍活着 → 挂起判定（subtype="stall"）。挂载 ask_user 的调用
+    //   （等待用户作答可静默很久）不启用。
+    QElapsedTimer m_actClock;             // 距上次收到子进程输出的计时
+    QTimer*    m_pStallTimer = nullptr;   // 停滞巡检定时器（30s 一拍）
+    bool       m_bStallWatch = false;     // 本轮调用是否启用停滞检测
+};

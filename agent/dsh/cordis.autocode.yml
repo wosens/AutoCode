@@ -1,0 +1,146 @@
+# AutoCode coding-agent deployment for the dsh-jsonrpc-agent runtime.
+# Composition basis: examples/jsonrpc-agent/cordis.yml, adapted for AutoCode
+# (Qt orchestrator driving this over the newline-delimited JSON-RPC SDK protocol).
+#
+# Differences from jsonrpc-agent:
+#   - llm-deepseek replaced by llm-pi-ai + settings-file + credentials-local so
+#     the provider route comes from $DSH_HOME/settings.yaml (glm-custom ->
+#     anthropic-messages API on the LAN relay). Provider/model still arrive
+#     per-process via the initialize request.
+#   - tool-fs-search added: the agent needs glob/grep for workspace discovery.
+#   - no permission/approval plugins: unattended preset, tools allowed by
+#     default (matches the claude backend's unrestricted posture).
+#   - maxTokensAsSuccess stays false: a token-capped turn must surface as
+#     max-tokens in turn/end so AutoCode can resume the session.
+#
+# stdout is reserved for JSON-RPC; do not add a console logger or terminal UI.
+# Version-managed master copy lives in the AutoCode repository at
+# agent/dsh/cordis.autocode.yml - edit there and sync here.
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: false
+
+# credentials-local resolves apiKeyEnv values through the
+# env -> ~/.dsh/.credentials.yaml -> ./.env -> ~/.dsh/.env ladder.
+- id: credentials
+  name: '@deepseek-ai/dsh-credentials-local'
+
+# 2026.08.18 custom-model support: "autocode-active" is an env-driven slot that
+# AutoCode fills at process start from the user-managed custom model list
+# (settings -> DeepSeekHarness -> custom models; the selected entry injects
+# DSH_LLM_BASE_URL / DSH_LLM_API / DSH_LLM_MODEL / DSH_LLM_CTX / DSH_LLM_MAXTOK
+# / DSH_LLM_NAME and the key value as AUTOCODE_DSH_API_KEY). Fallbacks keep a
+# bare runtime usable. "glm-custom" stays as the legacy fixed route for setups
+# with no custom list ([Agent] DshProvider=glm-custom).
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      autocode-active:
+        displayName: !!js process.env.DSH_LLM_NAME ?? 'AutoCode Active Model'
+        apiKeyEnv: AUTOCODE_DSH_API_KEY
+        api: !!js process.env.DSH_LLM_API ?? 'anthropic-messages'
+        baseURL: !!js process.env.DSH_LLM_BASE_URL ?? 'http://192.168.118.128:9000/claude'
+        models:
+          - id: !!js process.env.DSH_LLM_MODEL ?? 'glm-5.2'
+            name: Active Model
+            contextWindow: !!js Number(process.env.DSH_LLM_CTX ?? 131072)
+            maxTokens: !!js Number(process.env.DSH_LLM_MAXTOK ?? 32768)
+      glm-custom:
+        displayName: GLM Custom (Anthropic)
+        apiKeyEnv: GLM_CUSTOM_API_KEY
+        api: anthropic-messages
+        baseURL: http://192.168.118.128:9000/claude
+        models:
+          - id: glm-5.2
+            name: GLM 5.2
+            contextWindow: 131072
+            maxTokens: 32768
+
+# Managed child-process groups for the bash executor (spawn/kill/output plumbing).
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 120000
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a meticulous coding agent executing staged automation tasks. Follow the task instructions exactly and write the required output files before finishing.'
+    workspaceContext: false
+    # 2026.08.18 enable the skill subsystem and mount the Claude Code personal
+    # skill library (SKILL.md format is shared verbatim; discovery rank 300).
+    # Single source of truth: edits in ~/.claude/skills apply to both harnesses.
+    skills:
+      enabled: true
+      filesystem:
+        customSkillDirs:
+          # 2026.08.18 env-driven: AutoCode injects DSH_SKILLS_DIR = <user home>/.claude/skills
+          # (fallback keeps the dev-machine path for bare runs).
+          - !!js process.env.DSH_SKILLS_DIR ?? 'C:/Users/Administrator/.claude/skills'
+    toolBash:
+      enableRunInBackground: false
+    toolJobs: false
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
+    # Snapshot runs read the raw JSONL back; production keeps zstd frames.
+    compression: !!js "process.env.DSH_SNAPSHOT === undefined ? 'zstd' : 'none'"
+
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-spawn-in-process
+  name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+  config:
+    providerName: spawn
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    enableRunInBackground: false
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: fs-observation-policy
+  name: '@deepseek-ai/dsh-fs-observation-policy'
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  config:
+    thresholdRatio: 0.8
+    retainRatio: 0.16
+    maxTokens: 8192
+    compactionRetries: 1

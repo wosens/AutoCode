@@ -31,7 +31,8 @@ CAboutDialog::CAboutDialog(QWidget* a_pParent) : QDialog(a_pParent) {
     pLblVer->setFont(fntVer);
     pLblVer->setStyleSheet(QStringLiteral("color: #8a8a8a;"));   // 与标题栏版本号同款弱化
 
-    auto* pLblDesc = new QLabel(QStringLiteral("AI 驱动的自动化开发任务编排工具\n基于 Claude Code 的多阶段流水线执行与评审"), this);
+    // 2026.08.18 简介改后端中立表述（Agent 后端已可选：Claude Code / DeepSeekHarness）。
+    auto* pLblDesc = new QLabel(QStringLiteral("AI 驱动的自动化开发任务编排工具\n多后端 Agent（Claude Code / DeepSeekHarness）的多阶段流水线执行与评审"), this);
     pLblDesc->setStyleSheet(QStringLiteral("color: #505050;"));
 
     auto* pVInfo = new QVBoxLayout();

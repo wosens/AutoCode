@@ -161,6 +161,52 @@ private slots:
         stPm.ClearRecent();
         QVERIFY(stPm.RecentProjects().isEmpty());
     }
+
+    // 2026.08.19 [DshModels] 全字段往返（含中文显示名/密钥）：Save→Load 逐字段一致，
+    //   激活下标还原；缩短到 0 条后残留键清理生效（读回空表 + 无激活）。
+    //   背景反馈「显示名重启后变模型 ID」——本测试锁定显示名持久化链路不回归。
+    void testDshModelsRoundTrip() {
+        CProjectManager stPm;
+        QList<SDshModelEntry> aModels;
+        SDshModelEntry stE1;
+        stE1.sDisp    = QStringLiteral("公司中转 GLM-5.2");
+        stE1.sBaseURL = QStringLiteral("http://192.168.1.10:9000/claude");
+        stE1.sApiKey  = QStringLiteral("sk-测试密钥123");
+        stE1.sApi     = QStringLiteral("anthropic-messages");
+        stE1.sModelId = QStringLiteral("glm-5.2");
+        stE1.iCtx     = 128000;
+        stE1.iMaxTok  = 65536;
+        aModels.append(stE1);
+        SDshModelEntry stE2;
+        stE2.sDisp    = QStringLiteral("备用网关");
+        stE2.sBaseURL = QStringLiteral("http://10.0.0.2:8080/v1");
+        stE2.sApiKey.clear();
+        stE2.sApi     = QStringLiteral("openai-completions");
+        stE2.sModelId = QStringLiteral("model-b");
+        stE2.iCtx     = 200000;
+        stE2.iMaxTok  = 32768;
+        aModels.append(stE2);
+        QVERIFY(stPm.SaveDshModels(aModels, 1));
+
+        int iActive = -99;
+        const QList<SDshModelEntry> aBack = stPm.LoadDshModels(&iActive);
+        QCOMPARE(aBack.size(), 2);
+        QCOMPARE(iActive, 1);
+        QCOMPARE(aBack.at(0).sDisp,    stE1.sDisp);
+        QCOMPARE(aBack.at(0).sBaseURL, stE1.sBaseURL);
+        QCOMPARE(aBack.at(0).sApiKey,  stE1.sApiKey);
+        QCOMPARE(aBack.at(0).sApi,     stE1.sApi);
+        QCOMPARE(aBack.at(0).sModelId, stE1.sModelId);
+        QCOMPARE(aBack.at(0).iCtx,     stE1.iCtx);
+        QCOMPARE(aBack.at(0).iMaxTok,  stE1.iMaxTok);
+        QCOMPARE(aBack.at(1).sDisp,    stE2.sDisp);
+        QCOMPARE(aBack.at(1).sApi,     stE2.sApi);
+
+        // 缩短到 0 条：残留键清理后读回应为空表 + 无激活
+        QVERIFY(stPm.SaveDshModels({}, -1));
+        QCOMPARE(stPm.LoadDshModels(&iActive).size(), 0);
+        QCOMPARE(iActive, -1);
+    }
 };
 
 QTEST_MAIN(CTestProjectManager)

@@ -230,7 +230,7 @@
 <div class="steps">
   <div class="step">
     <b>装环境（仅首次）</b> — 菜单 <code>功能(F) → 环境安装...</code>，授权后自动安装 Git、Node.js 与 Claude Code CLI。
-    <div class="hint">已装过可跳过；脚本位于程序目录 install_env.bat，也可右键以管理员身份手动运行。</div>
+    <div class="hint">已装过可跳过；DeepSeekHarness 为可选组件，脚本结束前会询问是否一并安装（不装不影响使用）；脚本位于程序目录 install_env.bat，也可右键以管理员身份手动运行。</div>
   </div>
   <div class="step">
     <b>打开工程</b> — 菜单 <code>工程(P) → 打开工程目录...</code> 选择你的代码目录（或「新建工程目录...」从零开始）。
@@ -510,8 +510,15 @@
 <div class="warn">一句话记住：<b>想纠偏，先暂停</b>。暂停永远停在阶段边界，改完东西再继续或单阶段重跑，比指望运行中插话靠谱得多。</div>
 
 <h3>⚙️ 设置与环境安装</h3>
-<p><b>设置</b> — 菜单 <code>功能(F) → 设置...</code>：集中编辑全部可调参数（运行策略、Agent 参数、评审与助手行为、目录排除等），保存到 exe 同级 <code>config.ini</code>，确定后立即生效——软件保持绿色便携，配置随程序走。</p>
-<p><b>环境安装</b> — 菜单 <code>功能(F) → 环境安装...</code>：以管理员权限自动安装 Claude Code 运行所需环境 —— Git、Node.js、Claude Code CLI。装一次即可，之后可重复运行修复环境。</p>
+<p><b>设置</b> — 菜单 <code>功能(F) → 设置...</code>：分两页 Tab 集中编辑全部可调参数——「常用」页（运行策略、Agent、评审与助手、目录排除），「DeepSeekHarness参数设置」页（安装状态、node 路径 / DSH 根目录与 provider / 模型）。保存到 exe 同级 <code>config.ini</code>，确定后立即生效——软件保持绿色便携，配置随程序走。</p>
+<p><b>环境安装</b> — 菜单 <code>功能(F) → 环境安装...</code>：以管理员权限自动安装 Claude Code 运行所需环境 —— Git、Node.js、Claude Code CLI；结束前会询问是否一并安装 <b>DeepSeekHarness</b>（可选的 DeepSeek 官方 Agent 后端）。装一次即可，之后可重复运行修复环境。</p>
+<p><b>DeepSeekHarness（可选后端）</b> — 不装不影响 Claude Code 后端使用。两种装法：</p>
+<table>
+  <tr><th>途径</th><th>说明</th></tr>
+  <tr><td>环境安装脚本</td><td>运行 install_env.bat（菜单「环境安装」或右键以管理员身份运行），结束前选 <b>Y</b> 一并安装。</td></tr>
+  <tr><td>设置页一键安装</td><td>设置 → 「DeepSeekHarness参数设置」页 → 「安装 DeepSeekHarness…」按钮：以管理员权限运行脚本的单独安装模式（<code>/dsh</code>）。</td></tr>
+</table>
+<p>安装到程序目录内的 <code>DeepSeekHarness\deepseek-harness</code> 子目录（克隆 GitHub 仓库 + pnpm 依赖构建 + 部署 AutoCode 组合文件，需联网数分钟）——<b>随程序目录整体拷走即随身携带，保持绿色便携</b>。装完即用，零手填：AutoCode 启动时自动探测该目录并把根目录回填到 config.ini；设置页也可点「重新检测」立即生效。未安装时设置页的 DeepSeekHarness 参数整体置灰、「Agent 后端」下拉中的该项同时禁用，检测通过后自动解锁。</p>
 
 <!-- ================= FAQ ================= -->
 <h2 class="sec" id="faq">常见问题</h2>
@@ -547,6 +554,10 @@
 <details>
   <summary>标题栏的版本号三个数字是什么意思？</summary>
   <p>三段式 <code>v主.次.编译号</code>（如 v1.0.25）：主版本 = 架构级大改版，次版本 = 功能迭代，编译号 = 每次构建自动 +1，用于精确对应某个 exe。</p>
+</details>
+<details>
+  <summary>DeepSeekHarness 是什么？必须装吗？</summary>
+  <p>DeepSeek 官方开源的 Agent 执行框架，是 AutoCode 里与 Claude Code 并列的可选 Agent 后端（JSON-RPC 完整接入，支持流式过程与 token 统计）。<b>不装完全不影响</b>——默认走 Claude Code 后端。想用的话：设置 → 「DeepSeekHarness参数设置」页 → 「安装 DeepSeekHarness…」一键安装（或环境安装脚本结束前选 Y）；装完点「重新检测」，根目录自动填入，再把「Agent 后端」切到 DeepSeekHarness 即可（任务运行中禁止切换）。</p>
 </details>
 
 <footer>

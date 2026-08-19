@@ -41,7 +41,8 @@ public:
     // 排除目录（相对工程根，正斜杠）。集中常量，可扩展（design §0 Q5）。
     // 2026.08.15：默认清单可被 config.ini [Scan] ExcludeDirs 覆盖（SetExcludeDirs）。
     static QStringList& ExcludedDirs();
-    static void SetExcludeDirs(const QStringList& a_aDirs);   // 非空覆盖默认清单
+    // 覆盖默认清单；空清单 = 恢复内置默认（2026.08.18 语义修正，此前空被忽略）。
+    static void SetExcludeDirs(const QStringList& a_aDirs);
 
     // 可选：是否启用内容哈希（design §0 Q1 默认 false）。运行期固定，预留开关。
     // 默认方案为 size+mtime，已知局限「改了又改回（相同大小+原 mtime）」会漏判，

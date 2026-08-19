@@ -8,8 +8,20 @@
 
 #include "CGuideFingerprintScanner.h"
 
-class CClaudeRunner;
+class CAgentRunnerBase;
 class CTaskInfo;
+
+// 2026.08.18 自定义大模型条目（config.ini [DshModels]，DSH 后端多条目管理）。
+//   字段与 CDeepSeekRunner::SCustomModel 一一对应（CMainWindow 负责转换注入）。
+struct SDshModelEntry {
+    QString sDisp;      // 显示名
+    QString sBaseURL;   // 接入点（anthropic-messages 兼容）
+    QString sApiKey;    // 密钥明文（tooltip 已告知明文存储）
+    QString sApi;       // API 类型（默认 anthropic-messages）
+    QString sModelId;   // 模型 id
+    qint64  iCtx    = 200000;   // 上下文窗口（token）
+    int     iMaxTok = 32768;    // 单次最大输出
+};
 
 // FR-6：代码回退的历史版本元数据（一个备份快照的摘要）。
 struct SBackupVersion {
@@ -76,6 +88,8 @@ public:
 
     // 异步生成 guide.md：扫描工程结构调 claude
     void BuildGuideAsync();
+    // 2026.08.18 guide 生成/同步 runner 任一运行中（后端切换保护与漂移重建判定用）。
+    bool IsGuideBusy() const;
 
     // 需求4：按任务变更清单（changed_files.md）用独立 agent 增量更新 guide.md。
     //   a_sTaskId 非空 → 用该任务的 changed_files.md；空 → 取最新一份（手动触发）。
@@ -113,6 +127,11 @@ public:
     bool SaveSplitterState(const QByteArray& a_stState);
     // 载入 splitter 状态；无 config.ini / 缺键 → 返回空（调用方判空跳过 restoreState）。
     QByteArray LoadSplitterState();
+
+    // ---- 2026.08.18 任务列表高度持久化：左栏垂直 QSplitter（[Layout] VSplit）----
+    // 任务列表/资源管理器之间的拖动分隔条位置，语义与主 Splitter 对完全一致（Base64 文本）。
+    bool SaveVSplitState(const QByteArray& a_stState);
+    QByteArray LoadVSplitState();
 
     // ---- FR-4 助手 autocompact：2026.08.15 起改为「比例制」（[Adhoc] AutoCompactPct）----
     // 旧 [Adhoc] AutoCompact（千 token 绝对阈值）已废弃删除。比例为上下文窗口的百分比
@@ -156,6 +175,41 @@ public:
     // 2026.08.17 停滞检测阈值分钟数（[Agent] StallMinutes，默认 10；合法 1..120）：
     //   claude 进程活着但持续零输出达到阈值 → 判挂起，kill 后按会话断点自动续跑。
     int  LoadStallMinutes();
+
+    // ---- 2026.08.18 Agent 后端与 DeepSeekHarness 参数（[Agent] 段，全局单选）----
+    // 后端：claude=1（默认）/ dsh=2（DeepSeekHarness JSON-RPC）。
+    bool SaveAgentBackend(int a_iBackend);
+    int  LoadAgentBackend();
+    // 2026.08.18 轻量自动配置：DSH 仓库根目录（deepseek-harness 目录；bin.js/cordis.yml 按
+    //   固定布局由此推导；空=启动时探测 exe 同级 DeepSeekHarness 目录）。
+    bool    SaveDshRoot(const QString& a_sRoot);
+    QString LoadDshRoot();
+    // DSH 三路径（node.exe / bin.js / cordis.yml；空=未配置/按根目录推导，StartStage 前置校验报失败）。
+    bool    SaveDshNodePath(const QString& a_sPath);
+    QString LoadDshNodePath();
+    bool    SaveDshBinJsPath(const QString& a_sPath);
+    QString LoadDshBinJsPath();
+    bool    SaveDshCordisPath(const QString& a_sPath);
+    QString LoadDshCordisPath();
+    // DSH provider/model（默认 glm-custom / glm-5.2，内网中继 anthropic-messages API）。
+    bool    SaveDshProvider(const QString& a_sProvider);
+    QString LoadDshProvider();
+    bool    SaveDshModel(const QString& a_sModel);
+    QString LoadDshModel();
+    // 2026.08.18 DSH 计费单价（$/百万 token）：DSH 只报 token，客户端按单价折算；
+    //   默认对齐 claude 后端 Sonnet 档价目（同网关口径）。
+    bool    SaveDshPriceInPerM(double a_d);
+    double  LoadDshPriceInPerM();
+    bool    SaveDshPriceCacheReadPerM(double a_d);
+    double  LoadDshPriceCacheReadPerM();
+    bool    SaveDshPriceCacheWritePerM(double a_d);
+    double  LoadDshPriceCacheWritePerM();
+    bool    SaveDshPriceOutPerM(double a_d);
+    double  LoadDshPriceOutPerM();
+    // 2026.08.18 自定义大模型表（[DshModels] Count/Active/M<i>*）。
+    //   a_pActive 带出激活下标（-1 = 无；表空即未启用该功能）。
+    QList<SDshModelEntry> LoadDshModels(int* a_pActive = nullptr);
+    bool    SaveDshModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
 
     // ---- 扫描排除目录（config.ini 的 [Scan] ExcludeDirs，逗号分隔）----
     // 空 = 用内置默认清单（.autodev/build/Execute/.git/.vs/node_modules/doc）。
@@ -216,8 +270,8 @@ private:
     void SaveRecent();
 
     QString       m_sProjectDir;
-    CClaudeRunner* m_pGuideRunner = nullptr;
-    CClaudeRunner* m_pGuideSyncRunner = nullptr;   // 需求4 guide.md 增量同步专用 runner
+    CAgentRunnerBase* m_pGuideRunner = nullptr;       // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
+    CAgentRunnerBase* m_pGuideSyncRunner = nullptr;    // 需求4 guide.md 增量同步专用 runner
 
     QStringList   m_aRecentProjects;   // MRU，最前为最近
 };

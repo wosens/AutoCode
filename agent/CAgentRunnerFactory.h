@@ -1,0 +1,47 @@
+﻿#pragma once
+
+#include <QObject>
+
+#include "CAgentRunnerBase.h"
+#include "CClaudeRunner.h"
+#include "CDeepSeekRunner.h"
+
+// Agent 后端工厂（header-only）。
+//
+// 2026.08.18 多后端支持：后端为**全局单选**（config.ini [Agent] Backend，启动时由
+// CMainWindow 回填 SetBackend，设置变更时经漂移重建生效）。所有持有点（任务/评审
+// fan-out/ad-hoc/guide×2）统一经 Create() 拿 runner，不再裸 new 具体类。
+//
+// 后端漂移重建约定：持有点发现既有 runner 的 BackendName() 与工厂当前后端不一致且
+// 不在 Running/Grace/Retry 占用时，deleteLater 旧 runner 再 Create 新的。
+class CAgentRunnerFactory {
+public:
+    enum EBackend {
+        BackendClaude,   // Claude Code CLI（原路径）
+        BackendDsh       // DeepSeekHarness（JSON-RPC 完整接入）
+    };
+
+    static void SetBackend(EBackend a_eBackend) { s_eBackend = a_eBackend; }
+    static EBackend Backend() { return s_eBackend; }
+    static bool IsDsh() { return s_eBackend == BackendDsh; }
+    // 当前后端名（与各 runner BackendName() 同词汇表，漂移检测直接字符串比较）。
+    static QString BackendName() {
+        return s_eBackend == BackendDsh ? QStringLiteral("dsh") : QStringLiteral("claude");
+    }
+    // 后端显示名（UI 展示用：助手对话块说话人标签等，随当前选择的后端走）。
+    static QString BackendDisplayName() {
+        return s_eBackend == BackendDsh ? QStringLiteral("DSH") : QStringLiteral("Claude");
+    }
+
+    static CAgentRunnerBase* Create(QObject* a_pParent = nullptr) {
+        // 按全局单选后端分派。DSH 路径未配置时不在此拦截——StartStage 的前置校验
+        // 会带具体缺失路径报失败（工厂层拦会把配置错误变成静默回退，难排查）。
+        if (s_eBackend == BackendDsh) {
+            return new CDeepSeekRunner(a_pParent);
+        }
+        return new CClaudeRunner(a_pParent);
+    }
+
+private:
+    inline static EBackend s_eBackend = BackendClaude;   // 全局单选后端（默认 claude）
+};

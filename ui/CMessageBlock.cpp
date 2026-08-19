@@ -1,4 +1,5 @@
 ﻿#include "CMessageBlock.h"
+#include "../agent/CAgentRunnerFactory.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -88,7 +89,9 @@ void CMessageBlock::BuildAssistant() {
     pV->setContentsMargins(0, 0, 0, 0);
     pV->setSpacing(4);
 
-    auto* pSpeaker = new QLabel(QStringLiteral("⏺ Claude"), this);
+    // 2026.08.18 说话人标签随当前 Agent 后端显示（旧版硬编码 "⏺ Claude"，DSH 后端下误导）。
+    auto* pSpeaker = new QLabel(
+        QStringLiteral("⏺ ") + CAgentRunnerFactory::BackendDisplayName(), this);
     pSpeaker->setStyleSheet(QStringLiteral(
         "color: #d97757; font-weight: 600; padding: 0;"));
     pV->addWidget(pSpeaker);

@@ -15,7 +15,7 @@
 #include "core/TaskTypes.h"
 
 class CTaskInfo;
-class CClaudeRunner;
+class CAgentRunnerBase;
 class CProjectManager;
 struct SStageDef;
 
@@ -104,6 +104,7 @@ signals:
     void sigAdhocModel(const QString& a_sModel);                       // 助手所用模型名（供面板查上下文窗口）
     void sigAdhocUndo();                                               // 撤销最后一条提问（面板清尾块）
     void sigAdhocFinished();                                           // 一次助手调用结束（启用输入栏）
+    void sigAdhocRunning();                                            // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
     void sigAdhocStateChanged();                                       // sid/撤销栈变化（#1 存盘触发）
     // 2026.08.15 一次成功助手调用的消耗（输入含缓存读/写，与账单同口径）+ 本次调用耗时（ms）
     //   + API 请求数，由 CMainWindow 归集到当前档任务（助手档按任务分档，消耗跟随档走）。
@@ -219,7 +220,7 @@ private:
     enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed };
 
     CProjectManager* m_pPm;
-    CClaudeRunner*   m_pRunner  = nullptr;
+    CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
     CTaskInfo*       m_pCurTask = nullptr;
     QString          m_sLastAssistantText;  // 缓存最新助手文本，用作摘要来源
     bool             m_bSingleStageRerun = false;  // 需求3：单阶段重跑标志（Advance 完成后停原阶段，不推进）
@@ -236,7 +237,7 @@ private:
     std::thread      m_thBackup;             // RunCurrentStage 改码备份线程（同上）
 
     // —— 提示词 agent 状态 ——
-    CClaudeRunner* m_pAdhocRunner = nullptr;                       // 第二个 runner 实例（独立 QProcess）
+    CAgentRunnerBase* m_pAdhocRunner = nullptr;                    // 第二个 runner 实例（独立会话/进程）
     QString        m_sAdhocSid;                                    // 当前助手会话 sid（首条前为空）
     QString        m_sLastGuideHash;                               // 上次投喂 guide.md 的 SHA256（变更检测基线）
     bool           m_bAdhocReadOnly = false;                       // 本轮只读开关（决定 deny 黑名单内容）
@@ -246,6 +247,14 @@ private:
     QList<QPair<QString, QString>> m_aAdhocStack;                  // (prompt, sid) 链；撤销=弹栈回 m_sAdhocSid
     QDateTime      m_dtAdhocStart;                                 // 2026.08.15 本次助手调用起点（耗时归集用）
     int            m_iAdhocResume = 0;                             // 2026.08.15 本条提问 max-turns 已自动续跑次数（上限 2，新提问清零）
+    // 2026.08.19 运行中介入：
+    //   任务侧——DSH 后端协议不支持轮中插话，InjectUserTurn 返回 false 时排队，
+    //     LaunchStage 时前置并入下一阶段 prompt（换任务/停止即作废）。
+    //   助手侧——运行中收到的追加指令：claude 后端走 InjectUserTurn 轮中注入即时不达此
+    //     队列；DSH 后端排队，本轮成功收尾（OnAdhocFinished）后自动按同会话续发下一条。
+    QStringList    m_aPendingTaskInjects;
+    QStringList    m_aAdhocPendingInjects;
+    QString        m_sAdhocLastTaskId;   // 最近一次 Submit 的任务档 id（自动续发时记忆注入沿用）
 
     // —— 评审多视角并行（fan-out / fan-in）状态 ——
     struct SViewResult {       // 单视角评审 runner 的完成结果
@@ -260,7 +269,7 @@ private:
     int                         m_iReviewParallel = 3;     // 评审并行视角数（1=串行回退；默认 3）
     int                         m_iCurReviewViews = 0;     // 本轮 fan-out 实际视角数（档位可低于全局配置；fan-in 按它聚合）
     bool                        m_bWebSearch = true;       // 阶段联网检索开关（config.ini [Agent] WebSearch，默认开）
-    QList<CClaudeRunner*>       m_aReviewRunners;         // fan-out 视角 runner（parent=this，Qt 托管生命周期）
+    QList<CAgentRunnerBase*>    m_aReviewRunners;         // fan-out 视角 runner（parent=this，Qt 托管生命周期）
     QSet<QString>               m_aPendingViews;          // 待完成视角集合（空→全部完成 fan-in）
     QHash<QString, SViewResult> m_aViewResults;           // viewId → 完成结果
 };

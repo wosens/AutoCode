@@ -233,7 +233,8 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
 }
 
 void CProjectExplorerPanel::OnDoubleClicked(const QModelIndex& a_stIdx) {
-    // Q1 默认：双击调系统默认程序打开（目录则用资源管理器打开）。
+    // 2026.08.18 双击文件：文本文件 → 内嵌 Tab 显示（sigFileOpen，经 CTaskListPanel
+    //   转发到执行面板）；目录/非文本 → 保持 Q1 原行为（系统默认程序/资源管理器打开）。
     if (!a_stIdx.isValid()) {
         return;
     }
@@ -241,7 +242,44 @@ void CProjectExplorerPanel::OnDoubleClicked(const QModelIndex& a_stIdx) {
     if (sPath.isEmpty() || !IsUnderRoot(sPath)) {
         return;
     }
+    const QFileInfo stInfo(sPath);
+    if (stInfo.isFile() && IsTextFile(sPath)) {
+        emit sigFileOpen(sPath);
+        return;
+    }
     QDesktopServices::openUrl(QUrl::fromLocalFile(sPath));
+}
+
+bool CProjectExplorerPanel::IsTextFile(const QString& a_sAbsPath) {
+    // 两级判定：扩展名白名单命中即文本（覆盖源码/文档/配置常见格式）；
+    //   白名单外的扩展名嗅探文件头 4KB，含 \0 视为二进制，否则也按文本放行
+    //   （无扩展名/新后缀的纯文本文件也能进内嵌 Tab）。
+    static const QStringList aTextExts = {
+        // 源码
+        "cpp", "cc", "cxx", "c", "h", "hh", "hpp", "hxx", "inl", "cs", "java",
+        "py", "pyw", "rb", "go", "rs", "js", "ts", "jsx", "tsx", "m", "mm",
+        "sql", "lua", "pl", "php", "vue",
+        // 标记/文档
+        "md", "markdown", "txt", "log", "rtf", "csv", "tsv",
+        // Web/样式
+        "html", "htm", "xml", "css", "scss", "less", "svg", "json",
+        // 配置/脚本/工程
+        "ini", "cfg", "conf", "properties", "yml", "yaml", "toml",
+        "bat", "cmd", "ps1", "sh", "cmake", "mak", "mk", "pro", "pri", "prf",
+        "sln", "vcxproj", "filters", "props", "targets", "rc", "rc2", "def",
+        "gitignore", "gitattributes", "editorconfig", "dockerfile", "npmrc"
+    };
+    const QString sSuffix = QFileInfo(a_sAbsPath).suffix().toLower();
+    if (aTextExts.contains(sSuffix)) {
+        return true;
+    }
+    // 白名单外：嗅探前 4KB（含 \0 → 二进制；读不到也按二进制处理，稳妥）。
+    QFile stFile(a_sAbsPath);
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    const QByteArray aHead = stFile.read(4096);
+    return !aHead.isEmpty() && !aHead.contains('\0');
 }
 
 void CProjectExplorerPanel::DoCut() {

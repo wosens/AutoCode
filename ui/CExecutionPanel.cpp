@@ -14,6 +14,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QPlainTextEdit>
+#include <QStringDecoder>
 #include <QPushButton>
 #include <QProgressBar>
 #include <QToolButton>
@@ -225,7 +226,9 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     m_pStages->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     // FR-9：阶段表高度由左栏任务列表（Tab）底部位置动态同步（见 SyncStagesHeight），
     //       使「阶段表底部」与「任务列表底部」（不含按钮行）精确对齐，随字体/DPI 自适应。
-    //       初始给一个防塌缩的最小高度，首次 resize 即被同步值（setFixedHeight）覆盖。
+    //       初始给一个防塌缩的最小高度，首次 resize 即被同步值（splitter setSizes）覆盖。
+    //       2026.08.18 弃用 setFixedHeight：min==max 会把下方分隔条手柄锁死不可拖
+    //       （阶段/日志中间的拖动条失效），改由 SyncStagesHeight 走 setSizes 保对齐。
     m_pStages->setMinimumHeight(120);
     setPt11(m_pStages);
     setPt11(m_pStages->header());
@@ -262,10 +265,12 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
 
     pSplit->addWidget(m_pStages);
     pSplit->addWidget(m_pTabs);
+    m_pStageSplit = pSplit;   // FR-9 对齐需要随时 setSizes（记成成员）
     // FR-6：收紧「当前任务」与「阶段」区之间的分隔条厚度（≈5px），其余间距不变。
     pSplit->setHandleWidth(5);
     pSplit->setStretchFactor(0, 2);
     pSplit->setStretchFactor(1, 5);
+    pSplit->setChildrenCollapsible(false);   // 2026.08.18 两段都保底可见（手柄恢复可拖）
     pV->addWidget(pSplit, 1);
 
     // —— FR-3 任务运行中介入输入栏（阶段表/Tabs 下方，adhoc 助手栏之上）——
@@ -378,11 +383,17 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     pAdhocBar->addWidget(m_pBtnSend);
     pV->addLayout(pAdhocBar);
 
-    // 发送：Ctrl+Enter（eventFilter 拦截）或点击「发送」；运行中点击「发送」=停止。
-    // 发送后进入运行态（禁输入栏、按钮变「停止」、助手 Tab 标记运行中），由 OnAdhocFinished 恢复。
+    // 发送：Ctrl+Enter（eventFilter 拦截）或点击「发送」；运行中点击 = 停止或追加指令。
+    //   2026.08.19 运行中输入框有字 → 点击「➤ 追加指令」向正在执行的轮发送追加（claude
+    //   轮中注入 / DSH 排队自动续发）；无字 → 维持原「⏹ 停止」。
     connect(m_pBtnSend, &QPushButton::clicked, this, [this]() {
         if (m_bAdhocRunning) {
-            emit sigAdhocStop();   // #4 运行中：按钮即「停止」
+            if (m_pAdhocInput != nullptr
+                && !m_pAdhocInput->toPlainText().trimmed().isEmpty()) {
+                DoAdhocSend();   // 运行中追加：走提交流，编排器按后端注入/排队
+                return;
+            }
+            emit sigAdhocStop();   // #4 运行中无输入：按钮即「停止」
             return;
         }
         DoAdhocSend();
@@ -422,8 +433,12 @@ void CExecutionPanel::UpdateCostLabel() {
         m_pLblCost->setText(QStringLiteral("费用: $0.00 | 输入:0 输出:0 | 请求:0"));
         return;
     }
-    QString sText = QStringLiteral("费用: $%1 | 输入:%2 输出:%3 | 请求:%4 | %5")
-        .arg(m_pCurTask->TotalCost(), 0, 'f', 2)
+    // 2026.08.18 费用 ≤0 显示 "-"（DSH 后端无计费恒 0）。
+    const QString sCost = m_pCurTask->TotalCost() > 0.0
+        ? QStringLiteral("$%1").arg(m_pCurTask->TotalCost(), 0, 'f', 2)
+        : QStringLiteral("-");
+    QString sText = QStringLiteral("费用: %1 | 输入:%2 输出:%3 | 请求:%4 | %5")
+        .arg(sCost)
         .arg(FormatTokens(m_pCurTask->TotalInTokens()))
         .arg(FormatTokens(m_pCurTask->TotalOutTokens()))
         .arg(m_pCurTask->RequestCount())
@@ -997,13 +1012,23 @@ qint64 CExecutionPanel::ContextLimitForModel(const QString& a_sModel) {
 }
 
 void CExecutionPanel::UpdateAdhocInputState() {
-    // 输入栏可用 = 工程已打开 且 助手空闲；只读切换钮始终可用（随时为下一条指令切换模式）。
+    // 2026.08.19 运行中可输入追加指令：输入栏可用只看工程开关（空闲/运行中都能打字——
+    //   运行中输入+发送 = 向正在执行的助手轮追加指令，claude 后端轮中注入、DSH 后端
+    //   排队本轮结束后自动发送）；上下文/撤销按钮仍要求空闲。
     const bool bOk = m_bAdhocEnabled && !m_bAdhocRunning;
-    m_pAdhocInput->setEnabled(bOk);
+    m_pAdhocInput->setEnabled(m_bAdhocEnabled);
     m_pBtnContext->setEnabled(bOk);
     m_pBtnUndo->setEnabled(bOk);
     // #4 运行态标识：运行中「发送」变「停止」（红色、可点→sigAdhocStop）；空闲恢复「发送」。
-    if (m_bAdhocRunning) {
+    //   2026.08.19 运行中且输入框有字 → 「➤ 追加指令」（发送追加，不清空则随时可停）。
+    const bool bHasText = m_pAdhocInput != nullptr
+                          && !m_pAdhocInput->toPlainText().trimmed().isEmpty();
+    if (m_bAdhocRunning && bHasText) {
+        m_pBtnSend->setText(QStringLiteral("➤ 追加指令"));
+        m_pBtnSend->setEnabled(true);
+        m_pBtnSend->setStyleSheet(
+            QStringLiteral("QPushButton{background:#2563eb;color:white;}"));
+    } else if (m_bAdhocRunning) {
         m_pBtnSend->setText(QStringLiteral("⏹ 停止"));
         m_pBtnSend->setEnabled(true);
         m_pBtnSend->setStyleSheet(QStringLiteral("QPushButton{background:#dc2626;color:white;}"));
@@ -1117,6 +1142,11 @@ void CExecutionPanel::OnAdhocTextChanged() {
     // 助手输入框：复用通用高度自适应（#3），封顶 10 行。
     constexpr int k_iAdhocMaxLines = 10;
     AdjustInputHeight(m_pAdhocInput, k_iAdhocMaxLines);
+    // 2026.08.19 运行中可输入追加指令：有字时按钮从「⏹ 停止」切「➤ 追加指令」，
+    //   清空回落——按钮态跟随输入内容刷新。
+    if (m_bAdhocRunning) {
+        UpdateAdhocInputState();
+    }
 }
 
 void CExecutionPanel::RebuildPromptList() {
@@ -1154,16 +1184,71 @@ void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
 void CExecutionPanel::SyncStagesHeight(int a_iTaskListBottomY) {
     // FR-9：阶段表底部对齐左栏任务列表（Tab）底部（不含按钮行）。
     // 两栏在同一水平 splitter 内顶部对齐，故任务列表底部 y（相对左栏顶）减去本栏上 margin
-    // 即为阶段表应有高度（阶段表顶部贴本栏内容区上沿）。setFixedHeight 固定该高度，
-    // 窗口拉伸时阶段表不变，与任务列表底部始终保持齐平。
-    if (m_pStages == nullptr || a_iTaskListBottomY <= 0) {
+    // 即为阶段表应有高度（阶段表顶部贴本栏内容区上沿）。
+    // 2026.08.18 改走 splitter setSizes（弃 setFixedHeight——min==max 锁死手柄，阶段/日志
+    //   中间的拖动条不可拖）：左栏变化时对齐优先（重设两段比例）；用户拖本栏手柄时左栏
+    //   无 resize/信号，不会回写打架（手动偏移保持到下次左栏变化）。
+    if (m_pStageSplit == nullptr || m_pStages == nullptr || a_iTaskListBottomY <= 0) {
         return;
     }
     const int iTopMargin = layout()->contentsMargins().top();
     const int iH = a_iTaskListBottomY - iTopMargin;
-    if (iH > 0 && iH != m_pStages->height()) {
-        m_pStages->setFixedHeight(iH);
+    if (iH <= 0 || iH == m_pStages->height()) {
+        return;
     }
+    // 可用高度 = splitter 高度 - 手柄（5px）；启动早期未布局完成时 splitter 高度不足则跳过，
+    //   待下次 resize 再同步（与旧 setFixedHeight 的首帧行为一致）。
+    const int iAvail = m_pStageSplit->height() - m_pStageSplit->handleWidth();
+    if (iAvail <= iH) {
+        return;
+    }
+    m_pStageSplit->setSizes({iH, iAvail - iH});
+}
+
+void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath) {
+    // 2026.08.18 资源管理器双击文本文件的内嵌预览：Tab 惰性创建（首次双击才加页，
+    //   追加在「助手」右侧即末位），此后复用同一页换内容与标题（始终只有一个预览页）。
+    const QFileInfo stInfo(a_sAbsPath);
+    if (m_pFileView == nullptr) {
+        m_pFileView = new QPlainTextEdit(m_pTabs);
+        m_pFileView->setReadOnly(true);
+        m_pFileView->setLineWrapMode(QPlainTextEdit::NoWrap);   // 长行横向滚动，编辑器习惯
+        m_pFileView->setTabChangesFocus(true);                  // Tab 切焦点，不被文本吞键
+        QFont fntFile = m_pFileView->font();
+        fntFile.setFamily(QStringLiteral("Consolas"));
+        fntFile.setPointSize(11);   // 2026.08.19 与全局 11pt 统一（#7）
+        m_pFileView->setFont(fntFile);
+        m_pTabs->addTab(m_pFileView, stInfo.fileName());
+    } else {
+        m_pTabs->setTabText(m_pTabs->indexOf(m_pFileView), stInfo.fileName());
+    }
+    // 读取：上限 4MB 超出截断提示；编码 UTF-8 → 报错回退 GB18030（中文环境覆盖
+    //   GB2312/GBK）→ 均失败按 Latin1 兜底（不丢字节）。
+    QString sText;
+    QFile stFile(a_sAbsPath);
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        sText = QStringLiteral("无法读取文件：\n%1").arg(a_sAbsPath);
+    } else {
+        constexpr qint64 kiMaxBytes = 4 * 1024 * 1024;
+        QByteArray aBytes = stFile.read(kiMaxBytes + 1);
+        const bool bTrunc = aBytes.size() > kiMaxBytes;
+        if (bTrunc) {
+            aBytes.truncate(kiMaxBytes);
+        }
+        QStringDecoder stUtf8(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+        sText = stUtf8.decode(aBytes);
+        if (stUtf8.hasError()) {
+            QStringDecoder stGbk(QStringLiteral("GB18030"), QStringConverter::Flag::Stateless);
+            if (stGbk.isValid()) {
+                sText = stGbk.decode(aBytes);
+            }
+        }
+        if (bTrunc) {
+            sText += QStringLiteral("\n\n……（文件超过 4MB，已截断显示）");
+        }
+    }
+    m_pFileView->setPlainText(sText);
+    m_pTabs->setCurrentWidget(m_pFileView);
 }
 
 void CExecutionPanel::CreatePromptButton() {

@@ -12,6 +12,7 @@ class QPushButton;
 class QHBoxLayout;
 class QPoint;
 class QResizeEvent;
+class QSplitter;
 class CTaskInfo;
 class CProjectExplorerPanel;
 class QTimer;
@@ -50,6 +51,11 @@ public:
     // FR-3：切换工程资源管理器根目录（OpenProjectDir 成功后调用）；空串=清空树。
     void SetProjectRoot(const QString& a_sDir);
 
+    // 2026.08.18 任务列表高度分隔条：上段(任务Tab+按钮行)/资源管理器之间的垂直 QSplitter
+    //   状态存取（CMainWindow 在启动时恢复、关闭时保存，经 CProjectManager 落 [Layout] VSplit）。
+    QByteArray VSplitState() const;
+    void RestoreVSplitState(const QByteArray& a_stState);
+
 signals:
     void sigNewTask();
     void sigStartTask(CTaskInfo* a_pTask);
@@ -64,8 +70,11 @@ signals:
     void sigRollback(CTaskInfo* a_pTask);
     // FR-3：资源管理器「添加到聊天框」→ 注入 adhoc 助手输入框（Q1 默认）。
     void sigAddToChat(const QString& a_sText, const QString& a_sKind);
+    // 2026.08.18：资源管理器双击文本文件 → 执行面板「助手」右侧 Tab 内嵌显示（转发）。
+    void sigFileOpen(const QString& a_sAbsPath);
     // FR-9：任务列表（Tab）底部相对本 widget 顶部的 y 变化 → 供执行面板同步阶段表高度，
     //       使「阶段表底部」与「任务列表底部」（不含按钮行）对齐，随字体/DPI 自适应。
+    //       2026.08.19 仅窗口 resize 路径上报；左栏分隔条拖动不上报（各拖动条互不影响）。
     void sigTaskListBottom(int a_iBottomY);
 
 protected:
@@ -86,14 +95,21 @@ private:
     //   解引用已释放内存（d7f99cac 01:32:53 崩溃：OnElapsedTimer 读 m_pCur->Status()）。
     void ReconcileCur();
     static QString FormatTokens(qint64 a_iTokens);  // K/M/G 缩写
+    // 2026.08.18 费用格式化：≤0 显示 "-"（DSH 后端无计费恒 0；与请求/耗时列缺失值风格一致）。
+    static QString FormatCost(double a_dCost);
     // 2026.08.15 当前表行文本：名称 [类型] · 阶段 · 状态 [· 耗时] · 创建时间（PopulateCurrent 与秒级刷新共用）。
     static QString MakeTaskText(const CTaskInfo* a_pTask);
     static CTaskInfo* TaskOf(QListWidgetItem* a_pItem);
     static CTaskInfo* TaskOf(QTreeWidgetItem* a_pItem);
     void OnHistoryContextMenu(const QPoint& a_pos);   // 历史表右键「再次执行」（#6）
     void OnCurrentContextMenu(const QPoint& a_pos);   // 当前表右键「移除」（#3）
+    // FR-9：上报任务列表（Tab）底部 y（m_pTab 布局后 geometry 才准，height<=0 跳过）。
+    //   2026.08.19 只剩 resizeEvent 与 RestoreVSplitState 收尾两个调用点；左栏分隔条
+    //   拖动不再上报（否则右栏阶段/日志分隔条被连带拖动，见 ctor 注释）。
+    void ReportTaskListBottom();
 
     QTabWidget*   m_pTab      = nullptr;
+    QSplitter*    m_pVSplit   = nullptr;   // 2026.08.18 任务列表高度分隔条（上=Tab+按钮行，下=资源管理器）
     QHBoxLayout*  m_pMenuLayout = nullptr;  // FR-3 顶部菜单条容器（供主窗口注入菜单）
     QListWidget*  m_pListCur  = nullptr;   // 当前任务（未终结：Pending/Running/Paused/Stopped）
     QTreeWidget*  m_pTreeHis  = nullptr;   // 历史任务（全局 DB，终态：Done/Failed，多列）

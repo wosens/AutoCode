@@ -15,7 +15,8 @@
 #include <climits>
 #include <algorithm>
 
-#include "agent/CClaudeRunner.h"
+#include "agent/CClaudeRunner.h"   // ContextWindowForModel 静态仍在此
+#include "agent/CAgentRunnerFactory.h"
 #include "core/CTaskInfo.h"
 #include "core/StageDef.h"
 
@@ -222,14 +223,21 @@ void CProjectManager::BuildGuideAsync() {
     // 删除旧 guide，避免 claude 读到过期内容
     QFile::remove(AutoDevDir() + QStringLiteral("/guide.md"));
 
+        // 2026.08.18 后端漂移重建：非运行中才换（运行中由 OnSettings 拦截 + 双保险）。
+        if (m_pGuideRunner != nullptr
+            && m_pGuideRunner->BackendName() != CAgentRunnerFactory::BackendName()
+            && !m_pGuideRunner->IsRunning()) {
+            m_pGuideRunner->deleteLater();
+            m_pGuideRunner = nullptr;
+        }
     if (m_pGuideRunner == nullptr) {
-        m_pGuideRunner = new CClaudeRunner(this);
-        connect(m_pGuideRunner, &CClaudeRunner::sigInfo,
+        m_pGuideRunner = CAgentRunnerFactory::Create(this);
+        connect(m_pGuideRunner, &CAgentRunnerBase::sigInfo,
                 this, &CProjectManager::sigGuideLog);
-        connect(m_pGuideRunner, &CClaudeRunner::sigAssistantText,
+        connect(m_pGuideRunner, &CAgentRunnerBase::sigAssistantText,
                 this, [this](const QString& a_sText) { emit sigGuideLog(a_sText); });
         connect(m_pGuideRunner, qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
-                    &CClaudeRunner::sigFinished),
+                    &CAgentRunnerBase::sigFinished),
                 this, &CProjectManager::OnGuideRunnerFinished);
     }
 
@@ -245,7 +253,10 @@ void CProjectManager::BuildGuideAsync() {
         "2. 技术栈与依赖\n"
         "3. 目录结构（关键目录说明）\n"
         "4. 各模块清单：每个模块的位置、功能、与其他模块的调用关系\n"
-        "5. 构建/运行方式\n\n"
+        "5. 构建/运行方式\n"
+        "6. 编码规范声明（固定条目，必须有）：在文档靠前位置写明——"
+        "「编写/修改本工程代码时，自动遵循 %USERPROFILE%\\.claude\\CLAUDE.md 的全部规则"
+        "（命名/格式/文件编码/修改记录/配置位置等）」。\n\n"
         "约束：\n"
         "- 只创建 `.autodev/guide.md` 这一个文件，不要修改任何业务代码。\n"
         "- 内容要准确、基于真实扫描结果，不要臆造。\n"
@@ -320,13 +331,20 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
         return;
     }
 
+        // 2026.08.18 后端漂移重建：非运行中才换（运行中由 OnSettings 拦截 + 双保险）。
+        if (m_pGuideSyncRunner != nullptr
+            && m_pGuideSyncRunner->BackendName() != CAgentRunnerFactory::BackendName()
+            && !m_pGuideSyncRunner->IsRunning()) {
+            m_pGuideSyncRunner->deleteLater();
+            m_pGuideSyncRunner = nullptr;
+        }
     if (m_pGuideSyncRunner == nullptr) {
-        m_pGuideSyncRunner = new CClaudeRunner(this);
-        connect(m_pGuideSyncRunner, &CClaudeRunner::sigInfo, this, &CProjectManager::sigGuideLog);
-        connect(m_pGuideSyncRunner, &CClaudeRunner::sigAssistantText,
+        m_pGuideSyncRunner = CAgentRunnerFactory::Create(this);
+        connect(m_pGuideSyncRunner, &CAgentRunnerBase::sigInfo, this, &CProjectManager::sigGuideLog);
+        connect(m_pGuideSyncRunner, &CAgentRunnerBase::sigAssistantText,
                 this, [this](const QString& a_sText) { emit sigGuideLog(a_sText); });
         connect(m_pGuideSyncRunner, qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
-                    &CClaudeRunner::sigFinished),
+                    &CAgentRunnerBase::sigFinished),
                 this, &CProjectManager::OnGuideSyncRunnerFinished);
     }
 
@@ -343,7 +361,10 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
         "   - 删除文件 → 从结构/清单中移除对应条目。\n"
         "   - 必要时用 Read/Grep 抽看相关源文件以准确描述，但不要把代码细节写进 guide.md。\n"
         "   - 若某条记录纯为日志/验证类、不影响 guide.md，则跳过该条。\n"
-        "3. 若上述所有记录均不影响 guide.md，则不要做任何修改。\n\n"
+        "3. 若上述所有记录均不影响 guide.md，则不要做任何修改。\n"
+        "4. 固定条目自检（与记录无关，每次执行）：若 guide.md 中尚无"
+        "「自动遵循 %USERPROFILE%\\.claude\\CLAUDE.md 规则」的编码规范声明，"
+        "在文档靠前位置补上这一条；已有则不动。\n\n"
         "约束（重要）：\n"
         "- 只允许编辑 `.autodev/guide.md` 这一个文件，用 Edit/MultiEdit 就地修改；"
         "不得新建或改动其它任何文件，尤其不要写 `.autodev/record.md`。\n"
@@ -672,6 +693,36 @@ QByteArray CProjectManager::LoadSplitterState() {
     return QByteArray::fromBase64(sB64.toLatin1());
 }
 
+bool CProjectManager::SaveVSplitState(const QByteArray& a_stState) {
+    // 2026.08.18：任务列表高度分隔条 saveState() 落 [Layout] VSplit；与 SaveSplitterState 同形。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const QString sB64 = QString::fromLatin1(a_stState.toBase64());
+    WritePrivateProfileStringW(L"Layout", L"VSplit",
+                               sB64.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QByteArray CProjectManager::LoadVSplitState() {
+    // 2026.08.18：读 [Layout] VSplit → 还原字节数组；缺键/空 → 空数组（调用方跳过 restoreState）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return QByteArray();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[8192] = {0};
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"Layout", L"VSplit", L"", szBuf, 8192, wsPath.c_str());
+    if (dwCopied == 0) {
+        return QByteArray();
+    }
+    const QString sB64 = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
+    return QByteArray::fromBase64(sB64.toLatin1());
+}
+
 bool CProjectManager::SaveAutoCompactPct(int a_iPct) {
     // 2026.08.15 比例制：落 [Adhoc] AutoCompactPct（替代已删除的 [Adhoc] AutoCompact 千 token 档位）；失败不抛。
     const QString sPath = ConfigFilePath();
@@ -693,6 +744,12 @@ int CProjectManager::LoadAutoCompactPct() const {
     const std::wstring wsPath = sPath.toStdWString();
     const int iPct = GetPrivateProfileIntW(L"Adhoc", L"AutoCompactPct", 75, wsPath.c_str());
     return (iPct >= 10 && iPct <= 95) ? iPct : 75;
+}
+
+bool CProjectManager::IsGuideBusy() const {
+    // guide 生成/同步 runner 任一执行中即占用（后端切换/漂移重建的安全窗口判定）。
+    return (m_pGuideRunner != nullptr && m_pGuideRunner->IsRunning())
+        || (m_pGuideSyncRunner != nullptr && m_pGuideSyncRunner->IsRunning());
 }
 
 int CProjectManager::AutoCompactKFor(const QString& a_sModel) const {
@@ -771,6 +828,254 @@ int CProjectManager::LoadReviewResume() {
     const std::wstring wsPath = sPath.toStdWString();
     const int iN = GetPrivateProfileIntW(L"Policy", L"ReviewResume", 1, wsPath.c_str());
     return (iN >= 1 && iN <= 9) ? iN : 1;
+}
+
+bool CProjectManager::SaveAgentBackend(int a_iBackend) {
+    // 2026.08.18 落 [Agent] Backend（1=claude，2=dsh）；非法值兜底写 1。失败不抛。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"Backend",
+        QString::number(a_iBackend == 2 ? 2 : 1).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadAgentBackend() {
+    // 2026.08.18 无 config.ini/缺键 → 默认 1（claude）；仅认 1/2，其余兜底 1。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return 1;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iBackend = GetPrivateProfileIntW(L"Agent", L"Backend", 1, wsPath.c_str());
+    return (iBackend == 2) ? 2 : 1;
+}
+
+// 2026.08.18 DSH 三路径 + provider/model 的存取（[Agent] 段）。路径空=未配置
+//   （CDeepSeekRunner::StartStage 前置校验带具体缺失项报失败）；provider/model
+//   空串回退默认 glm-custom / glm-5.2（与 CDeepSeekRunner 静态默认一致）。
+static bool SaveDshStrKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey,
+                          const QString& a_sValue) {
+    const QString sPath = a_sPathCfg;
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", a_lpszKey,
+        a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+static QString LoadDshStrKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey,
+                             const QString& a_sDefault) {
+    const QString sPath = a_sPathCfg;
+    if (sPath.isEmpty()) {
+        return a_sDefault;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[512] = { 0 };
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"Agent", a_lpszKey, a_sDefault.toStdWString().c_str(), szBuf, 512, wsPath.c_str());
+    const QString sValue = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+    return sValue.isEmpty() ? a_sDefault : sValue;
+}
+
+bool CProjectManager::SaveDshRoot(const QString& a_sRoot) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshRoot", a_sRoot);
+}
+
+QString CProjectManager::LoadDshRoot() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshRoot", QString());
+}
+
+bool CProjectManager::SaveDshNodePath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshNodePath", a_sPath);
+}
+
+QString CProjectManager::LoadDshNodePath() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshNodePath", QString());
+}
+
+bool CProjectManager::SaveDshBinJsPath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshBinJsPath", a_sPath);
+}
+
+QString CProjectManager::LoadDshBinJsPath() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshBinJsPath", QString());
+}
+
+bool CProjectManager::SaveDshCordisPath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshCordisPath", a_sPath);
+}
+
+QString CProjectManager::LoadDshCordisPath() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshCordisPath", QString());
+}
+
+bool CProjectManager::SaveDshProvider(const QString& a_sProvider) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshProvider", a_sProvider);
+}
+
+QString CProjectManager::LoadDshProvider() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshProvider", QStringLiteral("glm-custom"));
+}
+
+bool CProjectManager::SaveDshModel(const QString& a_sModel) {
+    return SaveDshStrKey(ConfigFilePath(), L"DshModel", a_sModel);
+}
+
+QString CProjectManager::LoadDshModel() {
+    return LoadDshStrKey(ConfigFilePath(), L"DshModel", QStringLiteral("glm-5.2"));
+}
+
+// 2026.08.18 DSH 计费单价（$/百万 token，[Agent] DshPrice*）：DSH 协议只报 token
+//   不报金额，客户端按单价折算；默认对齐 claude 后端 Sonnet 档价目（同网关口径）。
+//   INI 无 double 型，走字符串互转（'g' 短格式；解析失败回退默认）。
+static bool SaveDshDblKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey,
+                          double a_dValue) {
+    return SaveDshStrKey(a_sPathCfg, a_lpszKey, QString::number(a_dValue, 'g', 8));
+}
+
+static double LoadDshDblKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey,
+                            double a_dDefault) {
+    bool bOk = false;
+    const double dValue = LoadDshStrKey(a_sPathCfg, a_lpszKey,
+                                        QString::number(a_dDefault, 'g', 8)).toDouble(&bOk);
+    return bOk ? qMax(0.0, dValue) : a_dDefault;
+}
+
+bool CProjectManager::SaveDshPriceInPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"DshPriceInPerM", a_d);
+}
+
+double CProjectManager::LoadDshPriceInPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"DshPriceInPerM", 3.0);
+}
+
+bool CProjectManager::SaveDshPriceCacheReadPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"DshPriceCacheReadPerM", a_d);
+}
+
+double CProjectManager::LoadDshPriceCacheReadPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"DshPriceCacheReadPerM", 0.3);
+}
+
+bool CProjectManager::SaveDshPriceCacheWritePerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"DshPriceCacheWritePerM", a_d);
+}
+
+double CProjectManager::LoadDshPriceCacheWritePerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"DshPriceCacheWritePerM", 3.75);
+}
+
+bool CProjectManager::SaveDshPriceOutPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", a_d);
+}
+
+double CProjectManager::LoadDshPriceOutPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", 15.0);
+}
+
+// 2026.08.18 自定义大模型表（[DshModels] Count/Active/M<i>*）：DSH 后端跨机器
+//   自配 LLM 的多条目管理（设置页维护，CMainWindow 启动/保存时注入 runner）。
+//   密钥经 INI 明文存储（设置页 tooltip 已告知）；读缓冲放宽到 1024 防长密钥截断。
+//   节与 [Agent] 不同，不复用 SaveDshStrKey/LoadDshStrKey（二者硬编码 L"Agent"）。
+QList<SDshModelEntry> CProjectManager::LoadDshModels(int* a_pActive) {
+    QList<SDshModelEntry> aModels;
+    if (a_pActive) {
+        *a_pActive = -1;
+    }
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return aModels;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Count", 0, wsPath.c_str()));
+    if (iCount <= 0) {
+        return aModels;
+    }
+    wchar_t szBuf[1024] = { 0 };
+    for (int i = 0; i < iCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            const DWORD dwCopied = GetPrivateProfileStringW(L"DshModels", wsKey.c_str(), L"",
+                                                            szBuf, 1024, wsPath.c_str());
+            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        };
+        SDshModelEntry stE;
+        stE.sDisp    = fnReadStr(L"Disp");
+        stE.sBaseURL = fnReadStr(L"URL");
+        stE.sApiKey  = fnReadStr(L"Key");
+        stE.sApi     = fnReadStr(L"Api");
+        stE.sModelId = fnReadStr(L"Model");
+        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        if (stE.iCtx <= 0) {
+            stE.iCtx = 200000;
+        }
+        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        if (stE.iMaxTok <= 0) {
+            stE.iMaxTok = 32768;
+        }
+        if (stE.sApi.isEmpty()) {
+            stE.sApi = QStringLiteral("anthropic-messages");
+        }
+        if (stE.sDisp.isEmpty()) {
+            stE.sDisp = stE.sModelId;
+        }
+        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
+            continue;   // 无模型 id / 接入点的残缺条目不进表
+        }
+        aModels.append(stE);
+    }
+    if (a_pActive) {
+        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Active", -1, wsPath.c_str()));
+        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+    }
+    return aModels;
+}
+
+bool CProjectManager::SaveDshModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    // 先读旧条目数再写新 Count（写后就读不到旧值了），缩短时用于清除残留键
+    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Count", 0, wsPath.c_str()));
+    const int iNewCount = a_aModels.size();
+    WritePrivateProfileStringW(L"DshModels", L"Count",
+                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            WritePrivateProfileStringW(L"DshModels", wsKey.c_str(),
+                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+        };
+        fnWrite(L"Disp",  stE.sDisp);
+        fnWrite(L"URL",   stE.sBaseURL);
+        fnWrite(L"Key",   stE.sApiKey);
+        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
+        fnWrite(L"Model", stE.sModelId);
+        fnWrite(L"Ctx",   QString::number(stE.iCtx));
+        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    }
+    // 表缩短时清掉残留旧条目键（防幽灵行被下次 Load 读回）
+    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
+            const std::wstring wsKey = wsPrefix + lpszSuffix;
+            WritePrivateProfileStringW(L"DshModels", wsKey.c_str(), nullptr, wsPath.c_str());
+        }
+    }
+    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
+    WritePrivateProfileStringW(L"DshModels", L"Active",
+                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    return true;
 }
 
 bool CProjectManager::SaveClaudeCmd(const QString& a_sCmd) {

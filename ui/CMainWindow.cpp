@@ -64,6 +64,7 @@
 #include "CProjectManager.h"
 #include "CTaskOrchestrator.h"
 #include "CClaudeRunner.h"
+#include "CAgentRunnerFactory.h"   // 2026.08.18 后端单选分派（自带 CDeepSeekRunner.h）
 #include "CTaskInfo.h"
 #include "core/StageDef.h"   // 2026.08.17 FindStage：中断恢复提示里显示阶段中文名
 #include "TaskTypes.h"
@@ -75,6 +76,42 @@
 #include "CAboutDialog.h"
 #include "CNewTaskDialog.h"
 #include "CTaskHistoryDB.h"
+
+// [Scan] ExcludeDirs 逗号串 → 逐项去空白的清单。用户常在逗号后带空格（".autodev, build"），
+// 不逐项 trim 会让 " build" 匹配失败、该目录排除悄悄失效（备份路径 BackupExcludeDirs
+// 内部已 trim，扫描路径此前漏了）。全空 → 空清单 = SetExcludeDirs 恢复内置默认。
+static QStringList ScanDirList(const QString& a_sDirs) {
+    QStringList aItems;
+    const QStringList aRaw = a_sDirs.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString& sItem : aRaw) {
+        const QString sTrim = sItem.trimmed();
+        if (!sTrim.isEmpty()) {
+            aItems.append(sTrim);
+        }
+    }
+    return aItems;
+}
+
+// 2026.08.18 自定义大模型表注入：SDshModelEntry（config.ini [DshModels]）→
+//   CDeepSeekRunner::SCustomModel（字段一一对应）。空表/无效下标原样传入 = 未启用，
+//   runner 内部 CustomActiveValid 判定，走 [Agent] DshProvider/DshModel 固定路由。
+//   生效时机 = 下一次 DSH 进程冷启动（长驻进程 env 在启动时注入，运行中的会话不受影响）。
+static void ApplyDshCustomModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    QVector<CDeepSeekRunner::SCustomModel> aRunnerModels;
+    aRunnerModels.reserve(a_aModels.size());
+    for (const SDshModelEntry& stE : a_aModels) {
+        CDeepSeekRunner::SCustomModel stM;
+        stM.sDisp    = stE.sDisp;
+        stM.sBaseURL = stE.sBaseURL;
+        stM.sApiKey  = stE.sApiKey;
+        stM.sApi     = stE.sApi;
+        stM.sModelId = stE.sModelId;
+        stM.iCtx     = stE.iCtx;
+        stM.iMaxTok  = stE.iMaxTok;
+        aRunnerModels.append(stM);
+    }
+    CDeepSeekRunner::SetCustomModels(aRunnerModels, a_iActive);
+}
 
 // 应用级原生消息过滤器：先于 Qt 内部消息处理看到所有 Win32 消息（QWidget::nativeEvent
 // 之前），Qt 内部即便特殊处理/吞掉 WM_NCLBUTTONDOWN 也拦不到这里——图标弹系统菜单
@@ -204,14 +241,51 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     CClaudeRunner::SetAskTimeoutSec(m_pPm->LoadAskTimeoutSec());
     // 2026.08.17 停滞检测阈值回填（[Agent] StallMinutes，默认 10 分钟）。
     CClaudeRunner::SetStallMinutes(m_pPm->LoadStallMinutes());
-    // 2026.08.15 扫描排除目录回填（[Scan] ExcludeDirs；空=内置默认）。
-    {
-        const QString sScanDirs = m_pPm->LoadScanExcludeDirs();
-        if (!sScanDirs.isEmpty()) {
-            CGuideFingerprintScanner::SetExcludeDirs(
-                sScanDirs.split(QLatin1Char(','), Qt::SkipEmptyParts));
+    // 2026.08.18 Agent 后端与 DSH 参数回填（全局单选：工厂分派 + CDeepSeekRunner 进程级静态）。
+    CAgentRunnerFactory::SetBackend(m_pPm->LoadAgentBackend() == 2
+        ? CAgentRunnerFactory::BackendDsh : CAgentRunnerFactory::BackendClaude);
+    // 2026.08.18 自动配置：DSH 根目录——config 显式键优先；空或失效（键指向的目录
+    //   无 bin.js/cordis.yml，如 config.ini 随发布包带到别的机器后的死路径）时探测
+    //   exe 同级/上级的 DeepSeekHarness\deepseek-harness（install_env.bat 固定安装
+    //   布局），探测命中即回写 config.ini（安装完成后零手填 + 搬机死键自愈）。
+    QString sDshRootStartup = m_pPm->LoadDshRoot();
+    if (!CDeepSeekRunner::LooksLikeDshRoot(sDshRootStartup)) {
+        const QString sProbed = CDeepSeekRunner::ProbeSiblingRoot();
+        if (CDeepSeekRunner::LooksLikeDshRoot(sProbed)) {
+            sDshRootStartup = sProbed;
+            m_pPm->SaveDshRoot(sDshRootStartup);
         }
     }
+    CDeepSeekRunner::SetDshRootPath(sDshRootStartup);
+    CDeepSeekRunner::SetDshNodePath(m_pPm->LoadDshNodePath());
+    CDeepSeekRunner::SetDshBinJsPath(m_pPm->LoadDshBinJsPath());
+    CDeepSeekRunner::SetDshCordisPath(m_pPm->LoadDshCordisPath());
+    CDeepSeekRunner::SetDshProvider(m_pPm->LoadDshProvider());
+    CDeepSeekRunner::SetDshModel(m_pPm->LoadDshModel());
+    CDeepSeekRunner::SetDshPriceInPerM(m_pPm->LoadDshPriceInPerM());
+    CDeepSeekRunner::SetDshPriceCacheReadPerM(m_pPm->LoadDshPriceCacheReadPerM());
+    CDeepSeekRunner::SetDshPriceCacheWritePerM(m_pPm->LoadDshPriceCacheWritePerM());
+    CDeepSeekRunner::SetDshPriceOutPerM(m_pPm->LoadDshPriceOutPerM());
+    // 2026.08.18 自定义大模型表（[DshModels]）：激活条目经 autocode-active env 槽位
+    //   覆盖 provider/model（表空/无激活 = 未启用，走上方固定路由）。
+    {
+        int iDshActiveStartup = -1;
+        const QList<SDshModelEntry> aDshModelsStartup = m_pPm->LoadDshModels(&iDshActiveStartup);
+        ApplyDshCustomModels(aDshModelsStartup, iDshActiveStartup);
+    }
+    // 2026.08.18 配置了 DSH 后端但本机不可用 → 启动即明确警告：不能等第一次阶段
+    //   启动才报错，用户需要立刻知道哪里坏了、怎么处理（文案含一键安装指引）。
+    if (CAgentRunnerFactory::IsDsh()) {
+        const QString sDshErr = CDeepSeekRunner::DshConfigError();
+        if (!sDshErr.isEmpty()) {
+            ExecMsgBox(QMessageBox::Warning, QStringLiteral("Agent 后端（DeepSeekHarness）不可用"),
+                sDshErr + QStringLiteral("\n\n当前后端为 DeepSeekHarness，问题解决前任务/助手/guide "
+                                          "将无法启动；也可到设置中切回 Claude Code。"), this);
+        }
+    }
+    // 2026.08.15 扫描排除目录回填（[Scan] ExcludeDirs；空=恢复内置默认）。
+    // 2026.08.18 修：逐项 trim（逗号后空格不再让排除失效）+ 空也下发（清空即回默认）。
+    CGuideFingerprintScanner::SetExcludeDirs(ScanDirList(m_pPm->LoadScanExcludeDirs()));
 
     // 编排器 → 执行面板
     connect(m_pOrch, &CTaskOrchestrator::sigStageLog,   this, &CMainWindow::OnStageLog);
@@ -245,6 +319,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             m_pExecPanel, &CExecutionPanel::OnAdhocUndo);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocFinished,
             m_pExecPanel, &CExecutionPanel::OnAdhocFinished);
+    // 2026.08.19 自动续发排队指令：编排器直接起新轮，面板无 UI 事件可感知——
+    //   StartAdhocStage 起跑时广播运行态（手动发送路径面板已自置，此处幂等）。
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocRunning,
+            m_pExecPanel, [this]() { m_pExecPanel->SetAdhocRunning(true); });
     // 面板输入栏 → 编排器（经本窗口转发）
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocSubmit,
             this, &CMainWindow::OnAdhocSubmit);
@@ -381,6 +459,9 @@ void CMainWindow::CreateUi() {
         if (!aState.isEmpty()) {
             pSplit->restoreState(aState);
         }
+        // 2026.08.18 恢复任务列表高度分隔条位置（左栏内部 垂直分隔条，[Layout] VSplit；
+        //   无记录 → 保留面板 ctor setSizes 的默认比例）。
+        m_pTaskPanel->RestoreVSplitState(m_pPm->LoadVSplitState());
     }
     pV->addWidget(pSplit, 1);
 
@@ -403,6 +484,9 @@ void CMainWindow::CreateUi() {
     // FR-3：资源管理器「添加到聊天框」→ 注入助手输入框。
     connect(m_pTaskPanel, &CTaskListPanel::sigAddToChat,
             m_pExecPanel, &CExecutionPanel::AppendToAdhocInput);
+    // 2026.08.18 资源管理器双击文本文件 → 执行面板「助手」右侧 Tab 内嵌显示。
+    connect(m_pTaskPanel, &CTaskListPanel::sigFileOpen,
+            m_pExecPanel, &CExecutionPanel::ShowFileTab);
     // FR-3：任务运行中介入输入栏 → 编排器 InjectTaskMessage。
     connect(m_pExecPanel, &CExecutionPanel::sigTaskInject,
             this, &CMainWindow::OnTaskInject);
@@ -957,6 +1041,39 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveReviewParallel(stDlg.ReviewParallel());
     m_pPm->SaveClaudeCmd(stDlg.ClaudeCmd());
     m_pPm->SaveAskTimeoutSec(stDlg.AskTimeoutSec());
+    // 2026.08.18 后端切换保护：任务/助手/guide 任一运行中禁止切后端——旧 runner
+    //   正在跑、切换只对新拉起生效，半新半旧混跑会让阶段产物跨后端语义错乱。
+    //   Backend 键拒存（保持原值），其余键照常；DSH 参数非运行敏感，直接落。
+    const int iNewBackend = stDlg.AgentBackend();
+    const bool bBackendChanged =
+        (iNewBackend == 2) != CAgentRunnerFactory::IsDsh();
+    const bool bBusy = (m_pOrch != nullptr && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAdhocRunning()))
+        || (m_pPm != nullptr && m_pPm->IsGuideBusy());
+    bool bBackendSaved = true;
+    if (bBackendChanged && bBusy) {
+        bBackendSaved = false;
+        ExecMsgBox(QMessageBox::Warning, QStringLiteral("设置"),
+                   QStringLiteral("有任务/助手/guide 正在运行，Agent 后端切换已保留原值"
+                                  "（其余设置已保存）。请空闲后再切换。"), this);
+    } else {
+        m_pPm->SaveAgentBackend(iNewBackend);
+    }
+    // 2026.08.18 轻量自动配置：根目录单字段落盘；root 生效时清掉旧 bin/cordis 显式键
+    //   （解析优先级=显式键>root 推导，清键防双源歧义；root 留空则旧键原样保留作回退）。
+    m_pPm->SaveDshRoot(stDlg.DshRoot());
+    m_pPm->SaveDshNodePath(stDlg.DshNodePath());
+    if (!stDlg.DshRoot().isEmpty()) {
+        m_pPm->SaveDshBinJsPath(QString());
+        m_pPm->SaveDshCordisPath(QString());
+    }
+    m_pPm->SaveDshProvider(stDlg.DshProvider());
+    m_pPm->SaveDshModel(stDlg.DshModel());
+    m_pPm->SaveDshPriceInPerM(stDlg.DshPriceInPerM());
+    m_pPm->SaveDshPriceCacheReadPerM(stDlg.DshPriceCacheReadPerM());
+    m_pPm->SaveDshPriceCacheWritePerM(stDlg.DshPriceCacheWritePerM());
+    m_pPm->SaveDshPriceOutPerM(stDlg.DshPriceOutPerM());
+    // 2026.08.18 自定义大模型表落盘（[DshModels] Count/Active/M<i>*）。
+    m_pPm->SaveDshModels(stDlg.DshModels(), stDlg.DshActiveModel());
     m_pPm->SaveWebSearch(stDlg.WebSearch());
     m_pPm->SaveAutoCompactPct(stDlg.AutoCompactPct());
     m_pPm->SaveAdhocContextLimit(stDlg.ContextLimit());
@@ -971,20 +1088,58 @@ void CMainWindow::OnSettings() {
     CClaudeRunner::SetClaudeCmd(stDlg.ClaudeCmd().isEmpty()
         ? QStringLiteral("claude") : stDlg.ClaudeCmd());
     CClaudeRunner::SetAskTimeoutSec(stDlg.AskTimeoutSec());
+    // 2026.08.18 后端/DSH 参数应用运行期：工厂分派立即切换（漂移重建由各持有点的
+    //   Ensure 逻辑负责——非运行中的旧 runner 在下一次使用前被替换为新后端实例）。
+    if (bBackendSaved) {
+        CAgentRunnerFactory::SetBackend(iNewBackend == 2
+            ? CAgentRunnerFactory::BackendDsh : CAgentRunnerFactory::BackendClaude);
+    }
+    // 2026.08.18 根目录应用运行期：显式值优先；空或失效（死路径自愈）时探测 exe
+    //   同级并自动回填落盘（设置页装完 DSH → 确定 → 探测命中即写 config.ini，
+    //   与启动路径同口径）。
+    QString sDshRootApply = stDlg.DshRoot();
+    if (!CDeepSeekRunner::LooksLikeDshRoot(sDshRootApply)) {
+        const QString sProbed = CDeepSeekRunner::ProbeSiblingRoot();
+        if (CDeepSeekRunner::LooksLikeDshRoot(sProbed)) {
+            sDshRootApply = sProbed;
+            m_pPm->SaveDshRoot(sDshRootApply);
+        }
+    }
+    CDeepSeekRunner::SetDshRootPath(sDshRootApply);
+    CDeepSeekRunner::SetDshNodePath(stDlg.DshNodePath());
+    // bin/cordis 静态跟随刚落盘的键值（root 已存 → 上方刚清空；root 留空 → 旧档回退值）。
+    CDeepSeekRunner::SetDshBinJsPath(m_pPm->LoadDshBinJsPath());
+    CDeepSeekRunner::SetDshCordisPath(m_pPm->LoadDshCordisPath());
+    CDeepSeekRunner::SetDshProvider(stDlg.DshProvider());
+    CDeepSeekRunner::SetDshModel(stDlg.DshModel());
+    CDeepSeekRunner::SetDshPriceInPerM(stDlg.DshPriceInPerM());
+    CDeepSeekRunner::SetDshPriceCacheReadPerM(stDlg.DshPriceCacheReadPerM());
+    CDeepSeekRunner::SetDshPriceCacheWritePerM(stDlg.DshPriceCacheWritePerM());
+    CDeepSeekRunner::SetDshPriceOutPerM(stDlg.DshPriceOutPerM());
+    // 2026.08.18 自定义大模型表应用到 runner 静态表（下次 DSH 进程冷启动生效）。
+    ApplyDshCustomModels(stDlg.DshModels(), stDlg.DshActiveModel());
+    // 2026.08.18 保存后仍不可用 → 立即警告兜底：设置页检测拦住了根目录缺失，但
+    //   cordis 未部署等半安装态在这里补提醒（与启动警告同文案口径）。
+    if (CAgentRunnerFactory::IsDsh()) {
+        const QString sDshErr = CDeepSeekRunner::DshConfigError();
+        if (!sDshErr.isEmpty()) {
+            ExecMsgBox(QMessageBox::Warning, QStringLiteral("Agent 后端（DeepSeekHarness）不可用"),
+                sDshErr + QStringLiteral("\n\n后端已切到 DeepSeekHarness，问题解决前任务/助手/guide "
+                                          "无法启动；也可重新打开设置切回 Claude Code。"), this);
+        }
+    }
     if (m_pExecPanel != nullptr) {
         m_pExecPanel->SetUserContextLimit(stDlg.ContextLimit());
     }
-    const QString sScanDirs = stDlg.ScanExcludeDirs();
-    if (!sScanDirs.isEmpty()) {
-        CGuideFingerprintScanner::SetExcludeDirs(
-            sScanDirs.split(QLatin1Char(','), Qt::SkipEmptyParts));
-    }
+    // 2026.08.18 修：逐项 trim + 空清单恢复内置默认（与启动路径同源，见 ScanDirList）。
+    CGuideFingerprintScanner::SetExcludeDirs(ScanDirList(stDlg.ScanExcludeDirs()));
 
     SetStatus(QStringLiteral("设置已保存到 config.ini（策略/压缩比例/目录排除对下一阶段生效）"));
 }
 
 void CMainWindow::OnHelp() {
-    // FR-9 帮助：打开 exe 同目录 help\使用说明.html（系统默认浏览器渲染图文使用说明）。
+    // 2026.08.19 弃帮助内嵌窗口：点菜单直接用系统默认浏览器打开 exe 同目录
+    //   help\使用说明.html（WebView2/QTextBrowser 双方案随 CHelpDialog 一并移除）。
     const QString sDir = QCoreApplication::applicationDirPath();
     const QString sHelp = sDir + QStringLiteral("/help/使用说明.html");
 
@@ -993,11 +1148,7 @@ void CMainWindow::OnHelp() {
                    QStringLiteral("未找到使用说明文件：\n%1").arg(sHelp), this);
         return;
     }
-
-    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(sHelp))) {
-        ExecMsgBox(QMessageBox::Warning, QStringLiteral("帮助"),
-                   QStringLiteral("打开使用说明失败（系统未关联 .html 默认程序）：\n%1").arg(sHelp), this);
-    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(sHelp));
 }
 
 void CMainWindow::OnAbout() {
@@ -1253,7 +1404,7 @@ void CMainWindow::OnDeleteTask(CTaskInfo* a_pTask) {
     }
     const auto eRet = ExecQuestion(
         QStringLiteral("删除任务"),
-        QStringLiteral("确认删除任务「%1」？该任务将从全局历史库与当前列表中移除，阶段产物(.md)保留以备审计")
+        QStringLiteral("确认彻底删除任务「%1」？\n该任务将从当前列表与全局历史库中删除（含工程侧 task.json，重开工程不再出现），阶段产物(.md)保留以备审计")
             .arg(a_pTask->Name()), this);
     if (eRet != QMessageBox::Yes) {
         return;
@@ -1267,19 +1418,25 @@ void CMainWindow::OnDeleteTask(CTaskInfo* a_pTask) {
     }
 
     // 2. 判断 a_pTask 属于哪个列表：活跃副本(m_aTasks) 还是历史副本(m_aHistoryTasks)。
-    //    活跃副本 → 同步删本工程的 task.json；历史副本 → 不动 task.json（属其它工程）。
+    // 2026.08.19 task.json 两边都删（此前历史副本不动——当前工程的终态任务也在历史表，
+    //    只删 DB 会因重开工程 LoadAllTasks 复活再镜像回 DB）；历史副本按任务自身
+    //    ProjectDir 定位（其它工程的记录同样彻底删除）。
     const int iAct = m_aTasks.indexOf(a_pTask);
     const bool bActive = (iAct >= 0);
     if (bActive) {
-        if (!m_pPm->ProjectDir().isEmpty()) {
-            QFile::remove(m_pPm->TaskDir(sId) + QStringLiteral("/task.json"));
-        }
         m_aTasks.removeAt(iAct);
     } else {
         const int iHis = m_aHistoryTasks.indexOf(a_pTask);
         if (iHis >= 0) {
             m_aHistoryTasks.removeAt(iHis);
         }
+    }
+    if (!a_pTask->ProjectDir().isEmpty()) {
+        const QString sJson = bActive && m_pPm != nullptr && !m_pPm->ProjectDir().isEmpty()
+            ? m_pPm->TaskDir(sId) + QStringLiteral("/task.json")
+            : QDir::cleanPath(a_pTask->ProjectDir() + QStringLiteral("/.autodev/tasks/")
+                + sId + QStringLiteral("/task.json"));
+        QFile::remove(sJson);
     }
 
     // 3. 清理选中态：助手档回退工程全局档（该任务档文件留存于任务目录，仅 task.json 被删）
@@ -1813,6 +1970,9 @@ void CMainWindow::SaveAssistantState() {
         return;
     }
     QJsonObject oRoot;
+    // 2026.08.18 sid/撤销栈是后端私有（claude 与 DSH 会话 id 互不相通）：存档记后端名，
+    //   LoadAssistantState 还原时后端不符则丢弃 sid/撤销栈（对话块等其余字段后端无关照常恢复）。
+    oRoot[QStringLiteral("backend")]    = CAgentRunnerFactory::BackendName();
     oRoot[QStringLiteral("sid")]        = m_pOrch->AdhocSid();
     oRoot[QStringLiteral("guideHash")]  = m_pOrch->AdhocGuideHash();   // 需求3：guide.md 投喂哈希基线
     oRoot[QStringLiteral("stack")]      = m_pOrch->AdhocStackToJson();
@@ -1857,7 +2017,15 @@ void CMainWindow::LoadAssistantState() {
     const QString sGuideHash = oRoot.value(QStringLiteral("guideHash")).toString();
     const QJsonArray aStack  = oRoot.value(QStringLiteral("stack")).toArray();
     const QJsonArray aBlocks = oRoot.value(QStringLiteral("blocks")).toArray();
-    m_pOrch->LoadAdhocState(sSid, aStack);            // 恢复链（不发信号，避免回写）
+    // 2026.08.18 后端校验：存档后端 ≠ 当前后端 → sid/撤销栈丢弃（claude --resume 吃到 DSH
+    //   sid 会直接报错；DSH 侧虽能自愈换新 sid，也一并跳过保持两方向语义一致）。
+    //   旧档无 backend 键 → 视为 claude（历史上唯一后端）；DSH 遇到旧 claude sid 自换新，安全。
+    const QString sBackend = oRoot.value(QStringLiteral("backend")).toString();
+    if (sBackend.isEmpty() || sBackend == CAgentRunnerFactory::BackendName()) {
+        m_pOrch->LoadAdhocState(sSid, aStack);        // 恢复链（不发信号，避免回写）
+    } else {
+        m_pOrch->LoadAdhocState(QString(), QJsonArray());
+    }
     m_pOrch->SetAdhocGuideHash(sGuideHash);           // 需求3：恢复 guide.md 投喂哈希基线
     m_pExecPanel->LoadAdhocBlocksFromJson(aBlocks);   // 恢复对话流（重建助手 Tab）
     // #1 上下文占用恢复：新版存档有 ctxFill 直接还原；旧版存档（无此字段）若有 sid 则标记未知（—），避免误显示 0。
@@ -1937,6 +2105,10 @@ void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
         // 与窗口尺寸无关，最大化态下保存亦正确。下次启动 CreateUi 中 restoreState 恢复。
         if (m_pMainSplit != nullptr) {
             m_pPm->SaveSplitterState(m_pMainSplit->saveState());
+        }
+        // 2026.08.18 任务列表高度分隔条（左栏内部）位置一并持久化。
+        if (m_pTaskPanel != nullptr) {
+            m_pPm->SaveVSplitState(m_pTaskPanel->VSplitState());
         }
     }
     QMainWindow::closeEvent(a_pEvent);

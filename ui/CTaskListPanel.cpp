@@ -6,6 +6,7 @@
 #include <QTreeWidgetItem>
 #include <QHeaderView>
 #include <QPushButton>
+#include <QSplitter>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QSignalBlocker>
@@ -20,6 +21,12 @@
 #include "core/StageDef.h"
 #include "TaskTypes.h"
 #include "CProjectExplorerPanel.h"
+
+QString CTaskListPanel::FormatCost(double a_dCost) {
+    // 2026.08.18 费用 ≤0 显示 "-"（缺失值风格；DSH 自 v1.0.38 起按单价折算可 >0，
+    //   计费单价全 0 或无数据时仍为 "-"）。
+    return a_dCost > 0.0 ? QString::number(a_dCost, 'f', 2) : QStringLiteral("-");
+}
 
 QString CTaskListPanel::FormatTokens(qint64 a_iTokens) {
     // 与 CExecutionPanel::FormatTokens 同口径（1000 进制，非 1024）。
@@ -136,14 +143,8 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
 
     m_pTab->addTab(m_pListCur, QStringLiteral("当前任务"));
     m_pTab->addTab(m_pTreeHis, QStringLiteral("历史任务"));
-    // FR-2：列表限高 ≈5 条（按当前字体行高动态计算，避免不同 DPI/字体偏离）。
-    // sizeHintForRow(0) 在数据为空时返回 -1，兜底用字体行高估算。
-    const int iRowH = m_pListCur->sizeHintForRow(0) > 0
-                          ? m_pListCur->sizeHintForRow(0)
-                          : m_pListCur->fontMetrics().height() + 4;
-    const int iTabOverhead = 40;   // Tab 标签条 + 边框 + 滚动条余量
-    m_pTab->setMaximumHeight(iRowH * 5 + iTabOverhead);
-    pV->addWidget(m_pTab, 0);   // 不再拿 stretch，超出可滚
+    // 2026.08.18 拆掉 FR-2 的 setMaximumHeight 限高（≈5 条）：列表高度改由下方垂直
+    //   分隔条控制，拖大上段即可看更多任务（任务多时的核心诉求）。
 
     auto* pH = new QHBoxLayout();
     m_pBtnNew   = new QPushButton(QStringLiteral("新建"), this);
@@ -160,14 +161,40 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     pH->addWidget(m_pBtnPause);
     pH->addWidget(m_pBtnStop);
     pH->addWidget(m_pBtnRollback);
-    pV->addLayout(pH);
 
-    // FR-3：列表按钮行下方新增工程资源管理器面板，占剩余空间（stretch=1）。
-    m_pExplorer = new CProjectExplorerPanel(this);
+    // 2026.08.18 任务列表高度分隔条：按钮行与资源管理器之间的垂直 QSplitter。
+    //   上段 = 任务 Tab（拿 stretch，拖大即看更多任务）+ 按钮行；下段 = 资源管理器。
+    //   位置由 CMainWindow 经 saveState/restoreState 持久化（[Layout] VSplit）。
+    m_pVSplit = new QSplitter(Qt::Vertical, this);
+    m_pVSplit->setHandleWidth(5);              // 与主窗口水平分隔条同宽
+    m_pVSplit->setChildrenCollapsible(false);  // 两段都不允许拖没，保底可见
+    auto* pTop = new QWidget(m_pVSplit);
+    auto* pVT = new QVBoxLayout(pTop);
+    pVT->setContentsMargins(0, 0, 0, 0);
+    pVT->addWidget(m_pTab, 1);   // 上段内列表占满剩余（超出可滚）
+    pVT->addLayout(pH);
+    m_pVSplit->addWidget(pTop);
+    m_pExplorer = new CProjectExplorerPanel(m_pVSplit);
     // 转发「添加到聊天框」信号给主窗口（注入 adhoc 助手输入框）。
     connect(m_pExplorer, &CProjectExplorerPanel::sigAddToChat,
             this, &CTaskListPanel::sigAddToChat);
-    pV->addWidget(m_pExplorer, 1);
+    // 转发「双击文本文件」信号给主窗口（执行面板内嵌 Tab 显示文件内容）。
+    connect(m_pExplorer, &CProjectExplorerPanel::sigFileOpen,
+            this, &CTaskListPanel::sigFileOpen);
+    m_pVSplit->addWidget(m_pExplorer);
+    // 初始默认上段高度 ≈ 旧限高（5 行 Tab + 按钮行），与改造前观感一致；
+    //   精确值不关键，restoreState 命中即被覆盖，setSizes 只定首次布局。
+    {
+        const int iRowH = m_pListCur->sizeHintForRow(0) > 0
+                              ? m_pListCur->sizeHintForRow(0)
+                              : m_pListCur->fontMetrics().height() + 4;
+        const int iBtnRow = m_pBtnNew->sizeHint().height();
+        m_pVSplit->setSizes({iRowH * 5 + 40 + iBtnRow, 400});
+    }
+    pV->addWidget(m_pVSplit, 1);
+    // 2026.08.19 本分隔条拖动不再上报底部 y：此前 splitterMoved → sigTaskListBottom →
+    //   右栏 SyncStagesHeight setSizes，拖左栏会连带拖动右栏「阶段/日志」分隔条（用户
+    //   要求各拖动条互不影响）。FR-9 对齐只在窗口 resize（resizeEvent）路径保留。
 
     // 2026.08.15 运行耗时秒级刷新：当前任务 Running 时每秒重写当前表对应行文本
     //   （只 setText 不重建、不动选中；无任务运行时空转开销可忽略）。
@@ -207,11 +234,27 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
 
 void CTaskListPanel::resizeEvent(QResizeEvent* a_pEvent) {
     QWidget::resizeEvent(a_pEvent);
+    ReportTaskListBottom();
+}
+
+void CTaskListPanel::ReportTaskListBottom() {
     // FR-9：上报任务列表（Tab）底部相对本 widget 顶部的 y，供执行面板同步阶段表高度对齐。
     // m_pTab 经布局后 geometry() 方准确；首帧 height()<=0 时跳过，待下次 resize 再报。
     if (m_pTab != nullptr && m_pTab->height() > 0) {
         emit sigTaskListBottom(m_pTab->geometry().bottom() + 1);
     }
+}
+
+QByteArray CTaskListPanel::VSplitState() const {
+    return m_pVSplit != nullptr ? m_pVSplit->saveState() : QByteArray();
+}
+
+void CTaskListPanel::RestoreVSplitState(const QByteArray& a_stState) {
+    // 空状态（首跑无记录）跳过，保留 ctor 里 setSizes 的默认比例。
+    if (m_pVSplit != nullptr && !a_stState.isEmpty()) {
+        m_pVSplit->restoreState(a_stState);
+    }
+    ReportTaskListBottom();
 }
 
 CTaskInfo* CTaskListPanel::TaskOf(QListWidgetItem* a_pItem) {
@@ -389,7 +432,7 @@ void CTaskListPanel::SetHistoryTasks(const QList<CTaskInfo*>& a_aTasks) {
         pItem->setText(1, ToString(pTask->Type()));
         pItem->setText(2, pDef ? pDef->sNameZh : QStringLiteral("?"));
         pItem->setText(3, ToString(pTask->Status()));
-        pItem->setText(4, QString::number(pTask->TotalCost(), 'f', 2));
+        pItem->setText(4, FormatCost(pTask->TotalCost()));
         pItem->setText(5, FormatTokens(pTask->TotalInTokens()));
         pItem->setText(6, FormatTokens(pTask->TotalOutTokens()));
         pItem->setText(7, pTask->RequestCount() > 0
@@ -436,7 +479,7 @@ void CTaskListPanel::UpdateTaskRow(CTaskInfo* a_pTask) {
     for (int i = 0; i < iCount; ++i) {
         QTreeWidgetItem* pItem = m_pTreeHis->topLevelItem(i);
         if (TaskOf(pItem) == a_pTask) {
-            pItem->setText(4, QString::number(a_pTask->TotalCost(), 'f', 2));
+            pItem->setText(4, FormatCost(a_pTask->TotalCost()));
             pItem->setText(5, FormatTokens(a_pTask->TotalInTokens()));
             pItem->setText(6, FormatTokens(a_pTask->TotalOutTokens()));
             pItem->setText(7, a_pTask->RequestCount() > 0
@@ -555,6 +598,8 @@ bool CTaskListPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
 void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
     // #6 历史表右键菜单：对所指任务（Done/Failed）提供「再次执行」——回到当前栏从当前阶段续跑。
     // （语义=原 OnReviveTask 续跑；入口由按钮改为右键菜单，去掉常驻「继续执行」按钮。）
+    // 2026.08.19 增「删除」：彻底删除该任务记录（两表 + 全局历史库 + 工程侧 task.json），
+    //   确认与删除逻辑在 CMainWindow::OnDeleteTask，此处只转发所选任务。
     QTreeWidgetItem* pItem = m_pTreeHis->itemAt(a_pos);
     if (pItem == nullptr) { return; }
     CTaskInfo* pTask = TaskOf(pItem);
@@ -563,17 +608,23 @@ void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
     QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5（移首位：查看优先于再次执行）
     menu.addSeparator();   // 查看与再次执行之间加分隔线
     QAction* pActRetry = menu.addAction(QStringLiteral("再次执行"));
+    menu.addSeparator();   // 删除是破坏性操作，与常规项分隔
+    QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
     QAction* pSel = menu.exec(m_pTreeHis->viewport()->mapToGlobal(a_pos));
     if (pSel == pActRetry) {
         emit sigReviveTask(pTask);
     } else if (pSel == pActView) {
         emit sigViewTask(pTask);
+    } else if (pSel == pActDelete) {
+        emit sigDeleteTask(pTask);
     }
 }
 
 void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     // #3 当前表右键「移除」：把所指任务移到历史任务列表（保留记录，可再次执行）。
     // 确认对话框与归档逻辑在 CMainWindow::OnRemoveTask（业务层），此处只转发所选任务。
+    // 2026.08.19 增「删除」：彻底删除该任务记录（与「移除」区别=不再进历史表），
+    //   确认与删除逻辑在 CMainWindow::OnDeleteTask，此处只转发所选任务。
     QListWidgetItem* pItem = m_pListCur->itemAt(a_pos);
     if (pItem == nullptr) { return; }
     CTaskInfo* pTask = TaskOf(pItem);
@@ -582,10 +633,13 @@ void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5
     menu.addSeparator();   // 查看与移除之间加分隔线
     QAction* pActRemove = menu.addAction(QStringLiteral("移除"));
+    QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
     QAction* pSel = menu.exec(m_pListCur->viewport()->mapToGlobal(a_pos));
     if (pSel == pActView) {
         emit sigViewTask(pTask);
     } else if (pSel == pActRemove) {
         emit sigRemoveTask(pTask);
+    } else if (pSel == pActDelete) {
+        emit sigDeleteTask(pTask);
     }
 }

@@ -284,8 +284,11 @@ void CNewTaskDialog::SetTask(const CTaskInfo* a_pTask) {
     m_pLblStatus->setText(ToString(a_pTask->Status()));
     const SStageDef* pDef = FindStage(a_pTask->CurrentStage());
     m_pLblStage->setText(pDef ? pDef->sNameZh : QStringLiteral("?"));
-    m_pLblCost->setText(QStringLiteral("$%1 | 输入:%2 输出:%3 | 请求:%4")
-                            .arg(QString::number(a_pTask->TotalCost(), 'f', 2))
+    // 2026.08.18 费用 ≤0 显示 "-"（DSH 后端无计费恒 0）。
+    const QString sCost = a_pTask->TotalCost() > 0.0
+        ? QString::number(a_pTask->TotalCost(), 'f', 2) : QStringLiteral("-");
+    m_pLblCost->setText(QStringLiteral("%1 | 输入:%2 输出:%3 | 请求:%4")
+                            .arg(sCost)
                             .arg(a_pTask->TotalInTokens())
                             .arg(a_pTask->TotalOutTokens())
                             .arg(a_pTask->RequestCount()));

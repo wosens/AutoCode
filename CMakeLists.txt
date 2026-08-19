@@ -42,6 +42,11 @@ qt_add_executable(AutoCode WIN32
     core/CStageMachine.cpp
     agent/CClaudeRunner.h
     agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CAgentRunnerFactory.h
     agent/CMcpAskServer.h
     agent/CMcpAskServer.cpp
     orch/CTaskOrchestrator.h
@@ -167,6 +172,18 @@ add_custom_command(TARGET AutoCode POST_BUILD
     COMMENT "Sync help/ to output dir"
 )
 
+# 2026.08.18 DSH 组合文件正本同步到 Execute/dsh/：install_env.bat 的 /dsh 安装段
+#   从脚本同级 dsh\cordis.autocode.yml 取正本，部署到 DSH 仓库 examples/autocode-agent/
+#   cordis.yml（组合文件必须在 examples/ 树内才能解析 node_modules，见 CDeepSeekRunner）。
+add_custom_command(TARGET AutoCode POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:AutoCode>/dsh"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/cordis.autocode.yml"
+        "$<TARGET_FILE_DIR:AutoCode>/dsh/cordis.autocode.yml"
+    COMMENT "Sync DSH cordis.autocode.yml to output dir"
+)
+
 # ---- 单元测试（CProjectManager 最近打开历史 MRU 逻辑）----
 # 仅测试业务逻辑，不依赖 GUI；config.ini 落在测试 exe 同级，用例内自行清理。
 qt_add_executable(test_projectmanager
@@ -177,6 +194,11 @@ qt_add_executable(test_projectmanager
     project/CGuideFingerprintScanner.cpp
     agent/CClaudeRunner.h
     agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CAgentRunnerFactory.h
     core/StageDef.h
     core/StageDef.cpp
     core/CTaskInfo.h
@@ -279,6 +301,11 @@ qt_add_executable(test_rollback
     project/CGuideFingerprintScanner.cpp
     agent/CClaudeRunner.h
     agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CAgentRunnerFactory.h
     core/StageDef.h
     core/StageDef.cpp
     core/CStageMachine.h
@@ -325,5 +352,25 @@ target_include_directories(import_tasks PRIVATE
 )
 target_link_libraries(import_tasks PRIVATE Qt6::Core)
 set_target_properties(import_tasks PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# ---- 集成测试（CDeepSeekRunner：联网真实调用 DSH 组合 + glm 中继，不挂 ctest）----
+# 手动跑: Execute/Release/test_dshrunner.exe（覆盖握手/三信号流/多轮续会话/注入轮）。
+qt_add_executable(test_dshrunner
+    tests/test_dshrunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+)
+target_include_directories(test_dshrunner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+)
+target_link_libraries(test_dshrunner PRIVATE Qt6::Core)
+set_target_properties(test_dshrunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )

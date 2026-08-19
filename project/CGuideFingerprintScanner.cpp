@@ -18,11 +18,11 @@ const QString CGuideFingerprintScanner::s_sChangeLogHeader =
 // Q1：默认 size+mtime 方案（不读内容，NFR3）。开启哈希需自行在 ScanProject 补实现。
 bool CGuideFingerprintScanner::s_bEnableHash = false;
 
-QStringList& CGuideFingerprintScanner::ExcludedDirs() {
-    // design §0 Q5 排除清单：生成物 / 工具目录 / 本工具自身数据。
-    // 2026.08.15 便携配置：默认清单为 config.ini [Scan] ExcludeDirs 的兜底值；
-    //   主窗口启动/设置变更时 SetExcludeDirs 覆盖（未设置时用默认）。
-    static QStringList s_aExcluded = {
+// design §0 Q5 内置默认排除清单：生成物 / 工具目录 / 本工具自身数据。
+// 2026.08.18 提取为独立函数：[Scan] ExcludeDirs 空/缺键的兜底，以及 SetExcludeDirs
+//   传空清单时恢复默认的来源（此前空被忽略，用户清空配置要重启才回默认）。
+static QStringList DefaultScanExcludeDirs() {
+    return {
         QStringLiteral(".autodev"),     // 本工具自身数据（含 guide.md / tasks）
         QStringLiteral("build"),       // CMake / 构建输出
         QStringLiteral("Execute"),     // exe 输出目录
@@ -31,15 +31,20 @@ QStringList& CGuideFingerprintScanner::ExcludedDirs() {
         QStringLiteral("node_modules"),// npm 依赖
         QStringLiteral("doc"),         // 文档目录
     };
+}
+
+QStringList& CGuideFingerprintScanner::ExcludedDirs() {
+    // 2026.08.15 便携配置：默认清单为 config.ini [Scan] ExcludeDirs 的兜底值；
+    //   主窗口启动/设置变更时 SetExcludeDirs 覆盖（空清单=恢复默认）。
+    static QStringList s_aExcluded = DefaultScanExcludeDirs();
     return s_aExcluded;
 }
 
 void CGuideFingerprintScanner::SetExcludeDirs(const QStringList& a_aDirs) {
-    // 2026.08.15 [Scan] ExcludeDirs：非空覆盖默认清单（扫描在后台线程跑，
+    // 2026.08.15 [Scan] ExcludeDirs：覆盖默认清单（扫描在后台线程跑，
     //   主线程启动时/设置保存时写入，写读不同时发生，无锁可接受）。
-    if (!a_aDirs.isEmpty()) {
-        ExcludedDirs() = a_aDirs;
-    }
+    // 2026.08.18 语义修正：空清单 = 恢复内置默认（此前空被忽略，清空配置不生效）。
+    ExcludedDirs() = a_aDirs.isEmpty() ? DefaultScanExcludeDirs() : a_aDirs;
 }
 
 qint64 CGuideFingerprintScanner::MtimeToUtcMs(const QDateTime& a_dt) {

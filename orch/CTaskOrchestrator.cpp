@@ -16,7 +16,7 @@
 #include <climits>
 
 #include "CProjectManager.h"
-#include "agent/CClaudeRunner.h"
+#include "agent/CAgentRunnerFactory.h"
 #include "core/CTaskInfo.h"
 #include "core/CStageMachine.h"
 #include "core/StageDef.h"
@@ -37,20 +37,31 @@ CTaskOrchestrator::~CTaskOrchestrator() {
 }
 
 void CTaskOrchestrator::EnsureRunner() {
+    // 2026.08.18 后端漂移重建：设置切换后端后旧 runner 仍在内存——非占用
+    //   （运行/宽限/重试等待）时替换为新后端实例；占用中本次仍用旧后端
+    //   （OnSettings 已拦运行中切换，此为双保险）。
     if (m_pRunner != nullptr) {
-        return;
+        if (m_pRunner->BackendName() == CAgentRunnerFactory::BackendName()) {
+            return;
+        }
+        if (m_pRunner->IsRunning() || m_pRunner->IsGraceActive()
+            || m_pRunner->IsRetryPending()) {
+            return;
+        }
+        m_pRunner->deleteLater();
+        m_pRunner = nullptr;   // 落到下方按新后端重建
     }
-    m_pRunner = new CClaudeRunner(this);
-    connect(m_pRunner, &CClaudeRunner::sigInfo, this, &CTaskOrchestrator::OnRunnerInfo);
-    connect(m_pRunner, &CClaudeRunner::sigAssistantText,
+    m_pRunner = CAgentRunnerFactory::Create(this);
+    connect(m_pRunner, &CAgentRunnerBase::sigInfo, this, &CTaskOrchestrator::OnRunnerInfo);
+    connect(m_pRunner, &CAgentRunnerBase::sigAssistantText,
             this, &CTaskOrchestrator::OnRunnerAssistantText);
-    connect(m_pRunner, &CClaudeRunner::sigToolUse,
+    connect(m_pRunner, &CAgentRunnerBase::sigToolUse,
             this, &CTaskOrchestrator::OnRunnerToolUse);
-    connect(m_pRunner, &CClaudeRunner::sigToolResult,
+    connect(m_pRunner, &CAgentRunnerBase::sigToolResult,
             this, &CTaskOrchestrator::OnRunnerToolResult);
     connect(m_pRunner,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
-                &CClaudeRunner::sigFinished),
+                &CAgentRunnerBase::sigFinished),
             this, &CTaskOrchestrator::OnRunnerFinished);
 }
 
@@ -256,6 +267,7 @@ void CTaskOrchestrator::StopAll() {
         m_pBuildProc->waitForFinished(3000);
     }
     m_pCurTask = nullptr;
+    m_aPendingTaskInjects.clear();   // 2026.08.19 介入排队随任务上下文一并作废
 }
 
 bool CTaskOrchestrator::IsRunnerBusy() const {
@@ -266,7 +278,7 @@ bool CTaskOrchestrator::IsRunnerBusy() const {
             || m_pRunner->IsRetryPending())) {
         return true;
     }
-    for (CClaudeRunner* pRunner : m_aReviewRunners) {
+    for (CAgentRunnerBase* pRunner : m_aReviewRunners) {
         if (pRunner != nullptr
             && (pRunner->IsRunning() || pRunner->IsGraceActive()
                 || pRunner->IsRetryPending())) {
@@ -302,7 +314,7 @@ int CTaskOrchestrator::ReviewViewCount(const CTaskInfo* a_pTask, EStage a_eStage
 void CTaskOrchestrator::StopReviewRunners() {
     // 终止所有评审并行 runner。不 delete（parent=this 托管）；
     // 清 pending 防 OnReviewViewFinished 在 stop 后仍触发 fan-in。
-    for (CClaudeRunner* pRunner : m_aReviewRunners) {
+    for (CAgentRunnerBase* pRunner : m_aReviewRunners) {
         if (pRunner != nullptr && (pRunner->IsRunning() || pRunner->IsGraceActive())) {
             pRunner->Stop();   // 2026.08.15 崩溃宽限期一并终止（否则宽限收尾仍会触发 fan-in）
         }
@@ -316,7 +328,7 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
         return;
     }
     // 清理上一轮残留 runner（deleteLater：Qt 安全删除，避免累积 + 不与 parent=this 冲突）
-    for (CClaudeRunner* pRunner : m_aReviewRunners) {
+    for (CAgentRunnerBase* pRunner : m_aReviewRunners) {
         if (pRunner != nullptr) {
             pRunner->Stop();
             pRunner->deleteLater();
@@ -343,13 +355,13 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
         const QString sViewOut = sStem + QStringLiteral("_") + sViewId + QStringLiteral(".md");
         m_aPendingViews.insert(sViewId);
 
-        auto* pRunner = new CClaudeRunner(this);   // parent=this → Qt 托管生命周期
+        auto* pRunner = CAgentRunnerFactory::Create(this);   // parent=this → Qt 托管生命周期
         m_aReviewRunners.append(pRunner);
 
         // Lambda 捕获 viewId + task 指针，转发对话流信号（带 viewId）、finished 转 OnReviewViewFinished。
         // 遵循 OnAdhoc* 纪律：不读 m_pCurTask 路由、不直接调 Advance（并发零串扰的根本）。
         // system 噪音行与 OnRunnerInfo 同口径：只落 run.log 复盘、不上屏（防刷屏卡死 UI）。
-        connect(pRunner, &CClaudeRunner::sigInfo, this,
+        connect(pRunner, &CAgentRunnerBase::sigInfo, this,
             [this, a_pTask, sViewId](const QString& a_sLine) {
                 WriteRunLog(a_pTask, QStringLiteral("system"),
                             QStringLiteral("[%1] %2").arg(sViewId, a_sLine));
@@ -358,19 +370,19 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
                 }
                 emit sigStageLog(a_pTask, QStringLiteral("[%1] %2").arg(sViewId, a_sLine));
             });
-        connect(pRunner, &CClaudeRunner::sigAssistantText, this,
+        connect(pRunner, &CAgentRunnerBase::sigAssistantText, this,
             [this, a_pTask, sViewId](const QString& a_sText) {
                 WriteRunLog(a_pTask, QStringLiteral("assistant"),
                             QStringLiteral("[%1] %2").arg(sViewId, a_sText));
                 emit sigAssistantText(a_pTask, a_sText, sViewId);
             });
-        connect(pRunner, &CClaudeRunner::sigToolUse, this,
+        connect(pRunner, &CAgentRunnerBase::sigToolUse, this,
             [this, a_pTask, sViewId](const QString& a_sTool, const QString& a_sInput) {
                 WriteRunLog(a_pTask, QStringLiteral("tool_use"),
                             QStringLiteral("[%1] %2 %3").arg(sViewId, a_sTool, a_sInput));
                 emit sigToolUse(a_pTask, a_sTool, a_sInput, sViewId);
             });
-        connect(pRunner, &CClaudeRunner::sigToolResult, this,
+        connect(pRunner, &CAgentRunnerBase::sigToolResult, this,
             [this, a_pTask, sViewId](const QString& a_sResult) {
                 WriteRunLog(a_pTask, QStringLiteral("tool_result"),
                             QStringLiteral("[%1] %2").arg(sViewId, a_sResult));
@@ -378,7 +390,7 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
             });
         connect(pRunner,
                 qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
-                    &CClaudeRunner::sigFinished),
+                    &CAgentRunnerBase::sigFinished),
                 this, [this, a_pTask, sViewId, pRunner](bool a_bOk, const QString& a_sResult,
                                                qint64 a_iIn, qint64 a_iOut,
                                                double a_dCost, const QString& a_sSid) {
@@ -686,7 +698,11 @@ void CTaskOrchestrator::RunCurrentStage(CTaskInfo* a_pTask) {
 }
 
 void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef) {
-    const QString sPrompt = BuildPrompt(a_pTask, a_stDef);
+    // 2026.08.19 换任务时上一任务的介入排队作废（排队指令只属于提交时的任务）。
+    if (a_pTask != m_pCurTask) {
+        m_aPendingTaskInjects.clear();
+    }
+    QString sPrompt = BuildPrompt(a_pTask, a_stDef);
     // 2026.08.15 (熔断人工决策) 指导意见已并入本轮 prompt，一次性消费，防泄漏到后续阶段。
     if (!a_pTask->ResumeGuidance().isEmpty()) {
         a_pTask->SetResumeGuidance(QString());
@@ -718,11 +734,30 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
         // 2026.08.17 中断续跑：任务带 lastSessionId（异常退出残留 / 失败任务再次执行）→
         //   不整阶段从头重跑，--resume 续会话 + 短续跑指令。全量阶段 prompt 重复注入会
         //   诱发重做已完成工作（token 翻倍）；ProceedToNext 推进阶段时已清 sid，
-        //   正常顺序启动不受影响。
-        m_pRunner->StartStage(a_pTask->ProjectDir(),
-            QStringLiteral("继续完成本阶段未完成的工作，从上次中断处接着做；不要重复已完成的改动。"),
+        //   正常顺序启动不受影响。2026.08.19 介入排队（DSH 兜底）并入短续跑指令——
+        //   保持续跑语义不回退成全量 prompt。
+        QString sResume = QStringLiteral(
+            "继续完成本阶段未完成的工作，从上次中断处接着做；不要重复已完成的改动。");
+        if (!m_aPendingTaskInjects.isEmpty()) {
+            sResume += QStringLiteral("\n\n【用户介入指令】以下是任务运行期间用户提交的"
+                                      "追加指令，请在继续工作时优先遵循、一并落实：\n%1")
+                          .arg(m_aPendingTaskInjects.join(QStringLiteral("\n")));
+            m_aPendingTaskInjects.clear();
+        }
+        m_pRunner->StartStage(a_pTask->ProjectDir(), sResume,
             sTools, MaxTurnsFor(a_pTask, a_stDef.eStage),
             a_pTask->LastSessionId());
+    } else if (!m_aPendingTaskInjects.isEmpty()) {
+        // 2026.08.19 介入排队消费（DSH 轮中插话受限的兜底）：排在 prompt 最前面，
+        //   强调是运行期间用户提交的指令；一次性消费。评审并行分支不消费（评审
+        //   prompt 语义独立，指令留给下一个生产阶段生效）。
+        const QString sInjects = m_aPendingTaskInjects.join(QStringLiteral("\n"));
+        m_aPendingTaskInjects.clear();
+        sPrompt = QStringLiteral(
+            "【用户介入指令】以下内容是任务运行期间用户提交的追加指令，"
+            "请在执行本阶段工作时优先遵循、一并落实：\n%1\n\n%2").arg(sInjects, sPrompt);
+        m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt, sTools,
+                              MaxTurnsFor(a_pTask, a_stDef.eStage));
     } else {
         m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt, sTools,
                               MaxTurnsFor(a_pTask, a_stDef.eStage));
@@ -1789,25 +1824,40 @@ bool CTaskOrchestrator::EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a
 //   - 压缩：/compact 在 headless 无效 → 「摘要→开新会话重播种」两步 + --autocompact 150k 自动兜底。
 // ---------------------------------------------------------------------------
 void CTaskOrchestrator::EnsureAdhocRunner() {
+    // 2026.08.18 后端漂移重建：换后端后旧 runner 的会话链（sid/撤销栈）跨后端无
+    //   意义——非占用时整组清（runner + m_sAdhocSid + 撤销栈 + guide 喂入基线），
+    //   回到首条新会话状态；占用中本次仍用旧后端。
     if (m_pAdhocRunner != nullptr) {
-        return;
+        if (m_pAdhocRunner->BackendName() == CAgentRunnerFactory::BackendName()) {
+            return;
+        }
+        if (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending()) {
+            return;
+        }
+        m_pAdhocRunner->deleteLater();
+        m_pAdhocRunner = nullptr;
+        m_sAdhocSid.clear();
+        m_aAdhocStack.clear();
+        m_sLastGuideHash.clear();
+        m_aAdhocPendingInjects.clear();   // 2026.08.19 会话链整体作废，排队指令随行
     }
-    m_pAdhocRunner = new CClaudeRunner(this);
+    m_pAdhocRunner = CAgentRunnerFactory::Create(this);
     // 连 ad-hoc 专属槽（不复用 OnRunner*，与任务 runner 隔离）。
-    connect(m_pAdhocRunner, &CClaudeRunner::sigInfo,
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigInfo,
             this, &CTaskOrchestrator::OnAdhocInfo);
-    connect(m_pAdhocRunner, &CClaudeRunner::sigAssistantText,
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigAssistantText,
             this, &CTaskOrchestrator::OnAdhocAssistantText);
-    connect(m_pAdhocRunner, &CClaudeRunner::sigToolUse,
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigToolUse,
             this, &CTaskOrchestrator::OnAdhocToolUse);
-    connect(m_pAdhocRunner, &CClaudeRunner::sigToolResult,
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigToolResult,
             this, &CTaskOrchestrator::OnAdhocToolResult);
     // 运行中上下文占用（每条 assistant 消息的 usage）→ 直通助手面板进度条实时刷新。
-    connect(m_pAdhocRunner, &CClaudeRunner::sigContextFill,
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigContextFill,
             this, &CTaskOrchestrator::sigAdhocContext);
     connect(m_pAdhocRunner,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
-                &CClaudeRunner::sigFinished),
+                &CAgentRunnerBase::sigFinished),
             this, &CTaskOrchestrator::OnAdhocFinished);
 }
 
@@ -1829,6 +1879,7 @@ void CTaskOrchestrator::StartAdhocStage(const QString& a_sPrompt) {
     m_dtAdhocStart = QDateTime::currentDateTime();   // 2026.08.15 耗时归集：本次调用起点
     m_pAdhocRunner->StartStage(sWorkDir, a_sPrompt, sTools, 40,
                                m_sAdhocSid, bFork, iAutoCompactK, /*a_bEnableAskUser=*/true);
+    emit sigAdhocRunning();   // 2026.08.19 面板进运行态（手动发送已自置，此处兜自动续发/压缩）
 }
 
 int CTaskOrchestrator::MaxIter() const {
@@ -1861,18 +1912,44 @@ void CTaskOrchestrator::InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_s
         return;
     }
     const bool bOk = m_pRunner->InjectUserTurn(a_sText);
-    // 可见反馈（AC-3.1）：无论 stdin 注入是否成功（R1 限制），都在对话流记一条 injected 事件。
+    if (bOk) {
+        // claude 后端：stream-json stdin 轮中追加 user 帧，当前轮立即收到新指令。
+        StageEvent(a_pTask, QStringLiteral("injected"),
+            QStringLiteral(" 已注入用户指令（当前轮立即生效）：%1").arg(a_sText.left(120)));
+        return;
+    }
+    // 2026.08.19 DSH 后端协议不支持轮中插话：排队到下一阶段 prompt 前置注入
+    //   （同任务有效；换任务/停止即作废，见 LaunchStage / Reset）。
+    m_aPendingTaskInjects.append(a_sText);
     StageEvent(a_pTask, QStringLiteral("injected"),
-        bOk ? QStringLiteral(" 已注入用户指令：%1").arg(a_sText.left(120))
-            : QStringLiteral(" 已记录用户指令（当前模式运行时注入受限）：%1").arg(a_sText.left(120)));
+        QStringLiteral(" 已排队用户指令（本阶段结束后的下一阶段注入）：%1")
+            .arg(a_sText.left(120)));
 }
 
 void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, const QString& a_sTaskId) {
-    // 2026.08.15 忙判定补崩溃宽限/重试等待中：此时 IsRunning()==false 但 runner 仍被占用，
-    //   放行会在宽限轮询/延迟重拉落地时与新提问互相踩。
+    // 2026.08.19 运行中追加指令（含 Claude Code / DSH 两后端）：
+    //   - 真运行中（IsRunning）：claude 后端 InjectUserTurn 即时轮中注入（stream-json
+    //     stdin 追加 user 帧，当前轮立即看到）；DSH 后端协议不支持轮中插话 → 排队，
+    //     本轮成功收尾后自动按同会话续发（OnAdhocFinished 消费队列）。
+    //   - 崩溃宽限/重试等待中：runner 被占用但无稳定会话可注入，维持「请稍候」。
+    if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+        if (!a_sText.trimmed().isEmpty()
+            && m_pAdhocRunner->InjectUserTurn(a_sText)) {
+            emit sigAdhocEvent(QStringLiteral("injected"),
+                QStringLiteral("已向正在执行的助手轮注入追加指令（立即生效）：%1")
+                    .arg(a_sText.left(120)));
+        } else if (!a_sText.trimmed().isEmpty()) {
+            m_aAdhocPendingInjects.append(a_sText);
+            emit sigAdhocEvent(QStringLiteral("queued"),
+                QStringLiteral("已排队追加指令（本轮结束后自动发送）：%1")
+                    .arg(a_sText.left(120)));
+        }
+        return;
+    }
     if (m_pAdhocRunner != nullptr
-        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
-            || m_pAdhocRunner->IsRetryPending())) {
+        && (m_pAdhocRunner->IsGraceActive() || m_pAdhocRunner->IsRetryPending())) {
+        // 2026.08.15 忙判定补崩溃宽限/重试等待中：此时 IsRunning()==false 但 runner 仍被占用，
+        //   放行会在宽限轮询/延迟重拉落地时与新提问互相踩。
         emit sigAdhocEvent(QStringLiteral("warn"),
             QStringLiteral("助手正在处理上一条指令，请稍候"));
         return;
@@ -1886,6 +1963,7 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
         return;
     }
     m_bAdhocReadOnly = a_bReadOnly;
+    m_sAdhocLastTaskId = a_sTaskId;   // 2026.08.19 自动续发排队指令时沿用同任务档（记忆注入）
     m_iAdhocResume = 0;   // 2026.08.15 新提问：max-turns 自动续跑计数清零
     m_eAdhocMode = Submitting;
     m_sAdhocPendingPrompt = a_sText;   // 原始提问入栈（注入内容不进撤销栈，保持用户可见语义）
@@ -1950,6 +2028,7 @@ void CTaskOrchestrator::UndoAdhoc() {
             QStringLiteral("助手运行中，无法撤销"));
         return;
     }
+    m_aAdhocPendingInjects.clear();   // 2026.08.19 撤销回退链：未发出的排队指令一并作废
     if (m_aAdhocStack.isEmpty()) {
         emit sigAdhocEvent(QStringLiteral("warn"),
             QStringLiteral("没有可撤销的提问"));
@@ -2127,6 +2206,13 @@ void CTaskOrchestrator::OnAdhocFinished(bool a_bOk, const QString& a_sResult,
         }
         emit sigAdhocEvent(QStringLiteral("done"), QStringLiteral("已完成"));
         emit sigAdhocFinished();
+        // 2026.08.19 运行中排队的追加指令自动续发：本轮成功收尾、runner 已空闲，按同
+        //   会话（m_sAdhocSid 链基点）作为下一条提问发出，逐条消费。失败/续跑中断路径
+        //   不消费——队列保留，待下一次成功提问后继续（避免向已死会话盲发）。
+        if (!m_aAdhocPendingInjects.isEmpty()) {
+            const QString sNext = m_aAdhocPendingInjects.takeFirst();
+            SubmitAdhoc(sNext, m_bAdhocReadOnly, m_sAdhocLastTaskId);
+        }
         return;
     }
     case CompactSummarize: {

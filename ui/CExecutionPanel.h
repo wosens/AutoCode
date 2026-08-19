@@ -14,6 +14,7 @@ class QTreeWidget;
 class QTreeWidgetItem;
 class QLabel;
 class QTabWidget;
+class QSplitter;
 class QListWidget;
 class QListWidgetItem;
 class QPlainTextEdit;
@@ -61,6 +62,9 @@ public:
     void OnAdhocEvent(const QString& a_sKind, const QString& a_sText);
     void OnAdhocUndo();                // 撤销：移除最后一条 prompt 块 + 其回复/工具块并重建
     void OnAdhocFinished();            // 一次助手调用结束：重新启用输入栏
+    // 2026.08.19 运行态对外置位：编排器自动续发排队指令起新轮时广播（见 sigAdhocRunning），
+    //   手动发送路径面板已自置、此处幂等。原 private，升 public 供主窗口连接。
+    void SetAdhocRunning(bool a_bRunning);
     void SetAdhocContext(qint64 a_iFill);   // 更新上下文进度条（<0 视为占用未知，进度归零）
     qint64 LastContextFill() const { return m_iLastContextFill; }   // 供主窗口存盘：当前上下文占用快照
     void OnAdhocModel(const QString& a_sModel);   // 收到模型名 → 查表更新上下文窗口分母
@@ -68,6 +72,9 @@ public:
     void SetAdhocEnabled(bool a_bEnabled);  // 工程未打开时禁用输入栏
     // FR-3：资源管理器「添加到聊天框」→ 把文本追加到 adhoc 助手输入框末尾。
     void AppendToAdhocInput(const QString& a_sText);
+    // 2026.08.18 资源管理器双击文本文件 → 「助手」右侧单实例 Tab 内嵌显示文件内容
+    //   （QPlainTextEdit 只读；双击其他文件复用同一 Tab 换内容与标题）。
+    void ShowFileTab(const QString& a_sAbsPath);
     // FR-9：按左栏任务列表（Tab）底部 y 同步阶段表高度，使两者底部对齐（任务列表不含按钮行）。
     void SyncStagesHeight(int a_iTaskListBottomY);
 
@@ -116,7 +123,6 @@ private:
     void RebuildAdhocView();   // 按 m_aAdhocBlocks 重建助手 Tab 对话流（分帧渐进，撤销/切档后调用）
     void RebuildAdhocChunk(quint32 a_uGen);   // 助手视图渐进重建一帧（代际号不符=被新重建顶替，立即终止）
     void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/m_bAdhocRunning 刷新输入栏可用性
-    void SetAdhocRunning(bool a_bRunning);  // 运行中禁用/结束后恢复输入栏（受工程开关约束）
     void DoAdhocSend();             // 发送当前输入（Ctrl+Enter / 发送按钮调用）
     void OnAdhocTextChanged();      // 多行输入框高度自适应（按内容行数，上限 10 行）
     // 输入框高度自适应通用版：按字体度量算单行高、按 blockCount 线性增长、封顶 a_iMaxLines 行。
@@ -146,7 +152,9 @@ private:
     void OnStagesContextMenu(const QPoint& a_stPos);   // 需求3：阶段表右键「再次执行」
 
     QTreeWidget*    m_pStages  = nullptr;
-    QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 两页
+    QSplitter*      m_pStageSplit = nullptr;   // 阶段表/日志Tab 的垂直分隔条（FR-9 对齐经 setSizes 设比例）
+    QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 / 文件预览
+    QPlainTextEdit* m_pFileView = nullptr;  // 2026.08.18 文件预览 Tab（双击文本文件，单实例复用）
     CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志
     QPlainTextEdit* m_pTaskInput = nullptr; // FR-3 任务对话流下方的介入输入栏
     QPushButton*    m_pBtnInject = nullptr; // FR-3 介入发送按钮
