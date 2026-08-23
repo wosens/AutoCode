@@ -8,7 +8,8 @@
 #include "db/CTaskHistoryDB.h"
 
 // 一次性 / 批量导入工具：把 <工程目录>/.autodev/tasks/*/task.json 全量 upsert 进
-// exe 同级的全局历史库 history.db。无 task.json 的任务目录跳过（需先还原 task.json）。
+// 该工程自己的历史库 <工程目录>/.autodev/history.db（2026.08.20 历史库按工程隔离，
+// 不再写 exe 同级全局库）。无 task.json 的任务目录跳过（需先还原 task.json）。
 //
 // 用法: import_tasks <工程目录>
 // 说明：开发期辅助工具，仅 CMake 目标，不纳入主程序 AutoCode.exe 与 vcxproj。
@@ -29,9 +30,9 @@ int main(int argc, char* argv[]) {
     }
 
     CTaskHistoryDB db;
-    if (!db.Open()) {
-        qInfo().noquote() << "打开历史库失败:"
-                          << (QCoreApplication::applicationDirPath() + QStringLiteral("/history.db"));
+    const QString sDbPath = CTaskHistoryDB::ProjectDbPath(sProject);
+    if (!db.Open(sDbPath)) {
+        qInfo().noquote() << "打开历史库失败:" << sDbPath;
         return 1;
     }
 

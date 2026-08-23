@@ -1,4 +1,4 @@
-﻿#include "CDeepSeekRunner.h"
+#include "CDeepSeekRunner.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -404,7 +404,19 @@ void CDeepSeekRunner::StartStage(const QString& a_sWorkDir,
 
 bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     if (m_eProcState == ProcBooting || m_eProcState == ProcReady) {
-        return true;
+        // 2026.08.20 cwd 热切换守卫：进程是旧工程 cwd 时不可复用——agent 的相对路径写
+        //   （.autodev/tasks/<id>/intake.md 等）会落进旧工程，新工程校验产物永远缺失，
+        //   造成「多次回退仍未生成 intake.md」级联暂停（实例：扑克任务产物写进扫雷）。
+        if (m_sProcWorkDir.isEmpty() ||
+            QDir::cleanPath(m_sProcWorkDir) == QDir::cleanPath(a_sWorkDir)) {
+            return true;
+        }
+        if (m_pProc->state() != QProcess::NotRunning) {
+            m_pProc->kill();
+            m_pProc->waitForFinished(3000);
+        }
+        m_eProcState = ProcDead;
+        // 落到下方冷启动路径：以新工程 cwd 重新拉进程 + 握手。
     }
     // 部署位组合文件对账：模板（exe 同级 dsh\cordis.autocode.yml）有更新而部署副本
     //   还是旧的（老安装/手工拷贝），冷启动前覆盖——旧副本缺 autocode-active 槽位时
@@ -421,6 +433,11 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     // 环境注入：DSH_CWD（bash/fs-local 工作目录）+ DSH_SESSION_ROOT（会话 jsonl 落盘，
     //   放工程 .autodev 下与任务产物同域，不污染工程根）。
     QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
+    oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+    oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+    oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
+    oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
     oEnv.insert(QStringLiteral("DSH_CWD"), a_sWorkDir);
     oEnv.insert(QStringLiteral("DSH_SESSION_ROOT"),
                 a_sWorkDir + QStringLiteral("/.autodev/dsh-sessions"));
@@ -449,6 +466,7 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     }
     m_pProc->setProcessEnvironment(oEnv);
     m_pProc->setWorkingDirectory(a_sWorkDir);
+    m_sProcWorkDir = a_sWorkDir;   // 2026.08.20 记录进程 cwd（EnsureProcess 工程切换检测用）
     ++m_iProcGen;   // 2026.08.19 进程代次 +1（热生效守卫：脏标只杀配置变更前的旧进程）
     m_eProcState = ProcBooting;
     m_uptime.restart();

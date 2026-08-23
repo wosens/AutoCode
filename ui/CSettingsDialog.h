@@ -53,6 +53,32 @@ public:
     //   激活条目生效时覆盖 Provider/模型两行（组合走 autocode-active env 槽位）。
     QList<SDshModelEntry> DshModels() const;
     int     DshActiveModel() const;
+    // 2026.08.19 PIAgent 第三后端参数（[Agent] Pi*）。
+    QString PiNodePath() const;
+    QString PiRoot() const;
+    QString PiProvider() const;
+    QString PiModel() const;
+    QString PiApiKey() const;
+    QString PiThinking() const;
+    // 2026.08.20 PIAgent 计费单价（$/百万 token）：pi 只报 token，客户端按单价折算费用。
+    double  PiPriceInPerM() const;
+    double  PiPriceCacheReadPerM() const;
+    double  PiPriceCacheWritePerM() const;
+    double  PiPriceOutPerM() const;
+    // 2026.08.20 PiAgent 自定义大模型表（[PiModels] + ~/.pi/agent/models.json）。
+    QList<SDshModelEntry> PiModels() const;
+    int     PiActiveModel() const;
+    // CodexHarness 第四后端参数（[Agent] Codex*；OpenAI Codex CLI 0.87.0）。
+    QString CodexNodePath() const;
+    QString CodexRoot() const;
+    QString CodexProvider() const;
+    QString CodexModel() const;
+    QString CodexApiKey() const;
+    QString CodexBaseUrl() const;
+    QString CodexWireApi() const;
+    // 2026.08.21 Codex 自定义大模型表（[CodexModels]；口径同 Pi 同名对）。
+    QList<SDshModelEntry> CodexModels() const;
+    int     CodexActiveModel() const;
     int     AutoCompactPct() const;
     qint64  ContextLimit() const;
     QString ScanExcludeDirs() const;
@@ -74,6 +100,33 @@ private:
     //   下拉的可用性。a_bSilent=false 时弹结果提示（「重新检测」按钮用）。
     void DetectDshInstalled(bool a_bSilent);
     void OnInstallDsh();       // 以管理员权限启动 install_env.bat /dsh 单装 DeepSeekHarness
+    // 2026.08.19 PIAgent 安装探测/单装（口径同 DSH：DetectPiInstalled 静默/手动两态；
+    //   OnInstallPi 提权运行 install_env.bat /pi，robocopy 本机源到 exe 同级 PIAgent\pi）。
+    void UpdatePiEnabled();
+    void DetectPiInstalled(bool a_bSilent);
+    void OnInstallPi();
+    void OnInstallPiNpm();       // 2026.08.20 联网安装：npm install -g pi-coding-agent
+    // 2026.08.20 PiAgent 自定义大模型列表维护（口径同 DSH 页同名四方法）。
+    void RefreshPiModelList();
+    int  CurPiModelRow() const;
+    void OnPiModelAdd();
+    void OnPiModelEdit();
+    void OnPiModelDel();
+    void OnPiModelSetActive();
+    // CodexHarness 安装探测/单装（口径同 Pi：DetectCodexInstalled 静默/手动两态；
+    //   OnInstallCodex 提权运行 install_env.bat /codex，npm 本地安装到 exe 同级
+    //   Execute\CodexHarness）。
+    void UpdateCodexEnabled();
+    void DetectCodexInstalled(bool a_bSilent);
+    void OnInstallCodex();
+    void OnInstallCodexLocal();   // 2026.08.21 本机源离线安装（robocopy，无需管理员）
+    // 2026.08.21 Codex 自定义大模型列表维护（口径同 Pi 页同名四方法）。
+    void RefreshCodexModelList();
+    int  CurCodexModelRow() const;
+    void OnCodexModelAdd();
+    void OnCodexModelEdit();
+    void OnCodexModelDel();
+    void OnCodexModelSetActive();
 
     QSpinBox*   m_pSpinMaxIter      = nullptr;
     QSpinBox*   m_pSpinMaxResume    = nullptr;
@@ -103,6 +156,58 @@ private:
     QPushButton* m_pBtnModelDel    = nullptr;
     QPushButton* m_pBtnModelActive = nullptr;
     QCheckBox*  m_pChkWebSearch     = nullptr;
+    // 2026.08.19 PIAgent Tab 控件（仿 DSH Tab：安装状态行 + node/root/provider/model/
+    //   apiKey/thinking 编辑组；thinking 为下拉，空项=默认）。
+    QLabel*     m_pLblPiState       = nullptr;
+    QPushButton* m_pBtnDetectPi     = nullptr;
+    QPushButton* m_pBtnInstallPi    = nullptr;
+    QPushButton* m_pBtnInstallPiNpm = nullptr;   // 2026.08.20 联网安装（npm 全局）
+    bool        m_bPiInstalled      = false;
+    QLineEdit*  m_pEditPiNode       = nullptr;
+    QLineEdit*  m_pEditPiRoot       = nullptr;
+    QLineEdit*  m_pEditPiProvider   = nullptr;
+    QLineEdit*  m_pEditPiModel      = nullptr;
+    QLineEdit*  m_pEditPiApiKey     = nullptr;
+    QComboBox*  m_pComboPiThinking  = nullptr;
+    QDoubleSpinBox* m_pSpinPiPriceIn        = nullptr;   // 2026.08.20 计费单价：纯输入
+    QDoubleSpinBox* m_pSpinPiPriceCacheRead = nullptr;   // 计费单价：缓存读
+    QDoubleSpinBox* m_pSpinPiPriceCacheWrite = nullptr;  // 计费单价：缓存写
+    QDoubleSpinBox* m_pSpinPiPriceOut       = nullptr;   // 计费单价：输出
+    // 2026.08.20 PiAgent 自定义大模型表（[PiModels]；多条目 + 激活下标，经
+    //   ~/.pi/agent/models.json 的 autocode-<n> provider 槽位生效）。
+    QList<SDshModelEntry> m_aPiModels;
+    int         m_iPiActiveModel = -1;    // -1=未启用（走 Provider/模型固定路由）
+    QTreeWidget* m_pTreePiModels = nullptr;
+    QPushButton* m_pBtnPiModelAdd    = nullptr;
+    QPushButton* m_pBtnPiModelEdit   = nullptr;
+    QPushButton* m_pBtnPiModelDel    = nullptr;
+    QPushButton* m_pBtnPiModelActive = nullptr;
+    // CodexHarness 第四后端（[Agent] Codex*）：安装状态行 + 表单七项（Root/Node/
+    //   Provider/Model/ApiKey/BaseUrl/WireApi 下拉）。
+    QLabel*     m_pLblCodexState   = nullptr;
+    QPushButton* m_pBtnDetectCodex = nullptr;
+    QPushButton* m_pBtnInstallCodex = nullptr;
+    bool        m_bCodexInstalled = false;
+    // 2026.08.21 配置里已存的后端值：不可用时不再静默弹回 claude（用户选择优先，
+    //   状态页红字提示 + 启动/保存有 CodexConfigError 兜底），仅拦「主动新切到」。
+    int         m_iCfgBackend = 1;
+    QLineEdit*  m_pEditCodexNode   = nullptr;
+    QLineEdit*  m_pEditCodexRoot   = nullptr;
+    QLineEdit*  m_pEditCodexProvider = nullptr;
+    QLineEdit*  m_pEditCodexModel  = nullptr;
+    QLineEdit*  m_pEditCodexApiKey = nullptr;
+    QLineEdit*  m_pEditCodexBaseUrl = nullptr;
+    QComboBox*  m_pComboCodexWireApi = nullptr;
+    // 2026.08.21 Codex 自定义大模型表（[CodexModels]；生效经 ~/.codex 的
+    //   autocode-<n> provider 槽位，CCodexRunner 合成写）+ 本机源离线安装按钮。
+    QList<SDshModelEntry> m_aCodexModels;
+    int         m_iCodexActiveModel = -1;    // -1=未启用（走固定路由）
+    QTreeWidget* m_pTreeCodexModels = nullptr;
+    QPushButton* m_pBtnCodexModelAdd    = nullptr;
+    QPushButton* m_pBtnCodexModelEdit   = nullptr;
+    QPushButton* m_pBtnCodexModelDel    = nullptr;
+    QPushButton* m_pBtnCodexModelActive = nullptr;
+    QPushButton* m_pBtnInstallCodexLocal = nullptr;
     QSpinBox*   m_pSpinCompactPct   = nullptr;
     QSpinBox*   m_pSpinCtxLimit     = nullptr;
     QLineEdit*  m_pEditScanDirs     = nullptr;

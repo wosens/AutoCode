@@ -21,6 +21,10 @@
 #include <QFont>
 #include <QVariant>
 #include <QProcess>
+#include <QSettings>
+#include <QSet>
+#include <QRegularExpression>
+#include <QProcessEnvironment>
 
 const QStringList& CProjectExplorerPanel::HiddenDirs() {
     // Q1 默认：隐藏常见生成目录（后续可由 FR-8 设置调）。
@@ -93,6 +97,10 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
             this, &CProjectExplorerPanel::OnCustomContextMenu);
     connect(m_pTree, &QTreeView::doubleClicked,
             this, &CProjectExplorerPanel::OnDoubleClicked);
+    // 2026.08.21 单击文件：与双击一致打开（文本→内嵌预览、其他→系统默认程序），
+    //   但文本文件不切换 Tab（只后台加载内容），用户停留当前页。
+    connect(m_pTree, &QTreeView::clicked,
+            this, &CProjectExplorerPanel::OnSingleClicked);
     // 父目录行随模型异步陆续插入：新到的兄弟行若非工程根则继续隐藏（见 SetRoot）；
     // 同时做目录级隐藏——命中 HiddenDirs 清单的目录（build/Execute/.git 等）整棵不显示。
     connect(m_pModel, &QFileSystemModel::rowsInserted, this,
@@ -195,6 +203,12 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
 
     QMenu menu(this);
     QAction* pActExplorer  = menu.addAction(QStringLiteral("通过资源管理器打开"));
+    // 2026.08.21 「打开方式」子菜单：列出该文件类型在注册表注册过的程序（仅文件）。
+    QMenu* pMenuOpenWith = nullptr;
+    if (QFileInfo(sSel).isFile()) {
+        pMenuOpenWith = menu.addMenu(QStringLiteral("打开方式"));
+        BuildOpenWithMenu(pMenuOpenWith, sSel);
+    }
     QAction* pActCut       = menu.addAction(QStringLiteral("剪切"));
     QAction* pActCopy      = menu.addAction(QStringLiteral("复制"));
     QAction* pActPaste     = menu.addAction(QStringLiteral("粘贴"));
@@ -215,10 +229,19 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
                             pActExplorer}) {
             pA->setEnabled(false);
         }
+        if (pMenuOpenWith != nullptr) {
+            pMenuOpenWith->setEnabled(false);
+        }
     }
 
     QAction* pSel = menu.exec(m_pTree->viewport()->mapToGlobal(a_stPos));
     if (pSel == nullptr) {
+        return;
+    }
+    // 2026.08.21 「打开方式」子菜单项：data() 携带该程序的 command 模板，命中即
+    //   以模板展开 %1 启动对应注册程序打开文件，不落入下方固定项分支。
+    if (pSel->data().isValid() && pSel->data().canConvert<QString>()) {
+        LaunchOpenWithCommand(pSel->data().toString(), sSel);
         return;
     }
     if      (pSel == pActExplorer) { OpenInExplorer(); }
@@ -234,7 +257,10 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
 
 void CProjectExplorerPanel::OnDoubleClicked(const QModelIndex& a_stIdx) {
     // 2026.08.18 双击文件：文本文件 → 内嵌 Tab 显示（sigFileOpen，经 CTaskListPanel
-    //   转发到执行面板）；目录/非文本 → 保持 Q1 原行为（系统默认程序/资源管理器打开）。
+    //   转发到执行面板）；非文本 → 系统默认程序打开。
+    //   2026.08.21 sigFileOpen 增加 a_bSwitchTab 参数，双击=true（切到预览页）。
+    //   2026.08.21 目录：不弹资源管理器，直接 return 交给 QTreeView 原生
+    //   expandsOnDoubleClick 展开/折叠本节点。
     if (!a_stIdx.isValid()) {
         return;
     }
@@ -243,8 +269,34 @@ void CProjectExplorerPanel::OnDoubleClicked(const QModelIndex& a_stIdx) {
         return;
     }
     const QFileInfo stInfo(sPath);
-    if (stInfo.isFile() && IsTextFile(sPath)) {
-        emit sigFileOpen(sPath);
+    if (!stInfo.isFile()) {
+        return;   // 目录：双击仅展开/折叠（树原生行为），不再外部打开
+    }
+    if (IsTextFile(sPath)) {
+        emit sigFileOpen(sPath, /*a_bSwitchTab=*/true);
+        return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(sPath));
+}
+
+void CProjectExplorerPanel::OnSingleClicked(const QModelIndex& a_stIdx) {
+    // 2026.08.21 单击文件：与双击语义一致地「打开」，但内嵌预览不切换 Tab
+    //   （sigFileOpen 第二参 false：只加载内容与更新页标题，用户停留当前 Tab）。
+    //   仅文件响应（目录单击保持原生选中/展开交互，不劫持）；单击先于双击触发，
+    //   文本文件随后双击会再带 true 走一遍（幂等：换内容+切页）。
+    if (!a_stIdx.isValid()) {
+        return;
+    }
+    const QString sPath = m_pModel->filePath(a_stIdx);
+    if (sPath.isEmpty() || !IsUnderRoot(sPath)) {
+        return;
+    }
+    const QFileInfo stInfo(sPath);
+    if (!stInfo.isFile()) {
+        return;   // 目录：单击不动作（留给双击展开/原生交互）
+    }
+    if (IsTextFile(sPath)) {
+        emit sigFileOpen(sPath, /*a_bSwitchTab=*/false);
         return;
     }
     QDesktopServices::openUrl(QUrl::fromLocalFile(sPath));
@@ -432,4 +484,187 @@ void CProjectExplorerPanel::OpenInExplorer() {
         aArgs << QStringLiteral("/select,") + QDir::toNativeSeparators(sPath);
     }
     QProcess::startDetached(QStringLiteral("explorer.exe"), aArgs);
+}
+
+// 展开命令模板里的 %VAR% 环境变量引用（定义见文末）。
+static QString ExpandEnvVars(const QString& a_sCmd);
+
+// ---------------------------------------------------------------------------
+// 2026.08.21 「打开方式」子菜单：HKCR 注册表枚举该类型注册过的程序。
+// ---------------------------------------------------------------------------
+// QSettings(NativeFormat) 读注册表键的默认值（Qt 以 "." 为默认值键名；部分键写
+// 在显式 "Default" 名下，两处兜底）。
+static QString RegDefaultValue(QSettings& a_stKey) {
+    QString sVal = a_stKey.value(QStringLiteral(".")).toString();
+    if (sVal.isEmpty()) {
+        sVal = a_stKey.value(QStringLiteral("Default")).toString();
+    }
+    return sVal.trimmed();
+}
+
+// 从 verb/command 模板提取 exe 基名做展示名兜底（MuiVerb 是间接资源串时取不到
+// 明文，用程序名比 verb 名（open/edit）更有辨识度）。
+static QString ExeBaseFromCommand(const QString& a_sCmd) {
+    const QStringList aParts = QProcess::splitCommand(a_sCmd);
+    if (aParts.isEmpty()) {
+        return QString();
+    }
+    return QFileInfo(aParts.first()).completeBaseName();
+}
+
+// 展开某 ProgID（HKCR\<ProgId>\shell\<verb>\command）下全部可用 verb 为菜单项。
+static void AddProgIdVerbs(QMenu* a_pMenu, const QString& a_sProgId,
+                           QSet<QString>* a_pSeenCmds) {
+    const QString sShellKey = QStringLiteral("HKEY_CLASSES_ROOT\\%1\\shell")
+                                  .arg(a_sProgId);
+    QSettings stShell(sShellKey, QSettings::NativeFormat);
+    const QStringList aVerbs = stShell.childGroups();
+    if (aVerbs.isEmpty()) {
+        return;
+    }
+    bool bAddedAny = false;
+    for (const QString& sVerb : aVerbs) {
+        QSettings stCmd(QStringLiteral("HKEY_CLASSES_ROOT\\%1\\shell\\%2\\command")
+                            .arg(a_sProgId, sVerb),
+                        QSettings::NativeFormat);
+        const QString sCmd = RegDefaultValue(stCmd);
+        if (sCmd.isEmpty()) {
+            continue;
+        }
+        // 去重：不同 ProgID 常指向同一 command（如多个 verb 都是同一 exe）。
+        if (a_pSeenCmds->contains(sCmd.toLower())) {
+            continue;
+        }
+        a_pSeenCmds->insert(sCmd.toLower());
+        // 展示名优先级：verb 键 MuiVerb/默认值（明文时）→ 模板 exe 基名 → verb 名。
+        QSettings stVerb(QStringLiteral("HKEY_CLASSES_ROOT\\%1\\shell\\%2")
+                             .arg(a_sProgId, sVerb),
+                         QSettings::NativeFormat);
+        QString sName = stVerb.value(QStringLiteral("MuiVerb")).toString().trimmed();
+        if (sName.isEmpty() || sName.startsWith(QLatin1Char('@'))) {
+            sName = RegDefaultValue(stVerb);
+        }
+        if (sName.isEmpty() || sName.startsWith(QLatin1Char('@'))) {
+            sName = ExeBaseFromCommand(sCmd);
+        }
+        if (sName.isEmpty()) {
+            sName = sVerb;
+        }
+        QAction* pAct = a_pMenu->addAction(sName);
+        pAct->setData(sCmd);
+        bAddedAny = true;
+    }
+    Q_UNUSED(bAddedAny);
+}
+
+void CProjectExplorerPanel::BuildOpenWithMenu(QMenu* a_pParentMenu,
+                                              const QString& a_sFilePath) {
+    // 枚举口径（与系统「打开方式」列表同源，全部在 HKCR）：
+    //   1) HKCR\.<ext> 默认值 → 主 ProgID（当前默认程序）的 shell verbs；
+    //   2) HKCR\.<ext>\OpenWithProgids → 各关联 ProgID 的 shell verbs；
+    //   3) HKCR\.<ext>\OpenWithList\<exe> → XP 式列表（command 在
+    //      HKCR\Applications\<exe>\shell\open\command 或就地 shell 下）。
+    const QString sSuffix = QFileInfo(a_sFilePath).suffix().toLower();
+    if (sSuffix.isEmpty()) {
+        a_pParentMenu->setEnabled(false);
+        return;
+    }
+    const QString sExtKey = QStringLiteral(".") + sSuffix;
+    QSet<QString> aSeenCmds;
+    QSettings stExt(QStringLiteral("HKEY_CLASSES_ROOT\\%1").arg(sExtKey),
+                    QSettings::NativeFormat);
+    const QString sMainProgId = RegDefaultValue(stExt);
+    if (!sMainProgId.isEmpty()) {
+        AddProgIdVerbs(a_pParentMenu, sMainProgId, &aSeenCmds);
+    }
+    // OpenWithProgids：子键名即 ProgID（值是空串/时间戳，不用读值）。
+    QSettings stOwpi(QStringLiteral("HKEY_CLASSES_ROOT\\%1\\OpenWithProgids")
+                         .arg(sExtKey),
+                     QSettings::NativeFormat);
+    const QStringList aOwpiIds = stOwpi.childGroups();
+    for (const QString& sId : aOwpiIds) {
+        AddProgIdVerbs(a_pParentMenu, sId, &aSeenCmds);
+    }
+    // OpenWithList：<exe> 子键就地找 shell\open/edit\command，找不到再查
+    // HKCR\Applications\<exe>。
+    QSettings stOwl(QStringLiteral("HKEY_CLASSES_ROOT\\%1\\OpenWithList")
+                        .arg(sExtKey),
+                    QSettings::NativeFormat);
+    const QStringList aOwlExes = stOwl.childGroups();
+    for (const QString& sExe : aOwlExes) {
+        AddProgIdVerbs(a_pParentMenu,
+                       QStringLiteral("%1\\OpenWithList\\%2").arg(sExtKey, sExe),
+                       &aSeenCmds);
+        AddProgIdVerbs(a_pParentMenu,
+                       QStringLiteral("Applications\\%1").arg(sExe), &aSeenCmds);
+    }
+    // 无任何注册程序：子菜单置灰（Windows 语义下几乎不发生，扩展名总有默认项）。
+    if (a_pParentMenu->isEmpty()) {
+        a_pParentMenu->setEnabled(false);
+    }
+}
+
+void CProjectExplorerPanel::LaunchOpenWithCommand(const QString& a_sCmdTemplate,
+                                                  const QString& a_sFilePath) {
+    // 模板形如 "C:\App\app.exe" "%1" / app.exe %1 %*：splitCommand 拆 token，
+    //   占位符替换——%1/%l/%L/%v/%V → 文件原生路径；%2..%9/%* 丢弃。
+    //   首 token 为程序，其余为参数，startDetached 启动（shell 已展开环境）。
+    //   2026.08.21 环境变量展开：注册表 command 模板常含 %SystemRoot%/%windir% 等
+    //   变量引用，startDetached 不做 shell 展开（如 notepad /pt 打印 verb），必须
+    //   先用系统环境表把 %VAR% 就地替换成实值再启动。
+    const QString sNative = QDir::toNativeSeparators(a_sFilePath);
+    QStringList aParts = QProcess::splitCommand(ExpandEnvVars(a_sCmdTemplate));
+    if (aParts.isEmpty()) {
+        QMessageBox::warning(nullptr, QStringLiteral("打开方式"),
+            QStringLiteral("注册的打开命令无效：\n%1").arg(a_sCmdTemplate));
+        return;
+    }
+    const QString sExe = aParts.takeFirst();
+    for (QString& sTok : aParts) {
+        if (sTok == QLatin1String("%*")) {
+            sTok.clear();
+            continue;
+        }
+        const QChar cPlace = sTok.startsWith(QLatin1Char('%')) && sTok.size() >= 2
+                                 ? sTok.at(1).toLower() : QChar();
+        if (cPlace == QLatin1Char('1') || cPlace == QLatin1Char('l')
+            || cPlace == QLatin1Char('v')) {
+            sTok = sNative;   // %1/%l/%v（含大写变体）→ 文件路径
+        } else if (cPlace.isDigit() && cPlace != QLatin1Char('0')
+                   && cPlace != QLatin1Char('1')) {
+            sTok.clear();     // %2..%9 附加占位符：无对应实参，丢弃
+        } else if (sTok.contains(QStringLiteral("%1"), Qt::CaseInsensitive)) {
+            // token 内嵌占位（如 -file:%1）：原地替换。
+            sTok.replace(QStringLiteral("%1"), sNative, Qt::CaseInsensitive);
+        }
+    }
+    aParts.removeAll(QString());
+    if (!QProcess::startDetached(sExe, aParts)) {
+        QMessageBox::warning(nullptr, QStringLiteral("打开方式"),
+            QStringLiteral("无法启动注册程序：\n%1\n\n文件：%2").arg(
+                a_sCmdTemplate, sNative));
+    }
+}
+
+// 2026.08.21 展开命令模板里的 %VAR% 环境变量引用（注册表 command 常见
+// %SystemRoot%\system32\notepad.exe 这类写法）：逐个查系统环境表替换实值，
+// 查不到的保留原样（不误伤）。%1/%l 等占位符不在 [A-Za-z_][A-Za-z0-9_]*%
+// 文法内，不会被本函数碰到。
+static QString ExpandEnvVars(const QString& a_sCmd) {
+    static const QRegularExpression s_reVar(
+        QStringLiteral("%([A-Za-z_][A-Za-z0-9_]*)%"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QProcessEnvironment stEnv = QProcessEnvironment::systemEnvironment();
+    QString sOut;
+    qsizetype iPos = 0;
+    QRegularExpressionMatchIterator it = s_reVar.globalMatch(a_sCmd);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        sOut += a_sCmd.mid(iPos, m.capturedStart() - iPos);
+        const QString sVal = stEnv.value(m.captured(1));
+        sOut += sVal.isEmpty() ? m.captured(0) : sVal;
+        iPos = m.capturedEnd();
+    }
+    sOut += a_sCmd.mid(iPos);
+    return sOut;
 }

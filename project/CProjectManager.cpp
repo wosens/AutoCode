@@ -1,4 +1,4 @@
-﻿#include "CProjectManager.h"
+#include "CProjectManager.h"
 
 #include <QDir>
 #include <QFile>
@@ -9,6 +9,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QByteArray>
+#include <QCryptographicHash>
+#include <QThread>   // 2026.08.22 blob 临时名防并发碰撞（线程 id 掺入）
+#include <QSet>
 
 #include <zstd.h>       // 备份压缩（#2）：第三方静态库 libzstd_static，逐文件 zstd 压缩/解压
 #include <Windows.h>
@@ -30,7 +33,21 @@ bool CProjectManager::Open(const QString& a_sDir) {
         return false;
     }
     m_sProjectDir = QDir::cleanPath(stDir.absolutePath());
+    // 切工程：旧 store 指针作废（含旧工程路径），惰性重建。
+    {
+        QMutexLocker stLock(&m_MutexStore);
+        delete m_pBackupStore;
+        m_pBackupStore = nullptr;
+    }
+    // 静默孤儿 GC（方案 §4.4：备份中断留下的无引用 blob）。
+    if (QDir(UnifiedBackupsDir()).exists()) {
+        BackupStore()->GcOrphanBlobs();
+    }
     return true;
+}
+
+CProjectManager::~CProjectManager() {
+    delete m_pBackupStore;
 }
 
 QString CProjectManager::AutoDevDir() const {
@@ -219,6 +236,46 @@ void CProjectManager::BuildGuideAsync() {
         return;
     }
     EnsureAutoDev();
+
+    // 2026.08.20 空工程支持（从 0 创建）：工程除 .autodev 等排除目录外没有任何文件时，
+    //   不再交给 Agent 扫描（无物可扫 → 臆造内容且不落盘 → 反复"生成失败"），改为本地
+    //   确定性写一份最小 guide.md（新工程占位骨架）。后续 Develop 产出源码后，任务启动前
+    //   的 SyncGuideIncremental 会自动补指纹表，菜单「生成 guide」也可全量重生成替换。
+    if (CGuideFingerprintScanner::ScanProject(m_sProjectDir).isEmpty()) {
+        const QString sGuide = QStringLiteral(
+            "# 工程指南（guide.md）\n\n"
+            "> 本工程为**新建空工程**：当前尚无任何源码文件，首个任务将**从零开始**创建全部代码。\n"
+            "> 本文件由 AutoCode 在工程为空时自动生成的占位骨架；工程出现源码后，"
+            "可通过菜单「工程 → 生成 guide」全量重生成，或由任务启动前的指纹增量同步自动维护。\n\n"
+            "## 1. 项目概述\n\n- 状态：空白工程，待首个任务定义产品形态。\n\n"
+            "## 2. 技术栈与依赖\n\n- 待定：以首个任务的需求描述为准。\n\n"
+            "## 3. 目录结构\n\n- 当前为空（仅 `.autodev/` 工作目录）。\n\n"
+            "## 4. 编码规范声明\n\n"
+            "编写/修改本工程代码时，自动遵循 %USERPROFILE%\\.claude\\CLAUDE.md 的全部规则"
+            "（命名/格式/文件编码/修改记录/配置位置等）。\n"
+            "新建文件使用 UTF-8（无 BOM）编码；修改已有文件时遵循其既有风格。\n\n"
+            "## 5. 构建 / 运行方式\n\n- 待定：由首个任务的设计/计划阶段确定。\n");
+        QFile stGuide(AutoDevDir() + QStringLiteral("/guide.md"));
+        if (!stGuide.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            emit sigGuideFinished(false,
+                QStringLiteral("空工程 guide.md 写入失败（无法创建文件）"));
+            return;
+        }
+        {
+            QTextStream stOut(&stGuide);
+            stOut.setEncoding(QStringConverter::Utf8);
+            stOut << sGuide;
+        }
+        stGuide.close();
+        AppendRecord(QStringLiteral("[%1] 空工程：本地生成 guide.md 占位骨架（无源码可扫描）")
+                         .arg(QDateTime::currentDateTime().toString(
+                             QStringLiteral("yyyy-MM-dd HH:mm"))));
+        SaveGuideSyncLines(1);   // 上面的 AppendRecord 即全部 record 行，水位线对齐
+        emit sigGuideLog(QStringLiteral(
+            ">>> 工程为空，已本地生成 guide.md 占位骨架（从零开发模式）"));
+        emit sigGuideFinished(true, QStringLiteral("guide.md 生成完成（空工程占位）"));
+        return;
+    }
 
     // 删除旧 guide，避免 claude 读到过期内容
     QFile::remove(AutoDevDir() + QStringLiteral("/guide.md"));
@@ -542,8 +599,51 @@ QStringList CProjectManager::RecentProjects() const {
     return m_aRecentProjects;
 }
 
+void CProjectManager::RemoveRecent(const QString& a_sDir) {
+    // 2026.08.20 与 AddRecent 同口径：按规范化路径比较，命中即删；不存在 no-op。
+    if (a_sDir.isEmpty()) {
+        return;
+    }
+    const QString sCmp = NormalizePath(QDir::cleanPath(a_sDir));
+    for (int i = 0; i < m_aRecentProjects.size(); ++i) {
+        if (NormalizePath(m_aRecentProjects.at(i)) == sCmp) {
+            m_aRecentProjects.removeAt(i);
+            break;
+        }
+    }
+    SaveRecent();
+}
+
 void CProjectManager::ClearRecent() {
     m_aRecentProjects.clear();
+}
+
+QString CProjectManager::LastBrowseDir() const {
+    // 2026.08.20 [UI] LastProjectDir：目录选择对话框的初始定位记忆。
+    //   无 config.ini / 缺键 / 目录已不存在 → 空串（调用方回退默认）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    wchar_t szBuf[MAX_PATH] = {0};
+    const DWORD dwLen = ::GetPrivateProfileStringW(L"UI", L"LastProjectDir", L"",
+                                                   szBuf, MAX_PATH, sPath.toStdWString().c_str());
+    const QString sDir = QString::fromWCharArray(szBuf, static_cast<int>(dwLen)).trimmed();
+    if (sDir.isEmpty() || !QDir(sDir).exists()) {
+        return QString();
+    }
+    return sDir;
+}
+
+void CProjectManager::SetLastBrowseDir(const QString& a_sDir) {
+    // 记住本次选择的目录（落盘失败不抛，本会话不记忆亦可接受）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty() || a_sDir.trimmed().isEmpty()) {
+        return;
+    }
+    WritePrivateProfileStringW(L"UI", L"LastProjectDir",
+                               a_sDir.trimmed().toStdWString().c_str(),
+                               sPath.toStdWString().c_str());
 }
 
 QString CProjectManager::ConfigFilePath() const {
@@ -831,26 +931,30 @@ int CProjectManager::LoadReviewResume() {
 }
 
 bool CProjectManager::SaveAgentBackend(int a_iBackend) {
-    // 2026.08.18 落 [Agent] Backend（1=claude，2=dsh）；非法值兜底写 1。失败不抛。
+    // 2026.08.18 落 [Agent] Backend（1=claude，2=dsh，3=pi）；
+    // 2026.08.21 修：扩展 4=codex——旧实现 1..3 钳位把 Codex 兜底改写回 1，
+    //   表现为「设置页选 CodexHarness 确认后无效」（其余键正常落盘）。
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return false;
     }
     const std::wstring wsPath = sPath.toStdWString();
     WritePrivateProfileStringW(L"Agent", L"Backend",
-        QString::number(a_iBackend == 2 ? 2 : 1).toStdWString().c_str(), wsPath.c_str());
+        QString::number((a_iBackend >= 1 && a_iBackend <= 4) ? a_iBackend : 1).toStdWString().c_str(),
+        wsPath.c_str());
     return true;
 }
 
 int CProjectManager::LoadAgentBackend() {
-    // 2026.08.18 无 config.ini/缺键 → 默认 1（claude）；仅认 1/2，其余兜底 1。
+    // 2026.08.18 无 config.ini/缺键 → 默认 1（claude）；仅认合法值，其余兜底 1。
+    // 2026.08.21 修：同 SaveAgentBackend 扩展 4=codex（旧 1..3 钳位读不回 4）。
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return 1;
     }
     const std::wstring wsPath = sPath.toStdWString();
     const int iBackend = GetPrivateProfileIntW(L"Agent", L"Backend", 1, wsPath.c_str());
-    return (iBackend == 2) ? 2 : 1;
+    return (iBackend >= 1 && iBackend <= 4) ? iBackend : 1;
 }
 
 // 2026.08.18 DSH 三路径 + provider/model 的存取（[Agent] 段）。路径空=未配置
@@ -974,6 +1078,33 @@ bool CProjectManager::SaveDshPriceOutPerM(double a_d) {
     return SaveDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", a_d);
 }
 
+// 2026.08.20 PIAgent 计费单价（$/百万 token，[Agent] PiPrice*PerM）：pi 协议只报
+//   token 分量不报金额，客户端按单价折算；默认对齐 DSH/claude 同档价目。
+bool CProjectManager::SavePiPriceInPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"PiPriceInPerM", a_d);
+}
+double CProjectManager::LoadPiPriceInPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"PiPriceInPerM", 3.0);
+}
+bool CProjectManager::SavePiPriceCacheReadPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"PiPriceCacheReadPerM", a_d);
+}
+double CProjectManager::LoadPiPriceCacheReadPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"PiPriceCacheReadPerM", 0.3);
+}
+bool CProjectManager::SavePiPriceCacheWritePerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"PiPriceCacheWritePerM", a_d);
+}
+double CProjectManager::LoadPiPriceCacheWritePerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"PiPriceCacheWritePerM", 3.75);
+}
+bool CProjectManager::SavePiPriceOutPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"PiPriceOutPerM", a_d);
+}
+double CProjectManager::LoadPiPriceOutPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"PiPriceOutPerM", 15.0);
+}
+
 double CProjectManager::LoadDshPriceOutPerM() {
     return LoadDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", 15.0);
 }
@@ -1076,6 +1207,308 @@ bool CProjectManager::SaveDshModels(const QList<SDshModelEntry>& a_aModels, int 
     WritePrivateProfileStringW(L"DshModels", L"Active",
                                std::to_wstring(iActive).c_str(), wsPath.c_str());
     return true;
+}
+
+// 2026.08.19 PIAgent 第三后端键（[Agent] Pi*）：root/node/provider/model/apiKey/thinking
+//   六项，存取口径同 Dsh*（SaveDshStrKey/LoadDshStrKey 走 [Agent] 节，直接复用）。
+bool CProjectManager::SavePiRoot(const QString& a_sRoot) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiRoot", a_sRoot);
+}
+
+QString CProjectManager::LoadPiRoot() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiRoot", QString());
+}
+
+bool CProjectManager::SavePiNodePath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiNodePath", a_sPath);
+}
+
+QString CProjectManager::LoadPiNodePath() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiNodePath", QString());
+}
+
+bool CProjectManager::SavePiProvider(const QString& a_sProvider) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiProvider", a_sProvider);
+}
+
+QString CProjectManager::LoadPiProvider() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiProvider", QStringLiteral("anthropic"));
+}
+
+bool CProjectManager::SavePiModel(const QString& a_sModel) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiModel", a_sModel);
+}
+
+QString CProjectManager::LoadPiModel() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiModel", QString());
+}
+
+bool CProjectManager::SavePiApiKey(const QString& a_sKey) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiApiKey", a_sKey);
+}
+
+QString CProjectManager::LoadPiApiKey() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiApiKey", QString());
+}
+
+bool CProjectManager::SavePiThinking(const QString& a_sLevel) {
+    return SaveDshStrKey(ConfigFilePath(), L"PiThinking", a_sLevel);
+}
+
+QString CProjectManager::LoadPiThinking() {
+    return LoadDshStrKey(ConfigFilePath(), L"PiThinking", QString());
+}
+
+// 2026.08.20 PiAgent 自定义大模型表（[PiModels]；实现口径与 [DshModels] 完全一致，
+//   仅节名不同——条目本体由 CPiAgentRunner 合成写 ~/.pi/agent/models.json 生效）。
+QList<SDshModelEntry> CProjectManager::LoadPiModels(int* a_pActive) {
+    QList<SDshModelEntry> aModels;
+    if (a_pActive) {
+        *a_pActive = -1;
+    }
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return aModels;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Count", 0, wsPath.c_str()));
+    if (iCount <= 0) {
+        return aModels;
+    }
+    wchar_t szBuf[1024] = { 0 };
+    for (int i = 0; i < iCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            const DWORD dwCopied = GetPrivateProfileStringW(L"PiModels", wsKey.c_str(), L"",
+                                                            szBuf, 1024, wsPath.c_str());
+            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        };
+        SDshModelEntry stE;
+        stE.sDisp    = fnReadStr(L"Disp");
+        stE.sBaseURL = fnReadStr(L"URL");
+        stE.sApiKey  = fnReadStr(L"Key");
+        stE.sApi     = fnReadStr(L"Api");
+        stE.sModelId = fnReadStr(L"Model");
+        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        if (stE.iCtx <= 0) {
+            stE.iCtx = 200000;
+        }
+        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        if (stE.iMaxTok <= 0) {
+            stE.iMaxTok = 32768;
+        }
+        if (stE.sApi.isEmpty()) {
+            stE.sApi = QStringLiteral("anthropic-messages");
+        }
+        if (stE.sDisp.isEmpty()) {
+            stE.sDisp = stE.sModelId;
+        }
+        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
+            continue;   // 无模型 id / 请求地址的残缺条目不进表
+        }
+        aModels.append(stE);
+    }
+    if (a_pActive) {
+        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Active", -1, wsPath.c_str()));
+        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+    }
+    return aModels;
+}
+
+bool CProjectManager::SavePiModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Count", 0, wsPath.c_str()));
+    const int iNewCount = a_aModels.size();
+    WritePrivateProfileStringW(L"PiModels", L"Count",
+                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            WritePrivateProfileStringW(L"PiModels", wsKey.c_str(),
+                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+        };
+        fnWrite(L"Disp",  stE.sDisp);
+        fnWrite(L"URL",   stE.sBaseURL);
+        fnWrite(L"Key",   stE.sApiKey);
+        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
+        fnWrite(L"Model", stE.sModelId);
+        fnWrite(L"Ctx",   QString::number(stE.iCtx));
+        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    }
+    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
+            const std::wstring wsKey = wsPrefix + lpszSuffix;
+            WritePrivateProfileStringW(L"PiModels", wsKey.c_str(), nullptr, wsPath.c_str());
+        }
+    }
+    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
+    WritePrivateProfileStringW(L"PiModels", L"Active",
+                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    return true;
+}
+
+// 2026.08.21 Codex 自定义大模型表（[CodexModels]；口径同 [PiModels]，差异仅一点：
+//   默认 API 格式 = chat（Codex wire_api，v0.88+ 仅 responses））。
+QList<SDshModelEntry> CProjectManager::LoadCodexModels(int* a_pActive) {
+    QList<SDshModelEntry> aModels;
+    if (a_pActive) {
+        *a_pActive = -1;
+    }
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return aModels;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Count", 0, wsPath.c_str()));
+    if (iCount <= 0) {
+        return aModels;
+    }
+    wchar_t szBuf[1024] = { 0 };
+    for (int i = 0; i < iCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            const DWORD dwCopied = GetPrivateProfileStringW(L"CodexModels", wsKey.c_str(), L"",
+                                                            szBuf, 1024, wsPath.c_str());
+            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        };
+        SDshModelEntry stE;
+        stE.sDisp    = fnReadStr(L"Disp");
+        stE.sBaseURL = fnReadStr(L"URL");
+        stE.sApiKey  = fnReadStr(L"Key");
+        stE.sApi     = fnReadStr(L"Api");
+        stE.sModelId = fnReadStr(L"Model");
+        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        if (stE.iCtx <= 0) {
+            stE.iCtx = 200000;
+        }
+        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        if (stE.iMaxTok <= 0) {
+            stE.iMaxTok = 32768;
+        }
+        if (stE.sApi.isEmpty()) {
+            stE.sApi = QStringLiteral("chat");   // Codex wire_api 默认 chat
+        }
+        if (stE.sDisp.isEmpty()) {
+            stE.sDisp = stE.sModelId;
+        }
+        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
+            continue;   // 无模型 id / 请求地址的残缺条目不进表
+        }
+        aModels.append(stE);
+    }
+    if (a_pActive) {
+        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Active", -1, wsPath.c_str()));
+        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+    }
+    return aModels;
+}
+
+bool CProjectManager::SaveCodexModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Count", 0, wsPath.c_str()));
+    const int iNewCount = a_aModels.size();
+    WritePrivateProfileStringW(L"CodexModels", L"Count",
+                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            WritePrivateProfileStringW(L"CodexModels", wsKey.c_str(),
+                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+        };
+        fnWrite(L"Disp",  stE.sDisp);
+        fnWrite(L"URL",   stE.sBaseURL);
+        fnWrite(L"Key",   stE.sApiKey);
+        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("chat") : stE.sApi);
+        fnWrite(L"Model", stE.sModelId);
+        fnWrite(L"Ctx",   QString::number(stE.iCtx));
+        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    }
+    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
+            const std::wstring wsKey = wsPrefix + lpszSuffix;
+            WritePrivateProfileStringW(L"CodexModels", wsKey.c_str(), nullptr, wsPath.c_str());
+        }
+    }
+    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
+    WritePrivateProfileStringW(L"CodexModels", L"Active",
+                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    return true;
+}
+
+// CodexHarness 第四后端（OpenAI Codex CLI 0.87.0，[Agent] Codex* 键；口径同 Pi*）。
+bool CProjectManager::SaveCodexRoot(const QString& a_sRoot) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexRoot", a_sRoot);
+}
+
+QString CProjectManager::LoadCodexRoot() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexRoot", QString());
+}
+
+bool CProjectManager::SaveCodexNodePath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexNodePath", a_sPath);
+}
+
+QString CProjectManager::LoadCodexNodePath() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexNodePath", QString());
+}
+
+bool CProjectManager::SaveCodexProvider(const QString& a_sProvider) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexProvider", a_sProvider);
+}
+
+QString CProjectManager::LoadCodexProvider() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexProvider", QString());
+}
+
+bool CProjectManager::SaveCodexModel(const QString& a_sModel) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexModel", a_sModel);
+}
+
+QString CProjectManager::LoadCodexModel() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexModel", QString());
+}
+
+bool CProjectManager::SaveCodexApiKey(const QString& a_sKey) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexApiKey", a_sKey);
+}
+
+QString CProjectManager::LoadCodexApiKey() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexApiKey", QString());
+}
+
+bool CProjectManager::SaveCodexBaseUrl(const QString& a_sUrl) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexBaseUrl", a_sUrl);
+}
+
+QString CProjectManager::LoadCodexBaseUrl() {
+    return LoadDshStrKey(ConfigFilePath(), L"CodexBaseUrl", QString());
+}
+
+bool CProjectManager::SaveCodexWireApi(const QString& a_sApi) {
+    return SaveDshStrKey(ConfigFilePath(), L"CodexWireApi", a_sApi);
+}
+
+QString CProjectManager::LoadCodexWireApi() {
+    // 默认 chat（v0.88+ 移除 wire_api="chat"，本后端锁定 0.87.0 按 chat 网关接入）。
+    const QString sApi = LoadDshStrKey(ConfigFilePath(), L"CodexWireApi",
+                                       QStringLiteral("chat"));
+    return sApi.isEmpty() ? QStringLiteral("chat") : sApi;
 }
 
 bool CProjectManager::SaveClaudeCmd(const QString& a_sCmd) {
@@ -1389,7 +1822,7 @@ bool CompressTree(const QString& a_sSrc, const QString& a_sDst, const QStringLis
 
 // 从备份版本目录恢复源码树到工程根：.zst 文件解压回原名，其余（旧版未压缩）直接拷贝。
 // 兼容新（压缩）与历史（未压缩）备份，无需额外格式标记。
-bool RestoreTree(const QString& a_sSrc, const QString& a_sDst) {
+bool RestoreTreeLegacy(const QString& a_sSrc, const QString& a_sDst) {
     const QDir stSrc(a_sSrc);
     if (!stSrc.exists()) {
         return false;
@@ -1399,7 +1832,7 @@ bool RestoreTree(const QString& a_sSrc, const QString& a_sDst) {
     }
     const QStringList aDirs = stSrc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
     for (const QString& sSub : aDirs) {
-        if (!RestoreTree(stSrc.filePath(sSub), QDir(a_sDst).filePath(sSub))) {
+        if (!RestoreTreeLegacy(stSrc.filePath(sSub), QDir(a_sDst).filePath(sSub))) {
             return false;
         }
     }
@@ -1645,7 +2078,7 @@ bool CProjectManager::RestoreSources(const QString& a_sTaskId, int a_iSeq, QStri
     }
 
     // 步骤 2：从目标备份版本恢复到工程根（zstd 解压 .zst；旧版未压缩文件直接拷回）。
-    if (!RestoreTree(sVerDir, sRoot)) {
+    if (!RestoreTreeLegacy(sVerDir, sRoot)) {
         // 拷贝失败 → 回滚：先清空工程根半恢复内容，再把临时目录拷回。
         for (const QString& sSub : stRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
             if (aExclude.contains(sSub, Qt::CaseInsensitive)) {
@@ -1665,4 +2098,698 @@ bool CProjectManager::RestoreSources(const QString& a_sTaskId, int a_iSeq, QStri
     // 步骤 3：成功 → 清理临时目录。
     RemoveTree(sTmp);
     return true;
+}
+
+// ============================================================================
+// ===== [PortableCore] CBackupStore —— 统一增量备份 CAS 存储核心（方案 v3.1 §4）=====
+// ============================================================================
+
+namespace {
+
+// 读 JSON 文件（自动跳 UTF-8 BOM）；失败返回空文档。
+QJsonDocument ReadJsonFile(const QString& a_sPath) {
+    QFile stFile(a_sPath);
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return QJsonDocument();
+    }
+    QByteArray bufData = stFile.readAll();
+    stFile.close();
+    if (bufData.startsWith("\xEF\xBB\xBF")) {
+        bufData = bufData.mid(3);
+    }
+    QJsonParseError stErr;
+    return QJsonDocument::fromJson(bufData, &stErr);
+}
+
+// 写 JSON 文件（按 a_bBom 决定是否写 UTF-8 BOM）。
+bool WriteJsonFile(const QString& a_sPath, const QJsonDocument& a_stDoc, bool a_bBom) {
+    QFile stFile(a_sPath);
+    if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    if (a_bBom) {
+        stFile.write("\xEF\xBB\xBF");
+    }
+    stFile.write(a_stDoc.toJson());
+    stFile.close();
+    return true;
+}
+
+// 统一库内路径工具（文件内静态风格）。
+QString BsStoreDir(const QString& a_sRoot) {
+    return QDir(a_sRoot).filePath(QStringLiteral("store"));
+}
+QString BsMetaName(int a_iSeq) {
+    return QString(QStringLiteral("%1.meta.json")).arg(a_iSeq, 4, 10, QLatin1Char('0'));
+}
+QString BsMetaPath(const QString& a_sRoot, int a_iSeq) {
+    return QDir(a_sRoot).filePath(BsMetaName(a_iSeq));
+}
+QString BsTmpDir(const QString& a_sRoot) {
+    return QDir(a_sRoot).filePath(QStringLiteral("_restore_tmp"));
+}
+
+}   // namespace
+
+CBackupStore::CBackupStore(const QString& a_sBackupsRoot, const QString& a_sSourceRoot,
+                           bool a_bBom)
+    : m_sBackupsRoot(a_sBackupsRoot), m_sSourceRoot(a_sSourceRoot), m_bBom(a_bBom) {}
+
+int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
+                         const QString& a_sStage, const QString& a_sPrompt, int a_iTarget) {
+    if (m_sBackupsRoot.isEmpty() || m_sSourceRoot.isEmpty() || a_sKind.isEmpty()
+        || a_sOwner.isEmpty() || !QDir(m_sSourceRoot).exists()) {
+        return 0;
+    }
+    QDir().mkpath(BsStoreDir(m_sBackupsRoot));
+
+    // 1) 遍历源码根（谓词过滤）→ manifest；未变内容 blob 已存在即跳过（FR-1.2 去重）。
+    QStringList aFiles;
+    std::function<void(const QString&, const QString&)> fnScan =
+        [&](const QString& a_sAbsDir, const QString& a_sPrefix) {
+            const QDir stDir(a_sAbsDir);
+            const QStringList aDirs = stDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+            for (const QString& sSub : aDirs) {
+                const QString sRel = a_sPrefix.isEmpty()
+                    ? sSub : a_sPrefix + QLatin1Char('/') + sSub;
+                if (m_pfFilter && !m_pfFilter(sRel)) {
+                    continue;
+                }
+                fnScan(stDir.filePath(sSub), sRel);
+            }
+            const QStringList aNames = stDir.entryList(QDir::Files);
+            for (const QString& sName : aNames) {
+                const QString sRelFile = a_sPrefix.isEmpty()
+                    ? sName : a_sPrefix + QLatin1Char('/') + sName;
+                // 2026.08.23 文件级白名单：只备份代码相关文件（中间文件/产物跳过，
+                //   不入 manifest → 不产生 blob，历史版本里已存的旧产物 blob 由 GC 兜底回收）。
+                if (m_pfFileFilter && !m_pfFileFilter(sRelFile)) {
+                    continue;
+                }
+                aFiles.append(sRelFile);
+            }
+        };
+    fnScan(m_sSourceRoot, QString());
+
+    QJsonObject oFiles;
+    for (const QString& sRel : aFiles) {
+        const QString sAbs = QDir(m_sSourceRoot).filePath(sRel);
+        QFile stF(sAbs);
+        if (!stF.open(QIODevice::ReadOnly)) {
+            return 0;   // 读取失败整版作废（已写 blob 为无害孤儿，GC 兜底）
+        }
+        const QByteArray bufData = stF.readAll();
+        stF.close();
+        const QString sHash = QString::fromLatin1(
+            QCryptographicHash::hash(bufData, QCryptographicHash::Sha256).toHex());
+        const QString sBlob = QDir(BsStoreDir(m_sBackupsRoot))
+            .filePath(sHash + QStringLiteral(".zst"));
+        // v3.1 blob 不可变落盘：先写唯一临时名再 rename（并发备份同一 hash 时，
+        // 后到者 rename 失败但最终 blob 已存在 = 内容相同，视为成功；防 remove+重写交错损坏共享 blob）。
+        if (!QFileInfo::exists(sBlob)) {
+            const QString sBlobTmp = sBlob + QStringLiteral(".tmp%1")
+                .arg(QDateTime::currentMSecsSinceEpoch()
+                     ^ reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16);
+            if (!ZstdCompressFile(sAbs, sBlobTmp)
+                || (!QFile::rename(sBlobTmp, sBlob) && !QFileInfo::exists(sBlob))) {
+                QFile::remove(sBlobTmp);
+                return 0;   // 压缩/落盘失败整版作废（残缺 tmp 无害，GC 兜底前不影响读取）
+            }
+            QFile::remove(sBlobTmp);   // rename 失败但 blob 已被并发对手落成 → 清自己的 tmp
+        }
+        const QFileInfo stInfo(sAbs);
+        QJsonObject oEnt;
+        oEnt[QStringLiteral("h")] = sHash;
+        oEnt[QStringLiteral("z")] = static_cast<qint64>(stInfo.size());
+        oEnt[QStringLiteral("m")] = stInfo.lastModified().toMSecsSinceEpoch();
+        oFiles[sRel] = oEnt;
+    }
+
+    // 2) meta 原子提交：扫 max+1 → 临时文件 + rename；rename 失败=序号被并发占用 → 重试 ≤3。
+    for (int iAttempt = 0; iAttempt < 3; ++iAttempt) {
+        int iMaxSeq = 0;
+        const QStringList aMetas = QDir(m_sBackupsRoot)
+            .entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+        for (const QString& sMeta : aMetas) {
+            bool bOk = false;
+            const int iDot = sMeta.indexOf(QLatin1Char('.'));
+            const int iSeq = (iDot > 0 ? sMeta.left(iDot) : sMeta).toInt(&bOk);   // 整段数字前缀（>9999 不断档）
+            if (bOk && iSeq > iMaxSeq) {
+                iMaxSeq = iSeq;
+            }
+        }
+        const int iSeq = iMaxSeq + 1;
+        QJsonObject oMeta;
+        oMeta[QStringLiteral("seq")]    = iSeq;
+        oMeta[QStringLiteral("time")]   = QDateTime::currentDateTime().toString(Qt::ISODate);
+        oMeta[QStringLiteral("kind")]   = a_sKind;
+        oMeta[QStringLiteral("owner")]  = a_sOwner;
+        if (!a_sStage.isEmpty())  oMeta[QStringLiteral("stage")]  = a_sStage;
+        if (!a_sPrompt.isEmpty()) oMeta[QStringLiteral("prompt")] = a_sPrompt.left(2000);
+        if (a_iTarget > 0)        oMeta[QStringLiteral("target")] = a_iTarget;
+        oMeta[QStringLiteral("format")] = QStringLiteral("cas");
+        oMeta[QStringLiteral("files")]  = oFiles;
+        const QString sFinal = BsMetaPath(m_sBackupsRoot, iSeq);
+        const QString sTmpF  = sFinal + QStringLiteral(".tmp");
+        if (!WriteJsonFile(sTmpF, QJsonDocument(oMeta), m_bBom)) {
+            return 0;
+        }
+        if (QFile::exists(sFinal)) {
+            QFile::remove(sTmpF);   // 重试窗口内被抢：清临时文件再重扫
+            continue;
+        }
+        if (QFile::rename(sTmpF, sFinal)) {
+            return iSeq;
+        }
+        QFile::remove(sTmpF);
+    }
+    return 0;
+}
+
+bool CBackupStore::Restore(int a_iSeq, QString& a_sErr) {
+    a_sErr.clear();
+    const QString sMetaPath = BsMetaPath(m_sBackupsRoot, a_iSeq);
+    const QJsonDocument stDoc = ReadJsonFile(sMetaPath);
+    if (!stDoc.isObject()) {
+        a_sErr = QStringLiteral("版本 #%1 不存在或元数据损坏").arg(a_iSeq);
+        return false;
+    }
+    const QJsonObject oMeta = stDoc.object();
+    if (!oMeta.contains(QStringLiteral("files"))) {
+        a_sErr = QStringLiteral("版本 #%1 为旧格式（无 manifest）").arg(a_iSeq);
+        return false;
+    }
+    const QJsonObject oFiles = oMeta.value(QStringLiteral("files")).toObject();
+
+    const QString sTmp = BsTmpDir(m_sBackupsRoot);
+    RemoveTree(sTmp);   // 清理上次残留（上层残留场景已先行处理）
+    if (!QDir().mkpath(sTmp)) {
+        a_sErr = QStringLiteral("创建恢复临时目录失败");
+        return false;
+    }
+    const QString sRoot = m_sSourceRoot;
+    const QDir stRoot(sRoot);
+
+    // ① 当前源码（谓词范围内顶层项）移入 tmp（rename，快；失败退 copy+remove，
+    //    任一项无法安全移入 → 中止恢复（工程未动），砰低 mv3 安全承诺）。
+    auto fnMoveToTmp = [&](const QString& a_sName) -> bool {
+        const QString sSrc = stRoot.filePath(a_sName);
+        const QString sDst = QDir(sTmp).filePath(a_sName);
+        if (QDir().rename(sSrc, sDst)) {
+            return true;
+        }
+        // rename 失败（句柄被编辑器/索引器/杀毒占用等）→ 拷贝+删除兜底。
+        if (QFileInfo(sSrc).isDir()) {
+            return MirrorTree(sSrc, sDst, QStringList()) && RemoveTree(sSrc);
+        }
+        return QFile::copy(sSrc, sDst) && QFile::remove(sSrc);
+    };
+    // 步骤①失败时的现场复原（把已移入 tmp 的项放回工程根；纯增量操作，不删任何现有内容）。
+    auto fnUndoMove = [&]() {
+        const QDir stTmpDir(sTmp);
+        for (const QString& sName : stTmpDir.entryList(
+                 QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot)) {
+            const QString sSrc = stTmpDir.filePath(sName);
+            if (QDir().rename(sSrc, stRoot.filePath(sName))) {
+                continue;
+            }
+            // rename 回不去 → 拷回（保留 tmp 副本，HasRestoreTmp 残留路径可重试）。
+            if (QFileInfo(sSrc).isDir()) {
+                MirrorTree(sSrc, stRoot.filePath(sName), QStringList());
+            } else {
+                QFile::copy(sSrc, stRoot.filePath(sName));
+            }
+        }
+        RemoveTree(sTmp);
+    };
+    for (const QString& sSub : stRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        if (m_pfFilter && !m_pfFilter(sSub)) {
+            continue;
+        }
+        if (!fnMoveToTmp(sSub)) {
+            fnUndoMove();
+            a_sErr = QStringLiteral("无法安全移入临时目录（破占用）：%1（工程未改动）").arg(sSub);
+            return false;
+        }
+    }
+    for (const QString& sFile : stRoot.entryList(QDir::Files)) {
+        // 2026.08.23 非代码文件（文件级谓词拒绝）不入恢复现场——留在原地不动
+        //   （不进 tmp → 不被删除也不被恢复；与备份侧「不备份」对称）。
+        if (m_pfFileFilter && !m_pfFileFilter(sFile)) {
+            continue;
+        }
+        if (!fnMoveToTmp(sFile)) {
+            fnUndoMove();
+            a_sErr = QStringLiteral("无法安全移入临时目录（破占用）：%1（工程未改动）").arg(sFile);
+            return false;
+        }
+    }
+    // 回滚辅助：清空工程根（谓词范围内）+ tmp 拷回（尽力还原现场）。
+    auto fnRollback = [&]() {
+        for (const QString& sSub : stRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+            if (m_pfFilter && !m_pfFilter(sSub)) {
+                continue;
+            }
+            RemoveTree(stRoot.filePath(sSub));
+        }
+        for (const QString& sFile : stRoot.entryList(QDir::Files)) {
+            QFile::remove(stRoot.filePath(sFile));
+        }
+        MirrorTree(sTmp, sRoot, QStringList());
+        RemoveTree(sTmp);
+    };
+
+    // ② 逐条解压 + sha256 复核（防线 3：坏 blob 硬失败且工程已还原）。
+    for (auto it = oFiles.begin(); it != oFiles.end(); ++it) {
+        const QString sRel  = it.key();
+        const QString sHash = it.value().toObject().value(QStringLiteral("h")).toString();
+        const QString sBlob = QDir(BsStoreDir(m_sBackupsRoot))
+            .filePath(sHash + QStringLiteral(".zst"));
+        const QString sDst  = QDir(sRoot).filePath(sRel);
+        QDir().mkpath(QFileInfo(sDst).absolutePath());
+        if (QFileInfo::exists(sDst) && !QFile::remove(sDst)) {
+            fnRollback();
+            a_sErr = QStringLiteral("目标文件无法覆盖：%1（工程已还原）").arg(sRel);
+            return false;
+        }
+        if (!ZstdDecompressFile(sBlob, sDst)) {
+            fnRollback();
+            a_sErr = QStringLiteral("store/%1.zst 损坏（版本 #%2 不可恢复，工程已还原）")
+                .arg(sHash.left(12)).arg(a_iSeq);
+            return false;
+        }
+        QFile stCheck(sDst);
+        if (!stCheck.open(QIODevice::ReadOnly)) {
+            fnRollback();
+            a_sErr = QStringLiteral("恢复后校验读取失败：%1（工程已还原）").arg(sRel);
+            return false;
+        }
+        const QByteArray bufCheck = stCheck.readAll();
+        stCheck.close();
+        const QString sHash2 = QString::fromLatin1(
+            QCryptographicHash::hash(bufCheck, QCryptographicHash::Sha256).toHex());
+        if (sHash2 != sHash) {
+            QFile::remove(sDst);
+            fnRollback();
+            a_sErr = QStringLiteral("store/%1.zst 内容校验失败（版本 #%2 不可恢复，工程已还原）")
+                .arg(sHash.left(12)).arg(a_iSeq);
+            return false;
+        }
+    }
+    // ③ 全部成功 → 非代码文件先从 tmp 拷回原地（备份侧未入 manifest，不能随 tmp 一起丢弃），
+    //   再删 tmp。manifest 内路径跳过（历史全量版本可能含非代码文件，以恢复点内容为准）。
+    {
+        QSet<QString> aManifest;
+        for (auto it = oFiles.begin(); it != oFiles.end(); ++it) {
+            aManifest.insert(it.key());
+        }
+        QDirIterator itTmp(sTmp, QDir::Files,
+                           QDirIterator::Subdirectories);
+        while (itTmp.hasNext()) {
+            const QString sAbs = itTmp.next();
+            const QString sRelInTmp = QDir(sTmp).relativeFilePath(sAbs);
+            if (aManifest.contains(sRelInTmp)
+                || !m_pfFileFilter || m_pfFileFilter(sRelInTmp)) {
+                continue;   // 已按 manifest 恢复 / 代码文件（不在 manifest = 恢复点不存在，正确删除）；
+                            //   只拷回「白名单外」的非代码文件（备份侧没入 manifest，不能丢）
+            }
+            const QString sDst = QDir(sRoot).filePath(sRelInTmp);
+            QDir().mkpath(QFileInfo(sDst).absolutePath());
+            QFile::copy(sAbs, sDst);
+        }
+    }
+    RemoveTree(sTmp);
+    return true;
+}
+
+bool CBackupStore::RestoreFromTmp(QString& a_sErr) {
+    a_sErr.clear();
+    const QString sTmp = BsTmpDir(m_sBackupsRoot);
+    if (!QDir(sTmp).exists()) {
+        return true;
+    }
+    if (!MirrorTree(sTmp, m_sSourceRoot, QStringList())) {
+        a_sErr = QStringLiteral("从恢复临时目录还原现场失败（临时目录保留，可重试）");
+        return false;
+    }
+    RemoveTree(sTmp);
+    return true;
+}
+QList<SBackupVersion> CBackupStore::List(const QString& a_sOwner) const {
+    QList<SBackupVersion> aVersions;
+    const QDir stRoot(m_sBackupsRoot);
+    if (!stRoot.exists()) {
+        return aVersions;
+    }
+    const QStringList aMetas = stRoot.entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+    for (const QString& sMeta : aMetas) {
+        const QJsonDocument stDoc = ReadJsonFile(stRoot.filePath(sMeta));
+        if (!stDoc.isObject()) {
+            continue;
+        }
+        const QJsonObject o = stDoc.object();
+        if (!a_sOwner.isEmpty() && o.value(QStringLiteral("owner")).toString() != a_sOwner) {
+            continue;
+        }
+        SBackupVersion st;
+        st.iSeq     = o.value(QStringLiteral("seq")).toInt();
+        st.sTime    = o.value(QStringLiteral("time")).toString();
+        st.sStage   = o.value(QStringLiteral("stage")).toString();
+        st.sSummary = o.value(QStringLiteral("summary")).toString();
+        st.sKind    = o.value(QStringLiteral("kind")).toString();
+        st.sOwner   = o.value(QStringLiteral("owner")).toString();
+        st.sPrompt  = o.value(QStringLiteral("prompt")).toString();
+        st.iTarget  = o.value(QStringLiteral("target")).toInt();
+        st.iFileCount = o.value(QStringLiteral("files")).toObject().size();
+        st.bLegacy  = !o.contains(QStringLiteral("files"));
+        if (st.iSeq > 0) {
+            aVersions.append(st);
+        }
+    }
+    std::sort(aVersions.begin(), aVersions.end(),
+              [](const SBackupVersion& a, const SBackupVersion& b) { return a.sTime > b.sTime; });
+    return aVersions;
+}
+
+bool CBackupStore::Diff(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const {
+    a_stOut = SDiffResult();
+    const QJsonObject oOld = ReadJsonFile(BsMetaPath(m_sBackupsRoot, a_iSeqOld))
+        .object().value(QStringLiteral("files")).toObject();
+    const QJsonObject oNew = ReadJsonFile(BsMetaPath(m_sBackupsRoot, a_iSeqNew))
+        .object().value(QStringLiteral("files")).toObject();
+    if (oOld.isEmpty() && oNew.isEmpty()) {
+        return false;   // 版本不存在或旧格式 → 界面占位
+    }
+    for (auto it = oNew.begin(); it != oNew.end(); ++it) {
+        const QJsonObject oN = it.value().toObject();
+        const qint64 iZN = oN.value(QStringLiteral("z")).toVariant().toLongLong();
+        if (!oOld.contains(it.key())) {
+            ++a_stOut.iAdded;
+            SDiffEntry st;
+            st.sPath = it.key(); st.sChange = QStringLiteral("add");
+            st.iSizeNew = iZN;
+            a_stOut.aEntries.append(st);
+        } else if (oOld.value(it.key()).toObject().value(QStringLiteral("h")).toString()
+                   != oN.value(QStringLiteral("h")).toString()) {
+            ++a_stOut.iChanged;
+            SDiffEntry st;
+            st.sPath = it.key(); st.sChange = QStringLiteral("mod");
+            st.iSizeOld = oOld.value(it.key()).toObject()
+                .value(QStringLiteral("z")).toVariant().toLongLong();
+            st.iSizeNew = iZN;
+            a_stOut.aEntries.append(st);
+        }
+    }
+    for (auto it = oOld.begin(); it != oOld.end(); ++it) {
+        if (!oNew.contains(it.key())) {
+            ++a_stOut.iRemoved;
+            SDiffEntry st;
+            st.sPath = it.key(); st.sChange = QStringLiteral("del");
+            st.iSizeOld = it.value().toObject()
+                .value(QStringLiteral("z")).toVariant().toLongLong();
+            a_stOut.aEntries.append(st);
+        }
+    }
+    return true;
+}
+
+int CBackupStore::PurgeOwner(const QString& a_sOwner) {
+    if (a_sOwner.isEmpty()) {
+        return 0;
+    }
+    const QDir stRoot(m_sBackupsRoot);
+    const QStringList aMetas = stRoot.entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+    int iDeleted = 0;
+    for (const QString& sMeta : aMetas) {
+        const QJsonObject o = ReadJsonFile(stRoot.filePath(sMeta)).object();
+        if (o.value(QStringLiteral("owner")).toString() == a_sOwner) {
+            if (QFile::remove(stRoot.filePath(sMeta))) {
+                ++iDeleted;
+            }
+        }
+    }
+    return iDeleted ? GcOrphanBlobs() : 0;
+}
+
+int CBackupStore::GcOrphanBlobs() {
+    const QDir stRoot(m_sBackupsRoot);
+    if (!stRoot.exists()) {
+        return 0;
+    }
+    QSet<QString> setUsed;
+    const QStringList aMetas = stRoot.entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+    for (const QString& sMeta : aMetas) {
+        const QJsonObject oFiles = ReadJsonFile(stRoot.filePath(sMeta))
+            .object().value(QStringLiteral("files")).toObject();
+        for (auto it = oFiles.begin(); it != oFiles.end(); ++it) {
+            setUsed.insert(it.value().toObject().value(QStringLiteral("h")).toString());
+        }
+    }
+    int iRemoved = 0;
+    const QDir stStore(BsStoreDir(m_sBackupsRoot));
+    if (stStore.exists()) {
+        // 2026.08.22 顺手清理并发备份留下的残缺 tmp（不匹配 *.zst，不会被误判为孤儿 blob）。
+        const QStringList aTmps = stStore.entryList({QStringLiteral("*.tmp*")}, QDir::Files);
+        for (const QString& sTmpF : aTmps) {
+            QFile::remove(stStore.filePath(sTmpF));
+        }
+        const QStringList aBlobs = stStore.entryList({QStringLiteral("*.zst")}, QDir::Files);
+        for (const QString& sBlob : aBlobs) {
+            if (!setUsed.contains(sBlob.left(sBlob.size() - 4))
+                && QFile::remove(stStore.filePath(sBlob))) {
+                ++iRemoved;
+            }
+        }
+    }
+    return iRemoved;
+}
+
+bool CBackupStore::HasRestoreTmp() const {
+    return QDir(BsTmpDir(m_sBackupsRoot)).exists();
+}
+
+bool CBackupStore::LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const {
+    const QJsonObject o = ReadJsonFile(
+        QDir(m_sBackupsRoot).filePath(QStringLiteral("notice.json"))).object();
+    if (!o.value(QStringLiteral("pending")).toBool(false)) {
+        return false;
+    }
+    a_iTargetSeq = o.value(QStringLiteral("target")).toInt();
+    a_sOwner     = o.value(QStringLiteral("owner")).toString();
+    return true;
+}
+
+void CBackupStore::SetPendingNotice(int a_iTargetSeq, const QString& a_sOwner) {
+    QJsonObject o;
+    o[QStringLiteral("pending")] = true;
+    o[QStringLiteral("target")]  = a_iTargetSeq;
+    o[QStringLiteral("time")]    = QDateTime::currentDateTime().toString(Qt::ISODate);
+    o[QStringLiteral("owner")]   = a_sOwner;
+    QDir().mkpath(m_sBackupsRoot);
+    WriteJsonFile(QDir(m_sBackupsRoot).filePath(QStringLiteral("notice.json")),
+                  QJsonDocument(o), m_bBom);
+}
+
+void CBackupStore::ClearPendingNotice() {
+    QFile::remove(QDir(m_sBackupsRoot).filePath(QStringLiteral("notice.json")));
+}
+
+bool CBackupStore::SetMetaField(int a_iSeq, const QString& a_sKey, const QJsonValue& a_vValue) {
+    const QString sMetaPath = BsMetaPath(m_sBackupsRoot, a_iSeq);
+    const QJsonDocument stDoc = ReadJsonFile(sMetaPath);
+    if (!stDoc.isObject()) {
+        return false;
+    }
+    QJsonObject o = stDoc.object();
+    o[a_sKey] = a_vValue;
+    // 2026.08.22 原子重写（tmp+rename）：写一半崩溃不损坏既有 meta（与 Backup 提交同模式）。
+    const QString sTmpF = sMetaPath + QStringLiteral(".tmp");
+    if (!WriteJsonFile(sTmpF, QJsonDocument(o), m_bBom)) {
+        return false;
+    }
+    if (QFile::exists(sMetaPath) && !QFile::remove(sMetaPath)) {
+        QFile::remove(sTmpF);
+        return false;
+    }
+    if (!QFile::rename(sTmpF, sMetaPath)) {
+        QFile::remove(sTmpF);
+        return false;
+    }
+    return true;
+}
+
+// ===== [/PortableCore] =====
+
+// ============================================================================
+// CProjectManager 统一备份库适配层（薄封装：定位路径 + 注入排除清单 + 合并 legacy）
+// ============================================================================
+
+QString CProjectManager::UnifiedBackupsDir() const {
+    return QDir::cleanPath(AutoDevDir() + QStringLiteral("/backups"));
+}
+
+// 2026.08.23 代码相关文件白名单：增量备份只备份代码/配置/文档类文本文件，
+//   中间文件与产物（*.obj/*.exe/*.zst/*.png 等）不入库。按扩展名（小写）判定；
+//   无扩展名的常见构建/说明文件按文件名判定；其余无扩展名文件一律视为非代码跳过。
+bool IsCodeRelatedFile(const QString& a_sRel) {
+    static const QSet<QString> s_aCodeExts = {
+        // C/C++ 家族
+        QStringLiteral("c"), QStringLiteral("cc"), QStringLiteral("cpp"),
+        QStringLiteral("cxx"), QStringLiteral("c++"), QStringLiteral("h"),
+        QStringLiteral("hh"), QStringLiteral("hpp"), QStringLiteral("hxx"),
+        QStringLiteral("h++"), QStringLiteral("inl"), QStringLiteral("ipp"),
+        QStringLiteral("tpp"), QStringLiteral("qml"), QStringLiteral("ui"),
+        QStringLiteral("qrc"), QStringLiteral("pro"), QStringLiteral("pri"),
+        // 脚本与其他语言
+        QStringLiteral("cs"), QStringLiteral("java"), QStringLiteral("kt"),
+        QStringLiteral("kts"), QStringLiteral("scala"), QStringLiteral("swift"),
+        QStringLiteral("m"), QStringLiteral("mm"), QStringLiteral("go"),
+        QStringLiteral("rs"), QStringLiteral("rb"), QStringLiteral("py"),
+        QStringLiteral("pyw"), QStringLiteral("pyi"), QStringLiteral("php"),
+        QStringLiteral("js"), QStringLiteral("jsx"), QStringLiteral("mjs"),
+        QStringLiteral("cjs"), QStringLiteral("ts"), QStringLiteral("tsx"),
+        QStringLiteral("vue"), QStringLiteral("svelte"),
+        QStringLiteral("sh"), QStringLiteral("bash"), QStringLiteral("zsh"),
+        QStringLiteral("bat"), QStringLiteral("cmd"), QStringLiteral("ps1"),
+        QStringLiteral("lua"), QStringLiteral("pl"), QStringLiteral("pm"),
+        QStringLiteral("r"), QStringLiteral("jl"), QStringLiteral("sql"),
+        QStringLiteral("proto"), QStringLiteral("gradle"),
+        // 构建/配置
+        QStringLiteral("cmake"), QStringLiteral("mk"), QStringLiteral("make"),
+        QStringLiteral("json"), QStringLiteral("yaml"), QStringLiteral("yml"),
+        QStringLiteral("toml"), QStringLiteral("ini"), QStringLiteral("cfg"),
+        QStringLiteral("conf"), QStringLiteral("properties"), QStringLiteral("xml"),
+        QStringLiteral("xaml"), QStringLiteral("gradlew"),
+        // 文档/文本
+        QStringLiteral("md"), QStringLiteral("markdown"), QStringLiteral("txt"),
+        QStringLiteral("rst"), QStringLiteral("html"), QStringLiteral("htm"),
+        QStringLiteral("css"), QStringLiteral("scss"), QStringLiteral("sass"),
+        QStringLiteral("less"),
+    };
+    static const QSet<QString> s_aCodeNames = {
+        QStringLiteral("Makefile"), QStringLiteral("makefile"),
+        QStringLiteral("GNUmakefile"), QStringLiteral("NMakefile"),
+        QStringLiteral("Dockerfile"), QStringLiteral("CMakeLists"),
+        QStringLiteral("LICENSE"), QStringLiteral("NOTICE"),
+        QStringLiteral(".gitignore"), QStringLiteral(".gitattributes"),
+        QStringLiteral(".editorconfig"), QStringLiteral(".dockerignore"),
+    };
+    const QString sName = QFileInfo(a_sRel).fileName();
+    const QString sExt  = QFileInfo(a_sRel).suffix().toLower();
+    return s_aCodeExts.contains(sExt) || s_aCodeNames.contains(sName);
+}
+
+CBackupStore* CProjectManager::BackupStore() const {
+    QMutexLocker stLock(&m_MutexStore);
+    if (m_pBackupStore == nullptr) {
+        m_pBackupStore = new CBackupStore(UnifiedBackupsDir(), m_sProjectDir, true);
+        // 排除清单谓词：以相对路径首段（顶层一级目录）判定，与旧 MirrorTree 同口径；
+        // BackupExcludeDirs 每次现读（含 .autodev 自身 → 库永不递归自备）。
+        m_pBackupStore->m_pfFilter = [this](const QString& a_sRel) {
+            const int iPos = a_sRel.indexOf(QLatin1Char('/'));
+            const QString sTop = (iPos > 0) ? a_sRel.left(iPos) : a_sRel;
+            return !BackupExcludeDirs().contains(sTop, Qt::CaseInsensitive);
+        };
+        // 2026.08.23 文件级白名单：只备份代码相关文件（目录过滤之后再按文件过滤，
+        //   中间文件/产物不再入 blob 库；恢复时这些文件原地保留不被触碰）。
+        m_pBackupStore->m_pfFileFilter = [](const QString& a_sRel) {
+            return IsCodeRelatedFile(a_sRel);
+        };
+    }
+    return m_pBackupStore;
+}
+
+int CProjectManager::BackupTree(const QString& a_sKind, const QString& a_sOwner,
+                                const QString& a_sStage, const QString& a_sPrompt,
+                                int a_iTarget) {
+    if (m_sProjectDir.isEmpty() || a_sOwner.isEmpty()) {
+        return 0;
+    }
+    return BackupStore()->Backup(a_sKind, a_sOwner, a_sStage, a_sPrompt, a_iTarget);
+}
+
+bool CProjectManager::RestoreTree(int a_iSeq, QString& a_sErr) {
+    a_sErr.clear();
+    if (m_sProjectDir.isEmpty() || a_iSeq <= 0) {
+        a_sErr = QStringLiteral("参数无效（工程未打开 / 序号非法）");
+        return false;
+    }
+    // 统一库有该 seq → CAS 恢复。
+    if (QFileInfo::exists(BsMetaPath(UnifiedBackupsDir(), a_iSeq))) {
+        return BackupStore()->Restore(a_iSeq, a_sErr);
+    }
+    // legacy 分派：扫 .autodev/tasks/*/backups 找该 seq → 转调旧 RestoreSources。
+    const QDir stTasks(AutoDevDir() + QStringLiteral("/tasks"));
+    if (stTasks.exists()) {
+        const QStringList aTasks = stTasks.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString& sTask : aTasks) {
+            if (QFileInfo::exists(QDir(BackupsDir(sTask)).filePath(BsMetaName(a_iSeq)))) {
+                return RestoreSources(sTask, a_iSeq, a_sErr);
+            }
+        }
+    }
+    a_sErr = QStringLiteral("目标版本不存在：%1").arg(a_iSeq);
+    return false;
+}
+
+bool CProjectManager::RestoreTree(const SBackupVersion& a_stVer, QString& a_sErr) {
+    if (a_stVer.bLegacy) {
+        return RestoreSources(a_stVer.sOwner, a_stVer.iSeq, a_sErr);
+    }
+    return RestoreTree(a_stVer.iSeq, a_sErr);
+}
+
+QList<SBackupVersion> CProjectManager::ListUnifiedBackups(const QString& a_sOwner) const {
+    QList<SBackupVersion> aVersions = BackupStore()->List(a_sOwner);
+    // legacy 合并：owner 为任务 id 时收其旧全量库（标 bLegacy / sKind=legacy / sOwner=任务 id）。
+    if (!a_sOwner.isEmpty() && a_sOwner != QStringLiteral("global")
+        && QDir(BackupsDir(a_sOwner)).exists()) {
+        const QList<SBackupVersion> aLegacy = ListBackups(a_sOwner);
+        for (SBackupVersion st : aLegacy) {
+            st.sKind   = QStringLiteral("legacy");
+            st.sOwner  = a_sOwner;
+            st.bLegacy = true;
+            aVersions.append(st);
+        }
+    }
+    // 两库序号空间独立 → 按 time ISO 倒序统一排序。
+    std::sort(aVersions.begin(), aVersions.end(),
+              [](const SBackupVersion& a, const SBackupVersion& b) { return a.sTime > b.sTime; });
+    return aVersions;
+}
+
+bool CProjectManager::DiffVersions(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const {
+    return BackupStore()->Diff(a_iSeqOld, a_iSeqNew, a_stOut);
+}
+
+int CProjectManager::PurgeOwner(const QString& a_sOwner) {
+    return BackupStore()->PurgeOwner(a_sOwner);
+}
+
+int CProjectManager::GcOrphanBlobs() {
+    return BackupStore()->GcOrphanBlobs();
+}
+
+bool CProjectManager::HasRestoreTmp() const {
+    return BackupStore()->HasRestoreTmp();
+}
+
+bool CProjectManager::RestoreFromTmp(QString& a_sErr) {
+    return BackupStore()->RestoreFromTmp(a_sErr);
+}
+
+bool CProjectManager::LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const {
+    return BackupStore()->LoadPendingNotice(a_iTargetSeq, a_sOwner);
+}
+
+void CProjectManager::SetPendingNotice(int a_iTargetSeq, const QString& a_sOwner) {
+    BackupStore()->SetPendingNotice(a_iTargetSeq, a_sOwner);
+}
+
+void CProjectManager::ClearPendingNotice() {
+    BackupStore()->ClearPendingNotice();
+}
+
+bool CProjectManager::SetUnifiedSummary(int a_iSeq, const QString& a_sSummary) {
+    return BackupStore()->SetMetaField(a_iSeq, QStringLiteral("summary"), a_sSummary.left(300));
 }

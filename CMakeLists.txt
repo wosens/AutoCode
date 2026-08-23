@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.21)
 
 # 提示：若 CMake 找不到 Qt6，使用 CMakePresets.json 的 "qt6" preset，
 # 或显式 -DCMAKE_PREFIX_PATH=D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64
@@ -32,7 +32,10 @@ qt_standard_project_setup()
 
 qt_add_executable(AutoCode WIN32
     main.cpp
+    core/CCrashDump.h
+    core/CCrashDump.cpp
     core/TaskTypes.h
+    core/CModelEntry.h
     core/CVersion.h
     core/StageDef.h
     core/StageDef.cpp
@@ -47,6 +50,12 @@ qt_add_executable(AutoCode WIN32
     agent/CDeepSeekRunner.h
     agent/CDeepSeekRunner.cpp
     agent/CAgentRunnerFactory.h
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
     agent/CMcpAskServer.h
     agent/CMcpAskServer.cpp
     orch/CTaskOrchestrator.h
@@ -199,6 +208,12 @@ qt_add_executable(test_projectmanager
     agent/CDeepSeekRunner.h
     agent/CDeepSeekRunner.cpp
     agent/CAgentRunnerFactory.h
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/CTaskInfo.h
@@ -213,11 +228,44 @@ target_include_directories(test_projectmanager PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_projectmanager PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_projectmanager PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
 set_target_properties(test_projectmanager PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_projectmanager COMMAND test_projectmanager)
+
+# ---- 单元测试（多助手 Tab：任务点击反复切档不挂死/不泄漏幽灵 Tab）----
+# 复现「点击任务卡死」路径：LoadAssistantsFromJson ↔ ResetAssistants 与
+# 「+」占位页的 currentChanged 再入。GUI 测试（QWidget）。
+qt_add_executable(test_execpanel
+    tests/test_execpanel.cpp
+    ui/CExecutionPanel.h
+    ui/CExecutionPanel.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CArtifactView.h
+    ui/CArtifactView.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(test_execpanel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(test_execpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+set_target_properties(test_execpanel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_execpanel COMMAND test_execpanel)
 
 # ---- 单元测试（CTaskHistoryDB：SQLite 历史库 Upsert/LoadAll/Delete 往返）----
 qt_add_executable(test_historydb
@@ -306,6 +354,12 @@ qt_add_executable(test_rollback
     agent/CDeepSeekRunner.h
     agent/CDeepSeekRunner.cpp
     agent/CAgentRunnerFactory.h
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/CStageMachine.h
@@ -322,7 +376,7 @@ target_include_directories(test_rollback PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_rollback PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_rollback PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
 set_target_properties(test_rollback PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -370,7 +424,55 @@ target_include_directories(test_dshrunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
 )
-target_link_libraries(test_dshrunner PRIVATE Qt6::Core)
+target_link_libraries(test_dshrunner PRIVATE Qt6::Core Qt6::Network)
 set_target_properties(test_dshrunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
+
+# ---- Pi 后端离线单元测试（不联网，挂 ctest）----
+qt_add_executable(test_pirunner
+    tests/test_pirunner.cpp
+    core/CModelEntry.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+)
+target_include_directories(test_pirunner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+)
+target_link_libraries(test_pirunner PRIVATE Qt6::Core Qt6::Network)
+add_test(NAME test_pirunner COMMAND test_pirunner)
+
+# ---- CodexHarness 后端离线单元测试（不联网，挂 ctest）----
+qt_add_executable(test_codexrunner
+    tests/test_codexrunner.cpp
+    core/CModelEntry.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+)
+target_include_directories(test_codexrunner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+)
+target_link_libraries(test_codexrunner PRIVATE Qt6::Core Qt6::Network)
+add_test(NAME test_codexrunner COMMAND test_codexrunner)

@@ -1,4 +1,4 @@
-﻿#include "CMessageBlock.h"
+#include "CMessageBlock.h"
 #include "../agent/CAgentRunnerFactory.h"
 
 #include <QLabel>
@@ -185,45 +185,31 @@ void CMessageBlock::BuildToolCard() {
     connect(m_pHeader, &QToolButton::toggled, this, [this](bool a_bChecked) {
         m_bExpanded = a_bChecked;
         m_pContent->setVisible(a_bChecked);
-        // 重建标题以刷新 ▶/▼ 箭头
-        m_pHeader->setText(QStringLiteral("%1 %2 %3")
-            .arg(a_bChecked ? QStringLiteral("▼") : QStringLiteral("▶"),
-                 ToolIcon(m_sTool),
-                 ToolSummary(m_sTool, m_sInput)));
+        m_pHeader->setText(HeaderText(a_bChecked));   // 刷新 ▶/▼ 箭头与 ×N 计数
     });
     pV->addWidget(m_pHeader);
 
     m_pContent = new QWidget(this);
-    auto* pCV = new QVBoxLayout(m_pContent);
-    pCV->setContentsMargins(0, 0, 0, 0);
-    pCV->setSpacing(4);
-
-    auto* pLblInput = new QLabel(QStringLiteral("入参"), m_pContent);
-    pLblInput->setStyleSheet(QStringLiteral("color: #6b7280;"));
-    pCV->addWidget(pLblInput);
-
-    m_pInputEdit = new QPlainTextEdit(m_pContent);
-    m_pInputEdit->setReadOnly(true);
-    m_pInputEdit->setFixedHeight(160);
-    m_pInputEdit->setStyleSheet(
-        QStringLiteral("QPlainTextEdit { background: #fafafa; border: 1px solid #e5e7eb;"
-                       " border-radius: 3px; font-family: %1; font-size: 11pt; }").arg(k_szMonoFont));
-    pCV->addWidget(m_pInputEdit);
-
-    auto* pLblResult = new QLabel(QStringLiteral("结果"), m_pContent);
-    pLblResult->setStyleSheet(QStringLiteral("color: #6b7280;"));
-    pCV->addWidget(pLblResult);
-
-    m_pResultEdit = new QPlainTextEdit(m_pContent);
-    m_pResultEdit->setReadOnly(true);
-    m_pResultEdit->setFixedHeight(120);
-    m_pResultEdit->setStyleSheet(
-        QStringLiteral("QPlainTextEdit { background: #fafafa; border: 1px solid #e5e7eb;"
-                       " border-radius: 3px; font-family: %1; font-size: 11pt; }").arg(k_szMonoFont));
-    pCV->addWidget(m_pResultEdit);
+    m_pContentLay = new QVBoxLayout(m_pContent);
+    m_pContentLay->setContentsMargins(0, 0, 0, 0);
+    m_pContentLay->setSpacing(8);
 
     pV->addWidget(m_pContent);
     m_pContent->setVisible(false);   // 默认折叠
+}
+
+// 2026.08.22 标题：单卡=「▶ 图标 摘要」；合并卡=「▶ 图标 首条摘要 … ×N」
+QString CMessageBlock::HeaderText(bool a_bArrowDown) const {
+    if (m_aTools.isEmpty()) {
+        return QString();
+    }
+    const SToolEntry& st0 = m_aTools.first();
+    QString sBody = QStringLiteral("%1 %2")
+        .arg(ToolIcon(st0.sTool), ToolSummary(st0.sTool, st0.sInput));
+    if (m_aTools.size() > 1) {
+        sBody += QStringLiteral("  … ×%1").arg(m_aTools.size());
+    }
+    return QStringLiteral("%1 %2").arg(a_bArrowDown ? QStringLiteral("▼") : QStringLiteral("▶"), sBody);
 }
 
 QString CMessageBlock::ToolSummary(const QString& a_sTool, const QString& a_sInputJson) {
@@ -250,59 +236,121 @@ QString CMessageBlock::ToolSummary(const QString& a_sTool, const QString& a_sInp
     return a_sTool + QStringLiteral("(") + sTarget + QStringLiteral(")");
 }
 
+// 2026.08.22 展开区按条目重建（合并卡=多个「入参/结果」小节；单卡兼容=1 节）
 void CMessageBlock::RebuildToolContent() {
-    if (m_pInputEdit == nullptr) {
+    if (m_pContentLay == nullptr) {
         return;
     }
-    QTextCursor cur(m_pInputEdit->document());
-    cur.select(QTextCursor::Document);
-    cur.removeSelectedText();
-
-    // Edit/MultiEdit 特化：红绿 diff（取 old_string/new_string）
-    const QString sToolLow = m_sTool.toLower();
-    if (sToolLow == "edit" || sToolLow == "multiedit") {
-        const QJsonObject o = QJsonDocument::fromJson(m_sInput.toUtf8()).object();
-        const QString sOld = o.value("old_string").toString();
-        const QString sNew = o.value("new_string").toString();
-
-        QTextCharFormat fmtOld;
-        fmtOld.setForeground(QColor("#b91c1c"));
-        QTextCharFormat fmtNew;
-        fmtNew.setForeground(QColor("#15803d"));
-
-        cur.insertText(QStringLiteral("--- 旧\n"), fmtOld);
-        for (const QString& sLine : sOld.split('\n')) {
-            cur.insertText(QStringLiteral("- ") + sLine + QStringLiteral("\n"), fmtOld);
+    // 清空旧条目控件
+    while (m_pContentLay->count() > 0) {
+        QLayoutItem* pItem = m_pContentLay->takeAt(0);
+        if (pItem->widget() != nullptr) {
+            pItem->widget()->deleteLater();
         }
-        cur.insertText(QStringLiteral("\n--- 新\n"), fmtNew);
-        for (const QString& sLine : sNew.split('\n')) {
-            cur.insertText(QStringLiteral("+ ") + sLine + QStringLiteral("\n"), fmtNew);
-        }
-        return;
+        delete pItem;
     }
+    for (int i = 0; i < m_aTools.size(); ++i) {
+        const SToolEntry& st = m_aTools[i];
+        auto* pLblInput = new QLabel(
+            m_aTools.size() > 1 ? QStringLiteral("入参 #%1").arg(i + 1) : QStringLiteral("入参"),
+            m_pContent);
+        pLblInput->setStyleSheet(QStringLiteral("color: #6b7280;"));
+        m_pContentLay->addWidget(pLblInput);
 
-    // 其他工具：格式化 JSON 展示
-    const QJsonDocument stDoc = QJsonDocument::fromJson(m_sInput.toUtf8());
-    const QString sShown = stDoc.isObject()
-        ? QString::fromUtf8(stDoc.toJson(QJsonDocument::Indented))
-        : m_sInput;
-    cur.insertText(sShown);
+        auto* pIn = new QPlainTextEdit(m_pContent);
+        pIn->setReadOnly(true);
+        pIn->setFixedHeight(160);
+        pIn->setStyleSheet(
+            QStringLiteral("QPlainTextEdit { background: #fafafa; border: 1px solid #e5e7eb;"
+                           " border-radius: 3px; font-family: %1; font-size: 11pt; }").arg(k_szMonoFont));
+
+        // Edit/MultiEdit 特化：红绿 diff（取 old_string/new_string）
+        const QString sToolLow = st.sTool.toLower();
+        if (sToolLow == "edit" || sToolLow == "multiedit") {
+            const QJsonObject o = QJsonDocument::fromJson(st.sInput.toUtf8()).object();
+            const QString sOld = o.value("old_string").toString();
+            const QString sNew = o.value("new_string").toString();
+
+            QTextCharFormat fmtOld;
+            fmtOld.setForeground(QColor("#b91c1c"));
+            QTextCharFormat fmtNew;
+            fmtNew.setForeground(QColor("#15803d"));
+
+            QTextCursor cur(pIn->document());
+            cur.insertText(QStringLiteral("--- 旧\n"), fmtOld);
+            for (const QString& sLine : sOld.split('\n')) {
+                cur.insertText(QStringLiteral("- ") + sLine + QStringLiteral("\n"), fmtOld);
+            }
+            cur.insertText(QStringLiteral("\n--- 新\n"), fmtNew);
+            for (const QString& sLine : sNew.split('\n')) {
+                cur.insertText(QStringLiteral("+ ") + sLine + QStringLiteral("\n"), fmtNew);
+            }
+        } else {
+            // 其他工具：格式化 JSON 展示
+            const QJsonDocument stDoc = QJsonDocument::fromJson(st.sInput.toUtf8());
+            pIn->setPlainText(stDoc.isObject()
+                ? QString::fromUtf8(stDoc.toJson(QJsonDocument::Indented))
+                : st.sInput);
+        }
+        m_pContentLay->addWidget(pIn);
+
+        auto* pLblResult = new QLabel(
+            m_aTools.size() > 1 ? QStringLiteral("结果 #%1").arg(i + 1) : QStringLiteral("结果"),
+            m_pContent);
+        pLblResult->setStyleSheet(QStringLiteral("color: #6b7280;"));
+        m_pContentLay->addWidget(pLblResult);
+
+        auto* pOut = new QPlainTextEdit(m_pContent);
+        pOut->setReadOnly(true);
+        pOut->setFixedHeight(120);
+        pOut->setStyleSheet(
+            QStringLiteral("QPlainTextEdit { background: #fafafa; border: 1px solid #e5e7eb;"
+                           " border-radius: 3px; font-family: %1; font-size: 11pt; }").arg(k_szMonoFont));
+        pOut->setPlainText(st.sResult);
+        m_pContentLay->addWidget(pOut);
+    }
 }
 
 void CMessageBlock::SetTool(const QString& a_sTool, const QString& a_sInputJson) {
-    m_sTool = a_sTool;
-    m_sInput = a_sInputJson;
+    SToolEntry st;
+    st.sTool  = a_sTool;
+    st.sInput = a_sInputJson;
+    m_aTools.clear();
+    m_aTools.append(st);
     if (m_pHeader != nullptr) {
-        m_pHeader->setText(QStringLiteral("▶ %1 %2")
-            .arg(ToolIcon(a_sTool), ToolSummary(a_sTool, a_sInputJson)));
+        m_pHeader->setText(HeaderText(false));
     }
     RebuildToolContent();
 }
 
+void CMessageBlock::AddMergedTool(const QString& a_sTool, const QString& a_sInputJson) {
+    SToolEntry st;
+    st.sTool  = a_sTool;
+    st.sInput = a_sInputJson;
+    m_aTools.append(st);
+    if (m_pHeader != nullptr) {
+        m_pHeader->setText(HeaderText(m_bExpanded));
+    }
+    RebuildToolContent();   // 折叠态不可见，重建成本可忽略；展开中追加即时可见
+}
+
+int CMessageBlock::ToolCount() const {
+    return m_aTools.size();
+}
+
 void CMessageBlock::SetResult(const QString& a_sResult) {
-    m_sResult = a_sResult;
-    if (m_pResultEdit != nullptr) {
-        m_pResultEdit->setPlainText(a_sResult);
+    // 2026.08.22 合并卡：结果按到达顺序回填到首个尚无结果的条目（与面板块序一致）
+    int iTarget = -1;
+    for (int i = 0; i < m_aTools.size(); ++i) {
+        if (m_aTools[i].sResult.isEmpty()) { iTarget = i; break; }
+    }
+    if (iTarget < 0) {
+        iTarget = m_aTools.size() - 1;   // 兜底：覆盖末条
+    }
+    m_aTools[iTarget].sResult = a_sResult;
+    // 展开态：即时刷新该条结果框（折叠态等展开时由 RebuildToolContent 呈现）
+    if (m_bExpanded && m_pContentLay != nullptr) {
+        RebuildToolContent();
     }
     // 错误结果：标题栏标红 + 自动展开
     if (IsErrorResult(a_sResult) && m_pHeader != nullptr) {
@@ -352,12 +400,18 @@ void CMessageBlock::SetEvent(const QString& a_sKind, const QString& a_sText) {
     //   否则 RichText QLabel 会把 \n 当空白折叠成空格（多行提示词挤成一行看不清）。
     QString sBody = a_sText.toHtmlEscaped();
     sBody.replace(QStringLiteral("\n"), QStringLiteral("<br>"));
+    // 2026.08.23 「你」徽标前缀用户头像图标（icon-generator 技能生成，qrc 内嵌）：
+    //   仅 eventKind=user 加；QLabel 富文本 <img> 走 Qt 资源路径，行内基线对齐。
+    const QString sIcon = (a_sKind == QStringLiteral("user"))
+        ? QStringLiteral("<img src=':/icons/user.png' width='16' height='16'/> ")
+        : QString();
     const QString sHtml = QStringLiteral(
-        "<span style='color:%1; %3'>%2</span>"
-        "<span style='color:#374151; %3'> %4</span>")
+        "%4<span style='color:%1; %3'>%2</span>"
+        "<span style='color:#374151; %3'> %5</span>")
         .arg(QString::fromUtf8(st.szColor),
              QString::fromUtf8(st.szBullet),
              st.bBold ? QStringLiteral("font-weight:600;") : QString(),
+             sIcon,
              sBody);
     m_pLabel->setText(sHtml);
     m_pLabel->setTextFormat(Qt::RichText);

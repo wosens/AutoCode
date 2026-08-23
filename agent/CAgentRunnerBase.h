@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 #include <QString>
@@ -61,7 +61,9 @@ public:
     // 供 ad-hoc agent 的「上下文大小」显示与压缩阈值判定。
     qint64 LastContextFill() const { return m_iLastContextFill; }
     // 本次运行的 API 请求数（assistant 消息条数，StartStage 时清零）——任务统计用。
-    int LastReqCount() const { return m_iLastReqCount; }
+    // 置虚：Codex 后端经本地代理拿到真实请求数并已实时上抛（sigUsageDelta），
+    // 阶段收尾时须报 0 防与实时累计重复（2026.08.21）。
+    virtual int LastReqCount() const { return m_iLastReqCount; }
     QString LastModel() const { return m_sLastModel; }   // 最近 result 的 model 字段（供查上下文窗口）
 
 signals:
@@ -70,6 +72,9 @@ signals:
     void sigToolUse(const QString& a_sTool, const QString& a_sInput);  // 工具调用
     void sigToolResult(const QString& a_sResult);                      // 工具结果（截断）
     void sigContextFill(qint64 a_iFill);   // 运行中上下文占用（每条 assistant 消息的 usage；值变化才发）
+    // 运行中真实计量增量（每完成一次 API 请求发一次；Codex 经本地代理解析网关
+    // usage 上抛，2026.08.21）：编排器即时累计进任务行（费用/输入/输出/请求列）。
+    void sigUsageDelta(qint64 a_iInTok, qint64 a_iOutTok);
     void sigFinished(bool a_bOk, const QString& a_sResult,            // 一次执行结束
                      qint64 a_iInTok, qint64 a_iOutTok,
                      double a_dCost, const QString& a_sSessionId);

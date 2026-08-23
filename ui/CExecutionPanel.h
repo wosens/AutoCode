@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QWidget>
 #include <QHash>
@@ -74,17 +74,33 @@ public:
     void AppendToAdhocInput(const QString& a_sText);
     // 2026.08.18 资源管理器双击文本文件 → 「助手」右侧单实例 Tab 内嵌显示文件内容
     //   （QPlainTextEdit 只读；双击其他文件复用同一 Tab 换内容与标题）。
-    void ShowFileTab(const QString& a_sAbsPath);
+    //   2026.08.21 增加 a_bSwitchTab：false=资源管理器单击预览——只加载内容/换
+    //   标题不切页（用户停留当前 Tab）；默认 true 保持双击切页原行为。
+    void ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab = true);
     // FR-9：按左栏任务列表（Tab）底部 y 同步阶段表高度，使两者底部对齐（任务列表不含按钮行）。
     void SyncStagesHeight(int a_iTaskListBottomY);
 
     // —— 对话流持久化（#1 助手 / #6 任务）：CMainWindow 在存盘/恢复时调用 ——
-    QJsonArray AdhocBlocksToJson() const;                        // 助手流 → JSON
-    void LoadAdhocBlocksFromJson(const QJsonArray& a_aBlocks);   // 恢复助手流（不发 changed）
+    // 2026.08.22 多助手：助手对话流改为按「助手」分条存取，Tab 标题即助手名。
+    QJsonArray AssistantsToJson() const;              // 全部助手（含 name/blocks/ctxFill/会话态）→ JSON 数组
+    void LoadAssistantsFromJson(const QJsonArray& a_aAssts, const QString& a_sActiveId);   // 恢复（重建各 Tab）
+    // 2026.08.22 会话态（sid/撤销栈/guideHash）回填：主窗口在切换/落盘前把编排器现值写入该助手。
+    void UpdateAsstSession(const QString& a_sId, const QString& a_sSid,
+                           const QString& a_sGuideHash, const QJsonArray& a_aStack);
+    QString AsstSid(const QString& a_sId) const;            // 该助手会话 sid（无则空）
+    QJsonArray AsstStack(const QString& a_sId) const;       // 该助手撤销栈 JSON
+    QString AsstGuideHash(const QString& a_sId) const;      // 该助手 guide.md 投喂哈希
+    qint64 AsstCtxFill(const QString& a_sId) const;         // 该助手上下文占用快照
+    QString ActiveAsstId() const { return m_sActiveAsst; }  // 当前激活（显示中）的助手 id
+    QString RunningAsstId() const { return m_sRunningAsst; }// 正在执行一轮的助手 id（无则空）
+    void ClearRunningAsst();                                // 结束态：清运行中助手（主窗口在读取后调用）
+    void ResetAssistants();                                 // 复位为单个默认助手（清空会话/对话流）
+    void ClearAsstTabs();                                   // 拆除全部助手 Tab + 清模型（不建默认助手；载档/复位共用，含「+」页再入防护）
+    int AsstCount() const { return m_aAssts.size(); }
     QJsonArray TaskBlocksToJson(const QString& a_sTaskId) const;
     void LoadTaskBlocksFromJson(const QString& a_sTaskId, const QJsonArray& a_aBlocks);
     bool HasTaskBlocks(const QString& a_sTaskId) const { return m_aBlocks.contains(a_sTaskId); }
-    void ClearAllBlocks();   // 切工程：清空全部内存对话流（任务 + 助手）
+    void ClearAllBlocks();   // 切工程：清空全部内存对话流（任务 + 各助手）
 
 signals:
     void sigAdhocSubmit(const QString& a_sText, bool a_bReadOnly);
@@ -92,6 +108,11 @@ signals:
     void sigAdhocCompact();
     void sigAdhocStop();
     void sigAdhocBlocksChanged();                         // 助手流变化（#1 存盘）
+    // 2026.08.22 多助手事件：新增/删除/切换/重命名/拖动排序 → 主窗口换载编排器会话或落盘。
+    void sigAsstAdded(const QString& a_sId);                          // 新增助手（已激活）
+    void sigAsstRemoved(const QString& a_sId, const QString& a_sNewActive);   // 删除助手
+    void sigAsstSwitched(const QString& a_sOldId, const QString& a_sNewId);   // 切换激活助手（点选 Tab）
+    void sigAsstLayoutChanged();                                      // 重命名 / 拖动排序（需落盘）
     void sigTaskChatChanged(const QString& a_sTaskId);    // 任务流变化（#6 去抖存盘）
     // 右键「设置上下文大小」→ 上抛用户设的上下文窗口上限（token；0=回退自动探测）。
     void sigAdhocContextLimitChanged(qint64 a_iLimit);
@@ -99,9 +120,18 @@ signals:
     void sigTaskInject(const QString& a_sTaskId, const QString& a_sText);
     // 需求3：阶段表右键「再次执行」→ 主窗口 → 编排器 RunSingleStage（仅该阶段，不推进后续）。
     void sigRerunStage(CTaskInfo* a_pTask, int a_eStage);
+    // 2026.08.23 死代码清理：sigRollbackTurn 已删——↶ 右侧▼（方案 §5.1 助手侧代码回退
+    //   入口）v1.0.224 移除后无发射点；代码回退唯一入口 = 任务列表「回退」按钮。
 
 protected:
     bool eventFilter(QObject* a_pWatched, QEvent* a_pEvent) override;   // 助手输入框 Ctrl+Enter 发送
+
+    // 2026.08.22 日志行时间前缀：流里已有日期 → 只加 [HH:mm:ss]；否则连日期一起
+    QString WithLogTime(const QString& a_sTaskId, const QString& a_sText);
+    QSet<QString> m_aDatedLogTasks;   // 已确认带日期（或已写入日期）的任务
+    // 2026.08.22 与上一次已输出的时间戳间隔 <60s 时不输出时间（返回空串），否则记录并返回前缀
+    QString StampPrefix(const QString& a_sKey, bool a_bFullDate);
+    QHash<QString, qint64> m_aLastStampSecs;   // 各流（taskId/助手流哨兵键）最后输出的时间戳
 
 private:
     // 单条对话流的数据快照（任务切换时据此重建 widget）
@@ -116,20 +146,23 @@ private:
     };
 
     CMessageBlock* CreateWidget(const SBlockData& a_stData);   // 由数据快照构建一个块 widget
+    // 2026.08.22 连续工具调用合并上屏：新块与前一块同为 ToolUse 且同视角时并入上一 widget（×N 折叠卡），
+    //   返回 false=不满足合并条件（由调用方正常新建 widget）
+    bool TryMergeToolWidget(const QList<SBlockData>& aBlocks, QList<CMessageBlock*>& aWidgets,
+                            int a_iNewIdx, const SBlockData& a_stData);
     void AppendData(const QString& a_sTaskId, const SBlockData& a_stData);   // 入缓存 + 当前任务则上屏
     void RebuildView();        // 按 m_sCurId 重建整条对话流（分帧渐进，避免数百块同步创建卡死 UI）
     void RebuildChunk(quint32 a_uGen);   // 渐进重建一帧（代际号不符=已被新重建顶替，立即终止）
-    void AppendAdhocBlock(const SBlockData& a_stData);   // ad-hoc 块入缓存 + 上屏助手 Tab
-    void RebuildAdhocView();   // 按 m_aAdhocBlocks 重建助手 Tab 对话流（分帧渐进，撤销/切档后调用）
-    void RebuildAdhocChunk(quint32 a_uGen);   // 助手视图渐进重建一帧（代际号不符=被新重建顶替，立即终止）
+    void AppendAdhocBlock(const SBlockData& a_stData);   // ad-hoc 块入缓存 + 上屏助手 Tab（运行中→该助手，否则激活助手）
+    void RebuildAdhocView();   // 按激活助手数据重建其对话流（分帧渐进，撤销/切档后调用）
+    void RebuildAsstView(const QString& a_sId);   // 2026.08.23 按指定助手重建（多助手各自独立控件，加载后预建防切换卡顿）
+    void RebuildAdhocChunk(const QString& a_sId, quint32 a_uGen);   // 助手视图渐进重建一帧（id/代际号不符=被顶替，立即终止）
     void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/m_bAdhocRunning 刷新输入栏可用性
     void DoAdhocSend();             // 发送当前输入（Ctrl+Enter / 发送按钮调用）
     void OnAdhocTextChanged();      // 多行输入框高度自适应（按内容行数，上限 10 行）
     // 输入框高度自适应通用版：按字体度量算单行高、按 blockCount 线性增长、封顶 a_iMaxLines 行。
     // 介入栏与助手栏共用，保证两框初始高度与增长行为完全一致（#3）。
     static void AdjustInputHeight(QPlainTextEdit* a_pEdit, int a_iMaxLines);
-    // FR-3：构造助手日志右上角半透明提示词按钮 + 下拉浮层（hover 弹出、移开收起、点击跳转）。
-    void CreatePromptButton();
     // FR-3：助手日志右上角半透明提示词按钮 hover/leave → 显示/隐藏提示词下拉浮层。
     void OnPromptBtnHovered();
     void OnPromptBtnLeaved();
@@ -153,7 +186,9 @@ private:
 
     QTreeWidget*    m_pStages  = nullptr;
     QSplitter*      m_pStageSplit = nullptr;   // 阶段表/日志Tab 的垂直分隔条（FR-9 对齐经 setSizes 设比例）
-    QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 / 文件预览
+    QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 /「+」页 / 文件预览
+    QWidget*        m_pAddTabPage = nullptr;  // 「+」新增助手占位页（选中即新增并弹回，参考 DSHAgentManage）
+    QWidget*        m_pArtifactsPage = nullptr;  // 「阶段产物」页本体（Tab 布局管制时识别非助手页用）
     QPlainTextEdit* m_pFileView = nullptr;  // 2026.08.18 文件预览 Tab（双击文本文件，单实例复用）
     CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志
     QPlainTextEdit* m_pTaskInput = nullptr; // FR-3 任务对话流下方的介入输入栏
@@ -179,24 +214,62 @@ private:
     int                               m_iRebuildIdx = 0;    // 重建进度（已创建的 block 下标）
     quint32                           m_uRebuildGen = 0;    // 重建代际号（切任务/重建重启时 +1 作废旧帧）
     bool                              m_bRebuilding = false; // 渐进重建中（AppendData 新块交分帧循环按序创建）
-    int                               m_iAdhocRebuildIdx = 0;    // 助手视图重建进度（已创建的 block 下标）
-    quint32                           m_uAdhocRebuildGen = 0;    // 助手视图重建代际号（切档/切工程时 +1 作废旧帧）
-    bool                              m_bAdhocRebuilding = false; // 助手视图渐进重建中（AppendAdhocBlock 新块交分帧循环按序创建）
+    // 2026.08.22 助手视图分帧重建状态移入各助手（SAsst::iRebuildIdx/uGen/bRebuilding）。
 
-    // —— 提示词 agent（独立对话流，固定显示在「助手」Tab，不受任务切换影响）——
-    CMessageView*          m_pAdhocView   = nullptr;   // Tab3：助手对话流
+    // —— 提示词 agent（独立对话流，按「助手」分 Tab，不受任务切换影响）——
+    // 2026.08.22 多助手：每个助手一个 Tab（标题=助手名，可关闭/拖动排序/双击重命名），
+    //   各自持有独立对话流与分帧重建状态；「+」角标按钮新增助手。
+    struct SAsst {
+        QString               sId;            // 助手 id（uuid，跨重命名稳定）
+        QString               sName;          // 助手名（Tab 标题）
+        QString               sSid;           // 会话 sid（编排器会话换载时回填）
+        QString               sGuideHash;     // guide.md 投喂哈希基线
+        QJsonArray            aStack;         // 撤销栈 JSON（prompt,sid 链）
+        qint64                iCtxFill = 0;   // 上下文占用快照（恢复进度条用）
+        QList<SBlockData>     aBlocks;        // 对话流数据快照
+        QList<CMessageBlock*> aWidgets;       // 与 aBlocks 一一对齐
+        int                   iRebuildIdx = 0;    // 分帧重建进度
+        quint32               uGen = 0;           // 分帧重建代际号
+        bool                  bRebuilding = false;// 分帧重建中（新块交分帧循环按序创建）
+        CMessageView*         pView = nullptr;    // 该助手的对话流视图（Tab 页本体；关闭后为 null，重开重建）
+        QToolButton*          pBtnPrompts = nullptr;  // FR-3 右上角提示词按钮（parent=pView）
+        QToolButton*          pBtnBottom  = nullptr;  // 提示词按钮正下方「↓」按钮（点击滚动到日志最底）
+        bool                  bClosed = false;   // 2026.08.23 已关闭（Tab 摘除但数据保留，可从「▾」菜单恢复）
+    };
+    SAsst* AsstById(const QString& a_sId);
+    const SAsst* AsstById(const QString& a_sId) const;
+    SAsst* ActiveAsst();              // 当前激活助手（无助手时 nullptr）
+    SAsst* RunningTargetAsst();       // 块归属目标：运行中助手 → 否则激活助手
+    SAsst* AsstByView(QWidget* a_pView);   // 按视图反查助手（Tab 事件定位）
+    // FR-3：为指定助手日志右上角创建半透明提示词按钮（hover 弹出、移开收起、点击跳转）。
+    void CreatePromptButton(SAsst& a_stAsst);
+    void SetupTabsInteraction();      // 可移动 / 原生「x」/「+」页 /「▾」角落按钮（构造一次，参考 DSHAgentManage）
+    void UpdateTabCloseButtons();     // 非助手页与「+」页隐藏关闭按钮；「+」页钉在最后助手 Tab 之后
+    void OnAsstTabCloseRequested(int a_iIdx);   // 原生「x」：关闭对应助手
+    CMessageView* CreateAsstTab(SAsst& a_stAsst, int a_iPos = -1);   // 建视图 + 提示词按钮 + 插 Tab
+    void RemoveAsstTab(SAsst& a_stAsst);                            // 摘 Tab（视图交 parent 回收）
+    void CloseAsst(const QString& a_sId);       // 点「x」：关闭该助手（Tab 摘除、数据保留，可经「▾」恢复）
+    void OnAsstMenuClicked();                  // 点「▾」：弹出已关闭助手菜单（选择恢复）
+    void ReopenAsst(const QString& a_sId);     // 从菜单恢复已关闭助手（重建 Tab 并激活）
+    void OnAsstAddClicked();                 // 点「+」：新增助手并激活（名字自动编号）
+    void OnAsstTabRenamed(int a_iIdx);       // 双击助手 Tab → 改名
+    void OnAsstTabMoved(int a_iFrom, int a_iTo);   // 拖动 → 模型顺序同步 Tab 相对顺序
+    void OnAsstTabCurrentChanged(int a_iIdx);      // 切 Tab：激活助手切换 + 状态栏同步
+    void SyncAsstsOrderToTabs();             // 拖动后按 Tab 顺序重排 m_aAssts
+    static QString AsstStampKey(const QString& a_sId);   // 时间戳哨兵键（@@adhoc@@+id，兼容旧流）
     QPlainTextEdit*        m_pAdhocInput  = nullptr;   // 指令输入框（多行，Ctrl+Enter 发送）
     QToolButton*           m_pBtnReadOnly = nullptr;   // 只读/完整 切换（checkable）
     QProgressBar*          m_pBtnContext  = nullptr;   // 上下文占比进度条（绿≤70%/红>70%，右键压缩）
     QPushButton*           m_pBtnUndo     = nullptr;   // ↶ 回退（点击→撤销）
     QPushButton*           m_pBtnSend     = nullptr;   // 发送
-    QToolButton*           m_pBtnPrompts  = nullptr;   // FR-3 助手日志右上角半透明提示词按钮（hover 弹下拉）
-    CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（hover 弹出、移开收起）
-    QList<SBlockData>      m_aAdhocBlocks;             // 助手对话流数据快照
-    QList<CMessageBlock*>  m_aAdhocWidgets;            // 与 m_aAdhocBlocks 一一对齐
-    QList<int>             m_aPromptIdx;               // FR-3 助手流中「用户提问」块下标（旧→新，供下拉跳转）
+    CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起）
+    QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
+    QString                m_sActiveAsst;              // 当前激活助手 id
+    QString                m_sRunningAsst;             // 正在执行一轮的助手 id（空=空闲）
+    QList<int>             m_aPromptIdx;               // FR-3 激活助手流中「用户提问」块下标（旧→新，供下拉跳转）
     bool                   m_bAdhocEnabled = false;    // 工程是否已打开（输入栏总开关）
     bool                   m_bAdhocRunning = false;    // 助手是否运行中（运行中禁输入栏）
+    bool                   m_bAsstTabsResetting = false;   // ResetAssistants 拆 Tab 期：忽略程序性 currentChanged（防「+」页自动激活被当新增 → 死循环）
 
     // —— 任务对话流去抖落盘（#6）——
     QTimer*                m_pChatSaveTimer = nullptr; // 去抖写定时器（500ms 合并高频输出）

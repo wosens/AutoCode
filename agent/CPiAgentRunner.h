@@ -1,0 +1,153 @@
+#pragma once
+
+#include <QElapsedTimer>
+#include <QJsonObject>
+#include <QProcess>
+#include <QStringList>
+#include <QTimer>
+
+#include "CAgentRunnerBase.h"
+// 2026.08.20 自定义大模型条目结构（Pi 后端多条目管理经 ~/.pi/agent/models.json）。
+#include "../core/CModelEntry.h"
+
+// PIAgent（pi coding-agent CLI）NDJSON 流式后端 runner（2026.08.19 第三后端接入）。
+//
+// 进程模型与 claude 后端同构：**一阶段一进程**。StartStage 每次启动
+// `node <cli.js> -p --mode json --offline ...`，stdout 为 NDJSON 事件流（首行 session
+// 头，随后 agent_start/turn_start/message_start/message_update/message_end/
+// tool_execution_*/turn_end/agent_end），逐行解析映射到基类信号；进程退出即结束。
+//
+// 关键口径（实测/源码核实，见任务目录 pi-json-sampling.md）：
+//   - usage 字段（pi packages/ai Usage）：input/output/cacheRead/cacheWrite（累计口径）；
+//     上下文占用 = input+cacheRead+cacheWrite（同 claude 三输入项口径）；缺字段容错为 0。
+//   - 计费：pi 虽报 usage.cost，按设计决策不采用 → cost 恒 0（费用列显示 "-"）。
+//   - AssistantMessage.stopReason=="length" → subtype="error_max_turns"（复用 claude
+//     词汇，上层 LastWasMaxTurns 自动续跑零改动）。
+//   - prompt 经 stdin 投递 + closeWriteChannel（实测可行，无挂起）。
+//   - 会话恢复：pi 磁盘会话跨进程可续——resumeSid 经 --session-id 传入（优于 DSH）；
+//     带 resumeSid 时**禁加** --no-session（否则会话不落盘）。
+//   - API key 经 QProcessEnvironment 按 provider 映射注入（不进命令行/日志，NFR-4）。
+//
+// claude 专属参数降级：a_iMaxTurns / a_iAutocompactK / a_bEnableAskUser 忽略
+// （pi 自带自动 compaction、无 ask_user 工具，StartStage 非默认值时提示一次）；
+// a_sDisallowedTools → --exclude-tools；a_bFork 忽略（--session-id 下无 fork 概念）。
+// InjectUserTurn 安全 no-op 返回 false（一次性进程，docs/extensions.md json 模式 UI no-op）。
+class CPiAgentRunner : public CAgentRunnerBase {
+    Q_OBJECT
+
+public:
+    explicit CPiAgentRunner(QObject* a_pParent = nullptr);
+    ~CPiAgentRunner() override;
+
+    // —— 进程级全局配置（config.ini [Agent] Pi*；所有 Pi runner 实例共享）——
+    //   root = PIAgent 仓库根（其下 pi\ 为 monorepo）；node 留空走 PATH 的 "node"；
+    //   provider/model 默认 anthropic / 空（空 model 用 pi 默认）；thinking 空=默认。
+    static void    SetPiRootPath(const QString& a_sRoot);
+    static QString PiRootPath();
+    static void    SetPiNodePath(const QString& a_sPath);
+    static QString PiNodePath();
+    static void    SetPiProvider(const QString& a_sProvider);
+    static QString PiProvider();
+    static void    SetPiModel(const QString& a_sModel);
+    static QString PiModel();
+    static void    SetPiApiKey(const QString& a_sKey);   // 明文存 config.ini（tooltip 已告知）
+    static QString PiApiKey();
+    static void    SetPiThinking(const QString& a_sLevel);   // off/low/medium/high…；空=默认
+    static QString PiThinking();
+
+    // —— 计费单价（$/百万 token，2026.08.20）：pi 协议只报 token 分量不报金额，
+    //    客户端按单价折算（同 DSH 口径）；默认对齐 claude 后端 Sonnet 档价目。
+    //    实际网关计费不同则改 config.ini [Agent] PiPrice*。全 0 = 不折算（费用列回 "-"）。
+    static void SetPiPriceInPerM(double a_d);
+    static void SetPiPriceCacheReadPerM(double a_d);
+    static void SetPiPriceCacheWritePerM(double a_d);
+    static void SetPiPriceOutPerM(double a_d);
+
+    // —— 自定义大模型表（config.ini [PiModels]；2026.08.20，激活条目经
+    //    ~/.pi/agent/models.json 的 autocode-<n> provider 槽位生效）——
+    //   每条目 = 一个独立 provider（autocode-1..N，含 baseUrl/api/apiKey/models），
+    //   Set 时即合成写 models.json（保留用户手写的非 autocode-* provider）；
+    //   激活条目覆盖 --provider/--model 固定路由（env 注入 API key 同时旁路，
+    //   密钥改走 models.json）。表空 / 无激活 = 走 Provider/模型固定路由。
+    static void SetPiModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    static QString PiActiveProvider();    // 激活条目 provider 键（autocode-<n>）；无激活=空
+    static QString PiActiveModelId();     // 激活条目模型 id；无激活=空
+    static QString PiModelsJsonPath();    // ~/.pi/agent/models.json
+    static bool    WritePiModelsJson();   // 合并写 models.json（true=写成功/无需写）
+
+    // 2026.08.20 联网安装（npm 全局）探测：npm root -g 下
+    //   node_modules/@earendil-works/pi-coding-agent/dist/cli.js；命中返回绝对路径。
+    //   进程内缓存一次（设置页检测与 cli.js 解析兜底共用）。
+    static QString NpmGlobalCliPath();
+
+    // 三个生效路径/探测（仿 CDeepSeekRunner 同名方法口径）。
+    static QString ResolveNodePath();   // 显式键 → "node"
+    static QString ResolveCliJsPath();  // root + \pi\packages\coding-agent\dist\cli.js
+    static bool    LooksLikePiRoot(const QString& a_sRoot);   // 判定文件存在
+    static QString ProbeSiblingRoot();  // exeDir{,/\..,/\../..} × \PIAgent
+    static QString PiConfigError();     // 空=可用；非空=指引（含 /pi 安装提示）
+    static QString PiInstallDiagnosis();   // 半安装态诊断（目录在、cli.js 缺）
+
+    QString BackendName() const override { return QStringLiteral("pi"); }
+
+    // 启动一次阶段执行：每次冷启动一个 pi 子进程，进程退出即本轮结束。
+    void StartStage(const QString& a_sWorkDir,
+                    const QString& a_sPrompt,
+                    const QString& a_sDisallowedTools,
+                    int a_iMaxTurns,
+                    const QString& a_sResumeSid,
+                    bool a_bFork,
+                    int a_iAutocompactK,
+                    bool a_bEnableAskUser) override;
+
+    // 终止当前执行：静默收尾（置终态 → kill → 不发 sigFinished，同 DSH/claude 口径）。
+    void Stop() override;
+
+    // 进程存活且本轮未报告 finish。
+    bool IsRunning() const override;
+
+    // 孤儿宽限不移植：node 直起（无 cmd.exe 中间层），进程死即真死。
+    bool IsGraceActive() const override { return false; }
+
+    // 一次性进程无轮次中插话：恒 false 安全 no-op。
+    bool IsRetryPending() const override;
+
+    bool InjectUserTurn(const QString& a_sText) override;
+
+private slots:
+    void slotOnStdOut();
+    void slotOnStdErr();
+    void slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus);
+    void slotOnErrorOccurred(QProcess::ProcessError a_eError);
+
+private:
+    void Reset();                            // 本轮状态清零（StartStage 开头调用）
+    double ComputeTurnCost() const;          // 轮内 token 分量 × 单价折算（$/M）
+    void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
+    void HandleMessageEnd(const QJsonObject& oMsg);
+    void FinishFromAgentEnd(const QJsonArray& aMessages);   // agent_end → 记录待报文本
+    void EmitFailed(const QString& a_sMsg);
+    void CheckStall();                       // 停滞巡检（30s 拍，同 claude/DSH 侧）
+    void ApplyUsage(const QJsonObject& oUsage);   // usage 三输入项/输出累计 + 上下文占用
+
+    QProcess*   m_pProc = nullptr;
+    QByteArray  m_buf;                    // stdout 跨 readyRead 行缓冲
+    bool        m_bFinished = false;      // 本轮已发 sigFinished（防重复）
+    bool        m_bAgentEnded = false;    // 已收 agent_end（进程退出即按成功收尾）
+    bool        m_bSawSession = false;    // 本轮已收 session 头（失败时避免误报上一轮 sid）
+    QString     m_sTurnText;              // 本轮最后一条 assistant 文本
+    QString     m_sLastStopReason;        // 最后一条 assistant 的 stopReason
+    // 2026.08.22 最后一次 API 调用错误（message_end stopReason=="error" 的 errorMessage）：
+    //   网关 429/500 等场景 pi 仍正常退出（exit 0）不落 stderr——此前静默吞掉，
+    //   UI 只见「无文本输出」，用户无从得知真实原因。现暂存并在收尾时带出。
+    QString     m_sLastApiError;
+    QString     m_sResumeSid;             // 本轮传入的 resumeSid（重试/记录用）
+    qint64      m_iSumPlainInTok   = 0;   // 本轮 Σ 纯输入（计费分量）
+    qint64      m_iSumCacheReadTok = 0;   // 本轮 Σ 缓存读
+    qint64      m_iSumCacheWriteTok = 0;  // 本轮 Σ 缓存写
+    qint64      m_iSumInTok  = 0;         // 本轮 Σ input（含 cache 读/写）
+    qint64      m_iSumOutTok = 0;         // 本轮 Σ output
+    QStringList m_aStderrTail;            // stderr 尾部（失败消息附带）
+    QElapsedTimer m_actClock;             // 距上次收到输出（stall 巡检）
+    QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
+};

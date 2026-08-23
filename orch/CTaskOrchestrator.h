@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 #include <QString>
@@ -10,6 +10,7 @@
 #include <QSet>
 #include <QHash>
 #include <QJsonArray>
+#include <atomic>   // 2026.08.22 m_bBackupRunning（回退互斥守卫读，备份线程写）
 #include <thread>
 
 #include "core/TaskTypes.h"
@@ -58,6 +59,16 @@ public:
     // 停止当前助手调用（不影响任务 runner）。
     void StopAdhoc();
     bool IsAdhocRunning() const;
+
+    // 2026.08.22 阶段后台备份线程（m_thBackup）是否运行中：CMainWindow::ExecuteRollback
+    // 互斥守卫用（备份期间 IsRunnerBusy 可能为 false，需单独挡住，防回退与并发备份同写统一库）。
+    bool IsBackupRunning() const { return m_bBackupRunning.load(); }
+
+    // 2026.08.20 (Agent 起名) 右键「自动命名」/新建任务 Intake 后触发：任务内容 +
+    //   guide.md 拼提示词经 adhoc 助手（只读、独立 AutoNaming 模式）交 Agent 生成一句话
+    //   简短名称，OnAdhocFinished 清洗后 SetName 回填并发 sigAutoNameDone；助手忙时
+    //   同步回退本地启发式 MaybeAutoNameTask。返回 true=已提交 Agent 或本地已命名。
+    bool AutoNameNow(CTaskInfo* a_pTask);
 
     // 设置评审阶段并行视角数（1=串行回退；>1=多视角并行 fan-out/fan-in）。
     void SetReviewParallel(int a_iN);
@@ -110,6 +121,9 @@ signals:
     //   + API 请求数，由 CMainWindow 归集到当前档任务（助手档按任务分档，消耗跟随档走）。
     void sigAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs,
                        int a_iReqs);
+    // 2026.08.20 Agent 自动命名：一次自动命名调用完成（含失败）→ 主窗口做 DB 副本
+    //   镜像 + 刷新两表。a_bOk=false 时 a_sName 为空。
+    void sigAutoNameDone(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sName);
 
 private slots:
     void OnRunnerInfo(const QString& a_sLine);
@@ -135,6 +149,10 @@ private:
     void Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sResult);
     QString BuildPrompt(CTaskInfo* a_pTask, const SStageDef& a_stDef);
     void RecordSummary(CTaskInfo* a_pTask, EStage a_eStage, bool bOk, const QString& a_sSummary);
+    // 2026.08.20 (自动命名·本地兜底)：Agent 起名不可用（助手忙/工程未开）时的同步
+    //   启发式：用户原始需求信息量最大行 → guide.md 首个非泛型标题，清洗截 24 字。
+    //   返回是否成功命名。
+    bool MaybeAutoNameTask(CTaskInfo* a_pTask);
     // FR-1：Verify 阶段额外向 record.md 写一条「验证结论：…」行（与 RecordSummary 并存）。
     // 结论来源优先取 verify.md 的「最终验证结论」行；缺失回退 a_sResult / m_sLastAssistantText。
     void RecordVerifySummary(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sResult);
@@ -216,8 +234,9 @@ private:
     void StartAdhocStage(const QString& a_sPrompt);    // 按 m_sAdhocSid/m_bAdhocReadOnly 组装 argv 起一次
 
     // 提示词 agent 运行模式：Idle=空闲；Submitting=用户提问中；
-    // CompactSummarize=压缩第一步（生成摘要）；CompactReseed=压缩第二步（摘要投新会话）。
-    enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed };
+    // CompactSummarize=压缩第一步（生成摘要）；CompactReseed=压缩第二步（摘要投新会话）；
+    // AutoNaming=自动命名（拼任务内容+guide.md 提示词交 Agent 起名，不动用户会话栈）。
+    enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming };
 
     CProjectManager* m_pPm;
     CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
@@ -235,6 +254,7 @@ private:
     // 可达秒级（千级文件扫描 / 整目录 zstd 拷贝），移出 UI 线程，完成后回主线程续跑。
     std::thread      m_thStartPrep;          // StartTask 预备线程（同时刻至多一个，guards 保证不重叠）
     std::thread      m_thBackup;             // RunCurrentStage 改码备份线程（同上）
+    std::atomic_bool m_bBackupRunning = {false};   // 2026.08.22 m_thBackup 运行标志（StopAll join / 回退守卫）
 
     // —— 提示词 agent 状态 ——
     CAgentRunnerBase* m_pAdhocRunner = nullptr;                    // 第二个 runner 实例（独立会话/进程）
@@ -242,6 +262,7 @@ private:
     QString        m_sLastGuideHash;                               // 上次投喂 guide.md 的 SHA256（变更检测基线）
     bool           m_bAdhocReadOnly = false;                       // 本轮只读开关（决定 deny 黑名单内容）
     EAdhocMode     m_eAdhocMode = Idle;                            // 异步流程状态机
+    CTaskInfo*     m_pAutoNameTask = nullptr;                      // 2026.08.20 AutoNaming 模式待命名任务
     QString        m_sAdhocPendingPrompt;                          // Submitting 模式记当前 prompt（压栈用）
     QString        m_sAdhocSummary;                                // CompactSummarize 产出、CompactReseed 投递
     QList<QPair<QString, QString>> m_aAdhocStack;                  // (prompt, sid) 链；撤销=弹栈回 m_sAdhocSid

@@ -1,4 +1,4 @@
-﻿#include <QApplication>
+#include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFont>
@@ -7,8 +7,12 @@
 
 #include "ui/CMainWindow.h"
 #include "agent/CMcpAskServer.h"
+#include "core/CCrashDump.h"
 
 int main(int argc, char* argv[]) {
+    // 2026.08.22 崩溃转储：崩溃/abort/purecall/std::terminate 等异常退出时
+    //   在 <exe 目录>\dump\ 落 MiniDump（最先装，覆盖后续所有路径，含 --mcp-ask-server 模式）。
+    CCrashDump::Install();
     // MCP ask-user server 模式：claude 经 --mcp-config 以子进程拉起本 exe，
     // 跑 stdio JSON-RPC（暴露 ask_user 工具），不启动 GUI。
     for (int i = 1; i < argc; ++i) {

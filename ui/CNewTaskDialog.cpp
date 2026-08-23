@@ -1,4 +1,4 @@
-#include "CNewTaskDialog.h"
+﻿#include "CNewTaskDialog.h"
 
 #include <QLineEdit>
 #include <QComboBox>
@@ -30,7 +30,8 @@ void CNewTaskDialog::SetupUi() {
     resize(720, 600);
 
     m_pName = new QLineEdit(this);
-    m_pName->setPlaceholderText(QStringLiteral("如：为 X 模块增加导出 CSV 功能"));
+    // 2026.08.20 留空即自动命名已是默认行为，占位提示不再说明（仅示例）。
+    m_pName->setPlaceholderText(QStringLiteral("如：为 X 模块增加导出 CSV 功能（可以为空）"));
 
     m_pType = new QComboBox(this);
     m_pType->addItem(QStringLiteral("feature（新功能）"),

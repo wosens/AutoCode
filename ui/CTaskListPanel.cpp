@@ -1,4 +1,4 @@
-﻿#include "CTaskListPanel.h"
+#include "CTaskListPanel.h"
 
 #include <QTabWidget>
 #include <QListWidget>
@@ -6,6 +6,7 @@
 #include <QTreeWidgetItem>
 #include <QHeaderView>
 #include <QPushButton>
+#include <QToolButton>
 #include <QSplitter>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -161,6 +162,7 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     pH->addWidget(m_pBtnPause);
     pH->addWidget(m_pBtnStop);
     pH->addWidget(m_pBtnRollback);
+    // 2026.08.22 「回退」右侧▼下拉已删：与「回退」按钮同信号功能重复（§5.1 旧入口）。
 
     // 2026.08.18 任务列表高度分隔条：按钮行与资源管理器之间的垂直 QSplitter。
     //   上段 = 任务 Tab（拿 stretch，拖大即看更多任务）+ 按钮行；下段 = 资源管理器。
@@ -178,7 +180,8 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     // 转发「添加到聊天框」信号给主窗口（注入 adhoc 助手输入框）。
     connect(m_pExplorer, &CProjectExplorerPanel::sigAddToChat,
             this, &CTaskListPanel::sigAddToChat);
-    // 转发「双击文本文件」信号给主窗口（执行面板内嵌 Tab 显示文件内容）。
+    // 转发「打开文本文件」信号给主窗口（执行面板内嵌 Tab 显示文件内容）。
+    //   2026.08.21 增加 a_bSwitchTab：双击=true 切到预览页；单击=false 只加载不切页。
     connect(m_pExplorer, &CProjectExplorerPanel::sigFileOpen,
             this, &CTaskListPanel::sigFileOpen);
     m_pVSplit->addWidget(m_pExplorer);
@@ -607,6 +610,8 @@ void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
     QMenu menu(this);
     QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5（移首位：查看优先于再次执行）
     menu.addSeparator();   // 查看与再次执行之间加分隔线
+    QAction* pActRename = menu.addAction(QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
+    QAction* pActAutoName = menu.addAction(QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
     QAction* pActRetry = menu.addAction(QStringLiteral("再次执行"));
     menu.addSeparator();   // 删除是破坏性操作，与常规项分隔
     QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
@@ -615,6 +620,10 @@ void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
         emit sigReviveTask(pTask);
     } else if (pSel == pActView) {
         emit sigViewTask(pTask);
+    } else if (pSel == pActRename) {
+        emit sigRenameTask(pTask);
+    } else if (pSel == pActAutoName) {
+        emit sigAutoNameTask(pTask);
     } else if (pSel == pActDelete) {
         emit sigDeleteTask(pTask);
     }
@@ -632,11 +641,17 @@ void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     QMenu menu(this);
     QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5
     menu.addSeparator();   // 查看与移除之间加分隔线
+    QAction* pActRename = menu.addAction(QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
+    QAction* pActAutoName = menu.addAction(QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
     QAction* pActRemove = menu.addAction(QStringLiteral("移除"));
     QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
     QAction* pSel = menu.exec(m_pListCur->viewport()->mapToGlobal(a_pos));
     if (pSel == pActView) {
         emit sigViewTask(pTask);
+    } else if (pSel == pActRename) {
+        emit sigRenameTask(pTask);
+    } else if (pSel == pActAutoName) {
+        emit sigAutoNameTask(pTask);
     } else if (pSel == pActRemove) {
         emit sigRemoveTask(pTask);
     } else if (pSel == pActDelete) {

@@ -1,27 +1,20 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 #include <QString>
 #include <QStringList>
 #include <QList>
 #include <QRect>
+#include <QJsonValue>
+#include <QMutex>
 
 #include "CGuideFingerprintScanner.h"
+// 2026.08.20 SDshModelEntry 迁至 core/CModelEntry.h（Pi 后端共用；见该头注释）。
+#include "../core/CModelEntry.h"
 
 class CAgentRunnerBase;
 class CTaskInfo;
 
-// 2026.08.18 自定义大模型条目（config.ini [DshModels]，DSH 后端多条目管理）。
-//   字段与 CDeepSeekRunner::SCustomModel 一一对应（CMainWindow 负责转换注入）。
-struct SDshModelEntry {
-    QString sDisp;      // 显示名
-    QString sBaseURL;   // 接入点（anthropic-messages 兼容）
-    QString sApiKey;    // 密钥明文（tooltip 已告知明文存储）
-    QString sApi;       // API 类型（默认 anthropic-messages）
-    QString sModelId;   // 模型 id
-    qint64  iCtx    = 200000;   // 上下文窗口（token）
-    int     iMaxTok = 32768;    // 单次最大输出
-};
 
 // FR-6：代码回退的历史版本元数据（一个备份快照的摘要）。
 struct SBackupVersion {
@@ -29,7 +22,71 @@ struct SBackupVersion {
     QString  sTime;           // 备份时刻（ISO，如 2026-08-13T14:22:01）
     QString  sStage;          // 备份时所处阶段（Develop/BugFix/CodeReview…）
     QString  sSummary;        // 修改内容摘要；首次备份为空（无上一版可对比）
+    // —— 统一增量备份（doc/增量备份方案.md v3.1）新增字段 ——
+    QString  sKind;           // stage|turn|rollback-pre；旧全量版本 = "legacy"
+    QString  sOwner;          // 任务 id / "global"
+    QString  sPrompt;         // kind=turn：该轮提问（截断 2000 字存量）
+    int      iTarget = 0;     // kind=rollback-pre：即将回退到的目标 seq
+    int      iFileCount = 0;  // manifest 文件总数（legacy=0，惰性不算）
+    bool     bLegacy = false; // 旧全量快照（meta 无 files 字段）
 };
+
+// 两版本间的文件变动明细（DiffVersions 输出）。
+struct SDiffEntry {
+    QString sPath;             // 工程根相对路径（正斜杠）
+    QString sChange;           // "mod"|"add"|"del"
+    qint64  iSizeOld = 0;
+    qint64  iSizeNew = 0;
+};
+struct SDiffResult {
+    int iChanged = 0;
+    int iAdded = 0;
+    int iRemoved = 0;
+    QList<SDiffEntry> aEntries;
+};
+
+#include <functional>
+
+// ===== [PortableCore] CBackupStore —— 以下整段为可移植 CAS 存储核心，勿混入 AutoCode 业务依赖 =====
+// （doc/增量备份方案.md v3.1 §4.1；无 Q_OBJECT → 无 moc、零构建系统影响；整类可拷贝复用）。
+class CBackupStore {
+public:
+    // a_sBackupsRoot: 备份库根（AutoCode=<工程>/.autodev/backups）
+    // a_sSourceRoot : 被备份的源码根（工程根）
+    // a_bBom        : meta/notice JSON 是否写 UTF-8 BOM（AutoCode=true）
+    CBackupStore(const QString& a_sBackupsRoot, const QString& a_sSourceRoot, bool a_bBom);
+
+    // 备份范围谓词：返回 false 的相对路径不入库（宿主注入过滤策略；正斜杠相对路径，含目录）。
+    std::function<bool(const QString&)> m_pfFilter;
+    // 2026.08.23 文件级谓词：返回 false 的「文件」不入库/不被恢复触碰（只备份代码相关文件，
+    //   中间文件与产物跳过；空=不过滤，PortableCore 独立复用时保持全量语义）。
+    std::function<bool(const QString&)> m_pfFileFilter;
+
+    // —— 版本操作 ——
+    int  Backup(const QString& a_sKind, const QString& a_sOwner,
+                const QString& a_sStage, const QString& a_sPrompt, int a_iTarget);   // →seq，0=失败
+    bool Restore(int a_iSeq, QString& a_sErr);          // 原子恢复 + hash 校验
+    QList<SBackupVersion> List(const QString& a_sOwner) const;   // 倒序（time ISO 降序）
+    bool Diff(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const;
+    int  PurgeOwner(const QString& a_sOwner);           // 删 owner 全部版本+GC，返回释放 blob 数
+    int  GcOrphanBlobs();                               // 无引用 blob 清理，返回删除数
+    bool HasRestoreTmp() const;                         // _restore_tmp 残留探测
+    bool RestoreFromTmp(QString& a_sErr);               // 残留现场还原（_restore_tmp 拷回源码根）
+
+    // —— 回退告知标志（notice.json）——
+    bool LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const;
+    void SetPendingNotice(int a_iTargetSeq, const QString& a_sOwner);
+    void ClearPendingNotice();
+
+    // —— 回填（summary 等扩展字段按 key 写入 meta 顶层）——
+    bool SetMetaField(int a_iSeq, const QString& a_sKey, const QJsonValue& a_vValue);
+
+private:
+    QString m_sBackupsRoot;
+    QString m_sSourceRoot;
+    bool    m_bBom;
+};
+// ===== [/PortableCore] =====
 
 // 工程管理：负责工程根目录、.autodev 目录结构、guide.md / record.md 的维护，
 // 以及任务私有产物目录的创建。guide.md 缺失时通过 claude 扫描生成。
@@ -38,6 +95,7 @@ class CProjectManager : public QObject {
 
 public:
     explicit CProjectManager(QObject* a_pParent = nullptr);
+    ~CProjectManager() override;
 
     // 设置工程根目录（绝对路径）
     bool Open(const QString& a_sDir);
@@ -109,12 +167,20 @@ public:
     // 记录一条最近打开的工程路径：规范化 → 去重 → 置顶（MRU）→ 持久化。
     // 成功打开工程后由 CMainWindow 调用。
     void AddRecent(const QString& a_sDir);
+    // 2026.08.20 从 MRU 移除一条（最近打开对话框右键删除；不存在则 no-op）并落盘。
+    void RemoveRecent(const QString& a_sDir);
     // 当前 MRU 历史列表（内存，最前 = 最近打开）。
     QStringList RecentProjects() const;
     // 从 exe 同级 config.ini 载入历史到内存（程序启动时调一次）。
     void LoadRecent();
     // 清空历史（本期 UI 不暴露，预留）。
     void ClearRecent();
+
+    // ---- 目录选择记忆（exe 同级 config.ini 的 [UI] LastProjectDir）----
+    // 2026.08.20 新建/打开工程的目录对话框初始定位：上次选择过的目录；无记录/目录已
+    //   不存在时返回空串（调用方回退 exe 目录）。落盘失败不抛。
+    QString LastBrowseDir() const;
+    void SetLastBrowseDir(const QString& a_sDir);
 
     // ---- 主窗口几何持久化（exe 同级 config.ini 的 [Window] 段）----
     // 保存窗口位置/大小/最大化态；落盘失败不抛、不退出（与 SaveRecent 一致）。
@@ -177,7 +243,7 @@ public:
     int  LoadStallMinutes();
 
     // ---- 2026.08.18 Agent 后端与 DeepSeekHarness 参数（[Agent] 段，全局单选）----
-    // 后端：claude=1（默认）/ dsh=2（DeepSeekHarness JSON-RPC）。
+    // 后端：claude=1（默认）/ dsh=2（DeepSeekHarness JSON-RPC）/ pi=3（PIAgent NDJSON 流式）。
     bool SaveAgentBackend(int a_iBackend);
     int  LoadAgentBackend();
     // 2026.08.18 轻量自动配置：DSH 仓库根目录（deepseek-harness 目录；bin.js/cordis.yml 按
@@ -206,10 +272,63 @@ public:
     double  LoadDshPriceCacheWritePerM();
     bool    SaveDshPriceOutPerM(double a_d);
     double  LoadDshPriceOutPerM();
+    // 2026.08.20 PIAgent 计费单价（$/百万 token，[Agent] PiPrice*PerM）：同 DSH 口径。
+    bool    SavePiPriceInPerM(double a_d);
+    double  LoadPiPriceInPerM();
+    bool    SavePiPriceCacheReadPerM(double a_d);
+    double  LoadPiPriceCacheReadPerM();
+    bool    SavePiPriceCacheWritePerM(double a_d);
+    double  LoadPiPriceCacheWritePerM();
+    bool    SavePiPriceOutPerM(double a_d);
+    double  LoadPiPriceOutPerM();
     // 2026.08.18 自定义大模型表（[DshModels] Count/Active/M<i>*）。
     //   a_pActive 带出激活下标（-1 = 无；表空即未启用该功能）。
     QList<SDshModelEntry> LoadDshModels(int* a_pActive = nullptr);
     bool    SaveDshModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+
+    // ---- PIAgent 第三后端（2026.08.19，[Agent] Pi* 键；空=未配置/默认）----
+    //   root = PIAgent 仓库根（其下 pi\ 为 monorepo；空=启动时探测 exe 同级 PIAgent）；
+    //   node 空=走 PATH；provider 默认 anthropic；model 空=用 pi 默认；thinking 空=默认。
+    bool    SavePiRoot(const QString& a_sRoot);
+    QString LoadPiRoot();
+    bool    SavePiNodePath(const QString& a_sPath);
+    QString LoadPiNodePath();
+    bool    SavePiProvider(const QString& a_sProvider);
+    QString LoadPiProvider();
+    bool    SavePiModel(const QString& a_sModel);
+    QString LoadPiModel();
+    // API key 明文存 config.ini（与 DSH SCustomModel 同口径，设置页 tooltip 告知）。
+    bool    SavePiApiKey(const QString& a_sKey);
+    QString LoadPiApiKey();
+    // thinking 级别（off/minimal/low/medium/high/xhigh/max；空=默认）。
+    bool    SavePiThinking(const QString& a_sLevel);
+    QString LoadPiThinking();
+    // 2026.08.20 PiAgent 自定义大模型表（[PiModels] Count/Active/M<i>*，口径同
+    //   [DshModels]）：激活条目经 ~/.pi/agent/models.json 生效（CPiAgentRunner 合成写）。
+    QList<SDshModelEntry> LoadPiModels(int* a_pActive = nullptr);
+    bool    SavePiModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    // ---- CodexHarness 第四后端（OpenAI Codex CLI 0.87.0，[Agent] Codex* 键）----
+    //   Root=npm 工程根（Execute\CodexHarness）；Node=node.exe（空=PATH）；Provider
+    //   空=autocode（~/.codex/config.toml 槽位）；WireApi 默认 chat（v0.88+ 仅 responses）。
+    bool    SaveCodexRoot(const QString& a_sRoot);
+    QString LoadCodexRoot();
+    bool    SaveCodexNodePath(const QString& a_sPath);
+    QString LoadCodexNodePath();
+    bool    SaveCodexProvider(const QString& a_sProvider);
+    QString LoadCodexProvider();
+    bool    SaveCodexModel(const QString& a_sModel);
+    QString LoadCodexModel();
+    bool    SaveCodexApiKey(const QString& a_sKey);
+    QString LoadCodexApiKey();
+    bool    SaveCodexBaseUrl(const QString& a_sUrl);
+    QString LoadCodexBaseUrl();
+    bool    SaveCodexWireApi(const QString& a_sApi);
+    QString LoadCodexWireApi();
+    // 2026.08.21 Codex 自定义大模型表（[CodexModels]）：激活条目覆盖 Provider/模型/
+    //   BaseUrl/WireApi/APIKey 固定路由，经 ~/.codex/config.toml 的 autocode-<n>
+    //   provider 槽位生效（CCodexRunner 合成写）；口径同 [PiModels]。
+    QList<SDshModelEntry> LoadCodexModels(int* a_pActive = nullptr);
+    bool    SaveCodexModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
 
     // ---- 扫描排除目录（config.ini 的 [Scan] ExcludeDirs，逗号分隔）----
     // 空 = 用内置默认清单（.autodev/build/Execute/.git/.vs/node_modules/doc）。
@@ -238,6 +357,28 @@ public:
     //   a_sErr 回带错误信息；成功返回 true。二次确认由 UI 层负责。
     bool RestoreSources(const QString& a_sTaskId, int a_iSeq, QString& a_sErr);
 
+    // ---- 统一增量备份库（CAS，doc/增量备份方案.md v3.1）：全部转发 CBackupStore ----
+    // 统一库根 <工程>/.autodev/backups（store/ + NNNN.meta.json + notice.json）。
+    QString UnifiedBackupsDir() const;
+    int  BackupTree(const QString& a_sKind, const QString& a_sOwner,
+                    const QString& a_sStage, const QString& a_sPrompt, int a_iTarget);
+    // 原子恢复；legacy 版本（统一库无该 seq 时扫旧任务库）自动转调 RestoreSources。
+    bool RestoreTree(int a_iSeq, QString& a_sErr);
+    // 按版本条目分派（bLegacy → 旧库 RestoreSources；否则 CAS 恢复）——两库序号空间独立，
+    // UI 选中条目时用此重载避免歧义。
+    bool RestoreTree(const SBackupVersion& a_stVer, QString& a_sErr);
+    // 统一库（过滤 owner）+ 旧全量库（owner 为任务 id 时）合并，按 time ISO 倒序。
+    QList<SBackupVersion> ListUnifiedBackups(const QString& a_sOwner) const;
+    bool DiffVersions(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const;
+    int  PurgeOwner(const QString& a_sOwner);
+    int  GcOrphanBlobs();
+    bool HasRestoreTmp() const;                 // _restore_tmp 残留探测（Open 尾/回退引擎前置）
+    bool RestoreFromTmp(QString& a_sErr);       // 残留现场还原（拷回工程根）
+    bool LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const;
+    void SetPendingNotice(int a_iTargetSeq, const QString& a_sOwner);
+    void ClearPendingNotice();
+    bool SetUnifiedSummary(int a_iSeq, const QString& a_sSummary);   // = SetMetaField("summary")
+
 signals:
     void sigGuideLog(const QString& a_sLine);
     void sigGuideFinished(bool a_bOk, const QString& a_sMsg);
@@ -257,9 +398,15 @@ private:
     void SaveGuideSyncLines(int a_iLines);
 
     // 取 exe 同级 config.ini 全路径（GetModuleFileName 去文件名 + "config.ini"）。
+    // 2026.08.20 转公开：主窗口 QFileSystemWatcher 盯此文件做多实例配置热重载。
+public:
     QString ConfigFilePath() const;
+private:
     // FR-6：取任务备份根目录 .autodev/tasks/<id>/backups。
     QString BackupsDir(const QString& a_sTaskId) const;
+    // 统一库 CBackupStore 惰性构造（m_sProjectDir 就绪后；线程安全，后台备份线程共用）。
+    // 注入排除清单谓词（BackupExcludeDirs 顶层一级，含 .autodev 自身防递归）。
+    CBackupStore* BackupStore() const;
     // FR-6（Q4 默认）：备份/恢复时排除的目录名清单（含 .autodev 自身，防递归无限增长，NFR-5）。
     // 2026.08.15：改读 config.ini [Backup] ExcludeDirs（逗号分隔；缺键回退内置默认），
     //   每次备份/恢复时现读，设置对话框保存后即生效。
@@ -274,4 +421,7 @@ private:
     CAgentRunnerBase* m_pGuideSyncRunner = nullptr;    // 需求4 guide.md 增量同步专用 runner
 
     QStringList   m_aRecentProjects;   // MRU，最前为最近
+    // 统一备份库（惰性构造；mutable：const 适配层方法内构造）。
+    mutable CBackupStore* m_pBackupStore = nullptr;
+    mutable QMutex  m_MutexStore;             // 惰性构造互斥（后台 stage 线程并发）
 };

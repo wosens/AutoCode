@@ -1,15 +1,22 @@
-﻿#include "CExecutionPanel.h"
+#include "CExecutionPanel.h"
 
 #include <functional>
 #include <utility>
+#include <algorithm>
 
 #include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QTabBar>
+#include <QUuid>
 #include <QTreeWidget>
 #include <QHeaderView>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QSplitter>
 #include <QSet>
+#include <QDateTime>
+#include <QRegularExpression>
 #include <QTabWidget>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -132,17 +139,25 @@ public:
             }
         });
     }
-    void Clear() { m_pList->clear(); }
+    void Clear() { m_pList->clear(); m_iMaxItemW = 0; }
     // 追加一条提问：a_iIdx = 提问在面板 m_aPromptIdx 序号，a_sText 全文（存 UserRole+1 用于 tooltip）。
     void AddItem(int a_iIdx, const QString& a_sText) {
         const QString sView = a_sText.section(QLatin1Char('\n'), 0, 0);   // 单行预览（首行）
-        auto* pItem = new QListWidgetItem(
-            QStringLiteral("%1  %2").arg(a_iIdx + 1).arg(sView.left(60)), m_pList);
+        const QString sDisp = QStringLiteral("%1  %2").arg(a_iIdx + 1).arg(sView.left(120));
+        auto* pItem = new QListWidgetItem(sDisp, m_pList);
         pItem->setData(Qt::UserRole, a_iIdx);
         pItem->setData(Qt::UserRole + 1, a_sText);   // 全文，tooltip 用
         pItem->setToolTip(QString());   // 关闭系统 tooltip，改用即时 showText
+        // 2026.08.23 自适应宽度：记录最长条目的文本像素宽（含列表左右留白 ~40px）。
+        m_iMaxItemW = qMax(m_iMaxItemW,
+                            m_pList->fontMetrics().horizontalAdvance(sDisp) + 40);
     }
     int Count() const { return m_pList->count(); }
+    // 2026.08.23 内容自适应宽度：提示词少/短 → 贴内容；默认上限翻倍到 520（原 260），
+    //   下限保留原 260（避免只有一两个短词时浮层过窄）。
+    int AdaptiveWidth() const {
+        return qBound(m_iWidthHint, m_iMaxItemW, m_iWidthHint * 2);
+    }
     void SetFixedWidthHint(int a_iW) { m_iWidthHint = a_iW; }
     int WidthHint() const { return m_iWidthHint; }
 protected:
@@ -163,6 +178,7 @@ private:
     QListWidget* m_pList    = nullptr;
     FPicked      m_fnPicked;
     int          m_iWidthHint = 260;
+    int          m_iMaxItemW  = 0;   // 本批条目最长文本像素宽（Clear 时复位）
 };
 
 // token 数格式化：<1000 原值，<1M 显示 K（1 位小数），<1G 显示 M，否则 G（2 位小数）。
@@ -254,14 +270,14 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     pOutSplit->addWidget(m_pArtifactView);
     pOutSplit->setStretchFactor(0, 1);
     pOutSplit->setStretchFactor(1, 4);
+    m_pArtifactsPage = pOutSplit;   // Tab 布局管制（UpdateTabCloseButtons）识别该页用
     m_pTabs->addTab(pOutSplit, QStringLiteral("阶段产物"));
     connect(m_pOutputs, &QListWidget::currentRowChanged,
             this, &CExecutionPanel::OnOutputSelected);
 
-    // —— Tab3：提示词 agent（独立对话流，#1/#2）——
-    m_pAdhocView = new CMessageView(this);
-    setPt11(m_pAdhocView);
-    m_pTabs->addTab(m_pAdhocView, QStringLiteral("助手"));
+    // —— 2026.08.22 多助手：助手对话流不再固定单 Tab，改为按助手动态增删 ——
+    //   Tab 交互（可关闭/可拖动/「+」角标/双击改名）在此统一配置，助手 Tab 随后按需创建。
+    SetupTabsInteraction();
 
     pSplit->addWidget(m_pStages);
     pSplit->addWidget(m_pTabs);
@@ -399,8 +415,19 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
         DoAdhocSend();
     });
     connect(m_pBtnUndo, &QPushButton::clicked, this, &CExecutionPanel::sigAdhocUndo);
-    // FR-3：助手日志右上角半透明提示词按钮（历次 User 提问快速跳转，取代已删除的 ◀▶ 导航）。
-    CreatePromptButton();
+    // FR-3：提示词下拉浮层（单实例，各助手右上角半透明按钮共用；hover 弹出、点击跳转）。
+    m_pPromptFlyout = new CPromptFlyout(this, [this](int a_iIdx) {
+        // 浮层存的是提问在 m_aPromptIdx（激活助手）中的序号 → 取真实块下标。
+        if (a_iIdx >= 0 && a_iIdx < m_aPromptIdx.size()) {
+            OnPromptPicked(m_aPromptIdx.at(a_iIdx));
+        }
+        if (m_pPromptFlyout != nullptr) {
+            m_pPromptFlyout->hide();
+        }
+    });
+    m_pPromptFlyout->installEventFilter(this);   // 离开浮层才收起（见 eventFilter）
+    // 2026.08.22 初始默认助手（首个助手，无存档时的空会话）。
+    ResetAssistants();
     // 右键「立即压缩」菜单已在 m_pBtnContext 创建处接好（customContextMenuRequested）。
 
     SetAdhocEnabled(false);   // 初始无工程：禁用输入栏（打开工程后由主窗口启用）
@@ -464,8 +491,12 @@ void CExecutionPanel::OnAssistantText(CTaskInfo* a_pTask, const QString& a_sText
     SBlockData st;
     st.eKind = CMessageBlock::Assistant;
     // 评审多视角并行：带视角前缀，让用户在共享对话流中区分各视角输出（轻量标签）。
-    st.sText = a_sViewId.isEmpty() ? a_sText
-               : QStringLiteral("【视角 %1】%2").arg(a_sViewId, a_sText);
+    // 2026.08.22 Agent 输出带时间前缀（用户提示词带日期+时间，见 DoAdhocSend）。
+    const QString sBody = a_sViewId.isEmpty() ? a_sText
+                          : QStringLiteral("【视角 %1】%2").arg(a_sViewId, a_sText);
+    // 2026.08.22 距上个时间戳 <1 分钟不输出时间（StampPrefix）
+    const QString sStamp = StampPrefix(a_pTask->Id(), /*a_bFullDate=*/false);
+    st.sText = sStamp.isEmpty() ? sBody : QStringLiteral("[%1] %2").arg(sStamp, sBody);
     st.sViewId = a_sViewId;
     AppendData(a_pTask->Id(), st);
 }
@@ -514,7 +545,7 @@ void CExecutionPanel::AppendLog(const QString& a_sTaskId, const QString& a_sLine
     st.eKind = a_sLine.startsWith(QStringLiteral("[错误]"))
                ? CMessageBlock::Error
                : CMessageBlock::System;
-    st.sText = a_sLine;
+    st.sText = WithLogTime(a_sTaskId, a_sLine);
     AppendData(a_sTaskId, st);
 }
 
@@ -523,8 +554,72 @@ void CExecutionPanel::AppendEvent(const QString& a_sTaskId, const QString& a_sKi
     SBlockData st;
     st.eKind      = CMessageBlock::Event;
     st.sEventKind = a_sKind;
-    st.sText      = a_sText;
+    st.sText      = WithLogTime(a_sTaskId, a_sText);
     AppendData(a_sTaskId, st);
+}
+
+// 2026.08.22 日志行时间前缀：该任务日志流里已出现过日期（此前行带 yyyy-MM-dd）
+//   → 只加 [HH:mm:ss]；否则（首行/全新会话）连日期一起 [yyyy-MM-dd HH:mm:ss]。
+//   判定用 m_aDatedLogTasks 记忆 + 兼容从 chat.json 重载的旧流（扫首个块文本）。
+// 2026.08.22 补充：与上一次已输出的时间戳间隔 <60s 时本行不带时间（见 StampPrefix）。
+QString CExecutionPanel::StampPrefix(const QString& a_sKey, bool a_bFullDate) {
+    const QDateTime tNow = QDateTime::currentDateTime();
+    qint64 llLast = m_aLastStampSecs.value(a_sKey, 0);
+    if (llLast == 0) {
+        // 首次（含重启/重载）：从持久化块里回扫最后一个时间戳前缀，防止跨会话 1 分钟内重复盖时间
+        static const QString kAdhoc = QStringLiteral("@@adhoc@@");   // 助手流哨兵键前缀（+助手 id）
+        const SAsst* pAsst = a_sKey.startsWith(kAdhoc)
+                             ? AsstById(a_sKey.mid(kAdhoc.length())) : nullptr;
+        const QList<SBlockData> aBlocks = (pAsst != nullptr) ? pAsst->aBlocks
+                                                             : m_aBlocks.value(a_sKey);
+        static const QRegularExpression reFull(QStringLiteral("^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})\\]"));
+        static const QRegularExpression reTime(QStringLiteral("^\\[(\\d{2}:\\d{2}:\\d{2})\\]"));
+        for (int i = aBlocks.size() - 1; i >= 0; --i) {
+            const QString& s = aBlocks[i].sText;
+            QRegularExpressionMatch m = reFull.match(s);
+            QDateTime t;
+            if (m.hasMatch()) {
+                t = QDateTime::fromString(m.captured(1), QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            } else {
+                m = reTime.match(s);
+                if (m.hasMatch()) {
+                    // 只有时间：按今天拼；若比当前还晚（跨零点）回退一天
+                    t = QDateTime(tNow.date(), QTime::fromString(m.captured(1), QStringLiteral("HH:mm:ss")));
+                    if (t.isValid() && t > tNow) t = t.addDays(-1);
+                }
+            }
+            if (t.isValid()) { llLast = t.toSecsSinceEpoch(); break; }
+        }
+    }
+    if (llLast > 0 && llLast + 60 > tNow.toSecsSinceEpoch()) {
+        return QString();   // 距上个时间戳不足 1 分钟：不输出时间
+    }
+    m_aLastStampSecs.insert(a_sKey, tNow.toSecsSinceEpoch());
+    return tNow.toString(a_bFullDate ? QStringLiteral("yyyy-MM-dd HH:mm:ss")
+                                     : QStringLiteral("HH:mm:ss"));
+}
+
+QString CExecutionPanel::WithLogTime(const QString& a_sTaskId, const QString& a_sText) {
+    if (!m_aDatedLogTasks.contains(a_sTaskId)) {
+        // 旧会话重载：首个系统/事件块若已带日期前缀则视为已有日期
+        const QList<SBlockData>& aBlocks = m_aBlocks.value(a_sTaskId);
+        static const QRegularExpression reDate(QStringLiteral("^\\[\\d{4}-\\d{2}-\\d{2}"));
+        bool bHasDate = false;
+        for (const SBlockData& st : aBlocks) {
+            if (reDate.match(st.sText).hasMatch()) { bHasDate = true; break; }
+        }
+        if (!bHasDate) {
+            const QString sStamp = StampPrefix(a_sTaskId, /*a_bFullDate=*/true);
+            if (sStamp.isEmpty()) {
+                return a_sText;   // 距上个时间戳 <1 分钟：不盖时间（日期下次再补）
+            }
+            m_aDatedLogTasks.insert(a_sTaskId);   // 本次写入日期后，后续行只需时间
+            return QStringLiteral("[%1] %2").arg(sStamp, a_sText);
+        }
+        m_aDatedLogTasks.insert(a_sTaskId);
+    }
+    const QString sStamp = StampPrefix(a_sTaskId, /*a_bFullDate=*/false);
+    return sStamp.isEmpty() ? a_sText : QStringLiteral("[%1] %2").arg(sStamp, a_sText);
 }
 
 void CExecutionPanel::AppendData(const QString& a_sTaskId, const SBlockData& a_stData) {
@@ -536,9 +631,40 @@ void CExecutionPanel::AppendData(const QString& a_sTaskId, const SBlockData& a_s
     if (m_bRebuilding) {
         return;   // 渐进重建中：分帧循环按实时列表顺序创建本块，此处跳过防重复上屏
     }
-    CMessageBlock* pW = CreateWidget(a_stData);
-    m_aCurWidgets.append(pW);
-    m_pView->AddBlock(pW);
+    // 2026.08.22 连续工具调用合并：并入上一张 ×N 折叠卡，否则新建
+    if (!TryMergeToolWidget(m_aBlocks[a_sTaskId], m_aCurWidgets,
+                            m_aBlocks[a_sTaskId].size() - 1, a_stData)) {
+        CMessageBlock* pW = CreateWidget(a_stData);
+        m_aCurWidgets.append(pW);
+        m_pView->AddBlock(pW);
+    }
+}
+
+// 2026.08.22 连续工具调用合并上屏：command/读写等工具常成串出现（数十条），
+//   逐条渲染既刷屏又拖慢滚动；合并为一张折叠卡，标题显示首条摘要 + ×N，展开看全部。
+bool CExecutionPanel::TryMergeToolWidget(const QList<SBlockData>& aBlocks,
+                                         QList<CMessageBlock*>& aWidgets,
+                                         int a_iNewIdx, const SBlockData& a_stData) {
+    if (a_stData.eKind != CMessageBlock::ToolUse || a_iNewIdx <= 0) {
+        return false;
+    }
+    const SBlockData& stPrev = aBlocks.at(a_iNewIdx - 1);
+    if (stPrev.eKind != CMessageBlock::ToolUse || stPrev.sViewId != a_stData.sViewId) {
+        return false;   // 前一块不是工具调用（或评审视角不同）：不合并
+    }
+    if (a_iNewIdx > aWidgets.size() || aWidgets.isEmpty()) {
+        return false;   // widget 列表未跟上（异常防御）
+    }
+    CMessageBlock* pW = aWidgets.at(a_iNewIdx - 1);
+    if (pW == nullptr || pW->ToolCount() <= 0) {
+        return false;
+    }
+    pW->AddMergedTool(a_stData.sTool, a_stData.sInput);
+    if (!a_stData.sResult.isEmpty()) {
+        pW->SetResult(a_stData.sResult);
+    }
+    aWidgets.append(pW);   // 同一 widget 占多个块位：结果回填/提示词跳转的索引对齐仍成立
+    return true;
 }
 
 CMessageBlock* CExecutionPanel::CreateWidget(const SBlockData& a_stData) {
@@ -586,9 +712,12 @@ void CExecutionPanel::RebuildChunk(quint32 a_uGen) {
     const QList<SBlockData>& aBlocks = m_aBlocks[m_sCurId];
     int iCreated = 0;
     while (m_iRebuildIdx < aBlocks.size() && iCreated < k_iRebuildChunk) {
-        CMessageBlock* pW = CreateWidget(aBlocks.at(m_iRebuildIdx));
-        m_aCurWidgets.append(pW);
-        m_pView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
+        // 2026.08.22 连续工具调用合并：重载/切任务的历史流同样折叠
+        if (!TryMergeToolWidget(aBlocks, m_aCurWidgets, m_iRebuildIdx, aBlocks.at(m_iRebuildIdx))) {
+            CMessageBlock* pW = CreateWidget(aBlocks.at(m_iRebuildIdx));
+            m_aCurWidgets.append(pW);
+            m_pView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
+        }
         ++m_iRebuildIdx;
         ++iCreated;
     }
@@ -790,23 +919,72 @@ void CExecutionPanel::SetCurrentTask(CTaskInfo* a_pTask) {
 }
 
 // ===========================================================================
-// 提示词 agent（「助手」Tab 独立对话流，#1/#2/#3/#4）
+// 提示词 agent（按「助手」分 Tab 的独立对话流，#1/#2/#3/#4）
+// 2026.08.22 多助手：块数据/控件/分帧状态全部下沉到各 SAsst；运行中的事件路由到
+//   正在执行的助手（m_sRunningAsst），空闲时路由到激活助手（m_sActiveAsst）。
 // ===========================================================================
 
+CExecutionPanel::SAsst* CExecutionPanel::AsstById(const QString& a_sId) {
+    for (SAsst& st : m_aAssts) {
+        if (st.sId == a_sId) {
+            return &st;
+        }
+    }
+    return nullptr;
+}
+
+const CExecutionPanel::SAsst* CExecutionPanel::AsstById(const QString& a_sId) const {
+    for (const SAsst& st : m_aAssts) {
+        if (st.sId == a_sId) {
+            return &st;
+        }
+    }
+    return nullptr;
+}
+
+CExecutionPanel::SAsst* CExecutionPanel::ActiveAsst() {
+    return AsstById(m_sActiveAsst);
+}
+
+CExecutionPanel::SAsst* CExecutionPanel::RunningTargetAsst() {
+    // 块归属目标：助手在跑 → 该助手（切 Tab 查看其他助手时日志不串流）；空闲 → 激活助手。
+    if (!m_sRunningAsst.isEmpty()) {
+        if (SAsst* p = AsstById(m_sRunningAsst)) {
+            return p;
+        }
+    }
+    return ActiveAsst();
+}
+
+QString CExecutionPanel::AsstStampKey(const QString& a_sId) {
+    // 助手流时间戳哨兵键：@@adhoc@@ + 助手 id（StampPrefix 依前缀路由到对应助手块列表）。
+    static const QString kAdhoc = QStringLiteral("@@adhoc@@");
+    return kAdhoc + a_sId;
+}
+
 void CExecutionPanel::AppendAdhocBlock(const SBlockData& a_stData) {
-    m_aAdhocBlocks.append(a_stData);
+    SAsst* pAsst = RunningTargetAsst();
+    if (pAsst == nullptr) {
+        return;   // 无助手（理论不达：始终保底一个助手）
+    }
+    pAsst->aBlocks.append(a_stData);
     // 分帧重建期间只入数据不建控件（镜像 AppendData 让路）：分帧循环读实时列表会按序补上，
     //   否则会同一块建两份控件。重建结束后的常规路径仍即时建块。
-    if (!m_bAdhocRebuilding) {
-        // 复用 CreateWidget（其内部以 m_pView 为 parent，AddBlock 会把块 reparent 进 m_pAdhocView）。
-        CMessageBlock* pW = CreateWidget(a_stData);
-        m_aAdhocWidgets.append(pW);
-        m_pAdhocView->AddBlock(pW);
+    if (!pAsst->bRebuilding) {
+        // 2026.08.22 连续工具调用合并：助手流同样折叠为 ×N 卡
+        if (!TryMergeToolWidget(pAsst->aBlocks, pAsst->aWidgets,
+                                pAsst->aBlocks.size() - 1, a_stData)) {
+            // 复用 CreateWidget（其内部以 m_pView 为 parent，AddBlock 会把块 reparent 进助手视图）。
+            CMessageBlock* pW = CreateWidget(a_stData);
+            pAsst->aWidgets.append(pW);
+            pAsst->pView->AddBlock(pW);
+        }
     }
     // FR-2：不再无条件 ScrollToBottom；滚动决策交给 CMessageView::AddBlock 内部 m_bFollow
     //        机制（与任务日志 Tab 行为一致，AC-2.1～2.4）。
-    // FR-3：新增用户提问时刷新提示词下拉索引（供半透明按钮下拉跳转）。
-    if (a_stData.eKind == CMessageBlock::Event &&
+    // FR-3：新增用户提问时刷新提示词下拉索引（供半透明按钮下拉跳转；仅归属激活助手时）。
+    if (pAsst->sId == m_sActiveAsst &&
+        a_stData.eKind == CMessageBlock::Event &&
         a_stData.sEventKind == QStringLiteral("user")) {
         RebuildPromptList();
     }
@@ -814,42 +992,62 @@ void CExecutionPanel::AppendAdhocBlock(const SBlockData& a_stData) {
 }
 
 void CExecutionPanel::RebuildAdhocView() {
-    // 分帧渐进创建（与任务视图 RebuildView/RebuildChunk 同款）：助手档按任务分档后，
-    //   单任务历史对话可达数百块，同步一次建完会卡 UI；切档/切工程时代际号作废在途旧帧。
-    m_pAdhocView->ResetFollow();   // FR-4：重建等同「跳到最新」，强制跟随到底
-    m_pAdhocView->Clear();
-    m_aAdhocWidgets.clear();
-    m_iAdhocRebuildIdx = 0;
-    ++m_uAdhocRebuildGen;   // 作废仍在排队的旧帧（上次重建尚未跑完就切了档）
-    m_bAdhocRebuilding = true;   // AppendAdhocBlock 新块交分帧循环按序创建，防重复上屏
-    RebuildAdhocChunk(m_uAdhocRebuildGen);
+    // 按激活助手数据重建其视图（分帧渐进，与任务视图同款）：单助手历史可达数百块，
+    //   同步一次建完会卡 UI；切助手/切工程时代际号作废在途旧帧。
+    RebuildAsstView(m_sActiveAsst);
 }
 
-void CExecutionPanel::RebuildAdhocChunk(quint32 a_uGen) {
-    if (a_uGen != m_uAdhocRebuildGen) {
-        return;   // 已被新的重建顶替（切档/切工程），本帧作废
-    }
-    int iCreated = 0;
-    while (m_iAdhocRebuildIdx < m_aAdhocBlocks.size() && iCreated < k_iRebuildChunk) {
-        CMessageBlock* pW = CreateWidget(m_aAdhocBlocks.at(m_iAdhocRebuildIdx));
-        m_aAdhocWidgets.append(pW);
-        m_pAdhocView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
-        ++m_iAdhocRebuildIdx;
-        ++iCreated;
-    }
-    if (m_iAdhocRebuildIdx < m_aAdhocBlocks.size()) {
-        QTimer::singleShot(0, this, [this, a_uGen]() { RebuildAdhocChunk(a_uGen); });
+void CExecutionPanel::RebuildAsstView(const QString& a_sId) {
+    // 2026.08.23 按指定助手重建（多助手各自独立控件；加载后逐个预建，切换 Tab 即时呈现）。
+    SAsst* pAsst = AsstById(a_sId);
+    if (pAsst == nullptr || pAsst->bClosed || pAsst->pView == nullptr) {
         return;
     }
-    m_bAdhocRebuilding = false;
-    m_pAdhocView->ScrollToBottomRobust();   // 需求7：恢复完成后多帧滚到助手日志最底
-    RebuildPromptList();   // FR-3 按恢复后的助手流重建提示词下拉索引
+    pAsst->pView->ResetFollow();   // FR-4：重建等同「跳到最新」，强制跟随到底
+    pAsst->pView->Clear();
+    pAsst->aWidgets.clear();
+    pAsst->iRebuildIdx = 0;
+    ++pAsst->uGen;   // 作废仍在排队的旧帧（上次重建尚未跑完就切了助手）
+    pAsst->bRebuilding = true;   // AppendAdhocBlock 新块交分帧循环按序创建，防重复上屏
+    RebuildAdhocChunk(pAsst->sId, pAsst->uGen);
+}
+
+void CExecutionPanel::RebuildAdhocChunk(const QString& a_sId, quint32 a_uGen) {
+    SAsst* pAsst = AsstById(a_sId);
+    if (pAsst == nullptr || a_uGen != pAsst->uGen) {
+        return;   // 助手已删除 / 已被新的重建顶替（切助手/切工程），本帧作废
+    }
+    int iCreated = 0;
+    while (pAsst->iRebuildIdx < pAsst->aBlocks.size() && iCreated < k_iRebuildChunk) {
+        // 2026.08.22 连续工具调用合并：助手流历史重载同样折叠
+        if (!TryMergeToolWidget(pAsst->aBlocks, pAsst->aWidgets,
+                                pAsst->iRebuildIdx, pAsst->aBlocks.at(pAsst->iRebuildIdx))) {
+            CMessageBlock* pW = CreateWidget(pAsst->aBlocks.at(pAsst->iRebuildIdx));
+            pAsst->aWidgets.append(pW);
+            pAsst->pView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
+        }
+        ++pAsst->iRebuildIdx;
+        ++iCreated;
+    }
+    if (pAsst->iRebuildIdx < pAsst->aBlocks.size()) {
+        QTimer::singleShot(0, this, [this, a_sId, a_uGen]() { RebuildAdhocChunk(a_sId, a_uGen); });
+        return;
+    }
+    pAsst->bRebuilding = false;
+    pAsst->pView->ScrollToBottomRobust();   // 需求7：恢复完成后多帧滚到助手日志最底
+    if (a_sId == m_sActiveAsst) {
+        RebuildPromptList();   // FR-3 按恢复后的助手流重建提示词下拉索引
+    }
 }
 
 void CExecutionPanel::OnAdhocAssistantText(const QString& a_sText) {
     SBlockData st;
     st.eKind = CMessageBlock::Assistant;
-    st.sText = a_sText;
+    // 2026.08.22 Agent 输出带时间前缀（用户提示词带日期+时间，见 DoAdhocSend）；
+    //   距上个时间戳 <1 分钟不输出时间（StampPrefix）。哨兵键按助手 id 区分（多助手）。
+    const QString sStamp = StampPrefix(AsstStampKey(RunningTargetAsst() ? RunningTargetAsst()->sId : QString()),
+                                        /*a_bFullDate=*/false);
+    st.sText = sStamp.isEmpty() ? a_sText : QStringLiteral("[%1] %2").arg(sStamp, a_sText);
     AppendAdhocBlock(st);
 }
 
@@ -863,12 +1061,16 @@ void CExecutionPanel::OnAdhocToolUse(const QString& a_sTool, const QString& a_sI
 
 void CExecutionPanel::OnAdhocToolResult(const QString& a_sResult) {
     // 回填到最近一个尚无结果的 ToolUse（与任务流相同的 use→result 交替启发式）。
-    for (int i = m_aAdhocBlocks.size() - 1; i >= 0; --i) {
-        if (m_aAdhocBlocks[i].eKind == CMessageBlock::ToolUse &&
-            m_aAdhocBlocks[i].sResult.isEmpty()) {
-            m_aAdhocBlocks[i].sResult = a_sResult;
-            if (i < m_aAdhocWidgets.size()) {
-                m_aAdhocWidgets[i]->SetResult(a_sResult);
+    SAsst* pAsst = RunningTargetAsst();
+    if (pAsst == nullptr) {
+        return;
+    }
+    for (int i = pAsst->aBlocks.size() - 1; i >= 0; --i) {
+        if (pAsst->aBlocks[i].eKind == CMessageBlock::ToolUse &&
+            pAsst->aBlocks[i].sResult.isEmpty()) {
+            pAsst->aBlocks[i].sResult = a_sResult;
+            if (i < pAsst->aWidgets.size()) {
+                pAsst->aWidgets[i]->SetResult(a_sResult);
             }
             emit sigAdhocBlocksChanged();   // #1 回填结果也持久化
             return;
@@ -895,20 +1097,25 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sKind, const QString& a_sTex
 }
 
 void CExecutionPanel::OnAdhocUndo() {
+    // 2026.08.22 多助手：撤销作用于激活助手的对话流（编排器撤销栈即激活助手会话）。
+    SAsst* pAsst = ActiveAsst();
+    if (pAsst == nullptr) {
+        return;
+    }
     // 从末尾回溯找最后一个「用户提问」块，连同其后所有回复/工具/事件块一并移除。
     int iCut = -1;
-    for (int i = m_aAdhocBlocks.size() - 1; i >= 0; --i) {
-        if (m_aAdhocBlocks[i].eKind == CMessageBlock::Event &&
-            m_aAdhocBlocks[i].sEventKind == QStringLiteral("user")) {
+    for (int i = pAsst->aBlocks.size() - 1; i >= 0; --i) {
+        if (pAsst->aBlocks[i].eKind == CMessageBlock::Event &&
+            pAsst->aBlocks[i].sEventKind == QStringLiteral("user")) {
             iCut = i;
             break;
         }
     }
     if (iCut < 0) {
-        return;   // 无提问块可撤销（理论不达：按钮在编排器栈空时已拦截）
+        return;   // 无提问块可撤销（编排器栈空时已 warn「没有可撤销的提问」，此处兜底）
     }
-    while (m_aAdhocBlocks.size() > iCut) {
-        m_aAdhocBlocks.removeLast();
+    while (pAsst->aBlocks.size() > iCut) {
+        pAsst->aBlocks.removeLast();
     }
     RebuildAdhocView();
     emit sigAdhocBlocksChanged();   // #1 撤销后落盘
@@ -927,6 +1134,10 @@ void CExecutionPanel::SetAdhocContext(qint64 a_iFill) {
         a_iFill = -1;
     }
     m_iLastContextFill = a_iFill;
+    // 2026.08.22 多助手：占用快照记到归属助手（运行中→该助手；否则激活助手），切助手时还原。
+    if (SAsst* pAsst = RunningTargetAsst()) {
+        pAsst->iCtxFill = a_iFill;
+    }
     UpdateContextButton();
 }
 
@@ -1049,10 +1260,9 @@ void CExecutionPanel::AppendToAdhocInput(const QString& a_sText) {
     if (m_pAdhocInput == nullptr || a_sText.isEmpty()) {
         return;
     }
-    // 切到助手 Tab，让用户看到注入结果。
-    const int iIdx = m_pTabs->indexOf(m_pAdhocView);
-    if (iIdx >= 0) {
-        m_pTabs->setCurrentIndex(iIdx);
+    // 切到激活助手 Tab，让用户看到注入结果。
+    if (SAsst* pAsst = ActiveAsst()) {
+        m_pTabs->setCurrentWidget(pAsst->pView);
     }
     QString sCur = m_pAdhocInput->toPlainText();
     if (!sCur.isEmpty() && !sCur.endsWith(QLatin1Char('\n')) &&
@@ -1069,13 +1279,36 @@ void CExecutionPanel::AppendToAdhocInput(const QString& a_sText) {
 
 void CExecutionPanel::SetAdhocRunning(bool a_bRunning) {
     m_bAdhocRunning = a_bRunning;
-    // #4 助手 Tab 标签提示运行态（●运行中 / 空闲）。
-    const int iIdx = m_pTabs->indexOf(m_pAdhocView);
-    if (iIdx >= 0) {
-        m_pTabs->setTabText(iIdx, a_bRunning ? QStringLiteral("助手 ●") : QStringLiteral("助手"));
+    // 2026.08.22 多助手：运行态归属助手。显式置 true 但无运行助手（自动续发排队指令的
+    //   广播路径）→ 归到激活助手；置 false → 清运行助手（下一轮发送时重新归属）。
+    if (a_bRunning && m_sRunningAsst.isEmpty()) {
+        m_sRunningAsst = m_sActiveAsst;
+    }
+    if (!a_bRunning) {
+        m_sRunningAsst.clear();
+    }
+    // #4 助手 Tab 标签提示运行态（●运行中 / 空闲）：只标运行助手的 Tab。
+    for (const SAsst& st : std::as_const(m_aAssts)) {
+        const int iIdx = m_pTabs->indexOf(st.pView);
+        if (iIdx >= 0) {
+            const bool bRun = (a_bRunning && st.sId == m_sRunningAsst);
+            m_pTabs->setTabText(iIdx, bRun ? st.sName + QStringLiteral(" ●") : st.sName);
+        }
     }
     UpdateAdhocInputState();
     UpdateBusyIndicator();   // #4 助手运行态变化 → 刷新执行态指示器
+}
+
+void CExecutionPanel::ClearRunningAsst() {
+    // 2026.08.22 结束态：主窗口在读取运行助手 id（回填会话）之后调用，随后
+    //   OnAdhocFinished → SetAdhocRunning(false) 幂等清空。
+    m_sRunningAsst.clear();
+    for (const SAsst& st : std::as_const(m_aAssts)) {
+        const int iIdx = m_pTabs->indexOf(st.pView);
+        if (iIdx >= 0) {
+            m_pTabs->setTabText(iIdx, st.sName);
+        }
+    }
 }
 
 void CExecutionPanel::UpdateBusyIndicator() {
@@ -1094,14 +1327,25 @@ void CExecutionPanel::DoAdhocSend() {
     if (sText.isEmpty()) {
         return;
     }
+    // 2026.08.22 多助手：本次提交归属「运行中助手」（追加指令场景），空闲时为激活助手。
+    SAsst* pAsst = RunningTargetAsst();
+    if (pAsst == nullptr) {
+        return;
+    }
     // 先本地渲染「用户提问」块（❯），与编排器撤销栈一一对应：撤销=移除本块及之后所有块。
+    // 2026.08.22 用户提示词带日期+时间前缀（Agent 输出只带时间，见 OnAssistantText）；
+    //   距上个时间戳 <1 分钟不输出时间（StampPrefix，键按助手 id 区分）。
     SBlockData stUser;
     stUser.eKind      = CMessageBlock::Event;
     stUser.sEventKind = QStringLiteral("user");
-    stUser.sText      = sText;
+    const QString sStamp = StampPrefix(AsstStampKey(pAsst->sId), /*a_bFullDate=*/true);
+    stUser.sText = sStamp.isEmpty() ? sText : QStringLiteral("[%1] %2").arg(sStamp, sText);
     AppendAdhocBlock(stUser);
-    // #2 发送后自动切到「助手」Tab，让用户立即看到日志。
-    m_pTabs->setCurrentWidget(m_pAdhocView);
+    // #2 发送后自动切到该助手 Tab，让用户立即看到日志。
+    m_pTabs->setCurrentWidget(pAsst->pView);
+    if (!m_bAdhocRunning) {
+        m_sRunningAsst = pAsst->sId;   // 本轮事件（回复/工具）路由到该助手
+    }
     // #4 先进入运行态（助手 Tab 标 ●、发送变「停止」），再 emit 提交：
     // 若提交在同步链中即失败（如 claude 启动失败），OnAdhocFinished 的 SetAdhocRunning(false)
     // 会落在 SetAdhocRunning(true) 之后，最终态正确归零；反之(true 覆盖在 false 之后)会卡在「运行中」假态。
@@ -1150,11 +1394,15 @@ void CExecutionPanel::OnAdhocTextChanged() {
 }
 
 void CExecutionPanel::RebuildPromptList() {
-    // FR-3：按 m_aAdhocBlocks 重建「用户提问」下标（旧→新），供半透明按钮下拉跳转。
+    // FR-3：按激活助手流重建「用户提问」下标（旧→新），供半透明按钮下拉跳转。
     m_aPromptIdx.clear();
-    for (int i = 0; i < m_aAdhocBlocks.size(); ++i) {
-        if (m_aAdhocBlocks[i].eKind == CMessageBlock::Event &&
-            m_aAdhocBlocks[i].sEventKind == QStringLiteral("user")) {
+    const SAsst* pAsst = ActiveAsst();
+    if (pAsst == nullptr) {
+        return;
+    }
+    for (int i = 0; i < pAsst->aBlocks.size(); ++i) {
+        if (pAsst->aBlocks[i].eKind == CMessageBlock::Event &&
+            pAsst->aBlocks[i].sEventKind == QStringLiteral("user")) {
             m_aPromptIdx.append(i);
         }
     }
@@ -1162,23 +1410,21 @@ void CExecutionPanel::RebuildPromptList() {
 
 void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
     // FR-3：点击下拉中某条提示词 → 把对应 User 提问块滚到助手日志最顶 + 横纵滚动条归零。
-    if (m_pAdhocView == nullptr) {
+    SAsst* pAsst = ActiveAsst();
+    if (pAsst == nullptr || pAsst->pView == nullptr) {
         return;
     }
-    if (a_iBlockIdx < 0 || a_iBlockIdx >= m_aAdhocWidgets.size()) {
+    if (a_iBlockIdx < 0 || a_iBlockIdx >= pAsst->aWidgets.size()) {
         return;
     }
-    CMessageBlock* pBlock = m_aAdhocWidgets[a_iBlockIdx];
+    CMessageBlock* pBlock = pAsst->aWidgets[a_iBlockIdx];
     if (pBlock == nullptr) {
         return;
     }
-    // 切到「助手」Tab，确保用户看到滚动结果。
-    const int iIdx = m_pTabs->indexOf(m_pAdhocView);
-    if (iIdx >= 0) {
-        m_pTabs->setCurrentIndex(iIdx);
-    }
+    // 切到该助手 Tab，确保用户看到滚动结果。
+    m_pTabs->setCurrentWidget(pAsst->pView);
     // 滚动到该块顶部：把内容 widget 内该块的 y（相对内容原点）设为垂直滚动条值。
-    m_pAdhocView->ScrollBlockToTop(pBlock);
+    pAsst->pView->ScrollBlockToTop(pBlock);
 }
 
 void CExecutionPanel::SyncStagesHeight(int a_iTaskListBottomY) {
@@ -1205,7 +1451,7 @@ void CExecutionPanel::SyncStagesHeight(int a_iTaskListBottomY) {
     m_pStageSplit->setSizes({iH, iAvail - iH});
 }
 
-void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath) {
+void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab) {
     // 2026.08.18 资源管理器双击文本文件的内嵌预览：Tab 惰性创建（首次双击才加页，
     //   追加在「助手」右侧即末位），此后复用同一页换内容与标题（始终只有一个预览页）。
     const QFileInfo stInfo(a_sAbsPath);
@@ -1219,6 +1465,7 @@ void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath) {
         fntFile.setPointSize(11);   // 2026.08.19 与全局 11pt 统一（#7）
         m_pFileView->setFont(fntFile);
         m_pTabs->addTab(m_pFileView, stInfo.fileName());
+        UpdateTabCloseButtons();   // 2026.08.22 预览页不带「x」（仅助手页可关闭）
     } else {
         m_pTabs->setTabText(m_pTabs->indexOf(m_pFileView), stInfo.fileName());
     }
@@ -1248,68 +1495,66 @@ void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath) {
         }
     }
     m_pFileView->setPlainText(sText);
-    m_pTabs->setCurrentWidget(m_pFileView);
+    // 2026.08.21 单击预览：只加载内容/更新标题不切页（a_bSwitchTab=false）；
+    //   双击（默认 true）保持原行为切到预览页。
+    if (a_bSwitchTab) {
+        m_pTabs->setCurrentWidget(m_pFileView);
+    }
 }
 
-void CExecutionPanel::CreatePromptButton() {
+void CExecutionPanel::CreatePromptButton(SAsst& a_stAsst) {
     // FR-3：助手日志右上角半透明提示词按钮（24x24，默认 50% 透明，hover 全不透明）。
-    m_pBtnPrompts = new QToolButton(m_pAdhocView);   // parent = 助手视图，叠在其右上角
-    m_pBtnPrompts->setText(QStringLiteral("≡"));   // 列表图标占位
-    m_pBtnPrompts->setFixedSize(24, 24);
-    m_pBtnPrompts->setToolTip(QStringLiteral("历史提问（鼠标移上查看 / 点击跳转）"));
-    m_pBtnPrompts->setAttribute(Qt::WA_ShowWithoutActivating);
-    m_pBtnPrompts->setMouseTracking(true);
-    QFont fBtn = m_pBtnPrompts->font();
+    //   2026.08.22 多助手：按钮 parent=该助手视图，随视图显隐；浮层单实例共用。
+    QToolButton* pBtn = new QToolButton(a_stAsst.pView);   // parent = 助手视图，叠在其右上角
+    a_stAsst.pBtnPrompts = pBtn;
+    pBtn->setText(QStringLiteral("≡"));   // 列表图标占位
+    pBtn->setFixedSize(24, 24);
+    pBtn->setToolTip(QStringLiteral("历史提问（鼠标移上查看 / 点击跳转）"));
+    pBtn->setAttribute(Qt::WA_ShowWithoutActivating);
+    pBtn->setMouseTracking(true);
+    QFont fBtn = pBtn->font();
     fBtn.setPointSize(11);
-    m_pBtnPrompts->setFont(fBtn);
+    pBtn->setFont(fBtn);
     // 默认 50% 透明；hover 时全不透明。QGraphicsOpacityEffect 作用于单个 widget。
-    auto* pEff = new QGraphicsOpacityEffect(m_pBtnPrompts);
+    auto* pEff = new QGraphicsOpacityEffect(pBtn);
     pEff->setOpacity(0.5);
-    m_pBtnPrompts->setGraphicsEffect(pEff);
-    m_pBtnPrompts->show();
-    m_pBtnPrompts->raise();
-
-    // hover（进入/离开按钮）→ 显示/隐藏提示词下拉浮层。
-    m_pBtnPrompts->installEventFilter(this);   // 拦 Enter/Leave
-    // 助手视图 resize/show/hide → 按钮贴右上角 + 按当前 Tab 可见性显隐。
-    if (m_pAdhocView != nullptr) {
-        m_pAdhocView->installEventFilter(this);
-    }
-    // 切 Tab → 刷新按钮可见性（仅在助手 Tab 显示）。
-    if (m_pTabs != nullptr) {
-        connect(m_pTabs, &QTabWidget::currentChanged, this, [this](int) {
-            if (m_pBtnPrompts != nullptr && m_pAdhocView != nullptr && m_pTabs != nullptr) {
-                const bool bVis = (m_pTabs->currentWidget() == m_pAdhocView);
-                m_pBtnPrompts->setVisible(bVis);
-                if (bVis) {
-                    // 右侧让出竖直滚动条（宽 10px）：按钮右沿距视图右边 11px，左移 5px 避免重叠。
-                    m_pBtnPrompts->move(m_pAdhocView->width() - m_pBtnPrompts->width() - 11, 6);
-                    m_pBtnPrompts->raise();
-                }
-            }
-        });
-    }
-    // 弹出浮层：parent=this，点击回调 OnPromptPicked。
-    m_pPromptFlyout = new CPromptFlyout(this, [this](int a_iIdx) {
-        // 浮层存的是提问在 m_aPromptIdx 中的序号 → 取真实块下标。
-        if (a_iIdx >= 0 && a_iIdx < m_aPromptIdx.size()) {
-            OnPromptPicked(m_aPromptIdx.at(a_iIdx));
-        }
-        if (m_pPromptFlyout != nullptr) {
-            m_pPromptFlyout->hide();
+    pBtn->setGraphicsEffect(pEff);
+    pBtn->hide();   // 仅该助手 Tab 可见时显示（currentChanged/resize 统一刷）
+    // hover（进入/离开按钮）→ 显示/隐藏提示词下拉浮层；视图 resize/show/hide → 按钮贴右上角。
+    pBtn->installEventFilter(this);
+    // 2026.08.23 提示词按钮正下方补一个「↓」按钮：点击将该助手日志滚动到最底。
+    QToolButton* pBtnBottom = new QToolButton(a_stAsst.pView);   // parent 同助手视图
+    a_stAsst.pBtnBottom = pBtnBottom;
+    pBtnBottom->setText(QStringLiteral("↓"));
+    pBtnBottom->setFixedSize(24, 24);
+    pBtnBottom->setToolTip(QStringLiteral("滚动到底部"));
+    pBtnBottom->setAttribute(Qt::WA_ShowWithoutActivating);
+    QFont fBtnB = pBtnBottom->font();
+    fBtnB.setPointSize(11);
+    pBtnBottom->setFont(fBtnB);
+    auto* pEffB = new QGraphicsOpacityEffect(pBtnBottom);
+    pEffB->setOpacity(0.5);
+    pBtnBottom->setGraphicsEffect(pEffB);
+    pBtnBottom->hide();   // 可见性/位置随提示词按钮统一刷
+    // hover 半透明→不透明；点击滚到该助手日志最底（多帧确保布局同步后真正到底）。
+    pBtnBottom->installEventFilter(this);
+    const QString sAsstId = a_stAsst.sId;
+    connect(pBtnBottom, &QToolButton::clicked, this, [this, sAsstId]() {
+        SAsst* pA = AsstById(sAsstId);
+        if (pA != nullptr && pA->pView != nullptr) {
+            pA->pView->ScrollToBottomRobust();
         }
     });
-
-    // 浮层也参与 hover/leave：鼠标离开按钮但进入浮层时保持显示，离开浮层才收起。
-    m_pPromptFlyout->installEventFilter(this);
+    a_stAsst.pView->installEventFilter(this);
 }
 
 void CExecutionPanel::OnPromptBtnHovered() {
-    // FR-3：鼠标移到半透明按钮 → 全不透明 + 立刻显示提示词下拉浮层。
-    if (m_pBtnPrompts == nullptr) {
+    // FR-3：鼠标移到半透明按钮 → 全不透明 + 立刻显示提示词下拉浮层（内容取激活助手流）。
+    const SAsst* pAsst = ActiveAsst();
+    if (pAsst == nullptr || pAsst->pBtnPrompts == nullptr) {
         return;
     }
-    if (auto* pEff = qobject_cast<QGraphicsOpacityEffect*>(m_pBtnPrompts->graphicsEffect())) {
+    if (auto* pEff = qobject_cast<QGraphicsOpacityEffect*>(pAsst->pBtnPrompts->graphicsEffect())) {
         pEff->setOpacity(1.0);
     }
     if (m_pPromptFlyout == nullptr || m_aPromptIdx.isEmpty()) {
@@ -1317,38 +1562,74 @@ void CExecutionPanel::OnPromptBtnHovered() {
     }
     // 刷新浮层内容（提问可能已变化）。
     m_pPromptFlyout->Clear();
+    // 2026.08.22 浮层条目去掉时间戳前缀（[yyyy-MM-dd HH:mm:ss] / [HH:mm:ss]），只显示提问内容
+    static const QRegularExpression k_reStamp(
+        QStringLiteral("^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]\\s*"
+                       "|^\\[\\d{2}:\\d{2}:\\d{2}\\]\\s*"));
     for (int i = 0; i < m_aPromptIdx.size(); ++i) {
         const int iBlock = m_aPromptIdx.at(i);
-        if (iBlock >= 0 && iBlock < m_aAdhocBlocks.size()) {
-            m_pPromptFlyout->AddItem(i, m_aAdhocBlocks[iBlock].sText);
+        if (iBlock >= 0 && iBlock < pAsst->aBlocks.size()) {
+            QString sPrompt = pAsst->aBlocks[iBlock].sText;   // 拷贝后去时间戳（pAsst 为 const）
+            m_pPromptFlyout->AddItem(i, sPrompt.remove(k_reStamp));
         }
     }
-    // 定位浮层到按钮左下方（全局坐标）。
-    const QPoint ptGlobal = m_pBtnPrompts->mapToGlobal(QPoint(0, m_pBtnPrompts->height()));
-    m_pPromptFlyout->resize(m_pPromptFlyout->WidthHint(),
+    // 2026.08.23 浮层自适应宽度（默认上限翻倍到 520；条目少/短时贴内容收缩，下限 260），
+    //   右沿仍对齐主窗口右沿（旧版贴按钮左下，长提问会把浮层顶宽出界）。
+    m_pPromptFlyout->resize(m_pPromptFlyout->AdaptiveWidth(),
                             qMin(m_pPromptFlyout->Count() * 24 + 8, 280));
-    m_pPromptFlyout->move(ptGlobal);
+    const QPoint ptBelow = pAsst->pBtnPrompts->mapToGlobal(
+        QPoint(0, pAsst->pBtnPrompts->height() + 4));
+    const QWidget* pWin = window();
+    const int iRightX = (pWin != nullptr)
+        ? pWin->mapToGlobal(QPoint(pWin->width(), 0)).x() : ptBelow.x();
+    m_pPromptFlyout->move(iRightX - m_pPromptFlyout->width(), ptBelow.y());
     m_pPromptFlyout->show();
     m_pPromptFlyout->raise();
 }
 
 void CExecutionPanel::OnPromptBtnLeaved() {
     // FR-3：鼠标离开按钮 → 恢复 50% 透明；浮层仅在鼠标也离开浮层时才收起（见 eventFilter）。
-    if (m_pBtnPrompts == nullptr) {
+    const SAsst* pAsst = ActiveAsst();
+    if (pAsst == nullptr || pAsst->pBtnPrompts == nullptr) {
         return;
     }
-    if (auto* pEff = qobject_cast<QGraphicsOpacityEffect*>(m_pBtnPrompts->graphicsEffect())) {
+    if (auto* pEff = qobject_cast<QGraphicsOpacityEffect*>(pAsst->pBtnPrompts->graphicsEffect())) {
         pEff->setOpacity(0.5);
     }
 }
 
 bool CExecutionPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
-    // FR-3：半透明提示词按钮的 Enter/Leave → 显示/隐藏下拉浮层 + 透明度切换。
-    if (a_pWatched == m_pBtnPrompts) {
+    // FR-3：半透明提示词按钮的 Enter/Leave → 显示/隐藏下拉浮层 + 透明度切换（各助手按钮统一）。
+    bool bIsPromptBtn = false;
+    SAsst* pBtnAsst = nullptr;
+    for (SAsst& st : m_aAssts) {
+        if (a_pWatched == st.pBtnPrompts) {
+            bIsPromptBtn = true;
+            pBtnAsst = &st;
+            break;
+        }
+    }
+    if (bIsPromptBtn) {
         if (a_pEvent->type() == QEvent::Enter) {
+            // 按钮属于的助手即当前 Tab（仅当前 Tab 按钮可见）→ 以其为准弹出。
+            if (pBtnAsst != nullptr && pBtnAsst->sId != m_sActiveAsst) {
+                m_sActiveAsst = pBtnAsst->sId;   // 防御：悬停按钮的助手必为当前页
+            }
             OnPromptBtnHovered();
         } else if (a_pEvent->type() == QEvent::Leave) {
             OnPromptBtnLeaved();
+        }
+    }
+    // 「↓」按钮：hover 半透明→不透明（同提示词按钮观感，不弹浮层）。
+    if (a_pEvent->type() == QEvent::Enter || a_pEvent->type() == QEvent::Leave) {
+        for (SAsst& st : m_aAssts) {
+            if (a_pWatched == st.pBtnBottom && st.pBtnBottom != nullptr) {
+                if (auto* pEffB = qobject_cast<QGraphicsOpacityEffect*>(
+                        st.pBtnBottom->graphicsEffect())) {
+                    pEffB->setOpacity(a_pEvent->type() == QEvent::Enter ? 1.0 : 0.5);
+                }
+                break;
+            }
         }
     }
     // FR-3：鼠标离开浮层（既不在按钮也不在浮层）→ 收起浮层。
@@ -1357,18 +1638,25 @@ bool CExecutionPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
             m_pPromptFlyout->hide();
         }
     }
-    // FR-3：助手视图 resize/show → 半透明按钮贴到右上角；仅助手 Tab 可见时显示按钮。
-    if (a_pWatched == m_pAdhocView &&
-        (a_pEvent->type() == QEvent::Resize || a_pEvent->type() == QEvent::Show ||
-         a_pEvent->type() == QEvent::Hide)) {
-        if (m_pBtnPrompts != nullptr && m_pAdhocView != nullptr) {
-            const bool bAdhocTab =
-                (m_pTabs != nullptr && m_pTabs->currentWidget() == m_pAdhocView);
-            const int iX = m_pAdhocView->width()  - m_pBtnPrompts->width()  - 11;   // 左移 5px 避让竖直滚动条
-            const int iY = 6;
-            m_pBtnPrompts->move(iX, iY);
-            m_pBtnPrompts->setVisible(bAdhocTab);
-            m_pBtnPrompts->raise();
+    // FR-3：助手视图 resize/show/hide → 半透明按钮贴到右上角；仅该助手 Tab 可见时显示按钮。
+    if (a_pEvent->type() == QEvent::Resize || a_pEvent->type() == QEvent::Show ||
+        a_pEvent->type() == QEvent::Hide) {
+        for (SAsst& st : m_aAssts) {
+            if (a_pWatched == st.pView && st.pBtnPrompts != nullptr) {
+                const bool bCurTab =
+                    (m_pTabs != nullptr && m_pTabs->currentWidget() == st.pView);
+                const int iX = st.pView->width() - st.pBtnPrompts->width() - 11;   // 左移 5px 避让竖直滚动条
+                const int iY = 6;
+                st.pBtnPrompts->move(iX, iY);
+                st.pBtnPrompts->setVisible(bCurTab && a_pEvent->type() != QEvent::Hide);
+                st.pBtnPrompts->raise();
+                if (st.pBtnBottom != nullptr) {
+                    st.pBtnBottom->move(iX, iY + st.pBtnPrompts->height() + 2);   // 紧贴提示词按钮下方
+                    st.pBtnBottom->setVisible(bCurTab && a_pEvent->type() != QEvent::Hide);
+                    st.pBtnBottom->raise();
+                }
+                break;
+            }
         }
     }
     // #3 助手输入框：Ctrl+Enter 发送（Enter 保留默认换行）。
@@ -1461,22 +1749,165 @@ CExecutionPanel::SBlockData CExecutionPanel::BlockFromJson(const QJsonObject& a_
     return st;
 }
 
-QJsonArray CExecutionPanel::AdhocBlocksToJson() const {
+// 2026.08.22 多助手持久化：全部助手（含各自会话态快照）→ JSON 数组。
+QJsonArray CExecutionPanel::AssistantsToJson() const {
     QJsonArray aArr;
-    for (const SBlockData& st : m_aAdhocBlocks) {
-        aArr.append(BlockToJson(st));
+    for (const SAsst& st : m_aAssts) {
+        QJsonObject o;
+        o[QStringLiteral("id")]        = st.sId;
+        o[QStringLiteral("name")]      = st.sName;
+        o[QStringLiteral("sid")]       = st.sSid;
+        o[QStringLiteral("guideHash")] = st.sGuideHash;
+        o[QStringLiteral("stack")]     = st.aStack;
+        o[QStringLiteral("ctxFill")]   = static_cast<double>(st.iCtxFill);
+        o[QStringLiteral("closed")]    = st.bClosed;   // 2026.08.23 已关闭（可从「▾」菜单恢复）
+        QJsonArray aBlocks;
+        for (const SBlockData& stB : st.aBlocks) {
+            aBlocks.append(BlockToJson(stB));
+        }
+        o[QStringLiteral("blocks")] = aBlocks;
+        aArr.append(o);
     }
     return aArr;
 }
 
-void CExecutionPanel::LoadAdhocBlocksFromJson(const QJsonArray& a_aBlocks) {
-    m_aAdhocBlocks.clear();
-    for (const QJsonValue& v : a_aBlocks) {
-        if (v.isObject()) {
-            m_aAdhocBlocks.append(BlockFromJson(v.toObject()));
+void CExecutionPanel::LoadAssistantsFromJson(const QJsonArray& a_aAssts, const QString& a_sActiveId) {
+    // 恢复：清掉现有助手 Tab，按数组逐个建助手 + Tab；激活 a_sActiveId（缺省第一个）。
+    //   非激活助手的视图惰性重建（切到该 Tab 时 RebuildAdhocView 按数据补建控件）。
+    //   用 ClearAsstTabs（不建默认助手）——旧实现走 ResetAssistants 会多出一个空「助手1」，
+    //   每次点任务切档累积一个，档文件随之越长越大。
+    ClearAsstTabs();
+    bool bSetActive = false;
+    QString sFirstId;
+    for (const QJsonValue& v : a_aAssts) {
+        if (!v.isObject()) {
+            continue;
+        }
+        const QJsonObject o = v.toObject();
+        SAsst st;
+        st.sId = o.value(QStringLiteral("id")).toString();
+        if (st.sId.isEmpty()) {
+            st.sId = QUuid::createUuid().toString(QUuid::WithoutBraces);   // 旧档缺 id 兜底
+        }
+        st.sName = o.value(QStringLiteral("name")).toString();
+        if (st.sName.isEmpty()) {
+            st.sName = QStringLiteral("助手1");
+        }
+        st.bClosed    = o.value(QStringLiteral("closed")).toBool(false);
+        st.sSid       = o.value(QStringLiteral("sid")).toString();
+        st.sGuideHash = o.value(QStringLiteral("guideHash")).toString();
+        st.aStack     = o.value(QStringLiteral("stack")).toArray();
+        st.iCtxFill   = static_cast<qint64>(o.value(QStringLiteral("ctxFill")).toDouble());
+        const QJsonArray aBlocks = o.value(QStringLiteral("blocks")).toArray();
+        for (const QJsonValue& vb : aBlocks) {
+            if (vb.isObject()) {
+                st.aBlocks.append(BlockFromJson(vb.toObject()));
+            }
+        }
+        if (sFirstId.isEmpty() && !st.bClosed) {
+            sFirstId = st.sId;
+        }
+        if (st.sId == a_sActiveId && !st.bClosed) {
+            bSetActive = true;
+        }
+        if (!st.bClosed) {
+            // 先入列表再建 Tab：CreateAsstTab 内的 UpdateTabCloseButtons 需能按视图
+            // 反查到该助手（否则新 Tab 一度被当未知页，布局整队错位）。
+            m_aAssts.append(st);
+            CreateAsstTab(m_aAssts.last());   // 已关闭的：数据入列表但不再建 Tab（「▾」菜单可恢复）
+        } else {
+            m_aAssts.append(st);   // 注意：SAsst 按值入列，后续经 AsstById 取址操作
         }
     }
-    RebuildAdhocView();   // 按恢复数据重建助手 Tab 对话流
+    if (m_aAssts.isEmpty() || sFirstId.isEmpty()) {
+        ResetAssistants();   // 空数组/全关闭兜底：保持至少一个打开的助手
+        return;
+    }
+    UpdateTabCloseButtons();
+    // 激活指定助手（无指定/不存在/已关闭 → 第一个打开的，满足「旧任务打开第一个助手显示日志」）。
+    const QString sAct = (bSetActive ? a_sActiveId : sFirstId);
+    const SAsst* pAct = AsstById(sAct);
+    if (pAct != nullptr) {
+        m_pTabs->setCurrentWidget(pAct->pView);   // → currentChanged → OnAsstTabCurrentChanged
+    }
+    // 2026.08.23 各助手独立日志控件：加载后对全部打开助手预建视图（分帧渐进，不卡 UI），
+    //   切换 Tab 即时呈现，不再依赖首次切入时的同步重建（此前切换数百块历史会明显卡顿）。
+    for (const SAsst& st : m_aAssts) {
+        if (!st.bClosed && !st.aBlocks.isEmpty()) {
+            RebuildAsstView(st.sId);
+        }
+    }
+}
+
+void CExecutionPanel::UpdateAsstSession(const QString& a_sId, const QString& a_sSid,
+                                        const QString& a_sGuideHash, const QJsonArray& a_aStack) {
+    if (SAsst* p = AsstById(a_sId)) {
+        p->sSid = a_sSid;
+        p->sGuideHash = a_sGuideHash;
+        p->aStack = a_aStack;
+    }
+}
+
+QString CExecutionPanel::AsstSid(const QString& a_sId) const {
+    const SAsst* p = AsstById(a_sId);
+    return p != nullptr ? p->sSid : QString();
+}
+
+QJsonArray CExecutionPanel::AsstStack(const QString& a_sId) const {
+    const SAsst* p = AsstById(a_sId);
+    return p != nullptr ? p->aStack : QJsonArray();
+}
+
+QString CExecutionPanel::AsstGuideHash(const QString& a_sId) const {
+    const SAsst* p = AsstById(a_sId);
+    return p != nullptr ? p->sGuideHash : QString();
+}
+
+qint64 CExecutionPanel::AsstCtxFill(const QString& a_sId) const {
+    const SAsst* p = AsstById(a_sId);
+    return p != nullptr ? p->iCtxFill : 0;
+}
+
+void CExecutionPanel::ResetAssistants() {
+    // 复位为单个默认空助手「助手1」（无档显式清空路径的兜底基底）。
+    // 2026.08.23 新建任务不跳「助手日志」：复位只重建助手 Tab，不改用户正在看的页——
+    //   复位前记住当前页：原本就在某助手 Tab（该 Tab 已被拆）才落到新建的「助手1」；
+    //   原本在「日志/阶段产物/文件预览」等任务侧页面 → 保持原页不动（新建任务后停在日志页）。
+    QWidget* pKeep = m_pTabs->currentWidget();
+    const bool bWasAsst = (pKeep != nullptr) && (AsstByView(pKeep) != nullptr);
+    ClearAsstTabs();
+    SAsst st;
+    st.sId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    st.sName = QStringLiteral("助手1");
+    m_aAssts.append(st);
+    CreateAsstTab(m_aAssts.last());
+    m_sActiveAsst = st.sId;
+    UpdateTabCloseButtons();
+    if (bWasAsst || m_pTabs->currentWidget() == nullptr) {
+        m_pTabs->setCurrentWidget(AsstById(m_sActiveAsst)->pView);
+    }
+    RebuildPromptList();
+}
+
+void CExecutionPanel::ClearAsstTabs() {
+    // 拆除全部助手 Tab 并清模型（不动任务侧数据）。供 ResetAssistants（随后补默认助手）
+    // 与 LoadAssistantsFromJson（随后按档重建，不应混入默认助手）共用。
+    // 再入防护：拆 Tab 期间 QTabWidget 的 currentChanged 一律忽略——否则摘除当前助手页时
+    // Qt 自动把相邻「+」占位页设为当前，被 OnAsstTabCurrentChanged 当成点「+」新增助手，
+    // 新助手又 append 进正被拆除的 m_aAssts（清一个生一个 → 死循环/迭代器失效，
+    // 即「点击任务卡死」的根因）。
+    m_bAsstTabsResetting = true;
+    for (int i = m_aAssts.size() - 1; i >= 0; --i) {
+        if (m_aAssts[i].pView != nullptr) {
+            RemoveAsstTab(m_aAssts[i]);
+        }
+    }
+    m_aAssts.clear();
+    m_sActiveAsst.clear();
+    m_sRunningAsst.clear();
+    m_aPromptIdx.clear();
+    m_bAsstTabsResetting = false;
+    UpdateTabCloseButtons();   // 无助手页 → 顺手摘除「+」占位页
 }
 
 QJsonArray CExecutionPanel::TaskBlocksToJson(const QString& a_sTaskId) const {
@@ -1502,24 +1933,405 @@ void CExecutionPanel::LoadTaskBlocksFromJson(const QString& a_sTaskId, const QJs
 }
 
 void CExecutionPanel::ClearAllBlocks() {
-    // 切工程：彻底清空内存对话流（任务 + 助手），避免新旧工程数据混淆。
+    // 切工程：彻底清空内存对话流（任务 + 各助手），避免新旧工程数据混淆。
     m_aBlocks.clear();
     m_aCurWidgets.clear();
-    m_aAdhocBlocks.clear();
-    m_aAdhocWidgets.clear();
     m_sCurId.clear();
     m_aDirtyTaskIds.clear();
-    // 作废两条分帧重建的在途帧：任务侧清 m_aBlocks 后循环自然空转，助手侧是扁平列表、
-    //   随后会被 LoadAssistantState 重新填充，必须靠代际号 +1 杀掉排队中的旧帧防串屏。
+    // 作废任务侧分帧重建的在途帧；助手侧整体复位（各 SAsst 连同视图/分帧状态一并重建）。
     m_bRebuilding = false;
     ++m_uRebuildGen;
-    m_bAdhocRebuilding = false;
-    ++m_uAdhocRebuildGen;
     if (m_pChatSaveTimer != nullptr) {
         m_pChatSaveTimer->stop();
     }
     m_pView->Clear();
-    m_pAdhocView->Clear();
+    ResetAssistants();
+}
+
+// ===========================================================================
+// 2026.08.22 多助手 Tab 管理：可关闭（右上角 x）/ 可拖动排序 /「+」新增 / 双击改名
+// ===========================================================================
+
+void CExecutionPanel::SetupTabsInteraction() {
+    if (m_pTabs == nullptr) {
+        return;
+    }
+    m_pTabs->setMovable(true);      // 拖动 Tab 换位（含日志/产物页；助手顺序随 Tab 相对顺序同步）
+    // 2026.08.23 按钮布局对齐 DSHAgentManage：助手页关闭按钮用 QTabWidget 原生「x」
+    //   （tabsClosable + tabCloseRequested，位置/热区/悬停效果与系统一致）；
+    //   「+」是一个真实占位 Tab（钉在最后助手 Tab 之后，选中即新增并弹回）；
+    //   「▾」放 QTabWidget 右上角角落（cornerWidget），不再叠在 Tab 标签内。
+    m_pTabs->setTabsClosable(true);
+    connect(m_pTabs, &QTabWidget::tabCloseRequested,
+            this, &CExecutionPanel::OnAsstTabCloseRequested);
+    // 「+」页（隐藏自身关闭按钮；插入时机见 UpdateTabCloseButtons）。
+    m_pAddTabPage = new QWidget(this);
+    m_pAddTabPage->setToolTip(QStringLiteral("新增助手（同一任务内多个并行助手，各占一个日志 Tab）"));
+    // 「▾」角落按钮：弹出已关闭助手菜单。
+    auto* pBtnClosed = new QToolButton(m_pTabs);
+    pBtnClosed->setText(QStringLiteral("▾"));
+    pBtnClosed->setToolTip(QStringLiteral("已关闭的助手（点击重新打开）"));
+    pBtnClosed->setAutoRaise(true);
+    connect(pBtnClosed, &QToolButton::clicked,
+            this, &CExecutionPanel::OnAsstMenuClicked);
+    m_pTabs->setCornerWidget(pBtnClosed, Qt::TopRightCorner);
+    // 拖动换位：同步 m_aAssts 顺序到 Tab 相对顺序并落盘。
+    connect(m_pTabs->tabBar(), &QTabBar::tabMoved,
+            this, &CExecutionPanel::OnAsstTabMoved);
+    // 双击助手 Tab → 重命名（Qt 6.8：QTabBar::tabBarDoubleClicked）。
+    connect(m_pTabs->tabBar(), &QTabBar::tabBarDoubleClicked,
+            this, &CExecutionPanel::OnAsstTabRenamed);
+    // 切 Tab：激活助手切换（切到非助手页不改激活；切到「+」页=新增）。
+    connect(m_pTabs, &QTabWidget::currentChanged,
+            this, &CExecutionPanel::OnAsstTabCurrentChanged);
+    UpdateTabCloseButtons();
+}
+
+void CExecutionPanel::UpdateTabCloseButtons() {
+    // ① 非助手页（日志/阶段产物/文件预览）与「+」页隐藏原生关闭按钮；
+    // ② Tab 布局管制：固定分区顺序 [日志][阶段产物][打开助手…][+][文件预览…]——
+    //    「+」恒在最后一个助手 Tab 之后、日志/产物恒在最左（对齐 DSHAgentManage 观感，
+    //    拖动非助手页不越区，「+」不会漂到条中间）。moveTab 为程序性移动，不发
+    //    tabMoved/currentChanged，不会重入。
+    // 2026.08.23 修「助手 Tab 无 x」：旧版对「不在 m_aAssts 里的页」一律 setTabButton(nullptr)
+    //   ——新建助手时 CreateAsstTab 先插 Tab 后入列表，该瞬间新 Tab 被误判为非助手页，
+    //   原生关闭按钮被剥掉且再无恢复路径（助手 Tab 从此没有 x）。改为只对四个已知
+    //   非助手页（日志/阶段产物/预览/「+」）隐藏，未知页（新建助手等）一律不碰。
+    if (m_pTabs == nullptr) {
+        return;
+    }
+    int iLastAsst = -1;
+    for (int i = 0; i < m_pTabs->count(); ++i) {
+        if (AsstByView(m_pTabs->widget(i)) != nullptr) {
+            iLastAsst = i;
+        }
+    }
+    for (int i = 0; i < m_pTabs->count(); ++i) {
+        QWidget* pW = m_pTabs->widget(i);
+        const bool bKnownNonAsst = (pW == m_pView || pW == m_pArtifactsPage ||
+                                    pW == m_pFileView || pW == m_pAddTabPage);
+        if (bKnownNonAsst) {
+            m_pTabs->tabBar()->setTabButton(i, QTabBar::RightSide, nullptr);
+            m_pTabs->tabBar()->setTabButton(i, QTabBar::LeftSide, nullptr);
+        }
+    }
+    // 有助手页才摆「+」页（构造早期无助手时先不出）。
+    if (iLastAsst < 0 || m_pAddTabPage == nullptr) {
+        const int iAddTab = m_pTabs->indexOf(m_pAddTabPage);
+        if (iAddTab >= 0) {
+            m_pTabs->removeTab(iAddTab);
+        }
+    } else if (m_pTabs->indexOf(m_pAddTabPage) < 0) {
+        const int iNew = m_pTabs->insertTab(iLastAsst + 1, m_pAddTabPage,
+                                            QStringLiteral("+"));
+        m_pTabs->tabBar()->setTabButton(iNew, QTabBar::RightSide, nullptr);
+        m_pTabs->tabBar()->setTabButton(iNew, QTabBar::LeftSide, nullptr);
+    }
+    // 分区顺序整队：[日志][阶段产物][打开助手（按当前 Tab 相对顺序）][+][其余（文件预览）]。
+    if (m_pTabs->indexOf(m_pAddTabPage) >= 0) {   // 仅助手存在时整队
+        QList<QWidget*> aOrder;
+        if (m_pView != nullptr && m_pTabs->indexOf(m_pView) >= 0) {
+            aOrder.append(m_pView);
+        }
+        if (m_pArtifactsPage != nullptr && m_pTabs->indexOf(m_pArtifactsPage) >= 0) {
+            aOrder.append(m_pArtifactsPage);
+        }
+        for (int i = 0; i < m_pTabs->count(); ++i) {
+            QWidget* pW = m_pTabs->widget(i);
+            if (pW != m_pAddTabPage && AsstByView(pW) != nullptr) {
+                aOrder.append(pW);   // 助手按当前相对顺序
+            }
+        }
+        aOrder.append(m_pAddTabPage);   // 「+」钉在最后助手之后
+        for (int i = 0; i < m_pTabs->count(); ++i) {
+            QWidget* pW = m_pTabs->widget(i);
+            if (!aOrder.contains(pW)) {
+                aOrder.append(pW);   // 文件预览等其余页保持相对顺序殿后
+            }
+        }
+        for (int iPos = 0; iPos < aOrder.size(); ++iPos) {
+            const int iIdx = m_pTabs->indexOf(aOrder.at(iPos));
+            if (iIdx >= 0 && iIdx != iPos) {
+                m_pTabs->tabBar()->moveTab(iIdx, iPos);
+            }
+        }
+    }
+}
+
+void CExecutionPanel::OnAsstTabCloseRequested(int a_iIdx) {
+    // 原生「x」：关闭对应助手（数据保留，可经「▾」恢复）。
+    SAsst* pAsst = AsstByView(m_pTabs->widget(a_iIdx));
+    if (pAsst != nullptr) {
+        CloseAsst(pAsst->sId);
+    }
+}
+
+CExecutionPanel::SAsst* CExecutionPanel::AsstByView(QWidget* a_pView) {
+    for (SAsst& st : m_aAssts) {
+        if (st.pView == a_pView) {
+            return &st;
+        }
+    }
+    return nullptr;
+}
+
+CMessageView* CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
+    // 建视图 + 右上角提示词按钮 + 插 Tab（默认插在最后一个助手 Tab 右侧）。
+    a_stAsst.pView = new CMessageView(this);
+    QFont fView = a_stAsst.pView->font();
+    fView.setPointSize(11);
+    a_stAsst.pView->setFont(fView);
+    CreatePromptButton(a_stAsst);
+    int iIdx = (a_iPos >= 0) ? a_iPos : m_pTabs->count();
+    if (a_iPos < 0) {
+        // 默认：插到最后一个助手 Tab 之后（文件预览页保持在最右）。
+        for (int i = m_pTabs->count() - 1; i >= 0; --i) {
+            if (AsstByView(m_pTabs->widget(i)) != nullptr) {
+                iIdx = i + 1;
+                break;
+            }
+        }
+    }
+    const bool bRun = (m_bAdhocRunning && a_stAsst.sId == m_sRunningAsst);
+    m_pTabs->insertTab(iIdx, a_stAsst.pView,
+                       bRun ? a_stAsst.sName + QStringLiteral(" ●") : a_stAsst.sName);
+    UpdateTabCloseButtons();
+    return a_stAsst.pView;
+}
+
+void CExecutionPanel::RemoveAsstTab(SAsst& a_stAsst) {
+    // 摘 Tab + 删视图（提示词按钮是其子控件随删）。
+    // 摘除前先预切走当前页：QTabWidget 摘掉当前页时会自动激活相邻页——相邻常是「+」占位页，
+    // 会被 OnAsstTabCurrentChanged 当成点「+」而新增助手（重置场景即死循环根因，也是
+    // 手动关闭助手时的幽灵新增）。预切到另一个打开的助手，无则日志页。
+    if (m_pTabs->currentWidget() == a_stAsst.pView) {
+        CMessageView* pNext = nullptr;
+        for (SAsst& st : m_aAssts) {
+            if (&st != &a_stAsst && !st.bClosed && st.pView != nullptr) {
+                pNext = st.pView;
+                break;
+            }
+        }
+        m_pTabs->setCurrentWidget(pNext != nullptr ? static_cast<QWidget*>(pNext)
+                                                   : static_cast<QWidget*>(m_pView));
+    }
+    const int iIdx = m_pTabs->indexOf(a_stAsst.pView);
+    if (iIdx >= 0) {
+        m_pTabs->removeTab(iIdx);   // 预切后不再是当前页，Qt 不再自动激活「+」页
+    }
+    delete a_stAsst.pView;
+    a_stAsst.pView = nullptr;
+    a_stAsst.pBtnPrompts = nullptr;
+    a_stAsst.pBtnBottom  = nullptr;
+    UpdateTabCloseButtons();
+}
+
+void CExecutionPanel::CloseAsst(const QString& a_sId) {
+    // 点「x」：关闭该助手——Tab 摘除、视图控件销毁，但对话/会话数据保留（bClosed=true），
+    //   可经「▾」菜单随时恢复（2026.08.23 由「删除」改为「关闭」语义）。
+    SAsst* pAsst = AsstById(a_sId);
+    if (pAsst == nullptr || pAsst->bClosed) {
+        return;
+    }
+    if (pAsst->sId == m_sRunningAsst && m_bAdhocRunning) {
+        QMessageBox::information(this, QStringLiteral("关闭助手"),
+            QStringLiteral("该助手正在执行指令，请先停止再关闭。"));
+        return;
+    }
+    if (std::count_if(m_aAssts.begin(), m_aAssts.end(),
+                      [](const SAsst& st) { return !st.bClosed; }) <= 1) {
+        QMessageBox::information(this, QStringLiteral("关闭助手"),
+            QStringLiteral("至少需要保留一个打开的助手。"));
+        return;
+    }
+    RemoveAsstTab(*pAsst);
+    // 控件已随视图销毁：清对齐列表与分帧重建状态（数据 aBlocks 保留，重开时按需重建）。
+    pAsst->aWidgets.clear();
+    pAsst->iRebuildIdx = 0;
+    ++pAsst->uGen;
+    pAsst->bRebuilding = false;
+    pAsst->bClosed = true;
+    // 移到列表末尾（m_aAssts 顺序 = Tab 顺序，已关闭的排在后面）。
+    const SAsst stKeep = *pAsst;
+    m_aAssts.removeIf([&a_sId](const SAsst& st) { return st.sId == a_sId; });
+    m_aAssts.append(stKeep);
+    if (m_sRunningAsst == a_sId) {
+        m_sRunningAsst.clear();   // 防御（运行中已拦截，正常不达）
+    }
+    // QTabWidget 摘页时已自动切到相邻页 → OnAsstTabCurrentChanged 已更新 m_sActiveAsst；
+    // 兜底：若当前页不是助手页，激活第一个打开的助手。
+    if (AsstById(m_sActiveAsst) == nullptr || AsstById(m_sActiveAsst)->bClosed) {
+        const SAsst* pFirst = nullptr;
+        for (const SAsst& st : m_aAssts) {
+            if (!st.bClosed) { pFirst = &st; break; }
+        }
+        if (pFirst != nullptr) {
+            m_pTabs->setCurrentWidget(pFirst->pView);
+        }
+    }
+    UpdateAdhocInputState();
+    emit sigAsstLayoutChanged();   // 关闭状态入档 → 落盘
+}
+
+void CExecutionPanel::OnAsstMenuClicked() {
+    // 点「▾」：弹出已关闭助手菜单，选择恢复（无已关闭项时置灰提示）。
+    QMenu menu(this);
+    bool bAny = false;
+    for (const SAsst& st : m_aAssts) {
+        if (!st.bClosed) {
+            continue;
+        }
+        bAny = true;
+        const QString sLabel = QStringLiteral("%1（%2 条对话）").arg(st.sName).arg(st.aBlocks.size());
+        QAction* pAct = menu.addAction(sLabel);
+        connect(pAct, &QAction::triggered, this, [this, id = st.sId]() { ReopenAsst(id); });
+    }
+    if (!bAny) {
+        QAction* pEmpty = menu.addAction(QStringLiteral("无已关闭的助手"));
+        pEmpty->setEnabled(false);
+    }
+    // 在「▾」按钮下方弹出（菜单按点击时的鼠标位置对齐）。
+    menu.exec(QCursor::pos());
+}
+
+void CExecutionPanel::ReopenAsst(const QString& a_sId) {
+    // 从「▾」菜单恢复已关闭助手：重建 Tab（插到最后一个打开的助手之后）并激活。
+    SAsst* pAsst = AsstById(a_sId);
+    if (pAsst == nullptr || !pAsst->bClosed) {
+        return;
+    }
+    // 移到第一个已关闭助手之前（即打开助手的末尾，与 Tab 插入位置一致）。
+    SAsst stKeep = *pAsst;
+    m_aAssts.removeIf([&a_sId](const SAsst& st) { return st.sId == a_sId; });
+    int iPos = 0;
+    while (iPos < m_aAssts.size() && !m_aAssts[iPos].bClosed) { ++iPos; }
+    m_aAssts.insert(iPos, stKeep);
+    SAsst* pNew = AsstById(a_sId);
+    pNew->bClosed = false;
+    CreateAsstTab(*pNew);
+    UpdateTabCloseButtons();
+    m_pTabs->setCurrentWidget(pNew->pView);   // → sigAsstSwitched（主窗口换载该助手会话）
+    emit sigAsstLayoutChanged();              // 恢复入档 → 落盘
+}
+
+void CExecutionPanel::OnAsstAddClicked() {
+    // 点「+」：新增助手（名字自动编号「助手N」，避开与打开/已关闭助手重名），自动激活。
+    int iN = 1;
+    QString sName;
+    do {
+        sName = QStringLiteral("助手%1").arg(iN++);
+    } while (std::any_of(m_aAssts.begin(), m_aAssts.end(),
+                         [&sName](const SAsst& st) { return st.sName == sName; }));
+    SAsst st;
+    st.sId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    st.sName = sName;
+    m_aAssts.append(st);   // 先入列表再建 Tab（UpdateTabCloseButtons 需按视图反查助手）
+    CreateAsstTab(m_aAssts.last());
+    UpdateTabCloseButtons();
+    m_pTabs->setCurrentWidget(AsstById(st.sId)->pView);   // → sigAsstSwitched（主窗口换会话）
+    emit sigAsstAdded(st.sId);
+}
+
+void CExecutionPanel::OnAsstTabRenamed(int a_iIdx) {
+    // 双击助手 Tab → 改名（Tab 标题即助手名）。
+    SAsst* pAsst = AsstByView(m_pTabs->widget(a_iIdx));
+    if (pAsst == nullptr) {
+        return;
+    }
+    bool bOk = false;
+    const QString sName = QInputDialog::getText(this, QStringLiteral("重命名助手"),
+        QStringLiteral("助手名："), QLineEdit::Normal, pAsst->sName, &bOk)
+        .trimmed();
+    if (!bOk || sName.isEmpty() || sName == pAsst->sName) {
+        return;
+    }
+    pAsst->sName = sName;
+    const bool bRun = (m_bAdhocRunning && pAsst->sId == m_sRunningAsst);
+    m_pTabs->setTabText(a_iIdx,
+                        bRun ? sName + QStringLiteral(" ●") : sName);
+    emit sigAsstLayoutChanged();   // 名字入档 → 落盘
+}
+
+void CExecutionPanel::OnAsstTabMoved(int, int) {
+    SyncAsstsOrderToTabs();
+    UpdateTabCloseButtons();   // 「+」页钉回最后助手 Tab 之后
+    emit sigAsstLayoutChanged();   // 顺序入档 → 落盘
+}
+
+void CExecutionPanel::SyncAsstsOrderToTabs() {
+    // 按 Tab 实际顺序重排 m_aAssts（助手之间的相对顺序；非助手页位置忽略，
+    //   已关闭助手不在 Tab 上，统一保持在列表末尾）。
+    QList<SAsst> aNew;
+    QSet<QString> aTaken;   // 已按 Tab 顺序取走的助手 id（同 id 唯一，直接标记）
+    for (int i = 0; i < m_pTabs->count(); ++i) {
+        SAsst* p = AsstByView(m_pTabs->widget(i));
+        if (p != nullptr && !aTaken.contains(p->sId)) {
+            aTaken.insert(p->sId);
+            aNew.append(*p);
+        }
+    }
+    for (const SAsst& st : m_aAssts) {
+        if (st.bClosed && !aTaken.contains(st.sId)) {
+            aNew.append(st);
+        }
+    }
+    if (aNew.size() == m_aAssts.size()) {
+        m_aAssts = aNew;
+    }
+}
+
+void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
+    // 重置拆除期（ResetAssistants 拆 Tab / 预切页）的程序性 currentChanged 一律忽略：
+    // 此时「+」页可能被 Qt 自动激活，不应当成用户新增；激活助手也即将整体复位。
+    if (m_bAsstTabsResetting) {
+        return;
+    }
+    // 「+」页被选中：新增助手并弹回（OnAsstAddClicked 末尾会把当前页切到新助手 Tab）。
+    if (m_pTabs->widget(a_iIdx) == m_pAddTabPage) {
+        const QString sBack = (AsstById(m_sActiveAsst) && !AsstById(m_sActiveAsst)->bClosed)
+                                  ? m_sActiveAsst : QString();
+        OnAsstAddClicked();
+        if (!sBack.isEmpty() && AsstById(m_sActiveAsst) == nullptr) {
+            m_pTabs->setCurrentWidget(AsstById(sBack)->pView);
+        }
+        return;
+    }
+    // 切 Tab：当前页是助手页 → 激活切换（非助手页如日志/产物/预览不改激活助手）。
+    SAsst* pAsst = AsstByView(m_pTabs->widget(a_iIdx));
+    if (pAsst == nullptr || pAsst->sId == m_sActiveAsst) {
+        return;
+    }
+    const QString sOld = m_sActiveAsst;
+    m_sActiveAsst = pAsst->sId;
+    // 首次切到该助手（或其控件列表为空）→ 按数据重建其视图（恢复档时惰性补建）。
+    if (pAsst->aWidgets.isEmpty() && !pAsst->aBlocks.isEmpty()) {
+        RebuildAdhocView();
+    } else {
+        RebuildPromptList();
+    }
+    // 上下文占用进度条切换到该助手快照。
+    m_iLastContextFill = pAsst->iCtxFill;
+    UpdateContextButton();
+    // FR-3：各助手右上角提示词按钮可见性（仅当前页的按钮显示并贴右上角）。
+    for (SAsst& st : m_aAssts) {
+        if (st.pBtnPrompts != nullptr && st.pView != nullptr) {
+            const bool bCur = (st.pView == pAsst->pView);
+            st.pBtnPrompts->setVisible(bCur);
+            if (bCur) {
+                st.pBtnPrompts->move(st.pView->width() - st.pBtnPrompts->width() - 11, 6);
+                st.pBtnPrompts->raise();
+            }
+            if (st.pBtnBottom != nullptr) {
+                const bool bCurB = (st.pView == pAsst->pView);
+                st.pBtnBottom->setVisible(bCurB);
+                if (bCurB) {
+                    st.pBtnBottom->move(st.pView->width() - st.pBtnBottom->width() - 11, 6 + 24 + 2);
+                    st.pBtnBottom->raise();
+                }
+            }
+        }
+    }
+    emit sigAsstSwitched(sOld, m_sActiveAsst);
 }
 
 void CExecutionPanel::MarkTaskDirty(const QString& a_sTaskId) {

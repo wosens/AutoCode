@@ -5,6 +5,8 @@
 #include <QCoreApplication>
 
 #include "project/CProjectManager.h"
+#include <QJsonDocument>
+#include <QJsonObject>
 
 // ============================================================================
 // FR-6 代码回退（备份 / 恢复 / 版本清单）单元测试 — 任务 406807ec
@@ -502,6 +504,337 @@ private slots:
         QCOMPARE(stPm.ListBackups(sTaskId).size(), 2);
         Wipe(sRoot);
     }
+
+    // ================= 统一增量备份库（CAS，方案 v3.1 §11 用例 1-10）=================
+
+    // 用例 1：首次 BackupTree —— meta 含 format/kind/owner；store 数=源文件数；files 含 h/z/m。
+    void testUnifiedFirstBackup() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "main.cpp", "int main(){return 0;}");
+        WriteFile(sRoot, "lib/util.h", "#pragma once\n");
+
+        CProjectManager stPm;
+        QVERIFY(stPm.Open(sRoot));
+        QVERIFY(stPm.EnsureAutoDev());
+        const int iSeq = stPm.BackupTree("stage", "task-u1", "Develop", "", 0);
+        QVERIFY2(iSeq == 1, "first unified backup seq should be 1");
+
+        const QString sMeta = stPm.UnifiedBackupsDir() + "/0001.meta.json";
+        QVERIFY(QFile::exists(sMeta));
+        QFile f(sMeta);
+        f.open(QIODevice::ReadOnly);
+        QByteArray buf = f.readAll();
+        f.close();
+        if (buf.startsWith("\xEF\xBB\xBF")) buf = buf.mid(3);
+        const QJsonObject o = QJsonDocument::fromJson(buf).object();
+        QCOMPARE(o.value("format").toString(), QStringLiteral("cas"));
+        QCOMPARE(o.value("kind").toString(), QStringLiteral("stage"));
+        QCOMPARE(o.value("owner").toString(), QStringLiteral("task-u1"));
+        const QJsonObject oFiles = o.value("files").toObject();
+        QCOMPARE(oFiles.size(), 2);
+        const QJsonObject oEnt = oFiles.value("lib/util.h").toObject();
+        QCOMPARE(oEnt.value("h").toString().size(), 64);
+        QVERIFY(oEnt.contains("z"));
+        QVERIFY(oEnt.contains("m"));
+        // store blob 数 = 源文件数（每文件一个内容 blob）。
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        QCOMPARE(stStore.entryList({"*.zst"}, QDir::Files).size(), 2);
+        Wipe(sRoot);
+    }
+
+    // 用例 2：改 1 文件再备 —— store 仅 +1；未变文件 blob 复用。
+    void testUnifiedIncrementalDedup() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "aaa");
+        WriteFile(sRoot, "b.cpp", "bbb");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        stPm.BackupTree("stage", "task-u2", "Develop", "", 0);
+        WriteFile(sRoot, "a.cpp", "CHANGED");
+        const int iSeq2 = stPm.BackupTree("stage", "task-u2", "BugFix", "", 0);
+        QCOMPARE(iSeq2, 2);
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        QCOMPARE(stStore.entryList({"*.zst"}, QDir::Files).size(), 3);   // 2 + 1 变更
+        Wipe(sRoot);
+    }
+
+    // 用例 3：删 1 文件再备 —— 新 meta 不含该路径；store 不减。
+    void testUnifiedDeleteFile() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "aaa");
+        WriteFile(sRoot, "b.cpp", "bbb");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        stPm.BackupTree("stage", "task-u3", "Develop", "", 0);
+        QFile::remove(sRoot + "/b.cpp");
+        const int iSeq2 = stPm.BackupTree("turn", "task-u3", "", "问题", 0);
+        QVERIFY(iSeq2 > 0);
+        QFile f(stPm.UnifiedBackupsDir() + "/0002.meta.json");
+        f.open(QIODevice::ReadOnly);
+        QByteArray buf = f.readAll();
+        f.close();
+        if (buf.startsWith("\xEF\xBB\xBF")) buf = buf.mid(3);
+        const QJsonObject oFiles = QJsonDocument::fromJson(buf).object().value("files").toObject();
+        QVERIFY(!oFiles.contains("b.cpp"));
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        QCOMPARE(stStore.entryList({"*.zst"}, QDir::Files).size(), 2);
+        Wipe(sRoot);
+    }
+
+    // 用例 3.5：代码白名单——中间文件/产物不入库；恢复不触碰它们（原地保留）。
+    void testUnifiedCodeOnlyFilter() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "main.cpp", "code-v1");
+        WriteFile(sRoot, "Makefile", "all:\n");
+        WriteFile(sRoot, "app.exe", "BIN");
+        WriteFile(sRoot, "sub/util.h", "header-v1");
+        WriteFile(sRoot, "sub/intermediate.obj", "OBJ");
+        WriteFile(sRoot, "logo.png", "PNG");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iSeq1 = stPm.BackupTree("stage", "task-u3b", "Develop", "", 0);
+        QVERIFY(iSeq1 > 0);
+        // manifest 只含代码/文本文件（5 个非代码产物全部排除）。
+        QFile f(stPm.UnifiedBackupsDir() + "/0001.meta.json");
+        f.open(QIODevice::ReadOnly);
+        QByteArray buf = f.readAll();
+        f.close();
+        if (buf.startsWith("\xEF\xBB\xBF")) buf = buf.mid(3);
+        const QJsonObject oFiles = QJsonDocument::fromJson(buf).object().value("files").toObject();
+        QCOMPARE(oFiles.size(), 3);   // main.cpp / Makefile / sub/util.h
+        QVERIFY(oFiles.contains("main.cpp"));
+        QVERIFY(oFiles.contains("Makefile"));
+        QVERIFY(oFiles.contains("sub/util.h"));
+        QVERIFY(!oFiles.contains("app.exe"));
+        QVERIFY(!oFiles.contains("sub/intermediate.obj"));
+        QVERIFY(!oFiles.contains("logo.png"));
+        // blob 也只有 3 个（产物不产生内容 blob）。
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        QCOMPARE(stStore.entryList({"*.zst"}, QDir::Files).size(), 3);
+        // 备份点之后：改代码、删代码、改产物 → 恢复到备份点。
+        WriteFile(sRoot, "main.cpp", "code-CHANGED");
+        WriteFile(sRoot, "new.cpp", "added");
+        QFile::remove(sRoot + "/sub/util.h");
+        WriteFile(sRoot, "sub/intermediate.obj", "OBJ-CHANGED");
+        QString sErr;
+        QVERIFY(stPm.RestoreTree(iSeq1, sErr));
+        // 代码逐字节回备份点；备份点后新增的代码文件被清。
+        QCOMPARE(ReadFile(sRoot + "/main.cpp"), QByteArray("code-v1"));
+        QCOMPARE(ReadFile(sRoot + "/sub/util.h"), QByteArray("header-v1"));
+        QVERIFY(!QFile::exists(sRoot + "/new.cpp"));
+        // 非代码文件不被恢复触碰（保留恢复前的现值，含产物内容变化与顶层产物）。
+        QCOMPARE(ReadFile(sRoot + "/sub/intermediate.obj"), QByteArray("OBJ-CHANGED"));
+        QCOMPARE(ReadFile(sRoot + "/app.exe"), QByteArray("BIN"));
+        QCOMPARE(ReadFile(sRoot + "/logo.png"), QByteArray("PNG"));
+        Wipe(sRoot);
+    }
+
+    // 用例 4：DiffVersions 三计数与明细。
+    void testUnifiedDiff() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "m1.cpp", "v1");
+        WriteFile(sRoot, "m2.cpp", "v1");
+        WriteFile(sRoot, "m3.cpp", "v1");
+        WriteFile(sRoot, "keep.cpp", "same");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iOld = stPm.BackupTree("stage", "task-u4", "Develop", "", 0);
+        WriteFile(sRoot, "m1.cpp", "v2");        // mod
+        WriteFile(sRoot, "m2.cpp", "v3");        // mod
+        QFile::remove(sRoot + "/m3.cpp");        // del
+        WriteFile(sRoot, "new.cpp", "n");        // add
+        const int iNew = stPm.BackupTree("stage", "task-u4", "BugFix", "", 0);
+        SDiffResult st;
+        QVERIFY(stPm.DiffVersions(iOld, iNew, st));
+        QCOMPARE(st.iChanged, 2);
+        QCOMPARE(st.iRemoved, 1);
+        QCOMPARE(st.iAdded, 1);
+        QCOMPARE(st.aEntries.size(), 4);
+        Wipe(sRoot);
+    }
+
+    // 用例 5：RestoreTree 到首版 —— 逐字节还原（含被改/被删文件）；排除目录未动。
+    void testUnifiedRestoreFirstVersion() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "v1");
+        WriteFile(sRoot, "sub/b.cpp", "V1");
+        WriteFile(sRoot, ".git/config", "git");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iSeq1 = stPm.BackupTree("stage", "task-u5", "Develop", "", 0);
+        WriteFile(sRoot, "a.cpp", "v2-modified");
+        QFile::remove(sRoot + "/sub/b.cpp");
+        WriteFile(sRoot, "extra.cpp", "new");
+        QString sErr;
+        QVERIFY2(stPm.RestoreTree(iSeq1, sErr), qPrintable(sErr));
+        QCOMPARE(ReadFile(sRoot + "/a.cpp"), QByteArray("v1"));
+        QCOMPARE(ReadFile(sRoot + "/sub/b.cpp"), QByteArray("V1"));
+        QVERIFY(!QFile::exists(sRoot + "/extra.cpp"));
+        QCOMPARE(ReadFile(sRoot + "/.git/config"), QByteArray("git"));   // 排除目录未动
+        Wipe(sRoot);
+    }
+
+    // 用例 6：旧全量 + 统一库合并列表（bLegacy 标记 / 倒序 / legacy 可恢复）。
+    void testUnifiedLegacyMerge() {
+        const QString sRoot = MakeSandbox();
+        const QString sTaskId = "task-u6";
+        WriteFile(sRoot, "a.cpp", "legacy-v1");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iLegacySeq = stPm.BackupSources(sTaskId, "Develop");   // 旧库 0001
+        QVERIFY(iLegacySeq > 0);
+        WriteFile(sRoot, "a.cpp", "unified-v2");
+        const int iUniSeq = stPm.BackupTree("turn", sTaskId, "", "问", 0);
+        QVERIFY(iUniSeq > 0);
+        const QList<SBackupVersion> aVersions = stPm.ListUnifiedBackups(sTaskId);
+        QCOMPARE(aVersions.size(), 2);
+        QVERIFY(aVersions[0].sTime >= aVersions[1].sTime);   // 倒序
+        int iLegacyCount = 0, iUniCount = 0;
+        for (const SBackupVersion& st : aVersions) {
+            if (st.bLegacy) {
+                ++iLegacyCount;
+                QCOMPARE(st.sKind, QStringLiteral("legacy"));
+            } else {
+                ++iUniCount;
+                QCOMPARE(st.sKind, QStringLiteral("turn"));
+            }
+        }
+        QCOMPARE(iLegacyCount, 1);
+        QCOMPARE(iUniCount, 1);
+        // legacy 可经统一入口恢复（按条目 bLegacy 分派旧路径）。
+        QString sErr;
+        const SBackupVersion* pLegacy = nullptr;
+        for (const SBackupVersion& st : aVersions) {
+            if (st.bLegacy) { pLegacy = &st; }
+        }
+        QVERIFY(pLegacy != nullptr);
+        QVERIFY2(stPm.RestoreTree(*pLegacy, sErr), qPrintable(sErr));
+        QCOMPARE(ReadFile(sRoot + "/a.cpp"), QByteArray("legacy-v1"));
+        Wipe(sRoot);
+    }
+
+    // 用例 7：blob 损坏 —— 恢复失败、树原状、err 指明坏 blob。
+    void testUnifiedCorruptBlob() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "good-content");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iSeq1 = stPm.BackupTree("stage", "task-u7", "Develop", "", 0);
+        QVERIFY(iSeq1 > 0);
+        WriteFile(sRoot, "a.cpp", "later-change");
+        // 截断首版 blob（损坏注入）。
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        const QStringList aBlobs = stStore.entryList({"*.zst"}, QDir::Files);
+        QCOMPARE(aBlobs.size(), 1);
+        QFile fBlob(stStore.filePath(aBlobs[0]));
+        fBlob.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        fBlob.write("junk");
+        fBlob.close();
+        QString sErr;
+        QVERIFY2(!stPm.RestoreTree(iSeq1, sErr), "corrupted blob must fail restore");
+        QVERIFY2(sErr.contains("损坏") || sErr.contains("校验失败"),
+                 qPrintable(QStringLiteral("err should point to corrupt blob: ") + sErr));
+        // 工程树还原原状（later-change 仍在；无半恢复文件）。
+        QCOMPARE(ReadFile(sRoot + "/a.cpp"), QByteArray("later-change"));
+        QVERIFY(!QDir(stPm.UnifiedBackupsDir() + "/_restore_tmp").exists());
+        Wipe(sRoot);
+    }
+
+    // 用例 8：rollback-pre —— 回退后产生 target 正确的新版本；回退到它=撤销回退。
+    void testUnifiedRollbackPreUndo() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "before");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iV1 = stPm.BackupTree("stage", "task-u8", "Develop", "", 0);
+        WriteFile(sRoot, "a.cpp", "after");
+        const int iPre = stPm.BackupTree("rollback-pre", "task-u8", "", "", iV1);
+        QVERIFY(iPre > iV1);
+        QString sErr;
+        QVERIFY(stPm.RestoreTree(iV1, sErr));
+        QCOMPARE(ReadFile(sRoot + "/a.cpp"), QByteArray("before"));
+        // 回退到 rollback-pre = 撤销回退（回到 after）。
+        QVERIFY(stPm.RestoreTree(iPre, sErr));
+        QCOMPARE(ReadFile(sRoot + "/a.cpp"), QByteArray("after"));
+        Wipe(sRoot);
+    }
+
+    // 用例 9：PurgeOwner + GC —— owner 版本 meta 删除；他版本仍引用 blob 存活；无引用回收。
+    void testUnifiedPurgeOwnerGc() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "shared.cpp", "shared-content");
+        WriteFile(sRoot, "only_a.cpp", "a-only");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        stPm.BackupTree("stage", "ownerA", "Develop", "", 0);
+        // ownerB 备份：共享 shared.cpp + 独有文件。
+        QFile::remove(sRoot + "/only_a.cpp");
+        WriteFile(sRoot, "only_b.cpp", "b-only");
+        stPm.BackupTree("stage", "ownerB", "Develop", "", 0);
+        QDir stStore(stPm.UnifiedBackupsDir() + "/store");
+        QCOMPARE(stStore.entryList({"*.zst"}, QDir::Files).size(), 3);
+        // 删 ownerA：其 meta 删；only_a blob 回收；shared blob 因 ownerB 引用存活。
+        stPm.PurgeOwner("ownerA");
+        QVERIFY(stPm.ListUnifiedBackups("ownerA").isEmpty());
+        const QStringList aLeft = stStore.entryList({"*.zst"}, QDir::Files);
+        QCOMPARE(aLeft.size(), 2);   // shared + only_b
+        QString sNoErr;
+        stPm.RestoreFromTmp(sNoErr);   // no-op（无残留）
+        Wipe(sRoot);
+    }
+
+    // 用例 10：中文路径/文件名全链路无损。
+    void testUnifiedChinesePaths() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, QStringLiteral("源码/主程序.cpp"), "中文内容");
+        WriteFile(sRoot, QStringLiteral("文档 说明.md"), "# 说明");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        const int iSeq = stPm.BackupTree("turn", "global", "", QStringLiteral("帮我改中文文件"), 0);
+        QVERIFY(iSeq > 0);
+        WriteFile(sRoot, QStringLiteral("源码/主程序.cpp"), "被改了");
+        QFile::remove(sRoot + QStringLiteral("/文档 说明.md"));
+        const QList<SBackupVersion> aV = stPm.ListUnifiedBackups("global");
+        QCOMPARE(aV.size(), 1);
+        QCOMPARE(aV[0].sPrompt, QStringLiteral("帮我改中文文件"));
+        QString sErr;
+        QVERIFY2(stPm.RestoreTree(iSeq, sErr), qPrintable(sErr));
+        QCOMPARE(ReadFile(sRoot + QStringLiteral("/源码/主程序.cpp")),
+                 QByteArray("中文内容"));
+        QCOMPARE(ReadFile(sRoot + QStringLiteral("/文档 说明.md")), QByteArray("# 说明"));
+        Wipe(sRoot);
+    }
+
+    // notice 五件套往返。
+    void testUnifiedNotice() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, "a.cpp", "x");
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        stPm.BackupTree("stage", "ownerN", "Develop", "", 0);
+        int iTarget = 0;
+        QString sOwner;
+        QVERIFY(!stPm.LoadPendingNotice(iTarget, sOwner));
+        stPm.SetPendingNotice(7, QStringLiteral("ownerN"));
+        QVERIFY(stPm.LoadPendingNotice(iTarget, sOwner));
+        QCOMPARE(iTarget, 7);
+        QCOMPARE(sOwner, QStringLiteral("ownerN"));
+        stPm.ClearPendingNotice();
+        QVERIFY(!stPm.LoadPendingNotice(iTarget, sOwner));
+        Wipe(sRoot);
+    }
+
 };
 
 QTEST_MAIN(CTestRollback)

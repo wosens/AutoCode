@@ -9,6 +9,12 @@ set "_ORIG_PATH=!PATH!"
 :: ---- 参数：/dsh = 只安装 DeepSeekHarness（设置页「安装 DeepSeekHarness」按钮调用）----
 set "DSH_ONLY=0"
 if /i "%~1"=="/dsh" set "DSH_ONLY=1"
+:: ---- 参数：/pi = 只安装 PIAgent（设置页「安装 PIAgent」按钮调用）----
+set "PI_ONLY=0"
+if /i "%~1"=="/pi" set "PI_ONLY=1"
+:: ---- 参数/codex = 只安装 CodexHarness（设置页「安装 CodexHarness…」按钮调用）----
+set "CODEX_ONLY=0"
+if /i "%~1"=="/codex" set "CODEX_ONLY=1"
 
 title AutoCode 环境安装
 cd /d "%~dp0"
@@ -18,10 +24,13 @@ cd /d "%~dp0"
 for %%i in ("%~dp0DeepSeekHarness\deepseek-harness") do set "DSH_ROOT=%%~fi"
 
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
+if "!PI_ONLY!"=="1" goto :BANNER_PI
+if "!CODEX_ONLY!"=="1" goto :BANNER_CODEX
 echo ============================================================
 echo   AutoCode 环境安装
 echo   一键安装：Git、Node.js LTS、Claude Code CLI
 echo   可选安装：DeepSeekHarness - DeepSeek 官方 Agent 后端
+echo   可选安装：PIAgent - pi coding-agent（本机源复制安装）
 echo   可选接入：GLM 中继工具 - Claude Code 换国产模型
 echo ============================================================
 echo.
@@ -36,7 +45,28 @@ echo   前置条件：Git 与 Node.js - 缺失时会自动安装
 echo ============================================================
 echo.
 
+:BANNER_PI
+echo ============================================================
+echo   PIAgent 单独安装
+echo   安装内容：pi coding-agent 运行时（robocopy 复制本机已构建源）
+echo   安装位置：脚本同级 PIAgent\pi
+echo   前置条件：Node.js - 缺失时会自动安装
+echo   源目录默认：脚本上级 PIAgent（含 pi\ 子目录），可用环境变量 PI_SRC 覆盖
+echo ============================================================
+echo.
+
 :ADMIN
+:: ---- CodexHarness 横幅（/codex 单装模式）----
+:BANNER_CODEX
+echo ============================================================
+echo   CodexHarness 单独安装
+echo   安装内容：@openai/codex@0.87.0（npm 本地工程安装，--save-exact 锁定版本）
+echo   安装位置：脚本同级 Execute\CodexHarness
+echo   版本说明：v0.88+ 已移除 wire_api="chat"，本后端锁定 0.87.0（chat 网关接入）
+echo ============================================================
+echo.
+goto :ADMIN
+
 :: ---- 0. 管理员权限检测（写 Program Files / 机器级 PATH 需要）----
 net session >nul 2>&1
 if !errorlevel! neq 0 (
@@ -53,6 +83,8 @@ echo.
 
 :: ---- 1. 选择 Claude Code 接入后端（DSH 单装模式跳过）----
 if "!DSH_ONLY!"=="1" goto :DETECT
+if "!PI_ONLY!"=="1" goto :DETECT
+if "!CODEX_ONLY!"=="1" goto :CODEX
 echo ============================================================
 echo   请选择 Claude Code 接入模型：
 echo     [1] Anthropic 原版 - 官方直连 + Anthropic 账号或 API key
@@ -82,7 +114,7 @@ if /i "!BACKEND!"=="GLM" ( where chelper >nul 2>&1 && set "HAVE_HELPER=1" )
 echo [检测]
 if "!HAVE_NODE!"=="1"   (echo    node     已安装) else (echo    node     缺失)
 if "!HAVE_GIT!"=="1"    (echo    git      已安装) else (echo    git      缺失)
-if "!DSH_ONLY!"=="0" (
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="1" (echo    claude   已安装) else (echo    claude   缺失)
     if /i "!BACKEND!"=="GLM" (
         if "!HAVE_HELPER!"=="1" (echo    chelper  已安装) else (echo    chelper  缺失)
@@ -103,7 +135,7 @@ echo.
 set "NEED=0"
 if "!HAVE_NODE!"=="0"   set "NEED=1"
 if "!HAVE_GIT!"=="0"    set "NEED=1"
-if "!DSH_ONLY!"=="0" (
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="0" set "NEED=1"
     if /i "!BACKEND!"=="GLM" if "!HAVE_HELPER!"=="0" set "NEED=1"
 )
@@ -112,6 +144,7 @@ if "!NEED!"=="0" (
     echo [检测] 所有必要组件已经就绪，无需重装。
     echo.
     if "!DSH_ONLY!"=="1" goto :DSH
+    if "!PI_ONLY!"=="1" goto :PI
     goto :DSH_ASK
 )
 
@@ -189,6 +222,8 @@ echo.
 
 :: DSH 单装模式：到此环境就绪，直接进安装段。
 if "!DSH_ONLY!"=="1" goto :DSH
+:: PI 单装模式：node 就绪即可（无需 git/npm 全局件），直接进安装段。
+if "!PI_ONLY!"=="1" goto :PI
 
 :: ---- 8. Claude Code CLI（claude 命令）----
 where claude >nul 2>&1
@@ -315,6 +350,105 @@ echo.
 :DSH_END
 goto :VERIFY
 
+:: ---- CodexHarness 单独安装段（/codex：npm 本地工程安装到脚本同级 Execute\CodexHarness）----
+:CODEX
+echo ============================================================
+echo   安装 CodexHarness（OpenAI Codex CLI 0.87.0）
+echo ============================================================
+:: 前置：node 需可用（版本 20 以上；未装时先用全量模式装 Node 再重跑本模式）。
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - Codex CLI 需要 Node 运行时。请先运行全量安装（装 Node）后重跑 install_env.bat /codex
+    goto :CODEX_END
+)
+set "NODE_MAJOR=0"
+for /f "tokens=1 delims=v." %%v in ('node -v') do set "NODE_MAJOR=%%v"
+if !NODE_MAJOR! LSS 20 (
+    echo [错误] Node 版本过低（主版本 !NODE_MAJOR!，需 20 以上）- 请升级 Node.js 后重跑。
+    goto :CODEX_END
+)
+for %%i in ("%~dp0Execute\CodexHarness") do set "CODEX_DST=%%~fi"
+if not exist "!CODEX_DST!" mkdir "!CODEX_DST!"
+cd /d "!CODEX_DST!"
+if not exist package.json (
+    echo {"name":"autocode-codexharness","version":"1.0.0"} > package.json
+)
+:: ---- 2026.08.21 本机源离线兜底：脚本上级有 CodexHarness 安装源（同级约定，同 PIAgent）
+::      时 robocopy 直接复制，跳过 npm（避免联网慢/卡死）；robocopy 失败再走 npm。
+if not defined CODEX_SRC set "CODEX_SRC=%~dp0..\CodexHarness"
+for %%i in ("!CODEX_SRC!") do set "CODEX_SRC=%%~fi"
+if exist "!CODEX_SRC!\node_modules\@openai\codex\package.json" (
+    echo [安装] 检测到本机源，robocopy 离线安装（源：!CODEX_SRC!）...
+    robocopy "!CODEX_SRC!" "!CODEX_DST!" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+    if !errorlevel! GEQ 8 (
+        echo [警告] robocopy 失败（退出码 !errorlevel!）- 回退 npm 联网安装。
+    ) else (
+        goto :CODEX_VERIFY
+    )
+)
+echo [安装] npm install @openai/codex@0.87.0 --save-exact ...
+call npm install @openai/codex@0.87.0 --save-exact
+if !errorlevel! neq 0 (
+    cd /d "%~dp0"
+    echo [错误] npm install 失败 - 查看上方输出（网络/npm 源问题），处理后重跑可续装。
+    goto :CODEX_END
+)
+echo [验证] node node_modules\@openai\codex\bin\codex.js --version ...
+call node node_modules\@openai\codex\bin\codex.js --version
+if !errorlevel! neq 0 (
+    cd /d "%~dp0"
+    echo [错误] codex.js --version 验证失败 - 安装未完成，请查看上方输出。
+    goto :CODEX_END
+)
+cd /d "%~dp0"
+echo [OK] CodexHarness 安装完成（!CODEX_DST!）
+echo        AutoCode 启动时会自动探测本目录并自动配置；
+echo        设置页也可点「重新检测」立即生效。
+echo.
+
+:CODEX_END
+goto :VERIFY
+
+:: ---- PIAgent 单独安装段（2026.08.19 第三后端；robocopy 本机源 → 脚本同级 PIAgent\pi）----
+:PI
+echo ============================================================
+echo   安装 PIAgent（pi coding-agent）
+echo ============================================================
+:: 前置：node 必须可用（前面块已尽力自动安装）。
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - PIAgent 需要 Node 运行时，请先装好再重试。
+    goto :PI_END
+)
+:: 源：默认脚本上级 PIAgent（发布目录旁的源码仓库），环境变量 PI_SRC 可覆盖。
+if not defined PI_SRC set "PI_SRC=%~dp0..\PIAgent"
+for %%i in ("!PI_SRC!") do set "PI_SRC=%%~fi"
+for %%i in ("%~dp0PIAgent") do set "PI_DST=%%~fi"
+if not exist "!PI_SRC!\pi\packages\coding-agent\dist\cli.js" (
+    echo [错误] 源目录无效：!PI_SRC!\pi 下未找到 packages\coding-agent\dist\cli.js
+    echo        可用环境变量 PI_SRC 指定 PIAgent 仓库根（含 pi\ 子目录）后重跑：
+    echo          set PI_SRC=D:\path\to\PIAgent ^&^& install_env.bat /pi
+    goto :PI_END
+)
+echo [安装] robocopy 复制 pi 运行时（源：!PI_SRC!\pi → 目标：!PI_DST!\pi）...
+if not exist "!PI_DST!" mkdir "!PI_DST!"
+robocopy "!PI_SRC!\pi" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+if !errorlevel! GEQ 8 (
+    echo [错误] robocopy 失败（退出码 !errorlevel!）- 请查看上方输出排查（磁盘空间/占用/权限）。
+    goto :PI_END
+)
+if exist "!PI_DST!\pi\packages\coding-agent\dist\cli.js" (
+    echo [OK] PIAgent 安装完成：!PI_DST!
+    echo        AutoCode 启动时会自动探测本目录并回填配置；
+    echo        设置页也可点「重新检测」立即生效。
+) else (
+    echo [错误] 未找到 cli.js - 安装未完成，请查看上方输出排查。
+)
+echo.
+
+:PI_END
+goto :VERIFY
+
 :: ---- 10. 安装结果验证 ----
 :VERIFY
 echo ============================================================
@@ -334,6 +468,11 @@ if exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
 ) else (
     echo [DeepSeekHarness] 未安装 - 可选组件，可在 AutoCode 设置页单独安装
 )
+if exist "%~dp0PIAgent\pi\packages\coding-agent\dist\cli.js" (
+    echo [PIAgent] 已安装：%~dp0PIAgent\pi
+) else (
+    echo [PIAgent] 未安装 - 可选组件，可在 AutoCode 设置页单独安装
+)
 if "!DSH_ONLY!"=="0" (
     call :ShowVer claude --version
     if /i "!BACKEND!"=="GLM" (
@@ -349,6 +488,7 @@ echo.
 
 :: ---- 11. 后续操作提示（DSH 单装模式无需 Claude 配置指引）----
 if "!DSH_ONLY!"=="1" goto :END
+if "!PI_ONLY!"=="1" goto :END
 echo ============================================================
 echo   后续配置（需要的话按提示完成）：
 echo ============================================================

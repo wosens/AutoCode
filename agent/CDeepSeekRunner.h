@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QElapsedTimer>
 #include <QJsonObject>
@@ -164,6 +164,7 @@ private:
     bool m_bCfgDirty = false;   // 轮次中遇配置变更，待收尾后重启进程
     int  m_iCfgDirtyGen = -1;  // 挂脏标时的进程代次（收尾杀进程只杀旧代，防误杀新配置进程）
     int  m_iProcGen = 0;       // 进程代次（EnsureProcess 冷启动 +1；区分新旧进程）
+    QString m_sProcWorkDir;    // 2026.08.20 当前 DSH 进程 cwd（工程切换检测：不一致须杀旧冷启）
 
     // 进程态（长驻生命周期）：NotCreated → Booting（握手中）→ Ready ⇄ Dead（退出/被杀）。
     enum EProcState { ProcNotCreated, ProcBooting, ProcReady, ProcDead };

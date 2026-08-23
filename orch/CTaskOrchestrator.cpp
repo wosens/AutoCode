@@ -1,4 +1,4 @@
-﻿#include "CTaskOrchestrator.h"
+#include "CTaskOrchestrator.h"
 
 #include <QFile>
 #include <QTextStream>
@@ -59,6 +59,17 @@ void CTaskOrchestrator::EnsureRunner() {
             this, &CTaskOrchestrator::OnRunnerToolUse);
     connect(m_pRunner, &CAgentRunnerBase::sigToolResult,
             this, &CTaskOrchestrator::OnRunnerToolResult);
+    // 2026.08.21 运行中真实计量（Codex 经本地代理解析网关 usage）：即时累计进
+    //   任务行费用/输入/输出/请求列并刷新 UI；阶段收尾 sigFinished 携带 0 防双计。
+    connect(m_pRunner, &CAgentRunnerBase::sigUsageDelta, this,
+            [this](qint64 a_iIn, qint64 a_iOut) {
+                if (m_pCurTask == nullptr) {
+                    return;
+                }
+                m_pCurTask->AddUsage(0.0, a_iIn, a_iOut);
+                m_pCurTask->AddRequests(1);
+                emit sigTaskChanged(m_pCurTask);
+            });
     connect(m_pRunner,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
                 &CAgentRunnerBase::sigFinished),
@@ -81,11 +92,13 @@ void CTaskOrchestrator::MaybeBackfillBackupSummary(CTaskInfo* a_pTask, EStage a_
         m_iCurBackupSeq = 0;
         return;
     }
-    // FR-6.3：首次备份（无上一版可对比）不记录修改内容——本次序号即该任务最小序号时跳过回填。
-    const QList<SBackupVersion> aVersions = m_pPm->ListBackups(a_pTask->Id());
+    // FR-6.3：首次备份（无上一版可对比）不记录修改内容——本次序号即该任务最小
+    // stage 版本序号时跳过回填（统一库口径：只比 kind=stage 的 CAS 版本，legacy 不计）。
+    const QList<SBackupVersion> aVersions = m_pPm->ListUnifiedBackups(a_pTask->Id());
     int iMinSeq = INT_MAX;
     for (const SBackupVersion& st : aVersions) {
-        if (st.iSeq > 0 && st.iSeq < iMinSeq) {
+        if (!st.bLegacy && st.sKind == QStringLiteral("stage")
+            && st.iSeq > 0 && st.iSeq < iMinSeq) {
             iMinSeq = st.iSeq;
         }
     }
@@ -98,7 +111,7 @@ void CTaskOrchestrator::MaybeBackfillBackupSummary(CTaskInfo* a_pTask, EStage a_
         sSum = QStringLiteral("（%1 阶段完成）").arg(StageNameZh(a_eStage));
     }
     // 截断防 meta.json 过大（摘要取前 300 字符）。
-    m_pPm->SetBackupSummary(a_pTask->Id(), m_iCurBackupSeq, sSum.left(300));
+    m_pPm->SetUnifiedSummary(m_iCurBackupSeq, sSum.left(300));
     m_iCurBackupSeq = 0;   // 回填完毕清零
 }
 
@@ -255,6 +268,13 @@ void CTaskOrchestrator::StopTask(CTaskInfo* a_pTask) {
 
 void CTaskOrchestrator::StopAll() {
     // FR-7 最低验收：切工程前停止当前任务 runner + 编译门，并置空 m_pCurTask。
+    // 2026.08.22 先 join 后台备份线程：备份期间 BackupTree 长时间使用 CProjectManager
+    // 的 store 指针，若不等待就切工程（Open → delete m_pBackupStore）会 use-after-free；
+    // 备份为纯文件 IO（秒级），阻塞等待可接受。
+    if (m_thBackup.joinable()) {
+        m_thBackup.join();
+    }
+    m_bBackupRunning = false;
     // OnRunnerFinished 首行已判 m_pCurTask==nullptr 早返回，故 runner 即便随后异步
     // 投递 finished 信号也不会访问到将被 ClearTasks delete 的任务对象。
     // 不 waitForFinished：避免阻塞 UI；竞态由 m_pCurTask 置空 + 早返回兜住。
@@ -387,6 +407,14 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
                 WriteRunLog(a_pTask, QStringLiteral("tool_result"),
                             QStringLiteral("[%1] %2").arg(sViewId, a_sResult));
                 emit sigToolResult(a_pTask, a_sResult, sViewId);
+            });
+        // 2026.08.21 评审视角 runner 的真实计量同样即时累计（收尾 sigFinished/
+        //   LastReqCount 在 m_bUsageLive 时已报 0，无双计）。
+        connect(pRunner, &CAgentRunnerBase::sigUsageDelta, this,
+            [this, a_pTask](qint64 a_iIn, qint64 a_iOut) {
+                a_pTask->AddUsage(0.0, a_iIn, a_iOut);
+                a_pTask->AddRequests(1);
+                emit sigTaskChanged(a_pTask);
             });
         connect(pRunner,
                 qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
@@ -659,8 +687,11 @@ void CTaskOrchestrator::RunCurrentStage(CTaskInfo* a_pTask) {
         if (m_thBackup.joinable()) {
             m_thBackup.join();   // guards 已保证无重叠，此处仅防御（立即返回）
         }
+        m_bBackupRunning = true;
         m_thBackup = std::thread([this, pGuard, sTaskId, sStageName, stDef, pPm]() {
-            const int iSeq = pPm->BackupSources(sTaskId, sStageName);   // 纯文件 IO
+            const int iSeq = pPm->BackupTree(QStringLiteral("stage"), sTaskId,
+                                             sStageName, QString(), 0);   // 纯文件 IO（统一 CAS 库）
+            m_bBackupRunning = false;   // 2026.08.22 备份结束满（在 invokeMethod 前置，避免下轮 join 前的窗口）
             QMetaObject::invokeMethod(this, [this, pGuard, iSeq, stDef]() {
                 if (pGuard.isNull()) {
                     return;   // 备份期间任务被删除/归档回收
@@ -1004,6 +1035,12 @@ void CTaskOrchestrator::Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a
     a_pTask->AppendHistory({eCur, a_pTask->StageIter(), a_bOk, sSummary});
     emit sigTaskChanged(a_pTask);
 
+    // 2026.08.20 (自动命名→Agent 定稿)：未填名称的临时名任务，Intake 成功后把
+    //   任务内容 + guide.md 拼成提示词交给 Agent 起名（仅一次，回填后清 autoNamed 标记）。
+    if (eCur == EStage::Intake && a_bOk && a_pTask->AutoNamed()) {
+        AutoNameNow(a_pTask);
+    }
+
     // 需求3：单阶段重跑（右键「再次执行」）——记录产物/历史后即停在原阶段，不推进、不续跑、不判死。
     //   无论本阶段成功或失败（含 max-turns），都置 Paused 结束；后续阶段产物不受影响。
     if (m_bSingleStageRerun) {
@@ -1180,8 +1217,23 @@ void CTaskOrchestrator::ReRunResume(CTaskInfo* a_pTask, const QString& a_sCont) 
     // 重置 m_dtStageStart 以正确判定本轮（续跑）评审输出文件新鲜度；助手文本缓存也清空。
     m_dtStageStart = QDateTime::currentDateTime();
     m_sLastAssistantText.clear();
+    // 任务侧 --resume 续跑（方案 §6.3）：pending 回退告知前置注入（一次性）。
+    QString sPrompt = a_sCont;
+    if (m_pPm != nullptr) {
+        int iNoticeTarget = 0;
+        QString sNoticeOwner;
+        // 2026.08.22 owner 校验：任务侧 notice 只由该任务自身消费（防被 global 助手轮抢先清除，
+        // 导致任务 --resume 续跑看不到告知）；owner 不匹配则保留待正主。
+        if (m_pPm->LoadPendingNotice(iNoticeTarget, sNoticeOwner)
+            && sNoticeOwner == a_pTask->Id()) {
+            sPrompt.prepend(QStringLiteral(
+                "【系统回退通知】工作目录已回退到版本 #%1：此前对话中描述的文件修改已不存在于磁盘。"
+                "请以当前磁盘内容为准，不要基于已被回退的修改继续工作。\n---\n").arg(iNoticeTarget));
+            m_pPm->ClearPendingNotice();
+        }
+    }
     EnsureRunner();
-    m_pRunner->StartStage(a_pTask->ProjectDir(), a_sCont,
+    m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt,
                           pDef ? pDef->sTools : QString(),
                           MaxTurnsFor(a_pTask, a_pTask->CurrentStage()),
                           a_pTask->LastSessionId());
@@ -1476,6 +1528,192 @@ QString CTaskOrchestrator::IterationStrategyHint(int a_iIter) {
                 "主动收缩范围（先保证评审的 critical/major 阻塞项全部解决），"
                 "输出前逐条自检评审意见是否全部闭环，宁可保守也不要引入新风险。");
     }
+}
+
+bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
+    // 2026.08.20 (自动命名) 定稿素材源——只读两处：
+    //   ① 任务内容：用户原始需求（多行取「信息量最大」的一行：最长且 ≤80 字，退首个
+    //      非空行）——任务名首先应反映用户要什么；
+    //   ② 工程 guide.md：首个非泛型标题（尾注括号优先）——任务内容为空时兜底。
+    //   不再读 requirements.md / intake.md 等阶段产物（模板腔标题，「需求收集 — 任务 xxx」
+    //   「用户原始需求」两轮误命名皆源于此）。
+    //   统一清洗（去 #/*/_/` 标记与「— 任务 id」装饰）后按「一句话简短描述」口径：
+    //   取首子句（不足 10 字顺延到下一子句边界），截断 24 字。SetName 发 sigChanged，
+    //   由 CMainWindow 落盘 task.json 并刷新 UI。
+
+    // 泛型素材判定：模板章节名/阶段名/纯元数据，作任务名无信息量，全部跳过。
+    static const QStringList aGeneric = {
+        QStringLiteral("需求收集"), QStringLiteral("需求概述"), QStringLiteral("需求分析"),
+        QStringLiteral("需求规格"), QStringLiteral("需求描述"), QStringLiteral("需求确认"),
+        QStringLiteral("需求文档"), QStringLiteral("功能需求"), QStringLiteral("非功能需求"),
+        QStringLiteral("验收标准"), QStringLiteral("待澄清"), QStringLiteral("概述"),
+        QStringLiteral("概要"), QStringLiteral("总结"), QStringLiteral("背景"),
+        QStringLiteral("目标"), QStringLiteral("设计"), QStringLiteral("方案"),
+        QStringLiteral("需求"), QStringLiteral("任务"), QStringLiteral("项目"),
+        QStringLiteral("requirements"), QStringLiteral("intake"),
+        QStringLiteral("overview"), QStringLiteral("summary"),
+    };
+    // 去模板装饰：标题里常见的「— 任务 <id>」段、编号/条目号前缀（1. / FR2. / AC3.）。
+    static const QRegularExpression reDecor(
+        QStringLiteral("[\\s]*[—–-]+[\\s]*任务[\\s]*[0-9a-zA-Z\\-]+|[\\b](?:FR|NFR|AC|Q)[\\d]+[\\.]|^[\\s]*[\\d]+[.、][\\s]*"));
+    // 注：[\\b] 非词界断言（char class 内无 \b 断言语义），条目号匹配用「行首+编号」已覆盖，
+    //   中缀 FR2. 场景由清洗阶段兜底，此处容忍。
+    auto isGeneric = [](const QString& a_s) {
+        QString s = a_s;
+        // 去尾缀阶段标注：需求收集（intake）/ Requirements (Stage 1) 之类。
+        static const QRegularExpression reStageTag(
+            QStringLiteral("[（(]\\s*(?:intake|stage\\s*\\d+|需求收集|阶段\\s*\\d+)\\s*[)）]\\s*$"),
+            QRegularExpression::CaseInsensitiveOption);
+        s.remove(reStageTag);
+        s.remove(QLatin1Char('.'));
+        s = s.trimmed();
+        if (s.size() < 4) { return true; }   // 太短必是泛型（如「需求」「概述」）
+        const QString sLow = s.toLower();
+        if (std::any_of(aGeneric.cbegin(), aGeneric.cend(),
+                        [&sLow](const QString& g) { return sLow == g.toLower(); })) {
+            return true;
+        }
+        // 2026.08.20 三次修订：intake.md 的模板章节名（「用户原始需求」「结构化整理」
+        //   「2. 动机与背景」等）包含式命中即视为泛型——此前「用户原始需求」被当任务名。
+        static const QStringList aGenericSub = {
+            QStringLiteral("原始需求"), QStringLiteral("用户需求"), QStringLiteral("结构化整理"),
+            QStringLiteral("动机与背景"), QStringLiteral("约束与边界"), QStringLiteral("待澄清"),
+            QStringLiteral("想要实现"), QStringLiteral("涉及的模块"), QStringLiteral("结合 guide"),
+            QStringLiteral("用户明确"), QStringLiteral("硬性需求"), QStringLiteral("不臆造"),
+        };
+        return std::any_of(aGenericSub.cbegin(), aGenericSub.cend(),
+                           [&s](const QString& g) { return s.contains(g); });
+    };
+
+    QString sCandidate;
+    // ① 任务内容（用户原始需求）：多行取「信息量最大」的一行（最长且 ≤80 字），单行或
+    //   都超长则取首个非空行——首行常是宽泛总起句（如「创建一个网页版小游戏」），其后
+    //   的具体描述行更能代表任务内容。
+    {
+        QString sFirst;
+        for (const QString& sLine : a_pTask->UserRequest().split(QLatin1Char('\n'))) {
+            const QString s = sLine.trimmed();
+            if (s.isEmpty()) { continue; }
+            if (sFirst.isEmpty()) { sFirst = s; }
+            if (s.size() <= 80 && s.size() > sCandidate.size()) {
+                sCandidate = s;
+            }
+        }
+        if (sCandidate.isEmpty()) { sCandidate = sFirst; }
+    }
+    // ② 工程 guide.md 兜底（任务内容为空时）：首个非泛型标题；标题尾注括号常承载标题
+    //   本体（「需求规格 — 任务 xxx（网页版飞机大战）」→「网页版飞机大战」），尾注含
+    //   guide/任务/阶段等元词时跳过。
+    if (isGeneric(sCandidate)) {
+        QFile stGuide(a_pTask->ProjectDir() + QStringLiteral("/.autodev/guide.md"));
+        if (stGuide.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QString sGuide = QTextStream(&stGuide).readAll();
+            static const QRegularExpression reHeading(
+                QStringLiteral("(?m)^#{1,3}\\s*(.+?)\\s*$"));
+            QRegularExpressionMatchIterator it = reHeading.globalMatch(sGuide);
+            static const QRegularExpression reParenTail(
+                QStringLiteral("[（(]([^（）()]{4,30})[)）][\\s]*$"));
+            while (it.hasNext()) {
+                const QString sRaw = it.next().captured(1).trimmed();
+                const QRegularExpressionMatch mParen = reParenTail.match(sRaw);
+                if (mParen.hasMatch()) {
+                    const QString sParen = mParen.captured(1).trimmed();
+                    if (!isGeneric(sParen) && !sParen.contains(QStringLiteral("guide"),
+                            Qt::CaseInsensitive)) {
+                        sCandidate = sParen;
+                        break;
+                    }
+                }
+                QString s = sRaw;
+                s.remove(reDecor);
+                s = s.trimmed();
+                if (!isGeneric(s)) { sCandidate = s; break; }
+            }
+        }
+    }
+
+    // 清洗：去 Markdown 强调/代码标记与残留 #/「— 任务 id」装饰，压缩空白；
+    //   「一句话简短描述」口径——取首个子句边界（，,。;；：:）之前的短句，首子句不足
+    //   10 字则顺延到下一子句边界（「创建一个网页版小游戏：竖版飞机大战」优于只取冒号前），
+    //   再截断 24 字。
+    sCandidate.remove(reDecor);
+    sCandidate = sCandidate.remove(QLatin1Char('#'))
+                           .remove(QLatin1Char('*'))
+                           .remove(QLatin1Char('`'))
+                           .remove(QStringLiteral("__"))
+                           .simplified();
+    {
+        static const QRegularExpression reSep(QStringLiteral("[，,。;；：:]"));
+        int iFrom = 0;
+        for (;;) {
+            const QRegularExpressionMatch mSep = reSep.match(sCandidate, iFrom);
+            if (!mSep.hasMatch() || mSep.capturedStart() >= sCandidate.size() - 1) {
+                break;   // 无更多子句边界
+            }
+            const int iLen = mSep.capturedStart();
+            if (iLen >= 10 || iLen >= 24) {
+                sCandidate = sCandidate.left(iLen).trimmed();
+                break;
+            }
+            iFrom = mSep.capturedStart() + 1;   // 首子句太短：顺延到下一边界
+        }
+    }
+    if (sCandidate.size() > 24) {
+        sCandidate = sCandidate.left(24).trimmed();
+    }
+    if (sCandidate.isEmpty()) {
+        return false;   // 无可用素材：保留临时名，标记不清（下次 Intake 重跑再试）
+    }
+
+    a_pTask->SetAutoNamed(false);
+    a_pTask->SetName(sCandidate);   // 发 sigChanged → task.json 回写 + UI 刷新
+    StageEvent(a_pTask, QStringLiteral("auto_named"),
+        QStringLiteral("⚙ 任务已自动命名：「%1」").arg(sCandidate));
+    return true;
+}
+
+bool CTaskOrchestrator::AutoNameNow(CTaskInfo* a_pTask) {
+    // 2026.08.20 (Agent 起名)：任务内容（用户原始需求）+ 工程 guide.md 拼提示词，经
+    //   adhoc 助手 runner 独立模式（AutoNaming）交 Agent 生成一句话简短名称；结果在
+    //   OnAdhocFinished 清洗后 SetName 回填，并发 sigAutoNameDone 供主窗口镜像 DB/刷新。
+    //   助手忙/工程未开 → 回退本地启发式 MaybeAutoNameTask（不阻塞命名）。
+    if (a_pTask == nullptr) { return false; }
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        return MaybeAutoNameTask(a_pTask);
+    }
+    if (m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending())) {
+        // 助手被占用（用户提问/压缩/上一次命名中）：本地启发式兜底，避免命名饿死。
+        return MaybeAutoNameTask(a_pTask);
+    }
+    // 素材①：任务内容（用户原始需求，截 2000 字防提示词膨胀）。
+    QString sReq = a_pTask->UserRequest().left(2000).trimmed();
+    if (sReq.isEmpty()) {
+        sReq = QStringLiteral("（用户需求为空，请结合项目指南推断本任务主旨）");
+    }
+    // 素材②：工程 guide.md（截 4000 字）。
+    QString sGuide = m_pPm->ReadGuide().left(4000).trimmed();
+    const QString sGuideSec = sGuide.isEmpty()
+        ? QStringLiteral("（项目指南为空）")
+        : QStringLiteral("以下是当前工程的项目指南（guide.md）：\n---\n%1\n---").arg(sGuide);
+    const QString sPrompt = QStringLiteral(
+        "【任务命名】请为下面的任务起一个简短的中文任务名称。\n\n"
+        "%1\n\n用户的任务需求（任务内容）：\n---\n%2\n---\n\n"
+        "命名要求：\n"
+        "1. 一句话描述任务要做什么（如「创建一个竖版的飞机大战游戏」），不超过 20 个字；\n"
+        "2. 结合项目指南理解任务在工程中的定位，名称要具体、能区分于其他任务；\n"
+        "3. 不要包含「任务」「需求」这类泛型词，不要带任务 id；\n"
+        "4. 只输出名称本身：不要任何解释、引号、标点结尾或多余文字。")
+        .arg(sGuideSec, sReq);
+    m_pAutoNameTask = a_pTask;
+    m_bAdhocReadOnly = true;    // 纯命名：禁 Bash/Edit/Write
+    m_sAdhocPendingPrompt.clear();
+    m_eAdhocMode = AutoNaming;
+    StageEvent(a_pTask, QStringLiteral("auto_naming"),
+        QStringLiteral("⚙ 正在结合任务内容与 guide.md 请 Agent 生成任务名称…"));
+    StartAdhocStage(sPrompt);
+    return true;
 }
 
 void CTaskOrchestrator::RecordSummary(CTaskInfo* a_pTask, EStage a_eStage,
@@ -1933,6 +2171,17 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
     //     本轮成功收尾后自动按同会话续发（OnAdhocFinished 消费队列）。
     //   - 崩溃宽限/重试等待中：runner 被占用但无稳定会话可注入，维持「请稍候」。
     if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+        // 轮中介入（方案 §2.3）：非只读文本注入前同口径拍 turn 快照（失败不阻断）。
+        if (!a_bReadOnly && !a_sText.trimmed().isEmpty() && m_pPm != nullptr
+            && !m_pPm->ProjectDir().isEmpty()) {
+            const QString sOwner = a_sTaskId.isEmpty()
+                ? QStringLiteral("global") : a_sTaskId;
+            if (m_pPm->BackupTree(QStringLiteral("turn"), sOwner,
+                                  QString(), a_sText.left(2000), 0) <= 0) {
+                emit sigAdhocEvent(QStringLiteral("backup_failed"),
+                    QStringLiteral("本轮注入无回退快照（备份失败，详见状态提示）"));
+            }
+        }
         if (!a_sText.trimmed().isEmpty()
             && m_pAdhocRunner->InjectUserTurn(a_sText)) {
             emit sigAdhocEvent(QStringLiteral("injected"),
@@ -2019,11 +2268,37 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
                 "纯查询/只读操作不要写。").arg(a_sTaskId));
         }
     }
+    // —— 统一备份（方案 §6.1/§6.3）：非只读轮投递前同步快照 + 回退告知注入 ——
+    if (!a_bReadOnly) {
+        const QString sOwner = a_sTaskId.isEmpty() ? QStringLiteral("global") : a_sTaskId;
+        int iNoticeTarget = 0;
+        QString sNoticeOwner;
+        // 2026.08.22 owner 校验：notice 只由同 owner（任务/global）的下一轮消费，
+        // 防跨档误吞（任务侧 --resume 续跑仍能看到自己的告知）。
+        if (m_pPm->LoadPendingNotice(iNoticeTarget, sNoticeOwner)
+            && sNoticeOwner == sOwner) {
+            sPrompt.prepend(QStringLiteral(
+                "【系统回退通知】工作目录已回退到版本 #%1：此前对话中描述的文件修改已不存在于磁盘。"
+                "请以当前磁盘内容为准，不要基于已被回退的修改继续工作。\n---\n").arg(iNoticeTarget));
+            m_pPm->ClearPendingNotice();
+        }
+        const int iSeq = m_pPm->BackupTree(QStringLiteral("turn"), sOwner,
+                                           QString(), a_sText.left(2000), 0);
+        if (iSeq <= 0) {
+            emit sigAdhocEvent(QStringLiteral("backup_failed"),
+                QStringLiteral("本轮无回退快照（备份失败，详见状态提示）"));
+        }
+    }
     StartAdhocStage(sPrompt);
 }
 
 void CTaskOrchestrator::UndoAdhoc() {
-    if (m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning()) {
+    // 2026.08.23 守卫补崩溃宽限/重试等待（与 Compact/Submit 同口径）：此时 IsRunning()
+    //   == false 但 runner 仍被占用，放行撤销会在宽限轮询/重试落地时弹栈换基点，
+    //   与仍在途的本轮收尾（压栈/事件回放）互踩出孤儿块。
+    if (m_pAdhocRunner != nullptr
+        && (m_pAdhocRunner->IsRunning() || m_pAdhocRunner->IsGraceActive()
+            || m_pAdhocRunner->IsRetryPending())) {
         emit sigAdhocEvent(QStringLiteral("warn"),
             QStringLiteral("助手运行中，无法撤销"));
         return;
@@ -2149,6 +2424,42 @@ void CTaskOrchestrator::OnAdhocFinished(bool a_bOk, const QString& a_sResult,
     m_dtAdhocStart = QDateTime();
 
     switch (m_eAdhocMode) {
+    case AutoNaming: {
+        // 2026.08.20 (Agent 起名)：只取结果首行清洗为名称——不动用户会话栈、不推进
+        //   m_sAdhocSid（fork 出的分支一次性使用）、不触发 guide 增量同步。
+        CTaskInfo* pTask = m_pAutoNameTask;
+        m_pAutoNameTask = nullptr;
+        m_eAdhocMode = Idle;
+        m_sAdhocPendingPrompt.clear();
+        emit sigAdhocFinished();   // 助手面板退出运行态（命名过程会短暂占用输入栏）
+        if (pTask == nullptr) { break; }
+        if (!a_bOk) {
+            StageEvent(pTask, QStringLiteral("auto_name_failed"),
+                QStringLiteral("✗ Agent 自动命名失败：%1（任务名保持不变）")
+                    .arg(a_sResult.left(120)));
+            emit sigAutoNameDone(pTask, false, QString());
+            break;
+        }
+        // 清洗：首行 → 去引号/书名号/Markdown 标记/空白 → 截 24 字。
+        QString sName = a_sResult.section(QLatin1Char('\n'), 0, 0).trimmed();
+        static const QRegularExpression reNoise(
+            QStringLiteral("^[\"'“”「『<>#*`]+|[\"'“”「』<>#*`。；;，,]+$"));
+        sName.remove(reNoise);
+        sName = sName.simplified();
+        if (sName.size() > 24) { sName = sName.left(24).trimmed(); }
+        if (sName.size() < 2) {   // 空名/乱输出：保持原名
+            StageEvent(pTask, QStringLiteral("auto_name_failed"),
+                QStringLiteral("✗ Agent 未给出有效名称，任务名保持不变"));
+            emit sigAutoNameDone(pTask, false, QString());
+            break;
+        }
+        pTask->SetAutoNamed(false);
+        pTask->SetName(sName);   // 发 sigChanged → task.json 回写 + UI 刷新
+        StageEvent(pTask, QStringLiteral("auto_named"),
+            QStringLiteral("⚙ Agent 已自动命名：「%1」").arg(sName));
+        emit sigAutoNameDone(pTask, true, sName);
+        break;
+    }
     case Submitting: {
         if (!a_bOk) {
             // 2026.08.15 ad-hoc max-turns 误报修复（7ce53172 实测）：--max-turns 40 打满时

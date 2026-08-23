@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QWidget>
 #include <QString>
@@ -7,6 +7,7 @@ class QLabel;
 class QTextBrowser;
 class QPlainTextEdit;
 class QToolButton;
+class QVBoxLayout;
 class QResizeEvent;
 class QShowEvent;
 
@@ -29,7 +30,10 @@ public:
     // —— 按 kind 填充（只调对应那个）——
     void SetAssistantText(const QString& a_sMarkdown);
     void SetTool(const QString& a_sTool, const QString& a_sInputJson);
-    void SetResult(const QString& a_sResult);          // 工具结果回填（ToolUse 专用）
+    // 2026.08.22 连续工具调用合并：追加一条进本卡（标题显示 ×N，展开看全部）
+    void AddMergedTool(const QString& a_sTool, const QString& a_sInputJson);
+    void SetResult(const QString& a_sResult);          // 工具结果回填（ToolUse 专用；合并卡按到达顺序填首个空结果）
+    int  ToolCount() const;                            // 合并卡内工具条目数（单卡=1）
     void SetEvent(const QString& a_sKind, const QString& a_sText);
     void SetSystemText(const QString& a_sText);         // System / Error 共用
 
@@ -51,6 +55,8 @@ private:
 
     // 工具卡：从入参 JSON 生成标题摘要（取 file_path/command/pattern/path 等）
     static QString ToolSummary(const QString& a_sTool, const QString& a_sInputJson);
+    // 工具卡标题（含 ▶/▼ 箭头、首条摘要与合并 ×N 计数）
+    QString HeaderText(bool a_bArrowDown) const;
     // 工具卡：构造 diff/入参内容
     void RebuildToolContent();
 
@@ -63,11 +69,10 @@ private:
     // ToolUse
     QToolButton*    m_pHeader   = nullptr;
     QWidget*        m_pContent  = nullptr;
-    QPlainTextEdit* m_pInputEdit = nullptr;
-    QPlainTextEdit* m_pResultEdit = nullptr;
-    QString         m_sTool;
-    QString         m_sInput;
-    QString         m_sResult;
+    QVBoxLayout*    m_pContentLay = nullptr;   // 展开区布局（合并卡按条目重建）
+    // 2026.08.22 合并卡：连续 ToolUse 条目列表（单卡也走此列表，长度 1）
+    struct SToolEntry { QString sTool; QString sInput; QString sResult; };
+    QList<SToolEntry> m_aTools;
     bool            m_bExpanded  = false;
 
     // Event / System / Error

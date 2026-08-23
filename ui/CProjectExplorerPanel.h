@@ -28,13 +28,14 @@ signals:
     // 「添加到聊天框」（Q1 默认）：把所选路径投到 adhoc 助手输入框。
     // a_sKind: "path" | "content"；本轮默认注入路径。
     void sigAddToChat(const QString& a_sText, const QString& a_sKind);
-    // 2026.08.18 双击文本文件：请求在执行面板「助手」右侧 Tab 内嵌显示内容。
-    //   仅文本文件发出（判定见 OnDoubleClicked）；其他文件保持系统默认程序打开。
-    void sigFileOpen(const QString& a_sAbsPath);
+    // 2026.08.21 打开文件请求（a_sAbsPath 文本文件；a_bSwitchTab=true 切到预览 Tab，
+    //   false=只加载内容/更新标题不切页——单击预览用，用户停留在当前 Tab）。
+    void sigFileOpen(const QString& a_sAbsPath, bool a_bSwitchTab);
 
 private slots:
-    void OnCustomContextMenu(const QPoint& a_stPos);   // 8 项菜单
-    void OnDoubleClicked(const QModelIndex& a_stIdx);  // 文本文件→sigFileOpen；其他→系统默认程序打开
+    void OnCustomContextMenu(const QPoint& a_stPos);   // 右键菜单（含「打开方式」子菜单）
+    void OnDoubleClicked(const QModelIndex& a_stIdx);  // 文本文件→sigFileOpen(切Tab)；其他→系统默认程序打开
+    void OnSingleClicked(const QModelIndex& a_stIdx);  // 2026.08.21 单击文件：与双击一致打开，但不切 Tab
 
 private:
     // 2026.08.18 文本文件判定：扩展名白名单（源码/文档/配置）命中即文本；
@@ -51,6 +52,12 @@ private:
     void CopyRelativePath();// 相对工程根 → 剪贴板
     void AddToChat();       // emit sigAddToChat
     void OpenInExplorer();  // explorer.exe 打开：目录=打开该目录，文件=所在目录并选中
+    // 2026.08.21 「打开方式」子菜单：枚举该文件类型在注册表（HKCR）注册的程序，
+    //   子菜单逐项列出，点击按其 command 模板调用对应程序打开文件。
+    void BuildOpenWithMenu(QMenu* a_pParentMenu, const QString& a_sFilePath);
+    // 按 command 模板展开 %1 并 startDetached 启动注册程序打开文件。
+    static void LaunchOpenWithCommand(const QString& a_sCmdTemplate,
+                                      const QString& a_sFilePath);
 
     bool    IsUnderRoot(const QString& a_sAbsPath) const;   // NFR-7 越界判定
     QString SelectedAbsPath() const;                        // 当前选中节点绝对路径（空=未选/无效）

@@ -1,4 +1,4 @@
-﻿#include "CClaudeRunner.h"
+#include "CClaudeRunner.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -8,6 +8,7 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
+#include <QProcessEnvironment>
 
 CClaudeRunner::CClaudeRunner(QObject* a_pParent)
     : CAgentRunnerBase(a_pParent) {
@@ -231,6 +232,15 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
     }
 
     m_pProc->setWorkingDirectory(a_sWorkDir);
+    // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
+    {
+        QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+        oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+        oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+        oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
+        oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
+        m_pProc->setProcessEnvironment(oEnv);
+    }
     // 上一进程收尾等待已移至函数开头（Reset() 之前，2026.08.17 竞态修复），此处直接启动。
     m_aLastArgs    = aArgs;      // 快速失败重试：保存本次启动参数
     m_sLastPrompt  = a_sPrompt;

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- 用户头像图标（AutoCode 助手日志「你」徽标前缀）：
+       线性人形剪影，主色 #2563eb 与「你」徽章文字同色。 -->
+  <g fill="none" stroke="#2563eb" stroke-width="2.6"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- 头：圆 -->
+    <circle cx="16" cy="10" r="5.4"/>
+    <!-- 肩：下弯弧（身体上半轮廓） -->
+    <path d="M 5.2 27
+             C 5.2 20.4 10.6 17.2 16 17.2
+             C 21.4 17.2 26.8 20.4 26.8 27"/>
+  </g>
+</svg>

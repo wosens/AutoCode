@@ -1,4 +1,4 @@
-﻿#include "CTaskInfo.h"
+#include "CTaskInfo.h"
 
 #include <QFile>
 #include <QJsonDocument>
@@ -60,6 +60,8 @@ bool CTaskInfo::SaveToFile(const QString& a_sFilePath) const {
     oRoot["userRequest"] = m_sUserRequest;
     oRoot["type"]        = static_cast<int>(m_eType);
     oRoot["tier"]        = static_cast<int>(m_eTier);   // 流程档位（简单/标准/严格）
+    oRoot["autoNamed"]   = m_bAutoNamed;   // 名称待自动推断（Intake 后回填）
+    oRoot["archived"]    = m_bArchived;    // 已「移除」归档到历史（启动加载不回当前表）
     // 自定义阶段清单（空数组不落盘 → 视为完整规范流，旧版读取兼容）
     if (!m_aFlowStages.isEmpty()) {
         QJsonArray aFlow;
@@ -149,6 +151,8 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
         o.value("type").toInt(static_cast<int>(ETaskType::Feature)));
     m_eTier        = static_cast<ETier>(
         o.value("tier").toInt(static_cast<int>(ETier::Standard)));   // 缺键→标准（向后兼容）
+    m_bAutoNamed   = o.value("autoNamed").toBool();   // 缺键→false（旧任务视为已定名）
+    m_bArchived    = o.value("archived").toBool();    // 缺键→false（旧任务未归档，兼容）
     m_aFlowStages.clear();
     const QJsonArray aFlow = o.value("flowStages").toArray();
     for (const QJsonValue& v : aFlow) {

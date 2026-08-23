@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 #include <QString>
@@ -32,7 +32,19 @@ public:
     void SetId(const QString& a_sId) { m_sId = a_sId; }
 
     QString Name() const { return m_sName; }
-    void SetName(const QString& a_sName) { m_sName = a_sName; }
+    // 名称变更发 sigChanged（自动命名回填时触发 task.json 回写与 UI 刷新）。
+    void SetName(const QString& a_sName) { m_sName = a_sName; emit sigChanged(); }
+
+    // 自动命名标记（2026.08.20）：新建任务未填名称时置 true（临时名占位），
+    // Intake 阶段产出 requirements.md 后由编排器据其推断正式名称并清标记。
+    bool AutoNamed() const { return m_bAutoNamed; }
+    void SetAutoNamed(bool a_b) { m_bAutoNamed = a_b; }
+
+    // 归档标记（2026.08.22）：右键「移除」把任务移到历史时置 true 并随 task.json 落盘；
+    // 启动加载据此把该任务归历史表，不回当前表（否则 Stopped 状态与普通停止无法区分，
+    // 重启后又被当活跃任务载回当前表）。「再次执行」时清零回活跃。
+    bool Archived() const { return m_bArchived; }
+    void SetArchived(bool a_b) { if (m_bArchived != a_b) { m_bArchived = a_b; emit sigChanged(); } }
 
     QString UserRequest() const { return m_sUserRequest; }
     void SetUserRequest(const QString& a_sReq) { m_sUserRequest = a_sReq; }
@@ -174,6 +186,8 @@ private:
     QString     m_sErr;
     bool        m_bPauseReq  = false;
     bool        m_bStopReq   = false;
+    bool        m_bAutoNamed = false;  // 名称待自动推断（Intake 后回填正式名称）
+    bool        m_bArchived  = false;  // 已被「移除」归档到历史（不回当前任务表）
     QString     m_sLastSessionId;   // 本阶段 claude 会话 id（供 --resume 续跑/编译修复）
     int         m_iResumeCount = 0; // 本阶段续跑/修复次数（封顶 k_iMaxResume，推进时清零）
     QString     m_sResumeGuidance;  // 熔断后人工指导意见（注入下一次生产阶段 prompt 后清空）

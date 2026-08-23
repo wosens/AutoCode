@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QMainWindow>
 #include <QList>
@@ -13,6 +13,7 @@ class CTaskListPanel;
 class CExecutionPanel;
 class CTaskHistoryDB;
 class CTaskInfo;
+struct SBackupVersion;
 class CTitleBar;
 class CTitleBarMsgFilter;
 class QMenuBar;
@@ -23,6 +24,8 @@ class QCloseEvent;
 class QShowEvent;
 class QLocalServer;
 class QLocalSocket;
+class QFileSystemWatcher;
+class QTimer;
 
 // 主窗口：整合工程管理、任务列表、执行视图、编排器。
 class CMainWindow : public QMainWindow {
@@ -70,7 +73,11 @@ private slots:
     void OnStartTask(CTaskInfo* a_pTask);
     void OnPauseTask(CTaskInfo* a_pTask);
     void OnStopTask(CTaskInfo* a_pTask);
-    void OnRollback(CTaskInfo* a_pTask);   // FR-6：弹历史版本对话框 → 原子恢复源码 → 任务置 Stopped
+    void OnRollback(CTaskInfo* a_pTask);   // FR-6：打开统一回退界面 → accept 后引擎执行
+    // 统一回退（方案 §5.1/§8）：助手侧入口（↶ 右侧▼）与两粒度回退引擎。
+    void OnRollbackTurnOpen();
+    void OnRollbackTo(CTaskInfo* a_pTask, const SBackupVersion& a_stVer);
+    void OnRollbackTurnTo(const SBackupVersion& a_stVer);
     void OnDeleteTask(CTaskInfo* a_pTask);
     void OnRemoveTask(CTaskInfo* a_pTask);   // 当前任务移除到历史（保留记录，可再次执行）（#3）
     void OnReviveTask(CTaskInfo* a_pTask);   // 失败任务加回当前栏续跑（#6）
@@ -78,6 +85,15 @@ private slots:
 
     // 查看任务（FR-5）：右键「查看任务内容」→ 只读对话框
     void OnViewTask(CTaskInfo* a_pTask);
+
+    // 2026.08.20 重命名：右键「重命名」→ 输入框改任务名（清 autoNamed，落 task.json + 历史库）
+    void OnRenameTask(CTaskInfo* a_pTask);
+
+    // 2026.08.20 自动命名：右键「自动命名」→ 任务内容+guide.md 拼提示词交 Agent
+    //   （AutoNameNow，异步；助手忙时本地启发式兜底），完成后 OnAutoNameDone 镜像/刷新。
+    void OnAutoNameTask(CTaskInfo* a_pTask);
+    void OnAutoNameDone(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sName);
+    void MirrorTaskIfDetached(CTaskInfo* a_pTarget);   // 非活跃副本镜像 task.json+历史库+刷新两表
 
     // 编排器回调
     void OnStageLog(CTaskInfo* a_pTask, const QString& a_sLine);
@@ -109,7 +125,16 @@ private slots:
 
 private:
     void CreateUi();
+    // §8 回退引擎（两入口共用）：残留前置 → 运行守卫 → 破坏性预检 → rollback-pre 快照
+    // → RestoreTree → 收尾（任务 Stopped / 对话徽章）+ SetPendingNotice。a_pTask=nullptr 即助手侧。
+    void ExecuteRollback(CTaskInfo* a_pTask, const SBackupVersion& a_stVer);
+    // 当前助手档 owner（选中任务=任务 id；否则 "global"）。
+    QString CurrentAdhocOwner() const;
     void StartAskServer();
+    // 2026.08.20 多实例配置同步：config.ini（exe 同级全局）回填运行期静态配置。
+    //   a_bStartup=true 仅启动调用（含 DSH/Pi 不可用警告弹窗）；热重载 false 静默。
+    void ApplyAgentConfigToRuntime(bool a_bStartup);
+    void OnConfigFileChanged();            // QFileSystemWatcher 触发（外部实例保存）
     void CreateMenus();
     void SetStatus(const QString& a_sText);
     // 迭代熔断（escalation）弹模态对话框：阻塞详情 + 打开任务目录 / 重置迭代并继续 / 忽略。
@@ -120,6 +145,14 @@ private:
     void ReloadHistory();                // 从全局 SQLite 库重载历史任务并刷新历史页
     void SaveAssistantState();           // 序列化助手档 → 选中任务存 tasks/<id>/assistant.json，否则工程级（#1）
     void LoadAssistantState();           // 读对应档 → 恢复助手会话链与对话流；无档显式清空（#1）
+    // 2026.08.22 多助手会话换载：编排器单会话 ↔ 面板各助手会话态互转。
+    void SyncOrchToPanel(const QString& a_sAsstId);   // 编排器 sid/栈/guideHash → 回填该助手
+    void LoadOrchFromPanel(const QString& a_sAsstId); // 该助手会话态 → 换载进编排器
+    // 2026.08.22 多助手事件：切助手换载会话；一轮结束回填运行助手并按需换载激活助手。
+    void OnAsstSwitched(const QString& a_sOldId, const QString& a_sNewId);
+    void OnAsstAdded(const QString& a_sId);
+    void OnAsstRemoved(const QString& a_sId, const QString& a_sNewActive);
+    void OnAdhocRunFinished();
     // 助手档切换原语（跟着任务走）：停跑 → 旧档落盘 → 切 m_pCur → 恢复新档。
     //   所有改变 m_pCur 的路径必须经此函数，禁止裸赋值（防旧档丢失 / 串档）。
     void SwitchAssistantArchive(CTaskInfo* a_pNewTask);
@@ -154,7 +187,7 @@ private:
     QSplitter*         m_pMainSplit = nullptr;   // FR-4 左右主分隔条（比例持久化）
     QLabel*            m_pLblStatus = nullptr;
 
-    std::unique_ptr<CTaskHistoryDB> m_pHistoryDb;   // 全局历史库（exe 同级 history.db）
+    std::unique_ptr<CTaskHistoryDB> m_pHistoryDb;   // 当前工程历史库（<工程>/.autodev/history.db；2026.08.20 按工程隔离）
     QList<CTaskInfo*>  m_aHistoryTasks;             // 历史页数据源（DB 加载副本，本窗口拥有）
     QList<CTaskInfo*>  m_aTasks;
     CTaskInfo*         m_pCur          = nullptr;
@@ -165,10 +198,14 @@ private:
 
     QMenu*             m_pMenuRecent = nullptr;
     // 子菜单显示上限（可调常量，FR-4.1）。
-    static constexpr int s_kiMaxRecentMenu = 10;
+    static constexpr int s_kiMaxRecentMenu = 20;   // 2026.08.20 菜单展示上限 10→20
 
     // ask_user 提问服务：孙进程 MCP server 经此管道发来提问，弹窗作答后回包。
     QLocalServer*      m_pAskServer = nullptr;
     QLocalSocket*      m_pAskClient = nullptr;   // 当前提问连接（串行，一次一个）
     QByteArray         m_bufAsk;                 // 提问连接行缓冲
+    // 2026.08.20 多实例配置同步：盯 config.ini（其他实例保存 → 热重载）。
+    QFileSystemWatcher* m_pCfgWatcher  = nullptr;
+    QTimer*             m_pCfgReloadTm = nullptr;   // 防抖合并（1s 窗口多次触发一次生效）
+    qint64              m_iCfgSelfSaveMs = 0;       // 自身最近一次保存时刻（ms；<2s 内的变更跳过）
 };

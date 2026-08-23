@@ -1,8 +1,9 @@
-﻿#pragma once
+#pragma once
 
 #include <QWidget>
 #include <QList>
 
+class QToolButton;
 class QTabWidget;
 class QListWidget;
 class QListWidgetItem;
@@ -66,12 +67,15 @@ signals:
     void sigReviveTask(CTaskInfo* a_pTask);   // 失败任务加回当前栏续跑（#6）
     void sigRemoveTask(CTaskInfo* a_pTask);   // 当前任务移除到历史（#3）
     void sigViewTask(CTaskInfo* a_pTask);     // FR-5 右键「查看任务内容」→ 只读展示
+    void sigRenameTask(CTaskInfo* a_pTask);   // 2026.08.20 右键「重命名」→ 主窗口弹输入框手动改任务名
+    void sigAutoNameTask(CTaskInfo* a_pTask); // 2026.08.20 右键「自动命名」→ 复用新建任务自动命名逻辑
     // FR-6：停止按钮右侧「回退」按钮 → 主窗口弹历史版本对话框。
     void sigRollback(CTaskInfo* a_pTask);
     // FR-3：资源管理器「添加到聊天框」→ 注入 adhoc 助手输入框（Q1 默认）。
     void sigAddToChat(const QString& a_sText, const QString& a_sKind);
     // 2026.08.18：资源管理器双击文本文件 → 执行面板「助手」右侧 Tab 内嵌显示（转发）。
-    void sigFileOpen(const QString& a_sAbsPath);
+    //   2026.08.21 增加切页标志：双击=true 切页；单击=false 只加载内容不切页。
+    void sigFileOpen(const QString& a_sAbsPath, bool a_bSwitchTab);
     // FR-9：任务列表（Tab）底部相对本 widget 顶部的 y 变化 → 供执行面板同步阶段表高度，
     //       使「阶段表底部」与「任务列表底部」（不含按钮行）对齐，随字体/DPI 自适应。
     //       2026.08.19 仅窗口 resize 路径上报；左栏分隔条拖动不上报（各拖动条互不影响）。
@@ -119,6 +123,7 @@ private:
     QPushButton*  m_pBtnPause = nullptr;
     QPushButton*  m_pBtnStop  = nullptr;
     QPushButton*  m_pBtnRollback = nullptr;   // FR-6 停止按钮右侧「回退」
+    // 2026.08.22 「回退」右侧▼下拉已删（与「回退」同信号功能重复）
     QList<CTaskInfo*> m_aTasks;            // 当前表数据源（本工程非终态）
     QList<CTaskInfo*> m_aHis;              // 2026.08.17 历史表数据源副本（悬垂对账用）
     QTimer*       m_pElapsedTimer = nullptr;   // 2026.08.15 运行耗时 1s 刷新（当前任务 Running 时跑）
