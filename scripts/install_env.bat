@@ -26,6 +26,9 @@ cd /d "%~dp0"
 ::   子目录 - 绿色便携：发布只拷 Execute 目录，DSH 随目录整体带走；程序侧
 ::   CDeepSeekRunner::ProbeSiblingRoot 同布局探测并自动回填配置。
 for %%i in ("%~dp0DeepSeekHarness\deepseek-harness") do set "DSH_ROOT=%%~fi"
+:: /update-dsh 模式第 3 参可显式指定 DSH 根（程序侧传配置的 DshRoot，带引号）：
+::   兼容非脚本同级的安装布局（如多实例共享外部 DSH 根）；%~3 去引号后整串生效。
+if "!DSH_UPDATE!"=="1" if not "%~3"=="" set "DSH_ROOT=%~3"
 
 if "!DSH_UPDATE!"=="1" goto :BANNER_DSH_UPDATE
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
@@ -469,12 +472,13 @@ goto :VERIFY
 
 :: ---- DSH 更新段（/update-dsh <tag>：fetch+reset 保留本地 + pnpm 重建 + 部署组合文件；
 ::      2026.09 任务 23183ccb。%~2 = 目标 tag 全名，由 AutoCode 侧 PickLatestTag 解析传入。
+::      %~3（可选，带引号）= DSH 根，缺省用脚本同级 DeepSeekHarness\deepseek-harness。
 ::      失败路径纪律：pushd 后所有退出必须先 popd；先 fetch 后 reset，fetch 失败零影响；
 ::      pnpm 阶段失败 = 半更新态（旧 bin.js 为 untracked 不受 reset 影响，仍可运行旧版），
 ::      重跑本更新即修复（幂等全流程）。）----
 :UPDATE_DSH
 if "%~2"=="" (
-    echo [错误] 缺少目标 tag 参数。用法：install_env.bat /update-dsh ^<tag^>
+    echo [错误] 缺少目标 tag 参数。用法：install_env.bat /update-dsh ^<tag^> [^<dsh根^>]
     echo        例：install_env.bat /update-dsh dsh-v0.1.2-alpha.3
     goto :UPDATE_DSH_END
 )

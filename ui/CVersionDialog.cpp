@@ -438,6 +438,11 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
     //   成功后才提权拉起 /update-dsh <tag>（tag 由 AutoCode 侧决定，bat 不再解析）。
     const QString sBatNative = QDir::toNativeSeparators(
         QCoreApplication::applicationDirPath() + QStringLiteral("/install_env.bat"));
+    // 第 3 参传配置的 DSH 根（带引号，空则省略回落脚本同级推导）：多实例共享
+    //   外部 DshRoot 时 bat 同级 DeepSeekHarness 目录可能不存在，更新目标必须
+    //   与本地版本读数同源（config 的 DshRoot），否则更新后版本显示不同步。
+    const QString sDshRootNative = QDir::toNativeSeparators(
+        CDeepSeekRunner::DshRootPath());
     if (!QFile::exists(QCoreApplication::applicationDirPath()
                        + QStringLiteral("/install_env.bat"))) {
         QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
@@ -450,7 +455,7 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
         QStringList() << QStringLiteral("ls-remote") << QStringLiteral("--tags")
                       << CDeepSeekRunner::DshRepoUrl(),
         kiQueryTimeoutMs,
-        [this, sBatNative](int a_iExitCode, const QString& a_sOut) {
+        [this, sBatNative, sDshRootNative](int a_iExitCode, const QString& a_sOut) {
             UpdateInfoLine();
             if (a_iExitCode != 0) {
                 QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
@@ -464,8 +469,12 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
                     QStringLiteral("远端未找到可识别的版本 tag，未做任何修改。"));
                 return;
             }
+            const QString sCmdUpdate = sDshRootNative.isEmpty()
+                ? QStringLiteral("\"%1\" /update-dsh %2").arg(sBatNative, sTag)
+                : QStringLiteral("\"%1\" /update-dsh %2 \"%3\"")
+                      .arg(sBatNative, sTag, sDshRootNative);
             if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 DeepSeekHarness"),
-                    QStringLiteral("\"%1\" /update-dsh %2").arg(sBatNative, sTag))) {
+                    sCmdUpdate)) {
                 QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
                     QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
                 return;

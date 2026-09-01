@@ -1,4 +1,4 @@
-﻿版本：v1.4.87
+﻿版本：v1.4.88
 [2026-08-24 11:20] v1.2.42 开始任务后自动切到「日志」页（不再跳助手 Tab）
 [2026-08-24 10:15] v1.2.41 「▾」已关闭助手列表不显示空助手（无任何对话的助手不再出现在列表中）。
 [2026-08-24 10:10] v1.2.40 Tab 条滚轮不新增助手：滚轮切换页跳过「+」占位页（选中即误增助手），新增助手唯一入口=点击「+」；「▾」已关闭助手菜单显示对话条数确认保留。
@@ -95,3 +95,4 @@
 [2026-08-29] [v1.4.85] 修「回退历史缺少最后两条提示」：turn 快照在工程无任何改动时原设计直接跳过建版（复用 lastSeq）——该条提示在回退列表凭空消失（实测 $HOME/.claude 工程：提示4纯调查+提示5重建 CLAUDE.md，前者的无差异快照跑 8.5 分钟判无差异不建版、后者提交时前者还在跑被中止又判无差异，两条均无记录点；万级文件 manifest 单版 34MB 也让「每条都建实版」不可行）。改为「同源引用版」：无差异时写数百字节 alias meta（"base" 指向同 owner 上一实版，链深≤1），List/Restore/Diff/ReadFile 四处经 BsResolveFiles 解析透明参与；跨 owner 不引用（PurgeOwner 删基版防孤儿，退回旧口径）。新增 testNoChangeAliasVersion（引用版建版/轻量断言/列表双条/空差异/读文件走 base/后续实版不受扰/跨 owner 退旧口径）。 - project/CProjectManager.cpp、tests/test_rollback.cpp
 [2026-08-29] [v1.4.86] 修「助手运行中新助手看似无法发送」：跨助手排队机制（v1.3.65）本身可用——切到另一助手输入文字后按钮即变「⏳ 排队发送」，但空输入时按钮恒显「⏹ 停止」、输入框占位符与空闲态无异，用户无从发现排队通道。UpdateAdhocInputState 增运行态可视化：①跨助手（激活≠运行）时输入框 placeholder 改「“助手N”正在运行；此处输入指令将排队，待其结束后自动发送（Ctrl+Enter）」；②运行中同助手 placeholder 改「向正在运行的助手追加指令…」；③「⏹ 停止」tooltip 跨助手时说清停止归属（停的是运行中助手）并提示排队通道，防误停。 - ui/CExecutionPanel.cpp
 [2026-09-01] [v1.4.87] 测试统一无头运行防弹窗：CMakeLists 给全部 9 个 ctest 目标统一设 QT_QPA_PLATFORM=offscreen，Qt 控件测试（test_execpanel 实例化 CExecutionPanel 面板、test_rollback 实例化回退窗口）不再弹出真实窗口抢占桌面焦点；test_rollback 的布局持久化用例在 offscreen 下窗口尺寸被 clamp（平台不支持 propagateSizeHints）致几何断言失败，补 QSKIP 仅在真实窗口平台执行该断言；ctest 9/9 通过 - CMakeLists.txt、tests/test_rollback.cpp
+[2026-09-01] [v1.4.88] 修 DSH 更新目标错配：版本窗 DSH 更新固定走 bat 同级 DeepSeekHarness\，而本机两实例 config DshRoot 均指向外部共享根（脚本同级目录不存在）→ 更新必报「未找到本机安装」且更新对象与版本读数不同源。install_env.bat /update-dsh 增第 3 参（%~3 显式指定 DSH 根，带引号整串生效、含空格路径安全，缺省回落同级推导）；CVersionDialog DSH 分派传配置 DshRoot（探测打桩验证有参覆盖/无参回落两态路由）；副本部署欠账一并收口：install_env.bat 三方同步（副本残留 e482d94 死循环旧版）、01.更新程序.bat 增补 install_env.bat 与 help 同步行（原仅拷 exe）、help 使用说明三方同步。 - scripts/install_env.bat、ui/CVersionDialog.cpp、help/使用说明.html

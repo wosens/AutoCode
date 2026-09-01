@@ -588,7 +588,7 @@
 <table class="tbl">
   <tr><th style="width:150px">后端</th><th>更新方式</th></tr>
   <tr><td><b>Claude Code</b></td><td><code>npm install -g @anthropic-ai/claude-code@latest</code>（装/更一体，未安装也可直接装）。</td></tr>
-  <tr><td><b>DeepSeekHarness</b></td><td>先查远端最新 tag → <code>install_env.bat /update-dsh &lt;tag&gt;</code>：git fetch+reset 切版本 + pnpm 重建，<b>保留本地</b>（node_modules、组合文件不受影响）；未安装时按钮置灰（先走安装）。失败重跑即修复（幂等）。</td></tr>
+  <tr><td><b>DeepSeekHarness</b></td><td>先查远端最新 tag → <code>install_env.bat /update-dsh &lt;tag&gt; &lt;dsh根&gt;</code>：git fetch+reset 切版本 + pnpm 重建，<b>保留本地</b>（node_modules、组合文件不受影响）；更新目标优先用设置页配置的根目录（多实例共享外部 DshRoot 也生效），未配置时回落程序目录 <code>DeepSeekHarness\</code>；未安装时按钮置灰（先走安装）。失败重跑即修复（幂等）。</td></tr>
   <tr><td><b>PIAgent</b></td><td><b>按安装形态自动分派</b>（点击时自动判定）：源码形态（exe 同级 PIAgent\pi 布局）→ 重跑安装脚本 <code>/pi</code> 模式 robocopy 全量重部署，<b>更新前请先自行拉取本机 PIAgent 源仓到新版本，否则复制到的仍是旧源</b>（点更新时会弹确认提醒）；npm 全局形态 → <code>npm install -g @earendil-works/pi-coding-agent</code> 直接更新 npm 全局包。未安装时按钮置灰（先走安装）。</td></tr>
   <tr><td><b>CodexHarness</b></td><td>始终重装锁定版 <code>npm install @openai/codex@0.87.0 --save-exact</code>（工程根内，提权窗口执行）。v0.88+ 已移除 <code>wire_api="chat"</code>，<b>不提供升级</b>，结论列恒显锁定说明。</td></tr>
 </table>
