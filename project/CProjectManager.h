@@ -7,6 +7,7 @@
 #include <QRect>
 #include <QJsonValue>
 #include <QMutex>
+#include <atomic>
 
 #include "CGuideFingerprintScanner.h"
 // 2026.08.20 SDshModelEntry 迁至 core/CModelEntry.h（Pi 后端共用；见该头注释）。
@@ -61,6 +62,22 @@ public:
     // 2026.08.23 文件级谓词：返回 false 的「文件」不入库/不被恢复触碰（只备份代码相关文件，
     //   中间文件与产物跳过；空=不过滤，PortableCore 独立复用时保持全量语义）。
     std::function<bool(const QString&)> m_pfFileFilter;
+    // 2026.08.26 目录级谓词（自 HarnessAgent BackupStore 平移）：目录级剪枝专用，
+    //   目录路径只查跳过目录段，不套文件扩展名白名单——文件级谓词对目录名（多无
+    //   扩展名）会误杀整棵子树。未注入时退回 m_pfFilter。
+    std::function<bool(const QString&)> m_pfDirFilter;
+    // 2026.08.26 单文件大小上限（字节，自 HarnessAgent 平移）：超限文件不入库（不报错）；
+    //   0 = 不限。
+    qint64 m_iMaxFileBytes = 0;
+
+    // 2026.08.29 可中止备份（修「窗口关闭后进程僵死」）：大工程（含 node_modules 的
+    //   pnpm 单仓，实测 5.6 万文件 25 分钟未扫完）首轮快照在后台线程跑时，应用退出/
+    //   下一轮快照须能叫停——RequestAbort() 置位后扫描/哈希循环及时退出（Backup 返回
+    //   0 静默失败）。复位只应由启动线程前的主线程做（ResetAbort），线程内不复位，
+    //   防并发中止被吞。
+    void RequestAbort() { m_bAbort.store(true); }
+    void ResetAbort()  { m_bAbort.store(false); }
+    std::atomic<bool> m_bAbort{false};
 
     // —— 版本操作 ——
     int  Backup(const QString& a_sKind, const QString& a_sOwner,
@@ -68,9 +85,13 @@ public:
     bool Restore(int a_iSeq, QString& a_sErr);          // 原子恢复 + hash 校验
     QList<SBackupVersion> List(const QString& a_sOwner) const;   // 倒序（time ISO 降序）
     bool Diff(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const;
+    // 2026.08.24 回退窗口「查看变更」：读指定版本中某文件的内容（定位 manifest →
+    // 解压 blob 到内存）。文件不在该版本 manifest / 旧格式 / blob 损坏 → false + a_sErr。
+    bool ReadFile(int a_iSeq, const QString& a_sRelPath, QByteArray& a_bufOut, QString& a_sErr) const;
     int  PurgeOwner(const QString& a_sOwner);           // 删 owner 全部版本+GC，返回释放 blob 数
     int  GcOrphanBlobs();                               // 无引用 blob 清理，返回删除数
     bool HasRestoreTmp() const;                         // _restore_tmp 残留探测
+    bool DiscardRestoreTmp(QString& a_sErr);            // 丢弃残留现场（删 _restore_tmp，自 HarnessAgent 平移）
     bool RestoreFromTmp(QString& a_sErr);               // 残留现场还原（_restore_tmp 拷回源码根）
 
     // —— 回退告知标志（notice.json）——
@@ -188,6 +209,11 @@ public:
     // 载入窗口几何；无 config.ini / 缺键时返回 false（调用方用默认几何）。
     bool LoadWindowGeometry(QRect& a_stGeometry, bool& a_bMaximized);
 
+    // ---- 设置对话框几何持久化（[SettingsWindow] 段 X/Y/W/H）----
+    // 2026.08.27：设置窗口大小/位置跨会话记忆（与主窗口 [Window] 同口径，无最大化态）。
+    bool SaveSettingsDialogGeometry(const QRect& a_stGeometry);
+    bool LoadSettingsDialogGeometry(QRect& a_stGeometry);
+
     // ---- FR-4 界面布局持久化：主 QSplitter 比例（exe 同级 config.ini 的 [Layout] 段）----
     // 保存 QSplitter::saveState() 的字节数组（以 Base64 文本落盘）；失败不抛、不退出。
     bool SaveSplitterState(const QByteArray& a_stState);
@@ -197,6 +223,10 @@ public:
     // ---- 2026.08.18 任务列表高度持久化：左栏垂直 QSplitter（[Layout] VSplit）----
     // 任务列表/资源管理器之间的拖动分隔条位置，语义与主 Splitter 对完全一致（Base64 文本）。
     bool SaveVSplitState(const QByteArray& a_stState);
+    // 2026.08.29 主界面布局碎片通用键值（[Layout] 节）：历史任务列宽/左栏 Tab 页/
+    //   阶段产物分割条/查看变更窗口几何等小项，调用方自定义格式（整型串或 base64）。
+    bool SaveLayoutValue(const QString& a_sKey, const QString& a_sVal);
+    QString LoadLayoutValue(const QString& a_sKey) const;
     QByteArray LoadVSplitState();
 
     // ---- FR-4 助手 autocompact：2026.08.15 起改为「比例制」（[Adhoc] AutoCompactPct）----
@@ -345,6 +375,12 @@ public:
     bool   SaveAdhocContextLimit(qint64 a_iLimit);
     qint64 LoadAdhocContextLimit() const;
 
+    // ---- 专家助手开关持久化（config.ini 的 [Adhoc] ExpertAssistant）----
+    // 2026.08.26 闭环改造：启用后助手提交改码提示词时自动做编译/测试验证并回注重试；
+    // 缺省开启（1）；0=手工禁用（回到纯对话模式）。LoadExpertAssistant 无记录返回 true。
+    bool SaveExpertAssistant(bool a_bOn);
+    bool LoadExpertAssistant() const;
+
     // ---- FR-6 代码回退：源码备份 / 恢复 / 版本清单（纯本地 Qt 文件系统操作）----
     // 全量镜像工程源码到 .autodev/tasks/<id>/backups/<seq>/，返回版本序号（0=失败）。
     //   排除 .autodev/build/Execute/.git/.vs/x64 等（防递归，NFR-5）。首次备份不写 summary。
@@ -370,6 +406,10 @@ public:
     // 统一库（过滤 owner）+ 旧全量库（owner 为任务 id 时）合并，按 time ISO 倒序。
     QList<SBackupVersion> ListUnifiedBackups(const QString& a_sOwner) const;
     bool DiffVersions(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const;
+    // 2026.08.24 回退窗口「查看变更」：读统一库某版本中某文件内容（转发 CBackupStore::ReadFile；
+    // 旧全量版本无 manifest，返回 false + 错误说明）。
+    bool ReadUnifiedFile(int a_iSeq, const QString& a_sRelPath,
+                         QByteArray& a_bufOut, QString& a_sErr) const;
     int  PurgeOwner(const QString& a_sOwner);
     int  GcOrphanBlobs();
     bool HasRestoreTmp() const;                 // _restore_tmp 残留探测（Open 尾/回退引擎前置）
@@ -401,6 +441,9 @@ private:
     // 2026.08.20 转公开：主窗口 QFileSystemWatcher 盯此文件做多实例配置热重载。
 public:
     QString ConfigFilePath() const;
+    // 2026.08.29 备份中止窄接口（编排器析构/快照换班用；BackupStore() 本体保持私有）。
+    void RequestBackupAbort();
+    void ResetBackupAbort();
 private:
     // FR-6：取任务备份根目录 .autodev/tasks/<id>/backups。
     QString BackupsDir(const QString& a_sTaskId) const;
@@ -419,6 +462,7 @@ private:
     QString       m_sProjectDir;
     CAgentRunnerBase* m_pGuideRunner = nullptr;       // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
     CAgentRunnerBase* m_pGuideSyncRunner = nullptr;    // 需求4 guide.md 增量同步专用 runner
+    std::atomic<bool> m_bFpSyncRunning = false;        // 2026.08.26 指纹同步后台线程占用标志（防重入/并发写 guide）
 
     QStringList   m_aRecentProjects;   // MRU，最前为最近
     // 统一备份库（惰性构造；mutable：const 适配层方法内构造）。

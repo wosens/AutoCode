@@ -72,18 +72,22 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
-    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a meticulous coding agent executing staged automation tasks. Follow the task instructions exactly and write the required output files before finishing.'
-    workspaceContext: false
-    # 2026.08.18 enable the skill subsystem and mount the Claude Code personal
-    # skill library (SKILL.md format is shared verbatim; discovery rank 300).
-    # Single source of truth: edits in ~/.claude/skills apply to both harnesses.
+    persona: !!js [process.env.DSH_SYSTEM_PROMPT ?? 'You are a meticulous coding agent executing staged automation tasks. Follow the task instructions exactly and write the required output files before finishing.', process.env.DSH_GLOBAL_CONTEXT].filter(Boolean).join('\n\n')
+    # 2026.08.24 enable workspace context (align with claude/pi/codex backends):
+    # auto-discovers and injects project AGENTS.md / CLAUDE.md (plus .local
+    # overlays). maxBytes caps the injected payload. Previously `false`, which
+    # silently dropped project CLAUDE.md. dshHome stays read-only (no home writes).
+    workspaceContext:
+      dshHome: !!js (process.env.DSH_HOME ?? (process.env.USERPROFILE || process.env.HOME) + '/.dsh')
+      maxBytes: 32768
+    # 2026.08.18 enable the skill subsystem; 2026.08.24 portable multi-dir:
+    # AutoCode injects DSH_SKILLS_DIRS = <exe dir>\skills;<user home>\.claude\skills
+    # (existing entries only, ';'-separated). Fallback keeps the dev-machine path
+    # for bare runs. Single source of truth: edits apply to both harnesses.
     skills:
       enabled: true
       filesystem:
-        customSkillDirs:
-          # 2026.08.18 env-driven: AutoCode injects DSH_SKILLS_DIR = <user home>/.claude/skills
-          # (fallback keeps the dev-machine path for bare runs).
-          - !!js process.env.DSH_SKILLS_DIR ?? 'C:/Users/Administrator/.claude/skills'
+        customSkillDirs: !!js (process.env.DSH_SKILLS_DIRS ?? 'C:/Users/Administrator/.claude/skills').split(';').filter(Boolean)
     toolBash:
       enableRunInBackground: false
     toolJobs: false

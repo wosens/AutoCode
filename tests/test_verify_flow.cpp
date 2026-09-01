@@ -16,7 +16,7 @@
 //   AC2.2/AC-N1 —— Verify 编入 Feature / Bugfix 两流程（CodeReview 后、Test 前）；既有 1~13 编号与流转不变。
 //   AC1.2      —— 指纹 Diff 命中 新增 / 修改 / 删除 三类。
 //   AC1.4      —— 无变化时 WriteIncremental 不改指纹表（逐字节保留未变行）。
-//   AC1.5      —— ScanProject 排除 .autodev/build/Execute/doc 等目录。
+//   AC1.5      —— ScanProject 排除隐藏目录（.git/.vs 等）+ .autodev（2026.08.26 新缺省）。
 // 不覆盖：UI（FR3/FR4，依赖 GUI）、验证阶段实际执行（FR2.3，需跑 Claude + 真实工程编译）。
 class CTestVerifyFlow : public QObject {
     Q_OBJECT
@@ -266,18 +266,20 @@ private slots:
         Wipe(sRoot);
     }
 
-    // ============ AC1.5：ScanProject 排除生成物/工具目录 ============
+    // ============ AC1.5（2026.08.26 修订）：只排隐藏目录（含 .git/.vs）+ .autodev ============
 
     void testScanExcludesBuildDirs() {
         const QString sRoot = MakeSandbox();
         WriteFile(sRoot, QStringLiteral("real.cpp"), "x");
-        // 这些目录下的文件不应被计入工程变更。
+        // 隐藏目录（.git/.vs/任意 '.' 开头）与 .autodev 不应计入。
         WriteFile(sRoot, QStringLiteral("build/obj.o"), "build artifact");
         WriteFile(sRoot, QStringLiteral("Execute/foo.exe"), "exe");
         WriteFile(sRoot, QStringLiteral(".autodev/guide.md"), "g");
         WriteFile(sRoot, QStringLiteral("doc/readme.txt"), "doc");
         WriteFile(sRoot, QStringLiteral(".git/config"), "git");
         WriteFile(sRoot, QStringLiteral(".vs/sln.docstate"), "vs");
+        WriteFile(sRoot, QStringLiteral(".hidden/deep/x.cpp"), "hidden dir");
+        WriteFile(sRoot, QStringLiteral("sub/.hiddendir/y.cpp"), "nested hidden dir");
 
         const QList<SFileFingerprint> aFp = CGuideFingerprintScanner::ScanProject(sRoot);
         QStringList aPaths;
@@ -285,21 +287,41 @@ private slots:
             aPaths << r.sRelPath;
         }
         QVERIFY2(aPaths.contains(QStringLiteral("real.cpp")), "real.cpp must be scanned");
+        // 2026.08.26 新语义：build/Execute/doc 不再缺省排除（用户需求：除隐藏外都不排除）。
+        QVERIFY2(aPaths.contains(QStringLiteral("build/obj.o")), "build/ must be scanned (new default)");
+        QVERIFY2(aPaths.contains(QStringLiteral("Execute/foo.exe")), "Execute/ must be scanned (new default)");
+        QVERIFY2(aPaths.contains(QStringLiteral("doc/readme.txt")), "doc/ must be scanned (new default)");
+        // 2026.08.26 二次修正：.autodev 也不排除（用户明确要求），扫描层照常入表。
+        QVERIFY2(aPaths.contains(QStringLiteral(".autodev/guide.md")),
+                 ".autodev/ must be scanned (user request); only guide.md is filtered at Diff level");
         for (const QString& s : aPaths) {
-            QVERIFY2(!s.startsWith(QStringLiteral("build/")),
-                     qPrintable(QStringLiteral("build/ must be excluded, got: ") + s));
-            QVERIFY2(!s.startsWith(QStringLiteral("Execute/")),
-                     qPrintable(QStringLiteral("Execute/ must be excluded, got: ") + s));
-            QVERIFY2(!s.startsWith(QStringLiteral(".autodev/")),
-                     qPrintable(QStringLiteral(".autodev/ must be excluded, got: ") + s));
-            QVERIFY2(!s.startsWith(QStringLiteral("doc/")),
-                     qPrintable(QStringLiteral("doc/ must be excluded, got: ") + s));
             QVERIFY2(!s.startsWith(QStringLiteral(".git/")),
                      qPrintable(QStringLiteral(".git/ must be excluded, got: ") + s));
             QVERIFY2(!s.startsWith(QStringLiteral(".vs/")),
                      qPrintable(QStringLiteral(".vs/ must be excluded, got: ") + s));
+            QVERIFY2(!s.startsWith(QStringLiteral(".hidden/")),
+                     qPrintable(QStringLiteral(".hidden/ must be excluded, got: ") + s));
+            QVERIFY2(!s.contains(QStringLiteral("/.hiddendir/")),
+                     qPrintable(QStringLiteral("nested hidden dir must be excluded, got: ") + s));
         }
         Wipe(sRoot);
+    }
+
+    // 2026.08.26：.autodev 入扫描，但指纹表自身 guide.md 不参与 Diff（防回写自我变更死循环）。
+    void testDiffIgnoresGuideSelf() {
+        QList<SFileFingerprint> aPrev;
+        aPrev << MkFp(QStringLiteral("src/a.cpp"), 100, 1000000)
+              << MkFp(QStringLiteral(".autodev/guide.md"), 500, 1000000)
+              << MkFp(QStringLiteral(".autodev/record.md"), 50, 1000000);
+        QList<SFileFingerprint> aCur;
+        aCur << MkFp(QStringLiteral("src/a.cpp"), 100, 1000000)          // 不变
+             << MkFp(QStringLiteral(".autodev/guide.md"), 999, 9999999)  // 自身变化 → 应被过滤
+             << MkFp(QStringLiteral(".autodev/record.md"), 80, 2000000); // 正常跟踪 → 修改
+        const SGuideChangeSet stCh = CGuideFingerprintScanner::Diff(aPrev, aCur);
+        QVERIFY(stCh.aAdded.isEmpty());
+        QVERIFY(stCh.aDeleted.isEmpty());
+        QCOMPARE(stCh.aModified.size(), 1);
+        QCOMPARE(stCh.aModified.first().sRelPath, QStringLiteral(".autodev/record.md"));
     }
 
     // AC1.5 细节：同前缀名不应误伤（buildfoo 不等于 build）。

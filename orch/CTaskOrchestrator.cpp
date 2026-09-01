@@ -23,17 +23,74 @@
 
 CTaskOrchestrator::CTaskOrchestrator(CProjectManager* a_pPm, QObject* a_pParent)
     : QObject(a_pParent), m_pPm(a_pPm) {
+    // 2026.08.27 助手 guide 同步空闲节流：旧实现非只读轮结束立即 SyncGuideAsync——大工程下
+    //   该调用要 Read 整份 guide+Edit（一次长请求），且与用户的下一轮提示词并发抢网关
+    //   （网关限流/缓存竞争，助手每步极慢主因之二）。改为空闲 3 分钟才同步；期间又跑新轮
+    //   则重置计时（活跃期不同步），agent/任务仍在跑也顺延，避免与前台调用并发。
+    m_tGuideSyncIdle.setSingleShot(true);
+    m_tGuideSyncIdle.setInterval(3 * 60 * 1000);
+    m_tGuideSyncIdle.callOnTimeout([this]() {
+        if (m_pPm == nullptr) {
+            return;
+        }
+        if ((m_pAdhocRunner != nullptr && m_pAdhocRunner->IsRunning())
+            || (m_pRunner != nullptr && m_pRunner->IsRunning())
+            || (m_pAdhocRunner != nullptr
+                && (m_pAdhocRunner->IsGraceActive() || m_pAdhocRunner->IsRetryPending()))) {
+            m_tGuideSyncIdle.start();   // 仍在跑：顺延 3 分钟
+            return;
+        }
+        m_pPm->SyncGuideAsync(QString());
+    });
 }
 
 CTaskOrchestrator::~CTaskOrchestrator() {
     // 后台预备/备份线程只做纯文件 IO（不触 Qt 对象），join 等其自然结束即可；
     // 队列 continuation 以 this 为上下文，析构后不会执行（Qt 自动丢弃）。
+    // 2026.08.29 修「窗口关闭后进程僵死」：备份线程首轮全量扫描大工程（含
+    //   node_modules 的 pnpm 单仓实测 25 分钟未完）时无超时 join 卡死退出——
+    //   先请求中止（扫描/哈希循环及时退出）再 join（秒级）。m_pPm 声明于本对象
+    //   之前（CMainWindow 成员逆序析构），此处仍然有效。
+    if (m_pPm != nullptr) {
+        m_pPm->RequestBackupAbort();
+    }
     if (m_thStartPrep.joinable()) {
         m_thStartPrep.join();
     }
     if (m_thBackup.joinable()) {
         m_thBackup.join();
     }
+    if (m_thAdhocBackup.joinable()) {
+        m_thAdhocBackup.join();
+    }
+}
+
+void CTaskOrchestrator::AsyncAdhocBackup(const QString& a_sOwner, const QString& a_sPrompt) {
+    // 2026.08.26 turn 快照后台化（大工程提交助手卡死修复）：BackupTree 全量扫描+逐文件哈希
+    //   在 UI 线程可达数十秒；快照仅作回退保障，失败不阻断本轮提问，异步化无顺序依赖。
+    //   线程内纯文件 IO（不触 Qt 控件），结果经 invokeMethod 回本对象线程发事件。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        return;
+    }
+    CProjectManager* const pPm = m_pPm;
+    const QString sOwner = a_sOwner, sPrompt = a_sPrompt;
+    if (m_thAdhocBackup.joinable()) {
+        // 2026.08.29 上一轮快照未完：先请求中止再等（旧实现裸 join——大工程首轮
+        //   扫描几十分钟时，下一次提交提示词会把 UI 卡到扫描结束）。
+        m_pPm->RequestBackupAbort();
+        m_thAdhocBackup.join();
+    }
+    m_pPm->ResetBackupAbort();   // 启动新线程前复位（主线程侧，无竞态）
+    m_thAdhocBackup = std::thread([this, pPm, sOwner, sPrompt]() {
+        const int iSeq = pPm->BackupTree(QStringLiteral("turn"), sOwner,
+                                         QString(), sPrompt.left(2000), 0);
+        QMetaObject::invokeMethod(this, [this, iSeq]() {
+            if (iSeq <= 0) {
+                emit sigAdhocEvent(QStringLiteral("backup_failed"),
+                    QStringLiteral("本轮无回退快照（备份失败，详见状态提示）"));
+            }
+        });
+    });
 }
 
 void CTaskOrchestrator::EnsureRunner() {
@@ -68,8 +125,14 @@ void CTaskOrchestrator::EnsureRunner() {
                 }
                 m_pCurTask->AddUsage(0.0, a_iIn, a_iOut);
                 m_pCurTask->AddRequests(1);
+                m_iLiveIn += a_iIn;   // 2026.08.27 本轮实时计量（Claude Code 式直观反馈）
+                m_iLiveOut += a_iOut;
+                emit sigLiveUsage(m_iLiveIn, m_iLiveOut);
                 emit sigTaskChanged(m_pCurTask);
             });
+    // 2026.08.27 流式实时刷新（绝对值直通显示，不入账）：claude stream_event / pi message_update。
+    connect(m_pRunner, &CAgentRunnerBase::sigLivePartial, this,
+            &CTaskOrchestrator::sigLiveUsage);
     connect(m_pRunner,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
                 &CAgentRunnerBase::sigFinished),
@@ -275,6 +338,9 @@ void CTaskOrchestrator::StopAll() {
         m_thBackup.join();
     }
     m_bBackupRunning = false;
+    if (m_thAdhocBackup.joinable()) {
+        m_thAdhocBackup.join();
+    }
     // OnRunnerFinished 首行已判 m_pCurTask==nullptr 早返回，故 runner 即便随后异步
     // 投递 finished 信号也不会访问到将被 ClearTasks delete 的任务对象。
     // 不 waitForFinished：避免阻塞 UI；竞态由 m_pCurTask 置空 + 早返回兜住。
@@ -414,6 +480,9 @@ void CTaskOrchestrator::StartReviewParallel(CTaskInfo* a_pTask, const SStageDef&
             [this, a_pTask](qint64 a_iIn, qint64 a_iOut) {
                 a_pTask->AddUsage(0.0, a_iIn, a_iOut);
                 a_pTask->AddRequests(1);
+                m_iLiveIn += a_iIn;   // 2026.08.27 本轮实时计量（评审视角一并汇总）
+                m_iLiveOut += a_iOut;
+                emit sigLiveUsage(m_iLiveIn, m_iLiveOut);
                 emit sigTaskChanged(a_pTask);
             });
         connect(pRunner,
@@ -637,6 +706,7 @@ void CTaskOrchestrator::RunCurrentStage(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
     }
+    ResetLiveUsage();   // 2026.08.27 新阶段开始：实时计量清零
 
     // 控制标志检查（阶段边界）
     if (a_pTask->StopRequested()) {
@@ -688,6 +758,7 @@ void CTaskOrchestrator::RunCurrentStage(CTaskInfo* a_pTask) {
             m_thBackup.join();   // guards 已保证无重叠，此处仅防御（立即返回）
         }
         m_bBackupRunning = true;
+        m_pPm->ResetBackupAbort();   // 2026.08.29 新备份线程前复位中止标志
         m_thBackup = std::thread([this, pGuard, sTaskId, sStageName, stDef, pPm]() {
             const int iSeq = pPm->BackupTree(QStringLiteral("stage"), sTaskId,
                                              sStageName, QString(), 0);   // 纯文件 IO（统一 CAS 库）
@@ -1015,6 +1086,7 @@ void CTaskOrchestrator::OnRunnerFinished(bool a_bOk, const QString& a_sResult,
     if (m_pRunner != nullptr) {
         pTask->AddRequests(m_pRunner->LastReqCount());   // 2026.08.15 本阶段 API 请求数
     }
+    ResetLiveUsage();   // 2026.08.27 阶段结束：本轮实时计量清零
     Advance(pTask, a_bOk, a_sResult);
 }
 
@@ -2093,6 +2165,16 @@ void CTaskOrchestrator::EnsureAdhocRunner() {
     // 运行中上下文占用（每条 assistant 消息的 usage）→ 直通助手面板进度条实时刷新。
     connect(m_pAdhocRunner, &CAgentRunnerBase::sigContextFill,
             this, &CTaskOrchestrator::sigAdhocContext);
+    // 2026.08.27 助手轮次实时计量：本轮累计 token 直通面板（Claude Code 式直观反馈）。
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigUsageDelta, this,
+            [this](qint64 a_iIn, qint64 a_iOut) {
+                m_iLiveIn += a_iIn;
+                m_iLiveOut += a_iOut;
+                emit sigLiveUsage(m_iLiveIn, m_iLiveOut);
+            });
+    // 流式实时刷新（绝对值直通显示，不入账）：与上一连接共展 sigLiveUsage。
+    connect(m_pAdhocRunner, &CAgentRunnerBase::sigLivePartial, this,
+            &CTaskOrchestrator::sigLiveUsage);
     connect(m_pAdhocRunner,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
                 &CAgentRunnerBase::sigFinished),
@@ -2101,6 +2183,7 @@ void CTaskOrchestrator::EnsureAdhocRunner() {
 
 void CTaskOrchestrator::StartAdhocStage(const QString& a_sPrompt) {
     EnsureAdhocRunner();
+    ResetLiveUsage();   // 2026.08.27 新轮次开始：实时计量清零
     const QString sWorkDir = m_pPm ? m_pPm->ProjectDir() : QString();
     // deny 黑名单（bypass 下 allow 失效、deny 生效）：readOnly=只读分析禁 Bash/Edit/Write；
     //   非 readOnly=ToolsDev() 现返回空串=全开。
@@ -2176,11 +2259,8 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
             && !m_pPm->ProjectDir().isEmpty()) {
             const QString sOwner = a_sTaskId.isEmpty()
                 ? QStringLiteral("global") : a_sTaskId;
-            if (m_pPm->BackupTree(QStringLiteral("turn"), sOwner,
-                                  QString(), a_sText.left(2000), 0) <= 0) {
-                emit sigAdhocEvent(QStringLiteral("backup_failed"),
-                    QStringLiteral("本轮注入无回退快照（备份失败，详见状态提示）"));
-            }
+            // 2026.08.26 turn 快照改后台（大工程 UI 卡死修复，见 AsyncAdhocBackup）。
+            AsyncAdhocBackup(sOwner, a_sText);
         }
         if (!a_sText.trimmed().isEmpty()
             && m_pAdhocRunner->InjectUserTurn(a_sText)) {
@@ -2230,10 +2310,21 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
             m_sLastGuideHash = sHash;
             emit sigAdhocStateChanged();   // 哈希变化 → 存盘 assistant.json
             const bool bFirst = m_sAdhocSid.isEmpty();
-            sPrompt = QStringLiteral("%1\n---\n%2\n---\n\n用户问题：%3").arg(
-                bFirst ? QStringLiteral("以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再回答用户问题：")
-                       : QStringLiteral("项目指南（guide.md）已更新，请阅读最新版本以同步项目认知："),
-                sGuide, a_sText);
+            if (bFirst) {
+                // 首次新建会话：仍全文投喂（保证模型一定拿到工程认知，一次性成本）。
+                sPrompt = QStringLiteral(
+                    "以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再回答用户问题："
+                    "\n---\n%1\n---\n\n\n用户问题：%2").arg(sGuide, a_sText);
+            } else {
+                // 2026.08.27 变更重投瘦身（大工程助手每步极慢主因之一）：旧实现把整份新
+                //   guide.md 塞进 user 消息——大工程几十~上百 KB，且内容每轮都变缓存
+                //   救不了，每轮多付一次大 prefill。改为只投一句话让 agent 用 Read 自取：
+                //   读多少缓存多少，与 Claude Code 的按需探索同口径。
+                sPrompt = QStringLiteral(
+                    "【项目指南已更新】.autodev/guide.md 自上次阅读后有变化，"
+                    "请先用 Read 工具读取 .autodev/guide.md 同步项目认知，"
+                    "再处理用户问题。\n\n\n用户问题：%1").arg(a_sText);
+            }
         }
     }
     // 需求4：非只读会话强制 agent 自治写 record.md——实际修改源码后必须追加一行，
@@ -2282,12 +2373,9 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, co
                 "请以当前磁盘内容为准，不要基于已被回退的修改继续工作。\n---\n").arg(iNoticeTarget));
             m_pPm->ClearPendingNotice();
         }
-        const int iSeq = m_pPm->BackupTree(QStringLiteral("turn"), sOwner,
-                                           QString(), a_sText.left(2000), 0);
-        if (iSeq <= 0) {
-            emit sigAdhocEvent(QStringLiteral("backup_failed"),
-                QStringLiteral("本轮无回退快照（备份失败，详见状态提示）"));
-        }
+        // 2026.08.26 turn 快照改后台（大工程 UI 卡死修复，见 AsyncAdhocBackup）：
+        //   异步快照不阻塞提问；失败仅事件提示。回退告知注入（上方）仍同步（只读 notice.json，轻量）。
+        AsyncAdhocBackup(sOwner, a_sText);
     }
     StartAdhocStage(sPrompt);
 }
@@ -2415,12 +2503,27 @@ void CTaskOrchestrator::OnAdhocFinished(bool a_bOk, const QString& a_sResult,
                                         double a_dCost, const QString& a_sSid) {
     // 2026.08.15 助手消耗归集：成功调用即上报（提问/压缩两步都算助手消耗，输入已含缓存读/写）。
     //   归集到哪个任务由 CMainWindow 按当前档决定（编排器不持有 UI 选中态）。
+    // 2026.08.29 修「助手输入/输出恒 0」：runner 本轮实时上抛过 sigUsageDelta 时收尾
+    //   sigFinished 报 0/0（防任务侧双计），助手独立流量只能靠下面的回退用
+    //   m_iLiveIn/m_iLiveOut 归集——旧序 ResetLiveUsage() 在函数顶部先行清零，回退
+    //   条件 (m_iLiveIn>0||m_iLiveOut>0) 恒假，sigAdhocUsage(0,0,…) → 面板
+    //   SAsst::iInTok/iOutTok 永不增长（未选任务时底部「输入:0 输出:0」）。注释
+    //   「先取值后清」与实现相反，现为真·先取值后清零（同函数内延后几行，
+    //   「本轮 ↑↓」标签收起时机无可感知差异）。
     if (a_bOk) {
         const qint64 iElapsedMs = m_dtAdhocStart.isValid()
             ? m_dtAdhocStart.msecsTo(QDateTime::currentDateTime()) : 0;
-        emit sigAdhocUsage(a_iIn, a_iOut, a_dCost, iElapsedMs,
+        // 2026.08.27 runner 已逐消息实时上抛（sigUsageDelta）时收尾报 0/0（防任务侧双计），
+        //   此处回退用本轮实时累计值归集——助手消耗统计不丢失。
+        qint64 iIn = a_iIn, iOut = a_iOut;
+        if (iIn == 0 && iOut == 0 && (m_iLiveIn > 0 || m_iLiveOut > 0)) {
+            iIn = m_iLiveIn;
+            iOut = m_iLiveOut;
+        }
+        emit sigAdhocUsage(iIn, iOut, a_dCost, iElapsedMs,
                            m_pAdhocRunner ? m_pAdhocRunner->LastReqCount() : 0);
     }
+    ResetLiveUsage();   // 2026.08.29 归集完成后才清零（顺带 sigLiveUsage(0,0) 收起「本轮」显示）
     m_dtAdhocStart = QDateTime();
 
     switch (m_eAdhocMode) {
@@ -2512,18 +2615,24 @@ void CTaskOrchestrator::OnAdhocFinished(bool a_bOk, const QString& a_sResult,
         emit sigAdhocContext(m_pAdhocRunner ? m_pAdhocRunner->LastContextFill() : 0);
         // 需求4：非只读会话完成 → 触发 guide.md 增量同步（SyncGuideAsync 内部按 record 水位线判定，
         //   无新改动则静默跳过不起 agent）。agent 若已自治写了 record，此处即检测到新内容。
+        //   2026.08.27 改空闲 3 分钟节流（见构造函数 m_tGuideSyncIdle）：不再与下一轮提示词
+        //   并发抢网关；活跃使用期间持续顺延，停下 3 分钟后才同步（含手动菜单立即可同步）。
         if (!m_bAdhocReadOnly && m_pPm != nullptr) {
-            m_pPm->SyncGuideAsync(QString());
+            m_tGuideSyncIdle.start();
         }
         emit sigAdhocEvent(QStringLiteral("done"), QStringLiteral("已完成"));
-        emit sigAdhocFinished();
-        // 2026.08.19 运行中排队的追加指令自动续发：本轮成功收尾、runner 已空闲，按同
-        //   会话（m_sAdhocSid 链基点）作为下一条提问发出，逐条消费。失败/续跑中断路径
-        //   不消费——队列保留，待下一次成功提问后继续（避免向已死会话盲发）。
+        // 2026.08.27 运行中排队的追加指令自动续发提前到 sigAdhocFinished 之前（同链续跑）：
+        //   原实现在收尾信号之后再续发——主窗口收尾链（OnAdhocRunFinished）会把「激活助手」
+        //   的会话换载进编排器（用户在运行中切到/新建了别的助手时），续发指令就落进了别的
+        //   助手的会话与日志；面板还会闪一下假空闲。现在续发轮与本轮同会话同助手，运行态
+        //   经 sigAdhocRunning 幂空延续（面板 ● 不落），排队全部消费完才发 sigAdhocFinished。
+        //   失败/续跑中断路径不消费（队列保留，待下一次成功提问后续发，原语义不变）。
         if (!m_aAdhocPendingInjects.isEmpty()) {
             const QString sNext = m_aAdhocPendingInjects.takeFirst();
             SubmitAdhoc(sNext, m_bAdhocReadOnly, m_sAdhocLastTaskId);
+            return;
         }
+        emit sigAdhocFinished();
         return;
     }
     case CompactSummarize: {

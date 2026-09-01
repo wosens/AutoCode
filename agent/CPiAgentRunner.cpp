@@ -173,6 +173,51 @@ bool CPiAgentRunner::WritePiModelsJson() {
     return true;
 }
 
+QString CPiAgentRunner::PiSettingsJsonPath() {
+    return QDir::homePath() + QStringLiteral("/.pi/agent/settings.json");
+}
+
+bool CPiAgentRunner::EnsurePiRetrySettings() {
+    // 2026.08.28 429 限流自愈（幂等合并写，同 models.json 口径）：
+    //   pi 轮级自动重试对 429/5xx 瞬态错误默认开启（settings.retry.enabled 默认 true、
+    //   maxRetries 默认 3），但基准退避 2s（2s/4s/8s 全程 ~15s）对分钟级滚动 TPM/RPM
+    //   配额限流无效——三次重试全落在配额未恢复窗口内，连击失败后 pi 放弃整轮。
+    //   补写 baseDelayMs=15000：15s/30s/60s 指数退避跨过配额滚动窗，重试成功率大幅
+    //   提升；错误分类正则（pi ai/utils/retry.ts）对 "429" 命中可重试、对
+    //   "insufficient_quota/quota exceeded/billing" 判不可重试（配额耗尽类不盲等）。
+    //   已有 retry 段（用户手工配置/先前已写）一律不动，尊重显式配置。
+    const QString sPath = PiSettingsJsonPath();
+    QDir().mkpath(QFileInfo(sPath).absolutePath());
+    QJsonObject oRoot;
+    bool bParsed = false;
+    QFile stIn(sPath);
+    if (stIn.open(QIODevice::ReadOnly)) {
+        QJsonParseError stErr;
+        const QJsonDocument oDoc = QJsonDocument::fromJson(stIn.readAll(), &stErr);
+        stIn.close();
+        if (stErr.error == QJsonParseError::NoError && oDoc.isObject()) {
+            oRoot = oDoc.object();
+            bParsed = true;
+        }
+    }
+    if (bParsed && oRoot.contains(QStringLiteral("retry"))) {
+        return true;   // 已配置：不动（用户显式配置优先）
+    }
+    // 文件不存在/解析失败（坏档重建即修复——pi 对坏 settings.json 自身无法启动）/无段：
+    //   保留其余顶层键，补写 retry 段。
+    QJsonObject oRetry;
+    oRetry.insert(QStringLiteral("enabled"), true);
+    oRetry.insert(QStringLiteral("maxRetries"), 3);
+    oRetry.insert(QStringLiteral("baseDelayMs"), 15000);
+    oRoot.insert(QStringLiteral("retry"), oRetry);
+    QFile stOut(sPath);
+    if (!stOut.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    stOut.write(QJsonDocument(oRoot).toJson(QJsonDocument::Indented));
+    return true;
+}
+
 QString CPiAgentRunner::NpmGlobalCliPath() {
     // 一次性探测（进程内缓存；npm 未装/未命中缓存空串）。走 npm root -g 拿全局
     //   node_modules 根（对 npm 前缀配置免疫），拼固定包内布局后校验存在。
@@ -199,6 +244,59 @@ QString CPiAgentRunner::NpmGlobalCliPath() {
     }
     s_sPiNpmCliCache = QDir::toNativeSeparators(sCli);
     return s_sPiNpmCliCache;
+}
+
+// —— 2026.09 版本管理：Pi 安装形态与本地版本（头文件注释为准） ——
+
+CPiAgentRunner::EPiForm CPiAgentRunner::DetectPiForm() {
+    // 优先级与 ResolveCliJsPath 一致：root 固定布局 → npm 全局。
+    const QString sRoot = PiRootPath();
+    if (!sRoot.isEmpty()
+        && QFileInfo::exists(
+            sRoot + QStringLiteral("/pi/packages/coding-agent/package.json"))) {
+        return EPiFormSource;
+    }
+    const QString sNpmCli = NpmGlobalCliPath();
+    if (!sNpmCli.isEmpty()) {
+        const QString sPkg = QFileInfo(sNpmCli).absolutePath()
+                           + QStringLiteral("/package.json");
+        if (QFileInfo::exists(sPkg)) {
+            return EPiFormNpm;
+        }
+    }
+    return EPiFormNone;
+}
+
+QString CPiAgentRunner::ResolvePiVersion(const QString& a_sRoot) {
+    // 读指定 package.json 的 version（open 失败/解析错/无 version 字段→空串）。
+    auto fnReadVer = [](const QString& a_sPkg) -> QString {
+        QFile stFile(a_sPkg);
+        if (!stFile.open(QIODevice::ReadOnly)) {
+            return QString();
+        }
+        QJsonParseError stErr;
+        const QJsonDocument oDoc = QJsonDocument::fromJson(stFile.readAll(), &stErr);
+        stFile.close();
+        if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
+            return QString();
+        }
+        return oDoc.object().value(QStringLiteral("version")).toString();
+    };
+    if (!a_sRoot.isEmpty()) {
+        // 显式根：只读该根的根包（miss→空串，不回退其它形态）。
+        const QString sRoot = QDir::fromNativeSeparators(a_sRoot.trimmed());
+        return fnReadVer(sRoot + QStringLiteral("/pi/packages/coding-agent/package.json"));
+    }
+    switch (DetectPiForm()) {
+        case EPiFormSource:
+            return fnReadVer(PiRootPath()
+                + QStringLiteral("/pi/packages/coding-agent/package.json"));
+        case EPiFormNpm:
+            return fnReadVer(QFileInfo(NpmGlobalCliPath()).absolutePath()
+                + QStringLiteral("/package.json"));
+        default:
+            return QString();
+    }
 }
 
 QString CPiAgentRunner::ResolveNodePath() {
@@ -324,12 +422,15 @@ void CPiAgentRunner::Reset() {
     m_iSumCacheWriteTok = 0;
     m_iSumInTok = 0;
     m_iSumOutTok = 0;
+    m_iLiveEmitIn = 0;    // 2026.08.27 实时计量已发累计复位
+    m_iLiveEmitOut = 0;
     m_sLastSubtype.clear();
     m_iLastReqCount = 0;
     m_iLastContextFill = 0;
     m_sLastModel.clear();
     m_aStderrTail.clear();
     m_buf.clear();
+    m_iNoMsgHintMs = -1;   // 2026.08.29 流式心跳提示节流复位
 }
 
 void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
@@ -367,19 +468,24 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
         m_bFinished = false;
     }
 
-    // —— 组装命令行（node 直起，参数化传参，Windows 路径含空格安全）——
+    // 离线约束（NFR-5）：跳过扩展/主题发现扫描，且避免工程本地扩展被静默加载
+    //   （安全面收敛）；--offline 跳过更新检查。
+    //   2026.08.24 技能放开（便携口径，不写用户主目录）：不再传 --no-skills——pi
+    //   默认发现 ~/.pi/agent/skills、<工程>/.pi/skills；同时经 --skill 依次挂载
+    //   CAgentRunnerBase::SharedSkillDirs()：<exe>\skills（便携）与 ~/.claude/skills。
     QStringList aArgs;
     aArgs << ResolveCliJsPath()
           << QStringLiteral("-p")
           << QStringLiteral("--mode") << QStringLiteral("json")
-          // 离线约束（NFR-5）：跳过扩展/技能/主题发现扫描，且避免工程本地扩展被
-          //   静默加载（安全面收敛）；--offline 跳过更新检查。
           << QStringLiteral("--offline")
           << QStringLiteral("--no-extensions")
-          << QStringLiteral("--no-skills")
           << QStringLiteral("--no-themes")
           // 非交互全自动：忽略（而非信任）工程本地可执行内容，避免无头模式挂起。
           << QStringLiteral("--no-approve");
+    const QStringList aSkillDirs = CAgentRunnerBase::SharedSkillDirs();
+    for (const QString& sDir : aSkillDirs) {
+        aArgs << QStringLiteral("--skill") << sDir;
+    }
     // 2026.08.20 自定义大模型激活条目覆盖固定路由：provider=autocode-<n>、model=条目
     //   模型 id（apiKey 走 models.json，不走 env 注入）；无激活 → Provider/模型 键。
     const bool bCustomActive = !PiActiveProvider().isEmpty();
@@ -389,6 +495,9 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     if (bCustomActive) {
         WritePiModelsJson();
     }
+    // 2026.08.28 429 限流自愈：无条件（固定路由同样会 429/5xx）幂等补写 settings.json
+    //   的 retry 段（已有段不动；详见 EnsurePiRetrySettings 注释）。
+    EnsurePiRetrySettings();
     aArgs << QStringLiteral("--provider")
           << (bCustomActive ? PiActiveProvider() : PiProvider());
     const QString sModelArg = bCustomActive ? PiActiveModelId() : PiModel();
@@ -417,6 +526,10 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
     oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
+    // 2026.08.28 助手提速：长缓存保留（cache_control.ttl=1h）。Anthropic 临时缓存默认 5 分钟
+    //   过期——用户每步间隔常超 5 分钟，过期后网关全量重算整个上下文（慢 prefill 网关上
+    //   几十秒/步）；长保留把窗口拉到 1 小时（网关不认 ttl 也无害，实测请求正常）。
+    oEnv.insert(QStringLiteral("PI_CACHE_RETENTION"), QStringLiteral("long"));
     if (!PiApiKey().isEmpty() && PiActiveProvider().isEmpty()) {
         QString sEnvName;
         const QString sP = PiProvider().toLower();
@@ -435,6 +548,23 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     }
     m_pProc->setProcessEnvironment(oEnv);
     m_pProc->setWorkingDirectory(a_sWorkDir);
+    // 2026.08.24 全局规则运行时注入（便携口径，不复制进 ~/.pi）：pi 的全局上下文
+    //   文件是 <agentDir>/AGENTS.md，为免向用户主目录写文件，改为把共享全局规则
+    //   （<exe>\CLAUDE.md 或 ~/.claude/CLAUDE.md）直接前置进本阶段 prompt。
+    //   工程根的 CLAUDE.md pi 原生发现，无需处理。
+    QString sPrompt = a_sPrompt;
+    const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
+    if (!sGlobalCtx.isEmpty()) {
+        sPrompt.prepend(QStringLiteral(
+            "以下是全局工程约定（CLAUDE.md），在整个任务中始终遵守：\n\n%1\n\n---\n\n")
+            .arg(sGlobalCtx));
+        emit sigInfo(QStringLiteral("[system/pi] 已注入全局规则（%1 字符）")
+                         .arg(QString::number(sGlobalCtx.size())));
+    }
+    if (!aSkillDirs.isEmpty()) {
+        emit sigInfo(QStringLiteral("[system/pi] 已挂载技能目录：%1")
+            .arg(aSkillDirs.join(QStringLiteral("；"))));
+    }
     emit sigInfo(QStringLiteral("[system/pi] 启动：%1 %2").arg(
         QDir::toNativeSeparators(ResolveCliJsPath()),
         QDir::toNativeSeparators(a_sWorkDir)));
@@ -445,11 +575,13 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
         return;
     }
     m_actClock.restart();
+    m_tNoMsg.start();   // 2026.08.29 完整事件计时（心跳提示用）
+    m_iNoMsgHintMs = -1;
     if (m_pStallTimer != nullptr && !m_pStallTimer->isActive()) {
         m_pStallTimer->start();
     }
     // prompt 经 stdin 投递后关闭写通道（实测可行，见 pi-json-sampling.md §5）。
-    m_pProc->write(a_sPrompt.toUtf8());
+    m_pProc->write(sPrompt.toUtf8());
     m_pProc->closeWriteChannel();
 }
 
@@ -513,7 +645,16 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
     QJsonParseError stErr;
     const QJsonDocument stDoc = QJsonDocument::fromJson(a_sLine, &stErr);
     if (stErr.error != QJsonParseError::NoError || !stDoc.isObject()) {
-        emit sigInfo(QString::fromUtf8(a_sLine));   // 非 JSON 行原样上抛（排查用）
+        // 2026.08.27 悬空 sid 场景友好化：pi 对不存在的 --session-id 会打英文 Warning
+        //   并自动用该 id 新建会话（实测自愈，不失败）——补中文说明，用户可知上下文
+        //   已重新开始（工程自其他电脑拷贝时常见）。
+        const QString sRaw = QString::fromUtf8(a_sLine);
+        if (sRaw.startsWith(QStringLiteral("Warning: No project session found"))) {
+            emit sigInfo(QStringLiteral("↻ 会话在本机不存在（工程可能自其他电脑拷贝），"
+                                        "pi 已自动新建会话续跑（上下文自本条重新开始）"));
+        } else {
+            emit sigInfo(sRaw);   // 非 JSON 行原样上抛（排查用）
+        }
         return;
     }
     const QJsonObject oRoot = stDoc.object();
@@ -530,11 +671,28 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
         //   以「一条 assistant 消息 = 一块」为口径（同 claude/DSH 的 message_end 整块），
         //   逐 Δ 发会把一句话拆成上百个小块（消息视图输出碎裂）。改为在 message_end
         //   里取最终完整文本一次性上抛（见 HandleMessageEnd）。
+        // 2026.08.27 帧自带累计 usage（本消息生成中实时刷新「本轮 ↑↓」；绝对值不入账）。
+        const QJsonObject oU = oRoot.value(QStringLiteral("usage")).toObject();
+        if (!oU.isEmpty()) {
+            const qint64 iIn = oU.value(QStringLiteral("input")).toInteger()
+                + oU.value(QStringLiteral("cacheRead")).toInteger()
+                + oU.value(QStringLiteral("cacheWrite")).toInteger();
+            const qint64 iOut = oU.value(QStringLiteral("output")).toInteger();
+            if (iIn > 0 || iOut > 0) {
+                emit sigLivePartial(m_iLiveEmitIn + iIn, m_iLiveEmitOut + iOut);
+            }
+        }
         return;
     }
     if (sType == QStringLiteral("message_end")) {
+        m_tNoMsg.restart();   // 完整消息 = 实质进展（心跳提示清零）
         HandleMessageEnd(oRoot.value(QStringLiteral("message")).toObject());
         return;
+    }
+    if (sType == QStringLiteral("tool_execution_start")
+        || sType == QStringLiteral("tool_execution_end")
+        || sType == QStringLiteral("turn_start")) {
+        m_tNoMsg.restart();   // 工具/新轮次 = 实质进展
     }
     if (sType == QStringLiteral("tool_execution_end")) {
         // 工具结果：result 容错为字符串/数组/对象（TextContent[] 等价拼接文本）。
@@ -573,6 +731,36 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
     if (sType == QStringLiteral("compaction_start")) {
         emit sigInfo(QStringLiteral("[system/pi] 上下文自动压缩进行中…"));
     }
+    // 2026.08.28 轮级自动重试进度透传（429/5xx 瞬态）：pi 重试期间无其他输出，
+    //   不透传则 UI 看起来像卡死（配合 EnsurePiRetrySettings 的长退避尤其必要）。
+    if (sType == QStringLiteral("auto_retry_start")) {
+        const int iAttempt = oRoot.value(QStringLiteral("attempt")).toInt();
+        const int iMax = oRoot.value(QStringLiteral("maxAttempts")).toInt();
+        const qint64 iDelayMs = oRoot.value(QStringLiteral("delayMs")).toInteger();
+        QString sWhy = oRoot.value(QStringLiteral("errorMessage")).toString();
+        if (sWhy.size() > 200) {
+            sWhy = sWhy.left(200) + QStringLiteral("…");
+        }
+        emit sigInfo(QStringLiteral("↻ 模型接口瞬态错误（429/5xx 类），%1 秒后自动重试"
+                                    "（第 %2/%3 次）：%4")
+                         .arg(QString::number(iDelayMs / 1000))
+                         .arg(QString::number(iAttempt))
+                         .arg(QString::number(iMax))
+                         .arg(sWhy));
+        return;
+    }
+    if (sType == QStringLiteral("auto_retry_end")) {
+        if (oRoot.value(QStringLiteral("success")).toBool()) {
+            emit sigInfo(QStringLiteral("↻ 自动重试成功，继续本轮…"));
+        } else {
+            QString sFinal = oRoot.value(QStringLiteral("finalError")).toString();
+            if (sFinal.size() > 200) {
+                sFinal = sFinal.left(200) + QStringLiteral("…");
+            }
+            emit sigInfo(QStringLiteral("⚠ 自动重试未能恢复：%1").arg(sFinal));
+        }
+        return;
+    }
 }
 
 void CPiAgentRunner::HandleMessageEnd(const QJsonObject& oMsg) {
@@ -590,14 +778,18 @@ void CPiAgentRunner::HandleMessageEnd(const QJsonObject& oMsg) {
     ApplyUsage(oMsg.value(QStringLiteral("usage")).toObject());
     m_sLastStopReason = oMsg.value(QStringLiteral("stopReason")).toString();
     // 2026.08.22 API 调用失败透传：stopReason=="error" 时 pi 携带 errorMessage
-    //   （如网关 429 限流 / 500 内部错误），content 为空——此前静默无输出。
-    //   现实时上抛系统行 + 暂存供收尾消息带出。
+    //   （如网关 429 限流 / 500 内部错误），content 为空。
+    //   2026.08.28 调整：不再实时上抛「本轮无输出」警告（pi 对 429/5xx 会自动重试，
+    //   auto_retry_start/end 事件另行提示；实时警告与重试提示交替出现且语义误导）。
+    //   只暂存 m_sLastApiError：最终失败由收尾 sigFinished 带出；不可重试类错误
+    //   （配额耗尽等，无 auto_retry 事件）同样在收尾带出。成功消息到达时清陈旧错误。
     if (m_sLastStopReason == QStringLiteral("error")) {
         const QString sErr = oMsg.value(QStringLiteral("errorMessage")).toString();
         if (!sErr.isEmpty()) {
             m_sLastApiError = sErr;
-            emit sigInfo(QStringLiteral("⚠ 模型接口错误（本轮无输出）：%1").arg(sErr));
         }
+    } else {
+        m_sLastApiError.clear();
     }
     // content：text 块整块上抛（2026.08.20：流式 delta 不再逐发，此处按 claude/DSH
     //   口径一条消息一块）；toolCall 块 → sigToolUse（arguments 为对象 → 序列化 JSON）。
@@ -641,6 +833,12 @@ void CPiAgentRunner::ApplyUsage(const QJsonObject& oUsage) {
     if (iIn > 0 && iIn != m_iLastContextFill && iIn <= iWinCap) {
         m_iLastContextFill = iIn;
         emit sigContextFill(iIn);
+    }
+    // 2026.08.27 逐消息实时计量上抛（本轮 ↑↓ 显示）；收尾 sigFinished 据已发累计报 0 防双计。
+    if (iIn > 0 || iOut > 0) {
+        m_iLiveEmitIn += iIn;
+        m_iLiveEmitOut += iOut;
+        emit sigUsageDelta(iIn, iOut);
     }
 }
 
@@ -687,6 +885,48 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
         //   上限）复用 claude 词汇 error_max_turns，上层 LastWasMaxTurns 自动续跑
         //   （pi 磁盘会话凭 --session-id 完整恢复上下文，续跑体验优于 DSH）。
         m_bFinished = true;
+        // 2026.08.28 最后一条 assistant 为 API 错误（429/5xx 自动重试耗尽或不可重试类）
+        //   时本轮未收敛：改报失败（旧版报 true + 轮内陈旧文本，上层误判阶段成功、
+        //   产出空产物继续推进）。失败消息带真因与限流应对指引。
+        if (m_sLastStopReason == QStringLiteral("error")) {
+            m_sLastSubtype = QStringLiteral("api_error");
+            QString sErr = m_sLastApiError.isEmpty()
+                ? QStringLiteral("（无错误详情）") : m_sLastApiError;
+            if (sErr.size() > 800) {
+                sErr = sErr.left(800) + QStringLiteral("…");
+            }
+            QString sHint;
+            // 2026.08.28 指引分类：quota/套餐额度耗尽类优先判（其消息常含 429 前缀，
+            //   误落限流分支会提示“稍等重试”白等；实测 SenseNova "token plan
+            //   entitlement exhausted"/"quota_exceeded_error" 即此类，等待无效）。
+            if (sErr.contains(QLatin1String("quota_exceeded"), Qt::CaseInsensitive)
+                || sErr.contains(QLatin1String("entitlement"), Qt::CaseInsensitive)
+                || sErr.contains(QLatin1String("insufficient_quota"))
+                || sErr.contains(QLatin1String("quota exceeded"), Qt::CaseInsensitive)
+                || sErr.contains(QLatin1String("out of budget"), Qt::CaseInsensitive)) {
+                sHint = QStringLiteral("\n处理：套餐/账户 token 额度已耗尽（quota 类错误，"
+                                       "非临时限流——等待与重试无效）。请在模型服务平台"
+                                       "充值/领取额度，或切换其他模型条目"
+                                       "（设置 → PiAgent 参数 → 自定义大模型）。");
+            } else if (sErr.contains(QLatin1String("429"))
+                || sErr.contains(QLatin1String("tpm"), Qt::CaseInsensitive)
+                || sErr.contains(QLatin1String("rpm"), Qt::CaseInsensitive)
+                || sErr.contains(QLatin1String("rate"), Qt::CaseInsensitive)) {
+                sHint = QStringLiteral("\n处理：模型/网关限流（每分钟 token 配额耗尽）——"
+                                       "稍等 1~2 分钟后重试；频繁触发请减小上下文"
+                                       "（清理会话/换新助手）或换配额更高的模型。"
+                                       "（pi 已自动长退避重试 3 次）");
+            } else {
+                sHint = QStringLiteral("\n处理：检查网关/模型服务可用性与模型条目配置"
+                                       "（设置 → PiAgent 参数）。 pi 已自动重试后仍失败。");
+            }
+            emit sigFinished(false,
+                             QStringLiteral("模型接口错误（自动重试后仍失败）：%1").arg(sErr) + sHint,
+                             (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                             (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                             ComputeTurnCost(), m_sLastSessionId);
+            return;
+        }
         const bool bMaxLen = m_sLastStopReason == QStringLiteral("length");
         m_sLastSubtype = bMaxLen ? QStringLiteral("error_max_turns")
                                  : QStringLiteral("success");
@@ -697,13 +937,38 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
                  ? QStringLiteral("模型接口错误，本轮无输出：%1").arg(m_sLastApiError)
                  : (bMaxLen ? QStringLiteral("达到输出 token 上限（stopReason=length），转自动续跑")
                             : QStringLiteral("(本轮无文本输出)"));
+            // 2026.08.29 空输出+输出量逼近上限的对症指引：thinking=high 时模型可把整轮
+            //   maxTokens 预算耗在思考段（实测拳皇任务：out=32768 正好打满、16.7 分钟
+            //   无任何正文/工具），空转一轮还烧钱——指路「调低思考级别或调大最大输出」。
+            if (m_sLastApiError.isEmpty() && m_iSumOutTok >= 30000) {
+                sMsg += QStringLiteral("\n⚠ 本轮输出 %1 token 已逼近「最大输出」上限且无正文产出——"
+                                       "疑似思考段耗尽了整个输出预算。处理：设置 → PiAgent 参数 "
+                                       "→ 把「思考级别」调低（medium/low），或调大条目「最大输出」"
+                                       "（网关上限 131072）后重发。")
+                            .arg(QString::number(m_iSumOutTok));
+            }
         }
-        emit sigFinished(true, sMsg, m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sLastSessionId);
+        emit sigFinished(true, sMsg,
+                         (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                         (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                         ComputeTurnCost(), m_sLastSessionId);
         return;
     }
     if (a_iExitCode == 0 && !m_bAgentEnded) {
-        // 退出码 0 但未见 agent_end（流被截断/版本差异）：按已有文本乐观收尾。
+        // 退出码 0 但未见 agent_end（流被截断/版本差异）：按已有文本乐观收尾；
+        //   但最后一条消息为 API 错误时同上改报失败（重试耗尽/不可重试均未收敛）。
         m_bFinished = true;
+        if (m_sLastStopReason == QStringLiteral("error")) {
+            m_sLastSubtype = QStringLiteral("api_error");
+            emit sigFinished(false,
+                QStringLiteral("模型接口错误：%1")
+                    .arg(m_sLastApiError.isEmpty() ? QStringLiteral("（无错误详情）")
+                                                   : m_sLastApiError.left(800)),
+                (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                ComputeTurnCost(), m_sLastSessionId);
+            return;
+        }
         m_sLastSubtype = QStringLiteral("success");
         emit sigFinished(true,
                          m_sTurnText.isEmpty()
@@ -711,7 +976,9 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
                                     ? QStringLiteral("模型接口错误，本轮无输出：%1").arg(m_sLastApiError)
                                     : QStringLiteral("(本轮无文本输出)"))
                              : m_sTurnText,
-                         m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sLastSessionId);
+                         (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                         (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                         ComputeTurnCost(), m_sLastSessionId);
         return;
     }
     // 非零退出：统一错误路径（stderr 尾部 + 指引，NFR-3）。
@@ -753,6 +1020,22 @@ void CPiAgentRunner::CheckStall() {
     //   经 --session-id 自动续跑，pi 磁盘会话跨进程可恢复）。
     if (m_bFinished || m_pProc == nullptr || m_pProc->state() == QProcess::NotRunning) {
         return;
+    }
+    // 2026.08.29 流式心跳提示：进程活着、增量字节仍在流（m_actClock 新鲜）但超过
+    //   3 分钟没有任何完整事件（message_end/工具/turn_start）——典型为 thinking=high
+    //   下模型长时间深度思考（实测单条消息流式 16 分钟打满 maxTokens），UI 只显示
+    //   完整消息、流式 usage 帧多为 0，用户侧看起来就是「卡死」。每 60s 补一条
+    //   可见提示（不终止进程；硬停滞检测只认总输出静默，不受影响）。
+    if (m_tNoMsg.isValid() && m_tNoMsg.elapsed() > 180000
+        && m_actClock.elapsed() < 45000) {
+        const qint64 iNoMsg = m_tNoMsg.elapsed();
+        if (m_iNoMsgHintMs < 0 || iNoMsg - m_iNoMsgHintMs >= 60000) {
+            m_iNoMsgHintMs = iNoMsg;
+            emit sigInfo(QStringLiteral("⏳ 模型仍在流式生成（已 %1 分钟无完整消息/工具事件，"
+                                        "输出仍在到达）——疑似深度思考中，并非卡死；"
+                                        "如需中断可点停止，或将思考级别调低/调大「最大输出」")
+                             .arg(QString::number(iNoMsg / 60000)));
+        }
     }
     const qint64 iLimitMs = static_cast<qint64>(CClaudeRunner::StallMinutes()) * 60000;
     if (m_actClock.elapsed() < iLimitMs) {

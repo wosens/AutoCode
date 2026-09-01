@@ -10,6 +10,7 @@
 #include <QSet>
 #include <QHash>
 #include <QJsonArray>
+#include <QTimer>   // 2026.08.27 m_tGuideSyncIdle（助手 guide 同步空闲节流）
 #include <atomic>   // 2026.08.22 m_bBackupRunning（回退互斥守卫读，备份线程写）
 #include <thread>
 
@@ -113,6 +114,9 @@ signals:
     void sigAdhocEvent(const QString& a_sKind, const QString& a_sText);  // 结构化事件徽章
     void sigAdhocContext(qint64 a_iFill);                              // 上下文占用（token）；-1=未知
     void sigAdhocModel(const QString& a_sModel);                       // 助手所用模型名（供面板查上下文窗口）
+    // 2026.08.27 运行中实时计量（任务阶段/助手轮次通用）：本轮累计 输入/输出 token，
+    //   每完成一次 API 请求发一次（Claude Code 式“当前指令消耗”直观反馈）；-1/-1=本轮结束清零。
+    void sigLiveUsage(qint64 a_iIn, qint64 a_iOut);
     void sigAdhocUndo();                                               // 撤销最后一条提问（面板清尾块）
     void sigAdhocFinished();                                           // 一次助手调用结束（启用输入栏）
     void sigAdhocRunning();                                            // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
@@ -255,10 +259,24 @@ private:
     std::thread      m_thStartPrep;          // StartTask 预备线程（同时刻至多一个，guards 保证不重叠）
     std::thread      m_thBackup;             // RunCurrentStage 改码备份线程（同上）
     std::atomic_bool m_bBackupRunning = {false};   // 2026.08.22 m_thBackup 运行标志（StopAll join / 回退守卫）
+    std::thread      m_thAdhocBackup;        // 2026.08.26 助手轮 turn 快照线程（大工程全量扫描+哈希可达数十秒，
+                                             //   同步跑在 UI 线程会卡死；与 m_thBackup 独立防任务/助手并发重叠）
+
+    // 2026.08.27 助手 guide 同步空闲节流：非只读轮结束不再立即 SyncGuideAsync（大工程下
+    //   该调用要 Read 整份 guide+Edit，且与下一轮提示词并发抢网关——助手每步极慢主因
+    //   之二）；改空闲 3 分钟同步，活跃期（新轮/agent 仍跑）持续顺延。
+    QTimer m_tGuideSyncIdle;
+
+    // 2026.08.26 助手轮 turn 快照改后台线程：不阻塞提交（失败仅事件提示，不阻断本轮）。
+    void AsyncAdhocBackup(const QString& a_sOwner, const QString& a_sPrompt);
 
     // —— 提示词 agent 状态 ——
     CAgentRunnerBase* m_pAdhocRunner = nullptr;                    // 第二个 runner 实例（独立会话/进程）
     QString        m_sAdhocSid;                                    // 当前助手会话 sid（首条前为空）
+    // 2026.08.27 本轮实时计量累计（任务阶段/助手轮次通用；阶段/轮次开始清零）
+    qint64         m_iLiveIn  = 0;
+    qint64         m_iLiveOut = 0;
+    void ResetLiveUsage() { m_iLiveIn = 0; m_iLiveOut = 0; emit sigLiveUsage(0, 0); }
     QString        m_sLastGuideHash;                               // 上次投喂 guide.md 的 SHA256（变更检测基线）
     bool           m_bAdhocReadOnly = false;                       // 本轮只读开关（决定 deny 黑名单内容）
     EAdhocMode     m_eAdhocMode = Idle;                            // 异步流程状态机

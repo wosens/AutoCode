@@ -22,7 +22,11 @@ CMessageView::CMessageView(QWidget* a_pParent)
                                  "QScrollBar:vertical { width: 10px; }"));
 
     m_pContent = new QWidget(this);
-    m_pContent->setStyleSheet(QStringLiteral("background: #ffffff;"));
+    // 2026.08.26 选择器限定：无选择器样式表会级联到后代右键菜单等弹出控件（虽然白色
+    //   无害，但控件级规则会覆盖全局 QMenu 样式表，一并规范掉）。
+    m_pContent->setObjectName(QStringLiteral("msgContent"));
+    m_pContent->setStyleSheet(
+        QStringLiteral("QWidget#msgContent { background: #ffffff; }"));
     m_pLayout = new QVBoxLayout(m_pContent);
     m_pLayout->setContentsMargins(12, 12, 12, 12);
     m_pLayout->setSpacing(10);

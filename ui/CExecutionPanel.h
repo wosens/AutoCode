@@ -26,6 +26,7 @@ class CBusyIndicator;
 class CArtifactView;
 class CTaskInfo;
 class CMessageView;
+class CFilePreviewWidget;   // 2026.08.25 文件预览 Tab（md/html/hex 多视图容器）
 class CPromptFlyout;   // FR-3：助手日志提示词下拉浮层（半透明按钮 hover 弹出）
 
 // 右侧执行面板：上方阶段进度、中间 Tab（日志对话流 / 阶段产物 .md）、底部 cost/token 统计。
@@ -49,6 +50,13 @@ public:
                      const QString& a_sText);                                      // 阶段生命周期事件
 
     void SetCurrentTask(CTaskInfo* a_pTask);   // 切换显示任务（重建对话流 + 刷新阶段表）
+    void ShowTaskLogPage();
+    // 2026.08.29 上下文进度条菜单（右键/左键共用）：立即压缩 + 设置上下文大小。
+    void ShowContextMenu(const QPoint& a_stGlobalPos);                    // 2026.08.24 切到任务侧「日志」页（开始任务后不落在助手 Tab）
+    // 2026.08.29 阶段产物页分割条持久化（[Layout] ArtifactsSplit，base64 saveState）。
+    QByteArray ArtifactsSplitState() const;
+    void RestoreArtifactsSplit(const QByteArray& a_stState);
+    void ShowActiveAssistantPage();           // 2026.08.26 切到当前激活助手 Tab（新建任务后立即看到助手日志）
     void RefreshTask(CTaskInfo* a_pTask);       // 状态变化时刷新阶段表/cost
     // FR-5：阶段产物落盘后由主窗口在 stage_done 事件调用——重扫产物目录并保留当前选中态
     //（重扫前记录选中产物绝对路径，重扫后若该文件仍存在则重新选中同一行，避免查看内容被清空）。
@@ -91,8 +99,20 @@ public:
     QJsonArray AsstStack(const QString& a_sId) const;       // 该助手撤销栈 JSON
     QString AsstGuideHash(const QString& a_sId) const;      // 该助手 guide.md 投喂哈希
     qint64 AsstCtxFill(const QString& a_sId) const;         // 该助手上下文占用快照
+    // 2026.08.27 助手独立流量记录：未选任务时助手消耗不再丢弃，累计到该助手自身
+    //   （随 assistant.json 持久化）。选了任务仍归集到任务（原行为不变，历史记录不丢）。
+    void AddAsstUsage(const QString& a_sId, qint64 a_iIn, qint64 a_iOut,
+                      double a_dCost, qint64 a_iMs, int a_iReqs);
+    // 2026.08.27 本轮实时计量（任务阶段/助手轮次通用）：显示在费用栏右侧“本轮 ↑x ↓y”，
+    //   阶段/轮次开始清零、每完成一次 API 请求刷新；(0,0) 隐藏。
+    void SetLiveUsage(qint64 a_iIn, qint64 a_iOut);
+    void ApplyLiveUsage(qint64 a_iIn, qint64 a_iOut);   // 限频到点实际上屏
     QString ActiveAsstId() const { return m_sActiveAsst; }  // 当前激活（显示中）的助手 id
     QString RunningAsstId() const { return m_sRunningAsst; }// 正在执行一轮的助手 id（无则空）
+    int QueuedAdhocCount() const { return m_aAdhocQueue.size(); }   // 2026.08.27 跨助手排队指令数（测试断言用）
+    // 2026.08.27 升 public 供测试驱动（test_execpanel 跨助手排队用例）：发送当前输入。
+    // 运行中且激活助手≠运行助手 → 排队到激活助手（QueueAdhocPrompt），不注入运行轮。
+    void DoAdhocSend();
     void ClearRunningAsst();                                // 结束态：清运行中助手（主窗口在读取后调用）
     void ResetAssistants();                                 // 复位为单个默认助手（清空会话/对话流）
     void ClearAsstTabs();                                   // 拆除全部助手 Tab + 清模型（不建默认助手；载档/复位共用，含「+」页再入防护）
@@ -153,12 +173,11 @@ private:
     void AppendData(const QString& a_sTaskId, const SBlockData& a_stData);   // 入缓存 + 当前任务则上屏
     void RebuildView();        // 按 m_sCurId 重建整条对话流（分帧渐进，避免数百块同步创建卡死 UI）
     void RebuildChunk(quint32 a_uGen);   // 渐进重建一帧（代际号不符=已被新重建顶替，立即终止）
-    void AppendAdhocBlock(const SBlockData& a_stData);   // ad-hoc 块入缓存 + 上屏助手 Tab（运行中→该助手，否则激活助手）
+    void AppendAdhocBlock(const SBlockData& a_stData, const QString& a_sTargetId = QString());   // ad-hoc 块入缓存 + 上屏助手 Tab（目标 id 空=运行中助手，否则激活助手；2026.08.27 增 id 直投——跨助手排队徽标要落到指定助手）
     void RebuildAdhocView();   // 按激活助手数据重建其对话流（分帧渐进，撤销/切档后调用）
     void RebuildAsstView(const QString& a_sId);   // 2026.08.23 按指定助手重建（多助手各自独立控件，加载后预建防切换卡顿）
     void RebuildAdhocChunk(const QString& a_sId, quint32 a_uGen);   // 助手视图渐进重建一帧（id/代际号不符=被顶替，立即终止）
     void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/m_bAdhocRunning 刷新输入栏可用性
-    void DoAdhocSend();             // 发送当前输入（Ctrl+Enter / 发送按钮调用）
     void OnAdhocTextChanged();      // 多行输入框高度自适应（按内容行数，上限 10 行）
     // 输入框高度自适应通用版：按字体度量算单行高、按 blockCount 线性增长、封顶 a_iMaxLines 行。
     // 介入栏与助手栏共用，保证两框初始高度与增长行为完全一致（#3）。
@@ -189,13 +208,18 @@ private:
     QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 /「+」页 / 文件预览
     QWidget*        m_pAddTabPage = nullptr;  // 「+」新增助手占位页（选中即新增并弹回，参考 DSHAgentManage）
     QWidget*        m_pArtifactsPage = nullptr;  // 「阶段产物」页本体（Tab 布局管制时识别非助手页用）
-    QPlainTextEdit* m_pFileView = nullptr;  // 2026.08.18 文件预览 Tab（双击文本文件，单实例复用）
+    QSplitter*      m_pArtifactsSplit = nullptr;  // 2026.08.29 阶段清单|Markdown 分割条（持久化）
+    CFilePreviewWidget* m_pFileView = nullptr;  // 2026.08.25 文件预览 Tab（单实例复用，内部分发纯文本/md/html/hex）
     CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志
     QPlainTextEdit* m_pTaskInput = nullptr; // FR-3 任务对话流下方的介入输入栏
     QPushButton*    m_pBtnInject = nullptr; // FR-3 介入发送按钮
     QListWidget*    m_pOutputs = nullptr;   // Tab2 左：阶段产物清单
     CArtifactView* m_pArtifactView = nullptr;  // Tab2 右：选中产物的 Markdown 渲染
     QLabel*         m_pLblCost = nullptr;
+    QLabel*         m_pLblLive = nullptr;   // 2026.08.27 本轮实时 token（运行中“本轮 ↑x ↓y”直观反馈）
+    QTimer*         m_pLiveTimer = nullptr; // 限频上屏定时器（200ms 单次）
+    qint64          m_iPendingLiveIn = 0;   // 暂存的最新流式值
+    qint64          m_iPendingLiveOut = 0;
     CBusyIndicator* m_pBusy    = nullptr;   // 执行态动画指示器（费用文本前，#4）
     QTimer*         m_pRunTimer = nullptr;  // 2026.08.15 运行耗时 1s 刷新定时器（仅当前任务 Running 时跑）
     bool            m_bTaskRunning = false; // 当前选中任务是否运行中（#4 指示器用）
@@ -226,6 +250,12 @@ private:
         QString               sGuideHash;     // guide.md 投喂哈希基线
         QJsonArray            aStack;         // 撤销栈 JSON（prompt,sid 链）
         qint64                iCtxFill = 0;   // 上下文占用快照（恢复进度条用）
+        // 2026.08.27 未选任务时的独立消耗累计（选任务时消耗归任务，不进这里）
+        double                dCost = 0.0;
+        qint64                iInTok = 0;
+        qint64                iOutTok = 0;
+        int                   iReqs = 0;
+        qint64                iElapsedMs = 0;
         QList<SBlockData>     aBlocks;        // 对话流数据快照
         QList<CMessageBlock*> aWidgets;       // 与 aBlocks 一一对齐
         int                   iRebuildIdx = 0;    // 分帧重建进度
@@ -241,6 +271,19 @@ private:
     SAsst* ActiveAsst();              // 当前激活助手（无助手时 nullptr）
     SAsst* RunningTargetAsst();       // 块归属目标：运行中助手 → 否则激活助手
     SAsst* AsstByView(QWidget* a_pView);   // 按视图反查助手（Tab 事件定位）
+    // —— 2026.08.27 跨助手排队发送：运行中助手 ≠ 激活助手时，提示词不再误注入运行轮 ——
+    //   入队（徽标 + ⏳ Tab 标记）；本轮结束（含编排器同会话续发链）后自动发送：
+    //   切到目标助手 Tab（触发会话换载）→ 上屏 user 块 → sigAdhocSubmit。
+    struct SQueuedAdhoc {
+        QString sAsstId;              // 目标助手 id
+        QString sText;                // 提示词原文
+        bool    bReadOnly = false;    // 只读开关（入队时快照）
+    };
+    void QueueAdhocPrompt(SAsst* a_pAsst, const QString& a_sText, bool a_bReadOnly);  // 入队 + 徽标
+    void ProcessAdhocQueue();        // 空闲时取队首发送（OnAdhocFinished 延迟触发）
+    bool AsstQueued(const QString& a_sId) const;   // 该助手是否有排队指令（Tab ⏳ 标记/关阷拦截用）
+    QString AsstTabText(const SAsst& a_st) const;  // Tab 标题（运行 ● / 排队 ⏳ / 纯名）
+    void RefreshAsstTabTexts();      // 统一刷全部助手 Tab 标题
     // FR-3：为指定助手日志右上角创建半透明提示词按钮（hover 弹出、移开收起、点击跳转）。
     void CreatePromptButton(SAsst& a_stAsst);
     void SetupTabsInteraction();      // 可移动 / 原生「x」/「+」页 /「▾」角落按钮（构造一次，参考 DSHAgentManage）
@@ -256,6 +299,9 @@ private:
     void OnAsstTabMoved(int a_iFrom, int a_iTo);   // 拖动 → 模型顺序同步 Tab 相对顺序
     void OnAsstTabCurrentChanged(int a_iIdx);      // 切 Tab：激活助手切换 + 状态栏同步
     void SyncAsstsOrderToTabs();             // 拖动后按 Tab 顺序重排 m_aAssts
+    // 2026.08.25 助手是否有用：对话流中存在用户发送的提示词（Event/user 块）；
+    //   无任何用户提示词 = 空助手（不入「▾」历史，关闭时直接舍弃）。
+    static bool AsstHasUserPrompt(const SAsst& a_st);
     static QString AsstStampKey(const QString& a_sId);   // 时间戳哨兵键（@@adhoc@@+id，兼容旧流）
     QPlainTextEdit*        m_pAdhocInput  = nullptr;   // 指令输入框（多行，Ctrl+Enter 发送）
     QToolButton*           m_pBtnReadOnly = nullptr;   // 只读/完整 切换（checkable）
@@ -266,6 +312,7 @@ private:
     QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
     QString                m_sActiveAsst;              // 当前激活助手 id
     QString                m_sRunningAsst;             // 正在执行一轮的助手 id（空=空闲）
+    QList<SQueuedAdhoc>    m_aAdhocQueue;              // 2026.08.27 跨助手排队指令（FIFO；档切换随 ClearAsstTabs 清空，不持久化）
     QList<int>             m_aPromptIdx;               // FR-3 激活助手流中「用户提问」块下标（旧→新，供下拉跳转）
     bool                   m_bAdhocEnabled = false;    // 工程是否已打开（输入栏总开关）
     bool                   m_bAdhocRunning = false;    // 助手是否运行中（运行中禁输入栏）

@@ -1,6 +1,7 @@
 ﻿#include "CNewTaskDialog.h"
 
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QComboBox>
 #include <QPlainTextEdit>
 #include <QCheckBox>
@@ -85,7 +86,13 @@ void CNewTaskDialog::SetupUi() {
     m_pLblElapsed = new QLabel(this);
 
     m_pBtns = new QDialogButtonBox(this);
-    connect(m_pBtns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    // 2026.08.26 输入规则在对话框内校验（不再等窗口关闭后判断）：
+    //   OK 不再直接 accept，先 Validate()，不通过则提示并留在对话框（输入不丢）。
+    connect(m_pBtns, &QDialogButtonBox::accepted, this, [this]() {
+        if (Validate()) {
+            accept();
+        }
+    });
     connect(m_pBtns, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     auto* pForm = new QFormLayout;
@@ -147,6 +154,18 @@ void CNewTaskDialog::ApplyMode() {
 
 QString CNewTaskDialog::Name() const {
     return m_pName->text().trimmed();
+}
+
+bool CNewTaskDialog::Validate() {
+    // 2026.08.26 对话框内校验（New 模式）：不满足规则弹提示返回 false，OK 不生效、
+    //   对话框不关，用户输入保留。View 模式无必填项，直接通过（按钮也仅 Close）。
+    if (m_eMode == New && UserRequest().isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+            QStringLiteral("需求描述不能为空"));
+        m_pReq->setFocus();
+        return false;
+    }
+    return true;
 }
 
 ETaskType CNewTaskDialog::Type() const {

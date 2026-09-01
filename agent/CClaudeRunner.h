@@ -40,6 +40,20 @@ public:
     static void SetStallMinutes(int a_iMin);
     static int  StallMinutes();
 
+    // —— 2026.09 版本管理（任务 23183ccb）：Claude Code 版本解析三件套 ——
+    //   （「后端版本管理」对话框与设置页状态行用；Codex/DSH/Pi 侧见各自 Runner。）
+    // 纯解析：从 "2.1.240 (Claude Code)" 类输出取首个 x.y.z 起始的版本串；无匹配→空。
+    static QString ParseClaudeVersionOutput(const QString& a_sOut);
+    // npm 全局 @anthropic-ai/claude-code 包 package.json 绝对路径（npm root -g 定位，
+    //   进程内缓存一次；npm 不可用/包未装→空串）。仅返回路径，version 由调用方读。
+    static QString NpmGlobalClaudePkgPath();
+    // 本机 Claude Code 版本："x.y.z" 或空串（CLI 与 npm 双源皆失败时不可区分未装/未知，
+    //   界面统一显示「未安装/未知」）。链：cmd /c <ClaudeCmd> --version（5s 启动/10s
+    //   结束，样板同 ClaudeSupportsAutocompact）→ 失败回退 npm 全局包 package.json。
+    //   注：内部两步均为同步子进程，供异步驱动方（CVersionDialog 的 QProcess 探测）
+    //   之外的测试/极端场景直接调用。
+    static QString ResolveClaudeVersion();
+
     // 模型名 → 上下文窗口 token 上限（未命中回退 200K）。2026.08.15 从
     //   CExecutionPanel::ContextLimitForModel 下沉到 agent 层：编排器计算
     //   自动压缩比例阈值也要用（面板委托到此处，单一实现）。
@@ -115,6 +129,12 @@ private:
     QElapsedTimer m_uptime;        // 本次进程存活计时（判快速失败）
     int         m_iFastRetry = 0;  // 本次 StartStage 已自动重试次数（上限 2）
     bool        m_bRetryPending = false;  // 快速失败重试等待中（Stop/抢占判定覆盖用）
+    // 2026.08.27 悬空 resume sid 自愈：--resume 的会话在本机不存在（工程自其他电脑拷贝，
+    //   会话数据在 ~/.claude 不随工程走）时 claude 报「No conversation found with session
+    //   ID」整轮失败——检测到即从参数剥离 --resume/--fork-session 杀进程新建会话重发本轮
+    //   （仅一次，m_bResumeDropped 防循环）；m_bQuietRestart 标记 kill 收尾走静默重拉。
+    bool        m_bResumeDropped  = false;
+    bool        m_bQuietRestart   = false;
 
     QProcess*  m_pProc     = nullptr;
     QByteArray m_buf;          // 跨 readyRead 的行缓冲
@@ -125,12 +145,20 @@ private:
     int        m_iProcEpoch = 0;
     // m_sLastSubtype / m_sLastSessionId / m_iLastContextFill / m_iLastReqCount /
     // m_sLastModel 已上移 CAgentRunnerBase（protected，Reset 时清零）
+    qint64    m_iLiveEmitIn = 0;    // 2026.08.27 已经 sigUsageDelta 实时上抛的输入累计（防收尾双计）
+    qint64    m_iLiveEmitOut = 0;   // 同上，输出累计
+    qint64    m_iStreamIn = 0;      // 2026.08.27 流式中消息输入（stream_event/message_start）
+    qint64    m_iStreamOut = 0;     // 流式中消息累计输出（stream_event/message_delta）
     QString    m_sMcpConfigPath;  // ask_user 模式下生成的 --mcp-config 临时文件（Reset 清理）
     QTimer*    m_pGraceTimer = nullptr;   // 崩溃宽限定时器（3s 一轮，上限 80 轮 = 240s）
     bool       m_bGraceActive = false;    // 宽限期进行中（抑制重复失败 / Stop 静默收尾用）
     int        m_iGraceTicks = 0;         // 宽限期已轮询次数
     qint64     m_iTranscriptSeen = 0;     // transcript 已读到的字节偏移（基线 = StartStage 时文件大小）
     QString    m_sTranscriptPath;         // 会话 transcript 路径缓存（首次命中后固定）
+    // 2026.08.27 空结果失败真因挖掘：读 transcript 尾部找错误条目（isApiErrorMessage /
+    //   error 级 system 行），返回拼接的错误文本（无则空串）——stderr 为空时（异机
+    //   headless 失败常见）唯一可靠的信息源。
+    QString MineTranscriptErrorTail();
     QStringList m_aStderrTail;            // 最近若干条 stderr 行（失败消息附带，防真因丢失）
     // 2026.08.17 停滞检测：m_actClock 在每次收到 stdout/stderr 字节时重启，30s 巡检一次，
     //   超阈值且进程仍活着 → 挂起判定（subtype="stall"）。挂载 ask_user 的调用

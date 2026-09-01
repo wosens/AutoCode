@@ -84,12 +84,18 @@ qt_add_executable(AutoCode WIN32
     ui/CAskUserDialog.cpp
     ui/CNewTaskDialog.h
     ui/CNewTaskDialog.cpp
+    ui/CVersionDialog.h
+    ui/CVersionDialog.cpp
     ui/CSettingsDialog.h
     ui/CSettingsDialog.cpp
     ui/CProjectExplorerPanel.h
     ui/CProjectExplorerPanel.cpp
     ui/CRollbackDialog.h
     ui/CRollbackDialog.cpp
+    ui/CDiffViewDialog.h
+    ui/CDiffViewDialog.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
     ui/CAboutDialog.h
     ui/CAboutDialog.cpp
     # SQLite 历史库层（纯 C API，直接编 sqlite3.c）
@@ -132,18 +138,18 @@ target_include_directories(AutoCode PRIVATE
 
 target_link_libraries(AutoCode PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network dwmapi ${ZSTD_LIB})
 
-# ---- 三段式版本号 v主.次.编译号（如 v1.0.345）----
-# 主/次版本取自上方 project(VERSION)；编译号每次编译自动 +1（计数落
-# build/autocode_build_number.txt，删 build 目录会归 1）。生成的 AutoCodeVersion.h
-# 供 core/CVersion.h 包含，标题栏/窗口标题经 AutoCodeVersionText() 显示。
+# ---- 三段式版本号 v主.次.编译号（如 v1.1.38）----
+# 2026.08.24 起按 %USERPROFILE%\.claude\CLAUDE.md「Version Number」规则：
+#   计数依据 = 工程根 readme.txt 修改记录条数（编译号=条数；每满 20 条次版本 +1；
+#   每满 100 条主版本 +1 且次版本清零），GenVersion.cmake 自动推导三段。
+#   readme.txt 首行维护「版本：vX.Y.N」，追加 Change Log 时同步更新。
+# 生成的 AutoCodeVersion.h 供 core/CVersion.h 包含，标题栏经 AutoCodeVersionText() 显示。
 add_custom_command(TARGET AutoCode PRE_BUILD
     COMMAND ${CMAKE_COMMAND}
-        -DVER_MAJOR=${PROJECT_VERSION_MAJOR}
-        -DVER_MINOR=${PROJECT_VERSION_MINOR}
-        -DSTAMP_FILE=${CMAKE_BINARY_DIR}/autocode_build_number.txt
+        -DREADME_FILE=${CMAKE_CURRENT_SOURCE_DIR}/readme.txt
         -DGEN_DIR=${CMAKE_BINARY_DIR}/gen
         -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/GenVersion.cmake
-    COMMENT "Generate AutoCodeVersion.h (bump build number)"
+    COMMENT "Generate AutoCodeVersion.h (from readme.txt entry count)"
 )
 
 # 输出到原 Execute 目录，沿用旧习惯
@@ -247,6 +253,8 @@ qt_add_executable(test_execpanel
     ui/CMessageBlock.cpp
     ui/CArtifactView.h
     ui/CArtifactView.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
     agent/CAgentRunnerFactory.h
     agent/CAgentRunnerBase.h
     agent/CAgentRunnerBase.cpp
@@ -343,6 +351,10 @@ add_test(NAME test_record_verify COMMAND test_record_verify)
 # 覆盖 AC-6.1/6.2、AC-6.4、AC-N。纯逻辑 + 临时文件系统，不依赖 GUI / Claude。
 qt_add_executable(test_rollback
     tests/test_rollback.cpp
+    ui/CRollbackDialog.h
+    ui/CRollbackDialog.cpp
+    ui/CDiffViewDialog.h
+    ui/CDiffViewDialog.cpp
     project/CProjectManager.h
     project/CProjectManager.cpp
     project/CGuideFingerprintScanner.h
@@ -453,6 +465,33 @@ target_include_directories(test_pirunner PRIVATE
 target_link_libraries(test_pirunner PRIVATE Qt6::Core Qt6::Network)
 add_test(NAME test_pirunner COMMAND test_pirunner)
 
+# ---- 后端版本管理纯函数离线单元测试（不联网不弹窗，挂 ctest；任务 23183ccb）----
+qt_add_executable(test_versiondlg
+    tests/test_versiondlg.cpp
+    core/CModelEntry.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    ui/CVersionDialog.h
+    ui/CVersionDialog.cpp
+)
+target_include_directories(test_versiondlg PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(test_versiondlg PRIVATE Qt6::Core Qt6::Network Qt6::Widgets)
+add_test(NAME test_versiondlg COMMAND test_versiondlg)
+
 # ---- CodexHarness 后端离线单元测试（不联网，挂 ctest）----
 qt_add_executable(test_codexrunner
     tests/test_codexrunner.cpp
@@ -476,3 +515,10 @@ target_include_directories(test_codexrunner PRIVATE
 )
 target_link_libraries(test_codexrunner PRIVATE Qt6::Core Qt6::Network)
 add_test(NAME test_codexrunner COMMAND test_codexrunner)
+
+# ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
+# 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
+set_tests_properties(
+    test_projectmanager test_execpanel test_historydb test_verify_flow
+    test_record_verify test_rollback test_pirunner test_versiondlg test_codexrunner
+    PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

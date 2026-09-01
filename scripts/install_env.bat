@@ -15,6 +15,10 @@ if /i "%~1"=="/pi" set "PI_ONLY=1"
 :: ---- 参数/codex = 只安装 CodexHarness（设置页「安装 CodexHarness…」按钮调用）----
 set "CODEX_ONLY=0"
 if /i "%~1"=="/codex" set "CODEX_ONLY=1"
+:: ---- 参数/update-dsh <tag> = 更新 DeepSeekHarness 到指定 tag（fetch+reset 保留本地；
+::      版本管理对话框「更新」调用，tag 由 AutoCode 经 ls-remote 解析后传入）----
+set "DSH_UPDATE=0"
+if /i "%~1"=="/update-dsh" set "DSH_UPDATE=1"
 
 title AutoCode 环境安装
 cd /d "%~dp0"
@@ -23,6 +27,7 @@ cd /d "%~dp0"
 ::   CDeepSeekRunner::ProbeSiblingRoot 同布局探测并自动回填配置。
 for %%i in ("%~dp0DeepSeekHarness\deepseek-harness") do set "DSH_ROOT=%%~fi"
 
+if "!DSH_UPDATE!"=="1" goto :BANNER_DSH_UPDATE
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
 if "!PI_ONLY!"=="1" goto :BANNER_PI
 if "!CODEX_ONLY!"=="1" goto :BANNER_CODEX
@@ -44,6 +49,7 @@ echo   安装位置：!DSH_ROOT!
 echo   前置条件：Git 与 Node.js - 缺失时会自动安装
 echo ============================================================
 echo.
+goto :ADMIN
 
 :BANNER_PI
 echo ============================================================
@@ -54,9 +60,8 @@ echo   前置条件：Node.js - 缺失时会自动安装
 echo   源目录默认：脚本上级 PIAgent（含 pi\ 子目录），可用环境变量 PI_SRC 覆盖
 echo ============================================================
 echo.
+goto :ADMIN
 
-:ADMIN
-:: ---- CodexHarness 横幅（/codex 单装模式）----
 :BANNER_CODEX
 echo ============================================================
 echo   CodexHarness 单独安装
@@ -66,6 +71,18 @@ echo   版本说明：v0.88+ 已移除 wire_api="chat"，本后端锁定 0.87.0（chat 网关接入
 echo ============================================================
 echo.
 goto :ADMIN
+
+:: ---- DSH 更新横幅（/update-dsh 模式）----
+:BANNER_DSH_UPDATE
+echo ============================================================
+echo   更新 DeepSeekHarness（fetch+reset 保留本地）
+echo   安装位置：!DSH_ROOT!
+echo   策略：git fetch 目标 tag + reset + pnpm 重建（node_modules 等本地文件不受影响）
+echo ============================================================
+echo.
+goto :ADMIN
+
+:ADMIN
 
 :: ---- 0. 管理员权限检测（写 Program Files / 机器级 PATH 需要）----
 net session >nul 2>&1
@@ -81,7 +98,8 @@ if !errorlevel! neq 0 (
 echo [OK] 已获取管理员权限。
 echo.
 
-:: ---- 1. 选择 Claude Code 接入后端（DSH 单装模式跳过）----
+:: ---- 1. 选择 Claude Code 接入后端（单装/更新模式跳过）----
+if "!DSH_UPDATE!"=="1" goto :UPDATE_DSH
 if "!DSH_ONLY!"=="1" goto :DETECT
 if "!PI_ONLY!"=="1" goto :DETECT
 if "!CODEX_ONLY!"=="1" goto :CODEX
@@ -449,6 +467,108 @@ echo.
 :PI_END
 goto :VERIFY
 
+:: ---- DSH 更新段（/update-dsh <tag>：fetch+reset 保留本地 + pnpm 重建 + 部署组合文件；
+::      2026.09 任务 23183ccb。%~2 = 目标 tag 全名，由 AutoCode 侧 PickLatestTag 解析传入。
+::      失败路径纪律：pushd 后所有退出必须先 popd；先 fetch 后 reset，fetch 失败零影响；
+::      pnpm 阶段失败 = 半更新态（旧 bin.js 为 untracked 不受 reset 影响，仍可运行旧版），
+::      重跑本更新即修复（幂等全流程）。）----
+:UPDATE_DSH
+if "%~2"=="" (
+    echo [错误] 缺少目标 tag 参数。用法：install_env.bat /update-dsh ^<tag^>
+    echo        例：install_env.bat /update-dsh dsh-v0.1.2-alpha.3
+    goto :UPDATE_DSH_END
+)
+echo ============================================================
+echo   更新 DeepSeekHarness 到 %~2
+echo ============================================================
+echo.
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - 请先运行完整模式安装（install_env.bat）装好 Node 后重试。
+    goto :UPDATE_DSH_END
+)
+where git >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Git - 请先运行完整模式安装（install_env.bat）装好 Git 后重试。
+    goto :UPDATE_DSH_END
+)
+if not exist "!DSH_ROOT!\package.json" (
+    echo [错误] 未找到本机安装 !DSH_ROOT!\package.json - 请先在 AutoCode 设置页
+    echo        「安装 DeepSeekHarness…」完成安装后再更新。
+    goto :UPDATE_DSH_END
+)
+:: 版本变量显式初始化为空（读失败时空值护卫跳过对比只报另一侧）。
+set "OLD_VER="
+set "NEW_VER="
+pushd "!DSH_ROOT!"
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Content -Raw package.json|ConvertFrom-Json).version"`) do set "OLD_VER=%%v"
+echo [更新] 当前版本：!OLD_VER!
+echo [更新] git fetch 目标 tag（浅拉取 refspec，浅/全克隆均适用）...
+git fetch --depth 1 origin "+refs/tags/%~2:refs/tags/%~2"
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] fetch 失败（网络/代理），工作区未做任何修改。
+    goto :UPDATE_DSH_END
+)
+git reset --hard FETCH_HEAD
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] git reset 失败 - 请查看上方输出排查后重跑本更新。
+    goto :UPDATE_DSH_END
+)
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Content -Raw package.json|ConvertFrom-Json).version"`) do set "NEW_VER=%%v"
+echo [更新] 源码已切换到：!NEW_VER!
+echo [安装] pnpm 包管理器 pnpm@11.7.0 ...
+call npm install -g pnpm@11.7.0
+call :RefreshPath
+where pnpm >nul 2>&1
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] pnpm 安装失败 - 请关闭窗口重试，或手动执行 npm install -g pnpm@11.7.0
+    goto :UPDATE_DSH_END
+)
+echo [更新] pnpm 依赖安装 - 数分钟，请耐心等待...
+call pnpm install
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] pnpm install 失败 - 处于半更新态（源码已到新 tag、构建未完成），
+    echo        重跑本更新修复；期间旧版本仍可运行。
+    goto :UPDATE_DSH_END
+)
+echo [构建] 编译 lib ...
+call pnpm run build:lib
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] build:lib 失败 - 处于半更新态（旧 bin.js 未删仍可运行），重跑本更新修复。
+    goto :UPDATE_DSH_END
+)
+popd
+:: 部署 AutoCode 组合文件（语句同 :DSH_CORDIS 段，此处重写不动原段）。
+if not exist "!DSH_ROOT!\examples\autocode-agent" mkdir "!DSH_ROOT!\examples\autocode-agent"
+if exist "%~dp0dsh\cordis.autocode.yml" (
+    copy /y "%~dp0dsh\cordis.autocode.yml" "!DSH_ROOT!\examples\autocode-agent\cordis.yml" >nul
+    echo [OK] 已部署 AutoCode 组合文件 cordis.yml。
+) else (
+    echo [警告] 未找到 %~dp0dsh\cordis.autocode.yml - 请确认 AutoCode 程序目录完整。
+)
+if not exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
+    echo [错误] 未找到 bin.js - 更新未完成，请查看上方输出排查。
+    goto :UPDATE_DSH_END
+)
+if "!OLD_VER!"=="" (
+    echo [OK] 已更新到 v!NEW_VER!（旧版本读取失败，跳过对比）。
+) else if "!NEW_VER!"=="" (
+    echo [OK] 已完成更新（新版本读取失败；源码已到 %~2）。
+) else if "!OLD_VER!"=="!NEW_VER!" (
+    echo [OK] 已是最新 v!NEW_VER!（已重新拉取并重建校验）。
+) else (
+    echo [OK] 已更新：v!OLD_VER! → v!NEW_VER!
+)
+echo.
+
+:UPDATE_DSH_END
+goto :VERIFY
+
 :: ---- 10. 安装结果验证 ----
 :VERIFY
 echo ============================================================
@@ -489,6 +609,7 @@ echo.
 :: ---- 11. 后续操作提示（DSH 单装模式无需 Claude 配置指引）----
 if "!DSH_ONLY!"=="1" goto :END
 if "!PI_ONLY!"=="1" goto :END
+if "!DSH_UPDATE!"=="1" goto :END
 echo ============================================================
 echo   后续配置（需要的话按提示完成）：
 echo ============================================================

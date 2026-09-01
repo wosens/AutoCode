@@ -9,6 +9,8 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
+#include <QStandardPaths>
 
 CClaudeRunner::CClaudeRunner(QObject* a_pParent)
     : CAgentRunnerBase(a_pParent) {
@@ -37,6 +39,46 @@ CClaudeRunner::~CClaudeRunner() {
 static QString s_sClaudeCmd;
 static int     s_iAskTimeoutSec = 0;   // 0 = 未设置，回退默认 600
 static int     s_iStallMinutes = 0;    // 2026.08.17 0 = 未设置，回退默认 10 分钟
+
+// 2026.08.27 旧版 CLI 兼容：探测当前 claude 是否支持 --autocompact（v2.1.221+）。
+//   其他电脑装旧版 Claude Code 时带该参会 unknown option 退出码 1。
+//   探测一次缓存；探测本身失败（超时/未装）按支持处理（保持本机现状，不退化）。
+static bool ClaudeSupportsAutocompact() {
+    static int s_iProbe = 0;           // 0=未探测 1=支持 -1=不支持
+    if (s_iProbe == 0) {
+        QProcess oProbe;
+        oProbe.start(QStringLiteral("cmd.exe"),
+                     {QStringLiteral("/c"), CClaudeRunner::ClaudeCmd(), QStringLiteral("--help")});
+        if (!oProbe.waitForStarted(5000) || !oProbe.waitForFinished(15000)) {
+            return true;               // 探测失败不缓存，下次再试；按支持（现状）
+        }
+        const QByteArray aOut = oProbe.readAllStandardOutput()
+                             + oProbe.readAllStandardError();
+        s_iProbe = aOut.contains("autocompact") ? 1 : -1;
+    }
+    return s_iProbe != -1;
+}
+
+// 2026.08.27 探测 --include-partial-messages（流式分块，供本轮计量实时刷新）：同上
+//   一次性探测缓存；旧 CLI 无此参不带（不影响功能，仅实时性回退为逐消息）。复用同一次
+//   --help 输出，两次探测合并为一次进程拉起。
+static bool s_bPartialProbeDone = false;
+static bool s_bPartialSupported = false;
+static bool ClaudeSupportsPartialMessages() {
+    if (!s_bPartialProbeDone) {
+        QProcess oProbe;
+        oProbe.start(QStringLiteral("cmd.exe"),
+                     {QStringLiteral("/c"), CClaudeRunner::ClaudeCmd(), QStringLiteral("--help")});
+        if (!oProbe.waitForStarted(5000) || !oProbe.waitForFinished(15000)) {
+            return false;              // 探测失败不缓存；不带（保守，功能不受影响）
+        }
+        const QByteArray aOut = oProbe.readAllStandardOutput()
+                             + oProbe.readAllStandardError();
+        s_bPartialSupported = aOut.contains("include-partial-messages");
+        s_bPartialProbeDone = true;
+    }
+    return s_bPartialSupported;
+}
 
 void CClaudeRunner::SetClaudeCmd(const QString& a_sCmd) {
     // 2026.08.15 [Agent] ClaudeCmd：空串/全空白回退默认 "claude"（依赖 PATH）。
@@ -84,6 +126,81 @@ qint64 CClaudeRunner::ContextWindowForModel(const QString& a_sModel) {
     return 200000;       // 未知模型兜底
 }
 
+// —— 2026.09 版本管理：Claude 版本解析三件套（实现，头文件注释为准） ——
+
+QString CClaudeRunner::ParseClaudeVersionOutput(const QString& a_sOut) {
+    // 实测输出形态 "2.1.240 (Claude Code)"：取首个 \d+\.\d+\.\d+ 起始的版本串
+    //   （允许第四段数字，如 2.1.240.1；无匹配返回空）。
+    static const QRegularExpression re(
+        QStringLiteral("\\d+\\.\\d+\\.\\d+(?:\\.\\d+)*"));
+    const QRegularExpressionMatch m = re.match(a_sOut);
+    return m.hasMatch() ? m.captured(0) : QString();
+}
+
+QString CClaudeRunner::NpmGlobalClaudePkgPath() {
+    // 一次性探测缓存（独立于 Pi 侧 s_sPiNpmCliCache——不同包）；npm root -g 定位全局
+    //   node_modules 根（对 npm 前缀配置免疫），拼包内 package.json 后校验存在
+    //   （同款处理见 CPiAgentRunner::NpmGlobalCliPath）。
+    static QString s_sClaudePkgCache;
+    static bool s_bClaudePkgProbed = false;
+    if (s_bClaudePkgProbed) {
+        return s_sClaudePkgCache;
+    }
+    s_bClaudePkgProbed = true;
+    const QString sNpm = QStandardPaths::findExecutable(QStringLiteral("npm.cmd"));
+    if (sNpm.isEmpty()) {
+        return QString();
+    }
+    QProcess stProc;
+    stProc.start(sNpm, { QStringLiteral("root"), QStringLiteral("-g") });
+    if (!stProc.waitForStarted(5000) || !stProc.waitForFinished(10000)) {
+        return QString();
+    }
+    const QString sRoot = QString::fromUtf8(stProc.readAllStandardOutput()).trimmed();
+    if (sRoot.isEmpty()) {
+        return QString();
+    }
+    const QString sPkg = QDir::fromNativeSeparators(sRoot)
+        + QStringLiteral("/@anthropic-ai/claude-code/package.json");
+    if (!QFile::exists(sPkg)) {
+        return QString();
+    }
+    s_sClaudePkgCache = QDir::toNativeSeparators(sPkg);
+    return s_sClaudePkgCache;
+}
+
+QString CClaudeRunner::ResolveClaudeVersion() {
+    // 链①：cmd /c <ClaudeCmd> --version（Windows 上 claude 是 npm shim claude.cmd，
+    //   必须经 cmd /c 启动；5s 启动/10s 结束）→ ParseClaudeVersionOutput。
+    QProcess stProc;
+    stProc.start(QStringLiteral("cmd.exe"),
+                 { QStringLiteral("/c"), ClaudeCmd(), QStringLiteral("--version") });
+    if (stProc.waitForStarted(5000) && stProc.waitForFinished(10000)) {
+        const QString sOut = QString::fromUtf8(stProc.readAllStandardOutput())
+                           + QString::fromUtf8(stProc.readAllStandardError());
+        const QString sVer = ParseClaudeVersionOutput(sOut);
+        if (!sVer.isEmpty()) {
+            return sVer;
+        }
+    }
+    // 链②回退：npm 全局包 package.json 的 version。
+    const QString sPkg = NpmGlobalClaudePkgPath();
+    if (sPkg.isEmpty()) {
+        return QString();
+    }
+    QFile stFile(sPkg);
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    QJsonParseError stErr;
+    const QJsonDocument oDoc = QJsonDocument::fromJson(stFile.readAll(), &stErr);
+    stFile.close();
+    if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
+        return QString();
+    }
+    return oDoc.object().value(QStringLiteral("version")).toString();
+}
+
 void CClaudeRunner::Reset() {
     // 清理上一轮的 ask_user MCP 配置临时文件（若存在）
     if (!m_sMcpConfigPath.isEmpty()) {
@@ -105,6 +222,8 @@ void CClaudeRunner::Reset() {
     m_sTranscriptPath.clear();
     m_aStderrTail.clear();
     m_aLastArgs.clear();       // 快速失败重试状态一并复位（新一轮从零计）
+    m_bResumeDropped = false;  // 2026.08.27 悬空 resume 自愈状态复位
+    m_bQuietRestart  = false;
     ++m_iProcEpoch;            // 2026.08.19 进程代次 +1（result 收尾关旧进程 stdin 的守卫）
     m_sLastPrompt.clear();
     m_sLastWorkDir.clear();
@@ -116,6 +235,10 @@ void CClaudeRunner::Reset() {
     m_sLastSessionId.clear();
     m_iLastContextFill = 0;
     m_iLastReqCount = 0;   // 2026.08.15 本次运行 API 请求数（assistant 消息条数）
+    m_iLiveEmitIn = 0;     // 2026.08.27 实时计量已发累计（防与收尾 sigFinished 双计）
+    m_iLiveEmitOut = 0;
+    m_iStreamIn = 0;       // 2026.08.27 流式中消息的输入/输出（message_start/delta）
+    m_iStreamOut = 0;
 }
 
 void CClaudeRunner::StartStage(const QString& a_sWorkDir,
@@ -219,8 +342,13 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
         aArgs << QStringLiteral("--disallowedTools") << a_sDisallowedTools;
     }
     aArgs << QStringLiteral("--max-turns") << QString::number(a_iMaxTurns);
-    if (a_iAutocompactK > 0) {
+    // 2026.08.27 流式分块：支持则开启（本轮计量随生成实时刷新；仅显示层增强）。
+    if (ClaudeSupportsPartialMessages()) {
+        aArgs << QStringLiteral("--include-partial-messages");
+    }
+    if (a_iAutocompactK > 0 && ClaudeSupportsAutocompact()) {
         // --autocompact <tokens>：上下文逼近窗口时自动压缩兜底（v2.1.221+，ad-hoc 长会话用）。
+        //   2026.08.27 旧版 CLI 无此选项，探测不支持则不带（否则 unknown option 秒退）。
         aArgs << QStringLiteral("--autocompact") << QStringLiteral("%1k").arg(a_iAutocompactK);
     }
     if (bMcpReady) {
@@ -294,7 +422,11 @@ void CClaudeRunner::RelaunchStage() {
     if (m_bFinished || m_bGraceActive || m_aLastArgs.isEmpty()) {
         return;
     }
-    emit sigInfo(QStringLiteral("↻ 自动重试 claude 调用（第 %1/2 次）…").arg(m_iFastRetry));
+    if (m_bResumeDropped && m_iFastRetry == 0) {
+        emit sigInfo(QStringLiteral("↻ 新建会话重发本轮（原会话在本机不存在）…"));
+    } else {
+        emit sigInfo(QStringLiteral("↻ 自动重试 claude 调用（第 %1/2 次）…").arg(m_iFastRetry));
+    }
     m_buf.clear();
     m_sLastSubtype.clear();
     m_pProc->setWorkingDirectory(m_sLastWorkDir);
@@ -373,7 +505,13 @@ void CClaudeRunner::slotOnStdErr() {
     const QByteArray bufData = m_pProc->readAllStandardError();
     const QList<QByteArray> aLines = bufData.split('\n');
     for (const QByteArray& szRaw : aLines) {
-        const QString sLine = QString::fromUtf8(szRaw).trimmed();
+        // 2026.08.27 中文 Windows 上 npm shim（claude.cmd）的报错按 GBK 输出，先 UTF-8 解、
+        //   出现替换符则回退本地 8 位编码（GBK）重解，消除 stderr 尾部乱码。
+        QString sLine = QString::fromUtf8(szRaw);
+        if (sLine.contains(QChar(0xFFFD))) {
+            sLine = QString::fromLocal8Bit(szRaw);
+        }
+        sLine = sLine.trimmed();
         if (sLine.isEmpty()) {
             continue;
         }
@@ -414,6 +552,31 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         return;
     }
 
+    if (sType == QStringLiteral("stream_event")) {
+        // 2026.08.27 流式 usage（--include-partial-messages）：message_start 带本消息输入
+        //   （input+缓存三项），message_delta 的 usage.output_tokens 为本消息累计输出——
+        //   据此实时刷新「本轮 ↑↓」显示（sigLivePartial 绝对值 = 已结算 + 流式中，不入账）。
+        const QJsonObject oEv = oRoot.value(QStringLiteral("event")).toObject();
+        const QString sEv = oEv.value(QStringLiteral("type")).toString();
+        if (sEv == QStringLiteral("message_start")) {
+            const QJsonObject oU = oEv.value(QStringLiteral("message")).toObject()
+                                     .value(QStringLiteral("usage")).toObject();
+            m_iStreamIn = oU.value(QStringLiteral("input_tokens")).toInteger()
+                + oU.value(QStringLiteral("cache_creation_input_tokens")).toInteger()
+                + oU.value(QStringLiteral("cache_read_input_tokens")).toInteger();
+        } else if (sEv == QStringLiteral("message_delta")) {
+            const qint64 iOut = oEv.value(QStringLiteral("usage")).toObject()
+                                   .value(QStringLiteral("output_tokens")).toInteger();
+            m_iStreamOut = iOut;
+            emit sigLivePartial(m_iLiveEmitIn + m_iStreamIn, m_iLiveEmitOut + m_iStreamOut);
+        } else if (sEv == QStringLiteral("message_stop")) {
+            // 本消息收口：交给 assistant 完整帧的 sigUsageDelta 入账，流式部分归零。
+            m_iStreamIn = 0;
+            m_iStreamOut = 0;
+        }
+        return;
+    }
+
     if (sType == QStringLiteral("assistant")) {
         const QJsonObject oMsg = oRoot.value(QStringLiteral("message")).toObject();
         // 2026.08.15 请求数统计：每条 assistant 消息 = 一次 API 调用（含缓存命中的调用）。
@@ -432,6 +595,14 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
             if (iFill > 0 && iFill != m_iLastContextFill && iFill <= iWinCap) {
                 m_iLastContextFill = iFill;
                 emit sigContextFill(iFill);
+            }
+            // 2026.08.27 逐消息实时计量上抛（本轮 ↑↓ 显示）：本条 API 调用的
+            //   输入（含 cache 三项）+ 输出。收尾 sigFinished 据已发累计报 0 防双计。
+            const qint64 iMsgOut = oUsage.value(QStringLiteral("output_tokens")).toInteger();
+            if (iFill > 0 || iMsgOut > 0) {
+                m_iLiveEmitIn += iFill;
+                m_iLiveEmitOut += iMsgOut;
+                emit sigUsageDelta(iFill, iMsgOut);
             }
         }
         const QJsonArray aContent = oMsg.value(QStringLiteral("content")).toArray();
@@ -507,9 +678,47 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         }
 
         const bool bOk = !bErr && (sSub == QStringLiteral("success"));
+        // 2026.08.27 实时计量已逐消息上抛（sigUsageDelta）时，收尾 token 报 0 防与
+        //   编排器实时累计双计（同 Codex 口径）；费用/会话 id 照报。未发过（无 assistant
+        //   消息的极端流）仍报 result 累计。
+        const qint64 iFinIn  = (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : iInTok;
+        const qint64 iFinOut = (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : iOutTok;
         m_sLastSubtype   = sSub;     // 供编排器区分 max-turns / 真错误
         m_sLastSessionId = sSid;     // 供编排器 --resume 续跑
         m_bFinished = true;
+        // 2026.08.27 悬空 resume sid 自愈：--resume 的会话在本机不存在（claude 报
+        //   「No conversation found with session ID」，工程自其他电脑拷贝时必现——
+        //   助手档 sid 随工程走、会话数据在 ~/.claude 不随工程走）→ 不发失败，从参数
+        //   剥离 --resume/--fork-session 杀进程，静默新建会话重发本轮（仅一次）。
+        if (!bOk && !m_bResumeDropped
+            && m_aLastArgs.contains(QStringLiteral("--resume"))
+            && m_aStderrTail.join(QStringLiteral(" "))
+                   .contains(QStringLiteral("No conversation found with session ID"),
+                              Qt::CaseInsensitive)) {
+            m_bResumeDropped = true;
+            m_bQuietRestart  = true;
+            m_bFinished      = false;
+            m_sLastSubtype.clear();
+            m_sLastSessionId.clear();   // 新轮换新 sid
+            for (int i = 0; i < m_aLastArgs.size();) {
+                if (m_aLastArgs.at(i) == QStringLiteral("--resume")) {
+                    if (i + 1 < m_aLastArgs.size()) {
+                        m_aLastArgs.removeAt(i + 1);
+                    }
+                    m_aLastArgs.removeAt(i);
+                } else if (m_aLastArgs.at(i) == QStringLiteral("--fork-session")) {
+                    m_aLastArgs.removeAt(i);
+                } else {
+                    ++i;
+                }
+            }
+            emit sigInfo(QStringLiteral("↻ 会话在本机不存在（工程可能自其他电脑拷贝，"
+                                        "会话数据不随工程走），自动新建会话重发本轮…"));
+            if (m_pProc != nullptr && m_pProc->state() != QProcess::NotRunning) {
+                m_pProc->kill();   // 收尾信号走 slotOnFinished 的 QuietRestart 分支重拉
+            }
+            return;
+        }
         // 2026.08.19 stream-json 输入模式：本轮结束（result）后关闭 stdin，claude 收到
         //   EOF 即干净退出，生命周期与旧「一次性管道」等价。emit 是同步调用——上层槽
         //   可能已同步 StartStage（max-turns 自动续跑）拉起新进程，凭代次守卫只关旧进程。
@@ -521,8 +730,43 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         if (!bOk && sMsg.trimmed().isEmpty()) {
             sMsg = QStringLiteral("无错误文本（subtype=%1）")
                        .arg(sSub.isEmpty() ? QStringLiteral("unknown") : sSub);
+            // 2026.08.27 真因挖掘①：会话 transcript 尾部的错误条目（isApiErrorMessage/
+            //   error 级 system 行）——异机 headless 失败而交互/VSCode 正常时 stderr
+            //   常为空，transcript 是唯一可靠信息源。
+            const QString sTrErr = MineTranscriptErrorTail();
+            if (!sTrErr.trimmed().isEmpty()) {
+                sMsg += QStringLiteral("；会话错误记录：%1").arg(sTrErr);
+            }
+            // 2026.08.27 真因挖掘②：stderr 尾部（同 EmitFailed 口径）。
+            if (!m_aStderrTail.isEmpty()) {
+                QString sTail = m_aStderrTail.join(QStringLiteral(" | "));
+                if (sTail.size() > 800) {
+                    sTail = sTail.left(800) + QStringLiteral("…");
+                }
+                sMsg += QStringLiteral("；stderr 尾部：%1").arg(sTail);
+            }
+            // 常见根因（新机器部署 Claude Code 后端）：未登录/无凭证/网关未配置。
+            const QString sTailLow = m_aStderrTail.join(QStringLiteral(" ")).toLower();
+            if (sTailLow.contains(QStringLiteral("api key"))
+                || sTailLow.contains(QStringLiteral("401"))
+                || sTailLow.contains(QStringLiteral("unauthorized"))
+                || sTailLow.contains(QStringLiteral("login"))
+                || sTailLow.contains(QStringLiteral("onboarding"))
+                || sTailLow.contains(QStringLiteral("credential"))) {
+                sMsg += QStringLiteral("；处理：在该电脑终端运行一次 claude 交互式完成登录/认证"
+                                       "（或配置 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN"
+                                       " 指向可用网关）后再试");
+            }
+            // 2026.08.27 悬空 resume 兕底提示（自动降级已用尽/未命中时）：会话 id 不跨机。
+            if (m_aStderrTail.join(QStringLiteral(" "))
+                    .contains(QStringLiteral("No conversation found with session ID"),
+                               Qt::CaseInsensitive)) {
+                sMsg += QStringLiteral("；处理：该会话 id 在本机不存在（工程/助手档自其他电脑"
+                                       "拷贝时常见，会话数据不随工程走），正常应已自动新建会话"
+                                       "重试；若仍失败，请新建一个助手再发");
+            }
         }
-        emit sigFinished(bOk, sMsg, iInTok, iOutTok, dCost, sSid);
+        emit sigFinished(bOk, sMsg, iFinIn, iFinOut, dCost, sSid);
         if (m_iProcEpoch == iEpoch && m_pProc != nullptr
             && m_pProc->state() != QProcess::NotRunning) {
             m_pProc->closeWriteChannel();   // 见上方代次守卫说明
@@ -535,6 +779,13 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
 }
 
 void CClaudeRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus) {
+    // 2026.08.27 悬空 resume 自愈的静默重拉：kill 收尾不发失败，短延迟原 prompt 重发
+    //   （参数已剥离 --resume）。
+    if (m_bQuietRestart) {
+        m_bQuietRestart = false;
+        QTimer::singleShot(300, this, [this]() { RelaunchStage(); });
+        return;
+    }
     if (m_bFinished || m_bGraceActive) {
         return;  // 已由 result 行发出 / 宽限期判定中
     }
@@ -556,6 +807,20 @@ void CClaudeRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStat
     //   上一进程会话清理（后台任务收尾/会话文件落盘）的瞬态错误，隔几秒原参数重拉即可恢复。
     //   重试 2 次仍快速失败才判死（真因看附带的 stderr 尾部）。
     if (m_uptime.isValid() && m_uptime.elapsed() < 15000 && m_iFastRetry < 2) {
+        // 2026.08.27 兜底：stderr 明确报 unknown option '--autocompact'（探测失效/版本变更）
+        //   → 从重试参数中剔除后重拉，不做无用动重试。
+        const QString sTail = m_aStderrTail.join(QStringLiteral(" "));
+        if (sTail.contains(QStringLiteral("unknown option"), Qt::CaseInsensitive)
+            && sTail.contains(QStringLiteral("autocompact"), Qt::CaseInsensitive)) {
+            for (int i = 0; i + 1 < m_aLastArgs.size(); ++i) {
+                if (m_aLastArgs.at(i) == QStringLiteral("--autocompact")) {
+                    m_aLastArgs.removeAt(i + 1);
+                    m_aLastArgs.removeAt(i);
+                    emit sigInfo(QStringLiteral("[system] 当前 claude CLI 不支持 --autocompact，已自动剔除并重试"));
+                    break;
+                }
+            }
+        }
         ++m_iFastRetry;
         m_bRetryPending = true;
         emit sigInfo(QStringLiteral("claude 进程 %1 秒内即退出（退出码=%2），5 秒后自动重试（第 %3/2 次）")
@@ -656,6 +921,81 @@ void CClaudeRunner::PollOrphanTranscript() {
         m_bGraceActive = false;
         EmitFailed(QStringLiteral("claude 进程崩溃，且宽限期内 transcript 未出现收敛标记"));
     }
+}
+
+QString CClaudeRunner::MineTranscriptErrorTail() {
+    // 2026.08.27 空结果失败（error_during_execution 等）真因挖掘：会话 transcript
+    //   （~/.claude/projects/<工程>/*/<sid>.jsonl）按事件逐行落盘，API 错误条目带
+    //   isApiErrorMessage:true 且含真实错误文本，error 级 system 行亦有描述——
+    //   stderr 为空（异机 headless 失败常见，交互/VSCode 正常）时这里是唯一可靠
+    //   信息源。取尾部 64KB 倒序找最多 3 条错误条目，找不到返回空串（静默降级）。
+    const QString sPath = FindTranscriptPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    QFile stFile(sPath);
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    const qint64 iSize = stFile.size();
+    const qint64 iTail = qMin<qint64>(iSize, 64 * 1024);
+    if (iTail > 0) {
+        stFile.seek(iSize - iTail);
+    }
+    const QList<QByteArray> aLines = stFile.readAll().split('\n');
+    QStringList aErrs;
+    auto fnExtractText = [](const QJsonObject& a_o) -> QString {
+        // 从事件对象抽可读文本：优先 message.content[] 的 text 项，其次 content/文本字符串字段。
+        const QJsonObject oMsg = a_o.value(QStringLiteral("message")).toObject();
+        const QJsonValue vContent = oMsg.contains(QStringLiteral("content"))
+            ? oMsg.value(QStringLiteral("content"))
+            : a_o.value(QStringLiteral("content"));
+        QStringList aParts;
+        if (vContent.isArray()) {
+            for (const QJsonValue& v : vContent.toArray()) {
+                const QString sT = v.toObject().value(QStringLiteral("text")).toString();
+                if (!sT.trimmed().isEmpty()) {
+                    aParts << sT;
+                }
+            }
+        } else if (vContent.isString()) {
+            aParts << vContent.toString();
+        }
+        return aParts.join(QStringLiteral(" "));
+    };
+    for (int i = aLines.size() - 1; i >= 0 && aErrs.size() < 3; --i) {
+        const QByteArray szLine = aLines.at(i).trimmed();
+        if (szLine.isEmpty()) {
+            continue;
+        }
+        const QJsonDocument stDoc = QJsonDocument::fromJson(szLine);
+        if (!stDoc.isObject()) {
+            continue;
+        }
+        const QJsonObject o = stDoc.object();
+        const bool bApiErr = o.value(QStringLiteral("isApiErrorMessage")).toBool();
+        const QString sLevel = o.value(QStringLiteral("level")).toString();
+        const QString sSub   = o.value(QStringLiteral("subtype")).toString();
+        const bool bErrLine  = bApiErr
+            || sLevel.compare(QStringLiteral("error"), Qt::CaseInsensitive) == 0
+            || sSub.contains(QStringLiteral("error"), Qt::CaseInsensitive);
+        if (!bErrLine) {
+            continue;
+        }
+        QString sText = fnExtractText(o);
+        if (sText.trimmed().isEmpty()) {
+            // 结构抽不到（未知事件形态）：退回原始行内 "text"/"content" 字段片段。
+            const QString sRaw = QString::fromUtf8(szLine);
+            static const QRegularExpression re(
+                QStringLiteral("\"(?:text|content|message)\"\s*:\s*\"([^\"]{20,400})\""));
+            const auto m = re.match(sRaw);
+            sText = m.hasMatch() ? m.captured(1) : sRaw.left(300);
+        }
+        if (!sText.trimmed().isEmpty()) {
+            aErrs.prepend(sText.left(400));
+        }
+    }
+    return aErrs.join(QStringLiteral(" | "));
 }
 
 QString CClaudeRunner::FindTranscriptPath() {

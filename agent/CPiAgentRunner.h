@@ -74,11 +74,33 @@ public:
     static QString PiActiveModelId();     // 激活条目模型 id；无激活=空
     static QString PiModelsJsonPath();    // ~/.pi/agent/models.json
     static bool    WritePiModelsJson();   // 合并写 models.json（true=写成功/无需写）
+    static QString PiSettingsJsonPath();  // ~/.pi/agent/settings.json
+    // 2026.08.28 429 TPM/RPM 限流自愈：pi 轮级自动重试（settings.retry，默认 3 次、
+    //   基准退避 2s → 2s/4s/8s 全程 ~15s）对分钟级滚动配额限流无效——重试全落在
+    //   配额未恢复的窗口内，3 连击全 429 后 pi 放弃，AutoCode 收「模型接口错误
+    //   （本轮无输出）：429 …」（如 deepseek "inference tpm exhausted"）。幂等补写
+    //   retry 段 baseDelayMs=15000（15s/30s/60s 指数退避，跨过配额滚动窗口）；
+    //   settings.json 已有 retry 段（用户显式配置/先前已写）则不动；StartStage
+    //   每次调用（同 models.json 自愈口径，防多实例竞态）。
+    static bool    EnsurePiRetrySettings();
 
     // 2026.08.20 联网安装（npm 全局）探测：npm root -g 下
     //   node_modules/@earendil-works/pi-coding-agent/dist/cli.js；命中返回绝对路径。
     //   进程内缓存一次（设置页检测与 cli.js 解析兜底共用）。
     static QString NpmGlobalCliPath();
+
+    // —— 2026.09 版本管理（任务 23183ccb）：Pi 安装形态与本地版本 ——
+    enum EPiForm { EPiFormNone = 0, EPiFormSource, EPiFormNpm };
+    // 形态探测：PiRootPath() 非空且 <root>/pi/packages/coding-agent/package.json 存在
+    //   → Source；否则 NpmGlobalCliPath() 命中且其同目录 package.json 存在 → Npm；
+    //   否则 None。优先级与 ResolveCliJsPath（root 布局 → npm 全局）一致。
+    //   注：探测的是 package.json，运行时用 dist/cli.js——正常安装下两者同版本，
+    //   半构建态（构建中断/进行中）可能不一致。
+    static EPiForm DetectPiForm();
+    // 本地版本：a_sRoot 非空→只读 <a_sRoot>/pi/packages/coding-agent/package.json
+    //   （miss→空串，不回退）；空→按 DetectPiForm() 分派（Source=根包 /
+    //   Npm=npm 全局包，包路径＝cli.js 同目录 package.json / None=空串）。
+    static QString ResolvePiVersion(const QString& a_sRoot = QString());
 
     // 三个生效路径/探测（仿 CDeepSeekRunner 同名方法口径）。
     static QString ResolveNodePath();   // 显式键 → "node"
@@ -147,7 +169,14 @@ private:
     qint64      m_iSumCacheWriteTok = 0;  // 本轮 Σ 缓存写
     qint64      m_iSumInTok  = 0;         // 本轮 Σ input（含 cache 读/写）
     qint64      m_iSumOutTok = 0;         // 本轮 Σ output
+    qint64      m_iLiveEmitIn = 0;    // 2026.08.27 已 sigUsageDelta 实时上抛的输入累计（防收尾双计）
+    qint64      m_iLiveEmitOut = 0;   // 同上，输出累计
     QStringList m_aStderrTail;            // stderr 尾部（失败消息附带）
     QElapsedTimer m_actClock;             // 距上次收到输出（stall 巡检）
+    // 2026.08.29 流式心跳：距上次「完整事件」（message_end/工具/turn_start）——
+    //   message_update 增量不算（thinking=high 下单条消息可流式十几分钟，UI 只显示
+    //   完整消息，期间看起来像卡死；心跳提示恢复可见性，见 CheckStall）。
+    QElapsedTimer m_tNoMsg;
+    qint64        m_iNoMsgHintMs = -1;      // 上次心跳提示时的无消息时长（60s 节流）
     QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
 };

@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 // Agent 后端 runner 抽象基类（2026.08.18 多后端支持：Claude Code / DeepSeekHarness）。
 //
@@ -66,6 +67,19 @@ public:
     virtual int LastReqCount() const { return m_iLastReqCount; }
     QString LastModel() const { return m_sLastModel; }   // 最近 result 的 model 字段（供查上下文窗口）
 
+    // —— 便携资产统一解析（2026.08.24，三后端共享口径）——
+    // 设计原则：**不向用户主目录写任何文件**（便携部署目标：程序目录拷到任意电脑即用）。
+    // 共享技能目录（按优先序，只列存在者）：
+    //   1) <exe 目录>\skills            —— 便携技能库，随程序目录走（部署时随身携带）；
+    //   2) <用户主目录>\.claude\skills   —— 机器上已有 Claude Code 技能库时自动复用。
+    // 各后端经原生机制挂载（pi: --skill；DSH: DSH_SKILLS_DIRS env → cordis customSkillDirs）。
+    static QStringList SharedSkillDirs();
+    // 全局规则内容（Claude Code 的 CLAUDE.md 语义）：优先 <exe 目录>\CLAUDE.md（便携），
+    // 回退 <用户主目录>\.claude\CLAUDE.md；两者都无返回空串。运行时注入 prompt/persona，
+    // 不复制进 ~/.pi、~/.dsh、~/.codex 等各 harness 的主目录（之前复制桥接方案废弃）。
+    // 上限保护：超过 64KB 视为异常不注入（防巨型文件挤占上下文）。
+    static QString SharedGlobalContextContent();
+
 signals:
     void sigInfo(const QString& a_sLine);                              // 系统/原始信息
     void sigAssistantText(const QString& a_sText);                     // 助手文本输出
@@ -75,6 +89,9 @@ signals:
     // 运行中真实计量增量（每完成一次 API 请求发一次；Codex 经本地代理解析网关
     // usage 上抛，2026.08.21）：编排器即时累计进任务行（费用/输入/输出/请求列）。
     void sigUsageDelta(qint64 a_iInTok, qint64 a_iOutTok);
+    // 2026.08.27 流式实时计量（绝对值：已结算累计 + 当前流式中消息的 usage）：显示专用，
+    //   收尾统计不走此信号（防与 sigUsageDelta 双计）。仅支持流式 usage 的后端发。
+    void sigLivePartial(qint64 a_iInTok, qint64 a_iOutTok);
     void sigFinished(bool a_bOk, const QString& a_sResult,            // 一次执行结束
                      qint64 a_iInTok, qint64 a_iOutTok,
                      double a_dCost, const QString& a_sSessionId);

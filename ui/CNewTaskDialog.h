@@ -37,6 +37,10 @@ public:
     // 勾选的阶段序列（按该类型规范流顺序；含强制项 Intake）。空=全勾（完整流）。
     QList<EStage> CheckedStages() const;
 
+    // 2026.08.26 对话框内输入校验：不满足规则弹提示并返回 false（OK 不生效、
+    //   对话框不关，用户输入保留）；通过返回 true。OK 按钮 accepted 时先走这里。
+    bool Validate();
+
     // —— View 模式：填入只读展示 ——
     void SetTask(const CTaskInfo* a_pTask);
 

@@ -1,12 +1,17 @@
 #include <QtTest/QtTest>
+#include <windows.h>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QCoreApplication>
+#include <QGuiApplication>
 
 #include "project/CProjectManager.h"
+#include "ui/CRollbackDialog.h"
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSplitter>
+#include <QTableWidget>
 
 // ============================================================================
 // FR-6 代码回退（备份 / 恢复 / 版本清单）单元测试 — 任务 406807ec
@@ -133,6 +138,115 @@ private:
     }
 
 private slots:
+    // ============ v1.4.85：无差异 turn 快照建「同源引用版」（回退列表不再缺条目）============
+
+    void testNoChangeAliasVersion() {
+        const QString sRoot = MakeSandbox();
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        WriteFile(sRoot, QStringLiteral("main.cpp"), "int main(){return 0;}");
+        const QString sOwner = QStringLiteral("asstA");
+        // 第一轮：真实改动 → 实版 1
+        const int iSeq1 = stPm.BackupTree(QStringLiteral("turn"), sOwner, QString(), QStringLiteral("提示1"), 0);
+        QVERIFY(iSeq1 > 0);
+        // 第二轮：无任何改动 → 应建引用版 2（原设计直接复用 1，回退列表缺该条提示）
+        const int iSeq2 = stPm.BackupTree(QStringLiteral("turn"), sOwner, QString(), QStringLiteral("提示2"), 0);
+        QVERIFY(iSeq2 > iSeq1);
+        const QString sMeta2 = stPm.UnifiedBackupsDir() + QStringLiteral("/")
+            + QStringLiteral("%1").arg(iSeq2, 4, 10, QLatin1Char('0'))
+            + QStringLiteral(".meta.json");
+        QVERIFY2(QFile::exists(sMeta2), "引用版 meta 应存在");
+        // 引用版 meta 必须轻量（无 files，base 指向实版）
+        const QJsonObject oMeta2 = QJsonDocument::fromJson(ReadFile(sMeta2)).object();
+        QVERIFY(oMeta2.contains(QStringLiteral("base")));
+        QVERIFY(!oMeta2.contains(QStringLiteral("files")));
+        QCOMPARE(oMeta2.value(QStringLiteral("base")).toInt(), iSeq1);
+        QVERIFY(ReadFile(sMeta2).size() < 2048);
+        // 列表两条都可见、fileCount 一致
+        const QList<SBackupVersion> aList = stPm.ListUnifiedBackups(sOwner);
+        QCOMPARE(aList.size(), 2);
+        for (const SBackupVersion& st : aList) {
+            QVERIFY(!st.bLegacy);
+            QVERIFY(st.iFileCount > 0);   // 引用版 fileCount 取基版，不为 0
+        }
+        // 引用版 vs 基版 = 空差异
+        SDiffResult stDiff;
+        QVERIFY(stPm.DiffVersions(iSeq1, iSeq2, stDiff));
+        QCOMPARE(stDiff.iAdded + stDiff.iChanged + stDiff.iRemoved, 0);
+        // 引用版读文件 = 基版内容
+        QByteArray buf;
+        QString sErr;
+        QVERIFY(stPm.ReadUnifiedFile(iSeq2, QStringLiteral("main.cpp"), buf, sErr));
+        QCOMPARE(buf, QByteArray("int main(){return 0;}"));
+        // 第三轮：真实改动 → 新实版 3（引用语义不破坏后续实版）
+        WriteFile(sRoot, QStringLiteral("main.cpp"), "int main(){return 1;}");
+        const int iSeq3 = stPm.BackupTree(QStringLiteral("turn"), sOwner, QString(), QStringLiteral("提示3"), 0);
+        QVERIFY(iSeq3 > iSeq2);
+        SDiffResult stDiff23;
+        QVERIFY(stPm.DiffVersions(iSeq2, iSeq3, stDiff23));
+        QCOMPARE(stDiff23.iChanged, 1);
+        // 跨 owner 无差异：不引用（防 PurgeOwner 孤儿），退回旧口径返回上一实版
+        const int iSeqOther = stPm.BackupTree(QStringLiteral("turn"), QStringLiteral("taskB"),
+                                              QString(), QStringLiteral("他owner"), 0);
+        QCOMPARE(iSeqOther, iSeq3);
+        Wipe(sRoot);
+    }
+
+    // ============ v1.3.78：回退窗口布局持久化往返（窗口/分割条/列宽）============
+
+    void testRollbackDialogLayoutPersist() {
+        // 窗口几何断言依赖真实窗口平台（resize/sizeHints 生效）；无头平台
+        //   （ctest 统一 QT_QPA_PLATFORM=offscreen 防弹窗）下尺寸被 clamp，跳过。
+        if (QGuiApplication::platformName() == QLatin1String("offscreen"))
+            QSKIP("window geometry test requires a real window platform");
+        const QString sRoot = MakeSandbox();
+        CProjectManager stPm;
+        stPm.Open(sRoot);
+        stPm.EnsureAutoDev();
+        // 布局落到测试 exe 同级 config.ini（Execute/Release/config.ini，与真实
+        //   exe 同名不同目录不互扰），结束后清理。
+        const QString sCfg = stPm.ConfigFilePath();
+        QFile::remove(sCfg);
+        {
+            CRollbackDialog stDlg(QStringLiteral("global"), &stPm);
+            stDlg.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&stDlg));
+            stDlg.resize(1024, 640);
+            QTest::qWait(80);
+            auto* pSplit = stDlg.findChild<QSplitter*>();
+            QVERIFY(pSplit != nullptr);
+            pSplit->setSizes({ 700, 290 });
+            QTest::qWait(80);
+            stDlg.reject();   // done→hide→hideEvent→SaveLayoutState
+        }
+        // 重开：窗口尺寸/分割条分配应还原（首次布局激活后按存档比例呈现）
+        {
+            CRollbackDialog stDlg(QStringLiteral("global"), &stPm);
+            stDlg.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&stDlg));
+            QTest::qWait(80);
+            QCOMPARE(stDlg.width(), 1024);
+            QCOMPARE(stDlg.height(), 640);
+            auto* pSplit = stDlg.findChild<QSplitter*>();
+            QVERIFY(pSplit != nullptr);
+            const QList<int> aSz = pSplit->sizes();
+            QVERIFY2(aSz.size() == 2 && aSz[0] > 640 && aSz[0] < 760,
+                     qPrintable(QStringLiteral("split=") + JoinIntsForMsg(aSz)));
+        }
+        QFile::remove(sCfg);
+        Wipe(sRoot);
+    }
+
+    static QString JoinIntsForMsg(const QList<int>& a_v) {
+        QString s;
+        for (const int i : a_v) {
+            if (!s.isEmpty()) s += QLatin1Char(',');
+            s += QString::number(i);
+        }
+        return s;
+    }
+
     // ============ AC-6.1：BackupSources 生成快照目录 + 元数据，序号单调递增 ============
 
     void testBackupCreatesVersionDirAndMeta() {

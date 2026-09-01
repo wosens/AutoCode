@@ -49,9 +49,15 @@ public:
     // 全量 BuildGuideAsync 仍可兜底，此开关供大工程/敏感场景开启。
     static bool s_bEnableHash;
 
-    // 扫描工程目录，产出当前指纹列表（递归、按 ExcludedDirs 过滤）。
+    // 扫描工程目录，产出当前指纹列表（递归、按 IsExcluded 过滤：隐藏 + ExcludeDirs）。
     // a_sRoot = 工程根绝对路径。失败（目录不存在）返回空表。仅取 QFileInfo（不读内容，NFR3）。
+    // 注意：大工程（十万级文件）枚举可能耗时数秒——调用方勿在 UI 线程直接调，
+    //   空判用 HasAnyScannableFile，全量扫描走后台线程。
     static QList<SFileFingerprint> ScanProject(const QString& a_sRoot);
+
+    // 空工程快速探测：找到首个非排除文件即 true（提前退出，不建全表）。
+    // 用于空工程判定，避免大工程上 ScanProject 全量枚举阻塞 UI（2026.08.26 卡死修复）。
+    static bool HasAnyScannableFile(const QString& a_sRoot);
 
     // 从 guide.md 全文解析出既有指纹表。无表/格式错返回空表（不抛）。
     static QList<SFileFingerprint> ParseFingerprintTable(const QString& a_sGuideText);

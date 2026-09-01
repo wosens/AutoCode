@@ -170,7 +170,7 @@
 
 <div class="hero">
   <h1>AutoCode 使用说明</h1>
-  <p>基于 Claude Code 的全自动软件开发编排器 —— 从需求到交付，一条流水线跑到底</p>
+  <p>多 Agent 后端驱动的全自动软件开发编排器 —— 从需求到交付，一条流水线跑到底</p>
   <span class="ver">C++ / Qt 6 · 绿色便携 · 版本号见标题栏（v主.次.编译号）</span>
 </div>
 
@@ -195,6 +195,11 @@
     <span class="ico">🏭</span>
     <b class="t">全流程自动编排</b>
     <span class="d">需求收集 → 需求确认 → 评审 → 设计 → 计划 → 开发 → 代码审查 → 测试，每个阶段自动调度 Claude 执行，全程无需人工盯守。</span>
+  </div>
+  <div class="card">
+    <span class="ico">🔀</span>
+    <b class="t">四大 Agent 后端随心切</b>
+    <span class="d">Claude Code / DeepSeekHarness(DSH) / PIAgent / CodexHarness 四后端并列，设置页一键切换；DSH/Pi/Codex 均支持自定义网关模型条目与费用折算。</span>
   </div>
   <div class="card">
     <span class="ico">🔀</span>
@@ -271,7 +276,7 @@
   </tr>
   <tr>
     <td><span class="badge">4</span></td><td><b>工程资源管理器</b></td>
-    <td>以工程目录为根节点浏览工程内<b>全部文件</b>（自动隐藏 .autodev/build/Execute/.git 等生成目录）；双击用系统默认程序打开，右键支持剪切/复制/粘贴/删除/改名/复制路径/「通过资源管理器打开」/「添加到聊天框」等。</td>
+    <td>以工程目录为根节点浏览工程内<b>全部文件</b>（自动隐藏 build/.git/.vs/node_modules 等生成目录；.autodev 与 Execute 可见）；单击文件即预览（文本类进内嵌预览页但不切页），双击文本类切到预览页，<b>exe 等非文本文件以文件所在目录为工作目录调系统默认程序运行</b>（与 Windows 资源管理器双击一致，游戏/便携程序可正常启动），支持 Windows 式拖拽（拖出到资源管理器/聊天窗口、树内移动/复制、拖入导入），右键支持剪切/复制/粘贴/删除/改名/复制路径/「通过资源管理器打开」/「打开方式」/「添加到聊天框」等。</td>
   </tr>
   <tr>
     <td><span class="badge">5</span></td><td><b>阶段进度表</b></td>
@@ -414,14 +419,15 @@
   <tr><td>最近打开</td><td>最近工程一键直达（子菜单最多 10 条，末尾「...」打开全量历史对话框）；启动时自动恢复上次工程。</td></tr>
   <tr><td>同步 Guide</td><td>按 record.md 中的改动流水增量更新 guide.md（任务完成后也会自动触发，此处为手动入口）。</td></tr>
   <tr><td>任务右键菜单</td><td>当前任务：查看任务内容 / 移除；历史任务：查看任务内容 / 再次执行。</td></tr>
-  <tr><td>回退按钮</td><td>打开统一回退界面：左侧记录点列表（任务阶段 / 助手轮次双粒度，增量备份），右侧文件变动明细，双击记录点即可把工程源码回退到该时点。回退前会先把当前现场自动快照留底，随时可再撤销回来。</td></tr>
+  <tr><td>回退按钮</td><td>打开统一回退界面：左侧记录点列表（任务阶段 / 助手轮次双粒度，增量备份），右侧文件变动明细，选中记录点后点「回退到此记录点」把工程源码回退到该时点（双击不执行回退，防误触）。回退前会先把当前现场自动快照留底，随时可再撤销回来。</td></tr>
 </table>
 
 <h3>📂 工程资源管理器</h3>
-<p>左栏底部的文件树：<b>工程目录本身就是根节点</b>（打开后自动展开），显示工程内<b>全部文件</b>；生成目录（<code>.autodev</code>、<code>build</code>、<code>Execute</code>、<code>.git</code>、<code>node_modules</code>）自动整目录隐藏，保持树面干净。</p>
+<p>左栏底部的文件树：<b>工程目录本身就是根节点</b>（打开后自动展开），显示工程内<b>全部文件</b>；生成目录（<code>build</code>、<code>.git</code>、<code>.vs</code>、<code>node_modules</code>）自动整目录隐藏，保持树面干净；<code>.autodev</code>（任务产物/记录）与 <code>Execute</code>（部署产物/配置/提示词）可见可浏览。<b>显示隐藏与备份排除互不相干</b>：备份范围由设置页「备份排除目录」（[Backup] ExcludeDirs，默认含 build/Execute/.autodev/node_modules 等——依赖目录文件量巨大且可再生，不备份可把大工程首轮快照从几十分钟降到秒级）单独控制，与树中是否可见无关。</p>
 <table class="tbl">
   <tr><th style="width:180px">操作</th><th>说明</th></tr>
   <tr><td>双击文件 / 目录</td><td>用系统默认程序打开（目录则用资源管理器打开）。</td></tr>
+  <tr><td><b>拖拽（2026.08.27 新增）</b></td><td>与 Windows 资源管理器一致：<b>拖出</b>——把文件/目录（支持多选）拖到系统资源管理器即复制/移动，拖到聊天软件发送框即作为附件；<b>树内拖动</b>——拖到另一目录默认移动（按住 Ctrl=复制）；<b>拖入</b>——从系统资源管理器拖文件到树上即复制进目标目录。目标同名自动加 “(2)” 序号，目录不可拖入自身子树。</td></tr>
   <tr><td>通过资源管理器打开</td><td>目录直接打开该目录；文件则打开所在目录并定位选中该文件。</td></tr>
   <tr><td>剪切 / 复制 / 粘贴</td><td>工程内文件与目录的移动复制（粘贴有同名冲突提示）。</td></tr>
   <tr><td>删除 / 改名</td><td>删除有二次确认；改名弹输入框，目标已存在会拦截。</td></tr>
@@ -453,7 +459,7 @@
   <tr><th style="width:130px">页签</th><th>内容</th></tr>
   <tr><td><b>日志</b></td><td>任务执行的完整对话流：Claude 的分析文本、每次工具调用（Read/Edit/Bash...）及结果，底部可发「介入指令」中途纠偏（仅任务运行中可用）。</td></tr>
   <tr><td><b>阶段产物</b></td><td>按阶段列出 .autodev/tasks/&lt;id&gt;/ 下生成的 .md 文档（需求书、设计书、计划书、审查报告...），右侧直接渲染阅读。</td></tr>
-  <tr><td><b>助手 1 / 助手 2 / …</b></td><td>动态多助手 Tab，每个 Tab 一条独立问答会话（互不串流）：<b>「＋」页</b>新增助手；Tab 上 <b>×</b> 关闭（会话保留可恢复）；右上角 <b>▾</b> 弹出已关闭助手列表选名恢复；<b>拖动</b>排序、<b>双击</b>改名。运行中的助手独立累计日志，切走再看也不丢。</td></tr>
+  <tr><td><b>助手 1 / 助手 2 / …</b></td><td>动态多助手 Tab，每个 Tab 一条独立问答会话（互不串流）：<b>「＋」页</b>新增助手；Tab 上 <b>×</b> 关闭（会话保留可恢复）；右上角 <b>▾</b> 弹出已关闭助手列表选名恢复；<b>拖动</b>排序、<b>双击</b>改名。运行中的助手独立累计日志，切走再看也不丢。Tab 标题标记：<b>●</b> 运行中、<b>⏳</b> 有排队指令。<br><b>跨助手排队（2026.08.27 新增）</b>：助手 A 运行中切到/新建助手 B 后发送，指令不会串进 A 的会话，而是排队到 B（按钮变「⏳ 排队发送」）；A 本轮结束后自动发送到 B。多条排队按先后依次发送。</td></tr>
   <tr><td><b>文件预览</b></td><td>资源管理器单击文件生成预览页，双击切到该页（多文件并存）。</td></tr>
 </table>
 
@@ -465,9 +471,9 @@
 <table class="tbl">
   <tr><th style="width:150px"></th><th>介入指令（日志页下方）</th><th>助手输入（助手页下方）</th></tr>
   <tr><td><b>对象</b></td><td>正在运行的任务</td><td>独立助手会话</td></tr>
-  <tr><td><b>时机</b></td><td>仅任务 Running 时可用</td><td>打开工程后随时可用；助手运行中仍可打字，发送变「➤ 追加指令」（本轮结束后自动发出）或「⏹ 停止」</td></tr>
+  <tr><td><b>时机</b></td><td>仅任务 Running 时可用</td><td>打开工程后随时可用；助手运行中仍可打字，发送变「➤ 追加指令」（向运行中的助手本轮追加，立即注入/本轮结束后自动发出）或「⏹ 停止」；若当前显示的是另一助手则变「⏳ 排队发送」（当前轮结束后自动发到该助手）</td></tr>
   <tr><td><b>典型用途</b></td><td>「测试不用跑 XX」「换个方案实现」</td><td>「这个函数干嘛的」「帮我加个注释」</td></tr>
-  <tr><td><b>附属功能</b></td><td>—</td><td><b>只读</b>开关（禁止改文件）、<b>↶ 回退</b>（对话层撤销最后一条提问，连带其回复一并移除；与源码回退正交）、上下文条（绿≤70%/红&gt;70%，右键可手动压缩/设窗口上限）</td></tr>
+  <tr><td><b>附属功能</b></td><td>—</td><td><b>只读</b>开关（禁止改文件）、<b>↶ 撤销</b>（对话层撤销最后一条提问，连带其回复一并移除；与源码回退正交）、上下文条（绿≤70%/红&gt;70%，<b>点击或右键</b>弹出「立即压缩上下文 / 设置上下文大小」——上下文过大时手动压缩可显著提速降费）</td></tr>
 </table>
 
 <h3>⏪ 代码回退：记录点 + 双粒度恢复</h3>
@@ -478,8 +484,8 @@
   <tr><td><b>助手轮次</b></td><td>助手每轮改码前留底，可精确回到某一问一答之前。</td></tr>
   <tr><td><b>回退前快照</b></td><td>每次执行回退前自动再留一份当前现场——<b>回退本身也可撤销</b>，放心操作。</td></tr>
 </table>
-<p>界面左侧选记录点，右侧即列出该时点的文件变动明细（新增/修改/删除）；双击记录点或点「回退到此记录点」确认执行。回退过程中断（断电/崩溃）会在下次打开工程时自动检测并还原到回退前状态，不会留下半截现场。</p>
-<div class="tip">提示词栏的「↶ 回退」是<b>对话撤销</b>（撤回最后一条提问），与此处的<b>源码回退</b>是两回事，互不影响。</div>
+<p>界面左侧选记录点，右侧即列出该时点的文件变动明细（新增/修改/删除）；选中后点「回退到此记录点」确认执行（双击记录点不执行回退，防误触）。右侧文件列表支持<b>右键 →「查看变更」</b>（或直接双击文件行）：弹出双栏并排对比窗口（类 Beyond Compare），左侧为上一记录点内容、右侧为当前记录点内容，变化区域自动标红/标绿、公共前后缀对齐、滚动条联动，可直观查看该文件具体改了什么；新增文件左侧显示「不存在」、删除文件右侧显示「不存在」，二进制文件不做文本对比。回退过程中断（断电/崩溃）会在下次打开工程时自动检测并还原到回退前状态，不会留下半截现场。备份为 CAS 增量存储（相同内容只存一份、只备份代码/构建配置/文档文本等代码相关文件，*.obj/*.exe/*.png 等中间产物不入库），占用小、速度快；回退不触碰非代码文件（原地保留）。</p>
+<div class="tip">提示词栏的「↶ 撤销」是<b>对话撤销</b>（撤回最后一条提问），与此处的<b>源码回退</b>是两回事，互不影响。</div>
 
 <h3 id="intervene">🤝 人工介入：时机与注意事项</h3>
 <p>全自动不等于放任不管。AutoCode 提供四种介入通道，可靠程度各不相同 —— <b>真正可靠的介入点是「阶段边界」和「熔断升级后」</b>，运行中途的实时插话受底层协议限制基本不生效（见下）。</p>
@@ -524,19 +530,84 @@
 <div class="warn">一句话记住：<b>想纠偏，先暂停</b>。暂停永远停在阶段边界，改完东西再继续或单阶段重跑，比指望运行中插话靠谱得多。</div>
 
 <h3>⚙️ 设置与环境安装</h3>
-<p><b>设置</b> — 菜单 <code>功能(F) → 设置...</code>：分两页 Tab 集中编辑全部可调参数——「常用」页（运行策略、Agent、评审与助手、目录排除），「DeepSeekHarness参数设置」页（安装状态、node 路径 / DSH 根目录与 provider / 模型）。保存到 exe 同级 <code>config.ini</code>，确定后立即生效——软件保持绿色便携，配置随程序走。</p>
-<p><b>环境安装</b> — 菜单 <code>功能(F) → 环境安装...</code>：以管理员权限自动安装 Claude Code 运行所需环境 —— Git、Node.js、Claude Code CLI；结束前会询问是否一并安装 <b>DeepSeekHarness</b>（可选的 DeepSeek 官方 Agent 后端）。装一次即可，之后可重复运行修复环境。</p>
-<p><b>DeepSeekHarness（可选后端）</b> — 不装不影响 Claude Code 后端使用。两种装法：</p>
-<table>
-  <tr><th>途径</th><th>说明</th></tr>
-  <tr><td>环境安装脚本</td><td>运行 install_env.bat（菜单「环境安装」或右键以管理员身份运行），结束前选 <b>Y</b> 一并安装。</td></tr>
-  <tr><td>设置页一键安装</td><td>设置 → 「DeepSeekHarness参数设置」页 → 「安装 DeepSeekHarness…」按钮：以管理员权限运行脚本的单独安装模式（<code>/dsh</code>）。</td></tr>
+<p><b>设置</b> — 菜单 <code>功能(F) → 设置...</code>：多页 Tab 集中编辑全部可调参数——「常用」页（运行策略、<b>Agent 后端</b>、评审与助手、目录排除），「DeepSeekHarness参数设置」「PIAgent 参数设置」「CodexHarness 参数设置」各后端专属页（安装状态、node 路径、根目录、自定义大模型条目）。保存到 exe 同级 <code>config.ini</code>，确定后立即生效——软件保持绿色便携，配置随程序走；多实例共享该文件并自动热同步。</p>
+
+<p><b>Agent 后端（四选一）</b> — 「常用」页下拉切换，任务运行中禁止切换：</p>
+<table class="tbl">
+  <tr><th style="width:170px">后端</th><th>说明</th></tr>
+  <tr><td><b>Claude Code</b></td><td>默认后端，走 Claude 官方 CLI。</td></tr>
+  <tr><td><b>DeepSeekHarness (DSH)</b></td><td>DeepSeek 官方 Agent 框架，JSON-RPC 接入，支持自定义网关模型条目与费用折算。</td></tr>
+  <tr><td><b>PIAgent</b></td><td>Earendil pi-coding-agent；支持自定义网关模型（Anthropic Messages 等 API 格式）、计费单价折算；对话流整段返回不碎裂。</td></tr>
+  <tr><td><b>CodexHarness</b></td><td>OpenAI Codex CLI（锁 0.87.0，chat wire + 本地代理自动注入 max_tokens/include_usage），支持自定义网关模型条目，费用/输入/输出/请求实时统计。</td></tr>
 </table>
-<p>安装到程序目录内的 <code>DeepSeekHarness\deepseek-harness</code> 子目录（克隆 GitHub 仓库 + pnpm 依赖构建 + 部署 AutoCode 组合文件，需联网数分钟）——<b>随程序目录整体拷走即随身携带，保持绿色便携</b>。装完即用，零手填：AutoCode 启动时自动探测该目录并把根目录回填到 config.ini；设置页也可点「重新检测」立即生效。未安装时设置页的 DeepSeekHarness 参数整体置灰、「Agent 后端」下拉中的该项同时禁用，检测通过后自动解锁。</p>
+
+<p><b>环境安装</b> — 菜单 <code>功能(F) → 环境安装...</code>：以管理员权限自动安装 Claude Code 运行所需环境 —— Git、Node.js、Claude Code CLI；结束前会询问是否一并安装 <b>DeepSeekHarness</b>。装一次即可，之后可重复运行修复环境。</p>
+
+<h3>🔌 可选后端的安装</h3>
+<p>三个可选后端均不装不影响 Claude Code 后端使用；未安装时设置页对应参数整体置灰、「Agent 后端」下拉中的该项禁用，安装+检测通过后自动解锁。各后端安装入口：</p>
+<table class="tbl">
+  <tr><th style="width:160px">后端</th><th style="width:220px">安装途径</th><th>说明</th></tr>
+  <tr>
+    <td rowspan="2"><b>DeepSeekHarness</b></td>
+    <td>环境安装脚本</td>
+    <td>install_env.bat 结束前选 <b>Y</b>（或脚本 <code>/dsh</code> 单独模式）：git clone + pnpm 构建，需联网数分钟。</td>
+  </tr>
+  <tr>
+    <td>设置页「安装 DeepSeekHarness…」</td>
+    <td>提权运行脚本 <code>/dsh</code> 模式。装到程序目录 <code>DeepSeekHarness\</code>，随目录拷走即携带；启动自动探测回填，也可「重新检测」。</td>
+  </tr>
+  <tr>
+    <td rowspan="2"><b>PIAgent</b></td>
+    <td>设置页「安装 PIAgent…」（本机源）</td>
+    <td>提权运行脚本 <code>/pi</code> 模式：从本机 PIAgent 源码仓库 robocopy 复制到 <code>Execute\PIAgent\</code>，<b>离线可用</b>（需本机有已构建源码，默认 exe 上级 <code>PIAgent\</code>，环境变量 PI_SRC 可改）。</td>
+  </tr>
+  <tr>
+    <td>设置页「联网安装（npm）」</td>
+    <td>提权 <code>npm install -g @earendil-works/pi-coding-agent</code>；装完检测自动从 npm 全局目录解析，<b>根目录都不用填</b>。</td>
+  </tr>
+  <tr>
+    <td rowspan="2"><b>CodexHarness</b></td>
+    <td>设置页「安装 CodexHarness…」</td>
+    <td>提权 npm 安装 codex-cli 0.87.0（本地工程布局），需联网。</td>
+  </tr>
+  <tr>
+    <td>设置页「本机源安装（离线）」</td>
+    <td>浏览选本机已有 Codex 安装源 → robocopy 整树复制到 exe 同级 <code>Execute\CodexHarness\</code>，<b>无需管理员/网络</b>——npm 联网卡死时的可靠替代。</td>
+  </tr>
+</table>
+<div class="tip">装好后安装按钮置灰不隐藏（仍可「重新检测」）。根目录输入框<b>输入即自动重检</b>：直接填本机已有安装路径（含全局 npm 目录）即可解锁后端下拉，不必非走安装按钮。</div>
+
+<h3>🧭 后端版本管理</h3>
+<p><b>后端版本管理</b> — 菜单 <code>功能(F) → 后端版本管理...</code> 或设置页「Agent」组「后端版本管理…」按钮：四 Agent 后端（Claude Code / DeepSeekHarness / PIAgent / CodexHarness）的<b>当前版本 / 最新版本 / 结论 / 更新入口</b>一站式表格。</p>
+<table class="tbl">
+  <tr><th style="width:150px">操作</th><th>说明</th></tr>
+  <tr><td><b>当前版本</b></td><td>打开即自动读取：DSH / Pi / Codex 直读本机安装文件；Claude 子进程探测（约 1–2 秒）。「刷新版本」随时重读。</td></tr>
+  <tr><td><b>查询最新版(联网)</b></td><td>手动触发（不自动联网）：npm registry 查三包 + git ls-remote 查 DSH 远端 tag，约 5–15 秒；显示的是<b>查询时刻</b>的远端值，仅本次会话有效，不落盘。</td></tr>
+  <tr><td><b>更新</b></td><td>按行分派：见下表。均弹<b>可见管理员命令窗口</b>执行，完成后窗口保持打开（cmd /k）供核对输出。</td></tr>
+</table>
+<table class="tbl">
+  <tr><th style="width:150px">后端</th><th>更新方式</th></tr>
+  <tr><td><b>Claude Code</b></td><td><code>npm install -g @anthropic-ai/claude-code@latest</code>（装/更一体，未安装也可直接装）。</td></tr>
+  <tr><td><b>DeepSeekHarness</b></td><td>先查远端最新 tag → <code>install_env.bat /update-dsh &lt;tag&gt;</code>：git fetch+reset 切版本 + pnpm 重建，<b>保留本地</b>（node_modules、组合文件不受影响）；未安装时按钮置灰（先走安装）。失败重跑即修复（幂等）。</td></tr>
+  <tr><td><b>PIAgent</b></td><td><b>按安装形态自动分派</b>（点击时自动判定）：源码形态（exe 同级 PIAgent\pi 布局）→ 重跑安装脚本 <code>/pi</code> 模式 robocopy 全量重部署，<b>更新前请先自行拉取本机 PIAgent 源仓到新版本，否则复制到的仍是旧源</b>（点更新时会弹确认提醒）；npm 全局形态 → <code>npm install -g @earendil-works/pi-coding-agent</code> 直接更新 npm 全局包。未安装时按钮置灰（先走安装）。</td></tr>
+  <tr><td><b>CodexHarness</b></td><td>始终重装锁定版 <code>npm install @openai/codex@0.87.0 --save-exact</code>（工程根内，提权窗口执行）。v0.88+ 已移除 <code>wire_api="chat"</code>，<b>不提供升级</b>，结论列恒显锁定说明。</td></tr>
+</table>
+<div class="tip"><b>更新闭环</b>：命令窗口出现 [OK] 并<b>关闭窗口后</b>，回到版本管理窗点「刷新版本」重读（或重开设置页「重新检测」）。Claude/DSH 更新后若设置页仍显旧值，重开一次设置页即可。<br>
+<b>运行中拦截</b>：当前全局后端有任务/助手在跑时点更新会弹确认——<b>建议先停掉该后端任务再更新</b>，避免半更新态干扰执行中任务。</div>
+<div class="warn">DSH 更新若报 <code>detected dubious ownership</code>（仓库属主不一致），在任意终端执行一次：
+<code>git config --global --add safe.directory &lt;DSH根目录&gt;</code> 后重跑更新即可。</div>
+
+<h3>🧠 自定义大模型（DSH / PIAgent / CodexHarness）</h3>
+<p>三个可选后端的设置页各有一个「自定义大模型」管理组（新增/编辑/删除/设为当前），字段 = 显示名、请求地址（网关 URL）、API 格式（anthropic-messages 原生 / chat / responses）、模型名称、API Key、上下文窗口、最大输出。激活条目即生效：AutoCode 在每次阶段启动前幂等自愈写入 <code>~/.pi/agent/models.json</code> 或 <code>~/.codex/</code>（config.toml + auth.json），多实例并发也不会互相覆盖坏。</p>
+<div class="warn">「最大输出」不得超过网关上限 <b>131072</b>（2^17）——超限值会触发网关 500，该后端全部请求失败。PIAgent 页还有「计费单价($/M)」四项（纯输入/缓存读/缓存写/输出），配置后任务费用列自动折算，全 0 则显示 "-"。</div>
 
 <!-- ================= FAQ ================= -->
 <h2 class="sec" id="faq">常见问题</h2>
 
+<details>
+  <summary>助手提示「调用失败：无错误文本（subtype=error_during_execution）」？</summary>
+  <p>失败消息会自动附带真因（stderr 尾部 / 会话错误记录）。常见两类：① <b>「No conversation found with session ID」</b>——正在恢复的会话 id 在本机不存在：工程/助手档自其他电脑拷贝时必现（会话数据存在 <code>~/.claude</code>，不随工程目录走），2026.08.27 起已自动降级为新建会话重发本轮（日志可见「↻ 会话在本机不存在…」），无需处理；若旧版仍失败，新建一个助手即可。② <b>认证/网络类</b>（stderr 含 api key/401/login 等）——在该电脑命令行运行一次 <code>claude</code> 交互式完成登录；走网关中转需配置 <code>ANTHROPIC_BASE_URL</code> / <code>ANTHROPIC_AUTH_TOKEN</code>，或换用 DSH/PIAgent/CodexHarness 后端+自定义模型条目。</p>
+</details>
 <details>
   <summary>点「新建任务」提示"请先打开工程目录"？</summary>
   <p>AutoCode 的所有任务都依附于工程。先通过 <code>工程(P) → 打开工程目录...</code> 打开一个代码目录（或新建工程目录），再创建任务。</p>
@@ -578,8 +649,24 @@
   <p>三段式 <code>v主.次.编译号</code>（如 v1.0.25）：主版本 = 架构级大改版，次版本 = 功能迭代，编译号 = 每次构建自动 +1，用于精确对应某个 exe。</p>
 </details>
 <details>
-  <summary>DeepSeekHarness 是什么？必须装吗？</summary>
-  <p>DeepSeek 官方开源的 Agent 执行框架，是 AutoCode 里与 Claude Code 并列的可选 Agent 后端（JSON-RPC 完整接入，支持流式过程与 token 统计）。<b>不装完全不影响</b>——默认走 Claude Code 后端。想用的话：设置 → 「DeepSeekHarness参数设置」页 → 「安装 DeepSeekHarness…」一键安装（或环境安装脚本结束前选 Y）；装完点「重新检测」，根目录自动填入，再把「Agent 后端」切到 DeepSeekHarness 即可（任务运行中禁止切换）。</p>
+  <summary>DeepSeekHarness / PIAgent / CodexHarness 是什么？必须装吗？</summary>
+  <p>三个都是与 Claude Code 并列的可选 Agent 后端（DSH = DeepSeek 官方框架；PIAgent = pi-coding-agent；CodexHarness = OpenAI Codex CLI 0.87.0）。<b>不装完全不影响</b>——默认走 Claude Code 后端。想用哪个：设置 → 对应参数页 → 安装按钮（详见「可选后端的安装」）→「重新检测」→「Agent 后端」切换（任务运行中禁止切换）。三个后端都支持自定义网关模型条目（设置页「自定义大模型」组）。</p>
+</details>
+<details>
+  <summary>PIAgent 报 "Unknown provider autocode-1" 或请求全部失败？</summary>
+  <p>多见于网关配置异常或「最大输出」超限。检查：① 设置页 PIAgent 模型条目的「最大输出」不得超过 <b>131072</b>（网关上限，超限必 500）；② 网关地址（如 192.168.118.128:9000）本机可达；③ 点「重新检测」确认安装有效。AutoCode 已在每次阶段启动前自动重写 ~/.pi/agent/models.json 自愈此类问题，偶发时重跑该阶段即可。</p>
+</details>
+<details>
+  <summary>PIAgent 报 429 "inference tpm exhausted"（每分钟 token 配额限流）？</summary>
+  <p>模型服务的分钟级限流（TPM/RPM），非配置错误。AutoCode 已自动把 PIAgent 的自动重试退避拉长为 15/30/60 秒（写入 ~/.pi/agent/settings.json 的 retry 段，可跨过配额滚动窗口），日志中会显示「↻ 模型接口瞬态错误…自动重试」进度；多次重试后仍失败时会明确报错并提示处理办法：稍等 1~2 分钟重发、减小上下文（新开助手）或换配额更高的模型。若频繁触发，说明当前模型/账号的每分钟配额小于单步上下文用量，应换模型。</p>
+</details>
+<details>
+  <summary>在工程资源管理器里点 exe 无法运行，系统资源管理器双击却正常？</summary>
+  <p>旧版打开非文本文件时未指定工作目录，exe 继承了 AutoCode 的当前目录而不是自己的文件夹——用相对路径读资源/配置的程序（游戏、便携软件常见）启动即退出，看起来就是「点了没反应」。现版已对齐 Windows 资源管理器双击口径：exe 以自身所在目录为工作目录启动，可直接正常运行；打开失败时会弹窗显示具体错误码。</p>
+</details>
+<details>
+  <summary>Codex 后端能统计费用吗？</summary>
+  <p>能。CodexHarness 经本地代理实时捕获每轮 usage（输入/输出 token 与请求数），任务运行中费用/输入/输出/请求四列即时刷新；DSH 与 PIAgent 同样支持（Pi 需在设置页配置计费单价四项后折算金额）。</p>
 </details>
 
 <footer>

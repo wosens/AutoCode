@@ -10,10 +10,18 @@
 #include <QGroupBox>
 #include <QDate>
 #include <QHideEvent>
+#include <QShowEvent>
+#include <QResizeEvent>
+#include <QTimer>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QMenu>
+#include <QMessageBox>
 #include <algorithm>
 #include <windows.h>
 
 #include "project/CProjectManager.h"
+#include "CDiffViewDialog.h"
 
 namespace {
 // 2026.08.23 布局键改内联字面量（原 QSettings 常量随 QSettings 一并移除）：
@@ -142,12 +150,87 @@ void CRollbackDialog::BuildUi() {
 
     connect(m_pTableVersions, &QTableWidget::itemSelectionChanged,
             this, &CRollbackDialog::OnSelectionChanged);
-    connect(m_pTableVersions, &QTableWidget::cellDoubleClicked,
-            this, &CRollbackDialog::OnCellDoubleClicked);
+    // 2026.08.28 取消「双击记录点直接回退」：回退唯一入口=底部「回退到此记录点」按钮，
+    //   双击误触直接执行回退风险高（原实现双击即 accept()）。文件列表双击=查看变更，保留。
     // 2026.08.22 用户手拖分割条时更新冻结值（否则下次点选会弹回旧位置）
     connect(m_pSplit, &QSplitter::splitterMoved, this, [this]() {
         m_aSplitSizes = m_pSplit->sizes();
     });
+
+    // 2026.08.24 文件列表右键「查看变更」（Beyond Compare 风格双栏对比）；双击同效。
+    m_pTableFiles->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pTableFiles, &QTableWidget::customContextMenuRequested,
+            this, &CRollbackDialog::OnFilesContextMenu);
+    connect(m_pTableFiles, &QTableWidget::cellDoubleClicked,
+            this, &CRollbackDialog::OnFilesCellDoubleClicked);
+}
+
+// 2026.08.24 文件列表右键菜单：对选中行提供「查看变更」。
+void CRollbackDialog::OnFilesContextMenu(const QPoint& a_pos) {
+    const int iRow = m_pTableFiles->rowAt(a_pos.y());
+    if (iRow < 0) {
+        return;   // 空白处不出菜单
+    }
+    m_pTableFiles->selectRow(iRow);
+    QMenu stMenu(this);
+    QAction* pAct = stMenu.addAction(QStringLiteral("查看变更"));
+    if (stMenu.exec(m_pTableFiles->viewport()->mapToGlobal(a_pos)) == pAct) {
+        ShowFileDiff(iRow);
+    }
+}
+
+void CRollbackDialog::OnFilesCellDoubleClicked(int a_iRow, int /*a_iCol*/) {
+    ShowFileDiff(a_iRow);   // 双击文件行 = 查看变更（与右键菜单一致）
+}
+
+void CRollbackDialog::ShowFileDiff(int a_iRow) {
+    if (m_pPm == nullptr || a_iRow < 0 || a_iRow >= m_aShownEntries.size()) {
+        return;
+    }
+    const SDiffEntry& stE = m_aShownEntries[a_iRow];
+    const int iRowVer = m_pTableVersions->currentRow();
+    if (iRowVer < 0 || iRowVer >= m_aVersions.size()) {
+        return;
+    }
+    const SBackupVersion& stNew = m_aVersions[iRowVer];
+    const int iSeqOld = (iRowVer + 1 < m_aVersions.size())
+        ? m_aVersions[iRowVer + 1].iSeq : -1;
+    // 版本侧标签（序号 + 时间）。
+    auto fnTime = [](const QString& a_s) {
+        QString s = a_s;
+        s.replace(QLatin1Char('T'), QLatin1Char(' '));
+        return s.left(16);
+    };
+    const QString sLblNew = QStringLiteral("#%1 · %2")
+        .arg(stNew.iSeq).arg(fnTime(stNew.sTime));
+    const QString sLblOld = iSeqOld > 0
+        ? QStringLiteral("#%1 · %2").arg(iSeqOld)
+            .arg(fnTime(m_aVersions[iRowVer + 1].sTime))
+        : QStringLiteral("（无上一记录点）");
+
+    // 读两侧内容：新增→旧侧缺失；删除→新侧缺失；修改→两侧都读（读失败弹错提示）。
+    QByteArray bufOld, bufNew;
+    QString sErr;
+    bool bOldMissing = (stE.sChange == QStringLiteral("add"));
+    bool bNewMissing = (stE.sChange == QStringLiteral("del"));
+    if (!bOldMissing) {
+        if (!m_pPm->ReadUnifiedFile(iSeqOld, stE.sPath, bufOld, sErr)) {
+            QMessageBox::warning(this, QStringLiteral("查看变更"),
+                QStringLiteral("读取上一记录点 #%1 中该文件失败：\n%2").arg(iSeqOld).arg(sErr));
+            return;
+        }
+    }
+    if (!bNewMissing) {
+        if (!m_pPm->ReadUnifiedFile(stNew.iSeq, stE.sPath, bufNew, sErr)) {
+            QMessageBox::warning(this, QStringLiteral("查看变更"),
+                QStringLiteral("读取记录点 #%1 中该文件失败：\n%2").arg(stNew.iSeq).arg(sErr));
+            return;
+        }
+    }
+    CDiffViewDialog stDlg(stE.sPath, bufOld, bufNew, bOldMissing, bNewMissing,
+                          sLblOld, sLblNew, this,
+                          m_pPm != nullptr ? m_pPm->ConfigFilePath() : QString());
+    stDlg.exec();
 }
 
 void CRollbackDialog::LoadData() {
@@ -298,7 +381,7 @@ void CRollbackDialog::FillVersionTable() {
         QString sTimeOld = m_aVersions.last().sTime;
         sTimeNew.replace(QLatin1Char('T'), QLatin1Char(' '));
         sTimeOld.replace(QLatin1Char('T'), QLatin1Char(' '));
-        m_pLblSummary->setText(QStringLiteral("共 %1 个记录点 · 最早 %2 · 最新 %3 · 双击记录点可直接回退")
+        m_pLblSummary->setText(QStringLiteral("共 %1 个记录点 · 最早 %2 · 最新 %3")
             .arg(m_aVersions.size())
             .arg(sTimeOld.left(16), sTimeNew.left(16)));
     }
@@ -318,6 +401,7 @@ void CRollbackDialog::OnSelectionChanged() {
 
 void CRollbackDialog::FillFilesTable(int a_iRow) {
     m_pTableFiles->setRowCount(0);
+    m_aShownEntries.clear();   // 2026.08.24 先清（legacy/无 diff 路径不留旧条目）
     if (a_iRow < 0 || a_iRow >= m_aVersions.size()) {
         m_pLblFilesCaption->setText(
             m_aVersions.isEmpty()
@@ -359,6 +443,7 @@ void CRollbackDialog::FillFilesTable(int a_iRow) {
                   if (iRa != iRb) { return iRa < iRb; }
                   return a.sPath < b.sPath;
               });
+    m_aShownEntries = aEntries;   // 2026.08.24 右键「查看变更」行号对齐数据源
     m_pTableFiles->setRowCount(aEntries.size());
     for (int i = 0; i < aEntries.size(); ++i) {
         const SDiffEntry& stE = aEntries[i];
@@ -386,14 +471,6 @@ void CRollbackDialog::FillFilesTable(int a_iRow) {
     }
 }
 
-void CRollbackDialog::OnCellDoubleClicked(int a_iRow, int /*a_iCol*/) {
-    // 双击 = 选中并直接确认（与「回退到此记录点」等价）。
-    if (a_iRow >= 0 && a_iRow < m_aVersions.size()) {
-        m_pTableVersions->selectRow(a_iRow);
-        accept();
-    }
-}
-
 void CRollbackDialog::hideEvent(QHideEvent* a_pEvent) {
     if (!m_bLayoutSaved) {
         SaveLayoutState();
@@ -402,10 +479,29 @@ void CRollbackDialog::hideEvent(QHideEvent* a_pEvent) {
     QDialog::hideEvent(a_pEvent);
 }
 
+void CRollbackDialog::showEvent(QShowEvent* a_pEvent) {
+    QDialog::showEvent(a_pEvent);
+    // 2026.08.28 首次显示后布局才真正激活：把冻结值刷成真实分配（构造期
+    //   RestoreLayoutState 里 sizes() 拿到的仍是未激活的假值/恢复原始值，
+    //   与实际呈现可能有出入；不刷的话首次点选记录点会弹回旧位置）。
+    QTimer::singleShot(0, this, [this]() {
+        m_aSplitSizes = m_pSplit->sizes();
+    });
+}
+
+void CRollbackDialog::resizeEvent(QResizeEvent* a_pEvent) {
+    QDialog::resizeEvent(a_pEvent);
+    // 2026.08.28 窗口 resize 后分割条按比例重分配：同步刷新冻结值，否则
+    //   用户拉大窗口后点选记录点会弹回旧尺寸（布局事件后取真值，延迟 0ms）。
+    QTimer::singleShot(0, this, [this]() {
+        m_aSplitSizes = m_pSplit->sizes();
+    });
+}
+
 // 2026.08.23 布局存取改用 Win32 profile API（与 CProjectManager 其余 config.ini IO 同口径）。
 // 旧实现用 QSettings(IniFormat)：Qt6 按 UTF-8 读写并整文件重写，会把 profile API 写下的
 // ANSI(GBK) 中文值（如 [Recent] 最近打开的中文工程路径）按 UTF-8 误读成 U+FFFD 再落盘，
-// 永久性打成乱码（“最近打开里面的中文全部乱码”根因）。base64 值全 ASCII，两侧等价安全。
+// 永久性打成乱码（“最近打开里面的中文全部乱码”根因）。数值串全 ASCII，两侧等价安全。
 static void WriteProfileString(const QString& a_sFile, const wchar_t* a_pwsSect,
                                const wchar_t* a_pwsKey, const QString& a_sVal) {
     WritePrivateProfileStringW(a_pwsSect, a_pwsKey, a_sVal.toStdWString().c_str(),
@@ -414,10 +510,48 @@ static void WriteProfileString(const QString& a_sFile, const wchar_t* a_pwsSect,
 
 static QString ReadProfileString(const QString& a_sFile, const wchar_t* a_pwsSect,
                                  const wchar_t* a_pwsKey) {
-    wchar_t szBuf[8192] = {0};   // base64 几何/表头最长数百字符，8K 富余
+    wchar_t szBuf[8192] = {0};   // 列宽/几何整型串最长数百字符，8K 富余
     const DWORD dw = GetPrivateProfileStringW(a_pwsSect, a_pwsKey, L"", szBuf, 8192,
                                               a_sFile.toStdWString().c_str());
     return QString::fromWCharArray(szBuf, static_cast<int>(dw));
+}
+
+// 2026.08.28 显式数值持久化辅助：严格整数表序列化/反序列化。
+//   旧版存 opaque base64（QHeaderView/QSplitter saveState）无任何校验——现场
+//   实测坏档静默生效（副本 config 曾存入 71/170 的未激活 sizeHint 假值，恢复后
+//   分割条不可用），且人不可读无法核对。改为可读整型串 + 解析/范围校验，坏档自弃。
+static QString JoinInts(const QList<int>& a_v) {
+    QString s;
+    for (const int i : a_v) {
+        if (!s.isEmpty()) {
+            s += QLatin1Char(',');
+        }
+        s += QString::number(i);
+    }
+    return s;
+}
+
+static QList<int> SplitInts(const QString& a_s, int a_iExpect) {
+    // 恰好 a_iExpect 个整数（允许负数——多屏左侧坐标 x 为负）才通过；
+    //   空串/个数不符/任何非数字字符（旧 base64 档混入同名键）返回空表。
+    //   用途层各自做范围校验（窗口几何限屏幕内、分割条两侧 ≥60、列宽限幅）。
+    if (a_s.isEmpty()) {
+        return {};
+    }
+    const QStringList aParts = a_s.split(QLatin1Char(','));
+    if (aParts.size() != a_iExpect) {
+        return {};
+    }
+    QList<int> v;
+    for (const QString& sP : aParts) {
+        bool bOk = false;
+        const int i = sP.toInt(&bOk);
+        if (!bOk) {
+            return {};
+        }
+        v.append(i);
+    }
+    return v;
 }
 
 void CRollbackDialog::SaveLayoutState() {
@@ -429,14 +563,35 @@ void CRollbackDialog::SaveLayoutState() {
         return;
     }
     const wchar_t* pwsSect = L"Layout";
-    WriteProfileString(sCfg, pwsSect, L"RollbackVerHdr",
-        QString::fromLatin1(m_pTableVersions->horizontalHeader()->saveState().toBase64()));
-    WriteProfileString(sCfg, pwsSect, L"RollbackFileHdr",
-        QString::fromLatin1(m_pTableFiles->horizontalHeader()->saveState().toBase64()));
-    WriteProfileString(sCfg, pwsSect, L"RollbackSplit",
-        QString::fromLatin1(m_pSplit->saveState().toBase64()));
-    WriteProfileString(sCfg, pwsSect, L"RollbackGeo",
-        QString::fromLatin1(saveGeometry().toBase64()));
+    // 2026.08.28 显式数值持久化：窗口几何/分割条/两表列宽全部存整型串，
+    //   RestoreLayoutState 严格校验；旧四个 base64 键顺带清除防复活。
+    WriteProfileString(sCfg, pwsSect, L"RollbackWin",
+        JoinInts({ x(), y(), width(), height() }));
+    WriteProfileString(sCfg, pwsSect, L"RollbackPane", JoinInts(m_pSplit->sizes()));
+    QList<int> aColsV;
+    for (int i = 0; i < m_pTableVersions->columnCount(); ++i) {
+        aColsV.append(m_pTableVersions->columnWidth(i));
+    }
+    WriteProfileString(sCfg, pwsSect, L"RollbackColsV", JoinInts(aColsV));
+    QList<int> aColsF;
+    for (int i = 0; i < m_pTableFiles->columnCount(); ++i) {
+        aColsF.append(m_pTableFiles->columnWidth(i));
+    }
+    WriteProfileString(sCfg, pwsSect, L"RollbackColsF", JoinInts(aColsF));
+    ::WritePrivateProfileStringW(pwsSect, L"RollbackVerHdr", nullptr,
+                                 (LPCWSTR)sCfg.utf16());
+    ::WritePrivateProfileStringW(pwsSect, L"RollbackFileHdr", nullptr,
+                                 (LPCWSTR)sCfg.utf16());
+    ::WritePrivateProfileStringW(pwsSect, L"RollbackSplit", nullptr,
+                                 (LPCWSTR)sCfg.utf16());
+    ::WritePrivateProfileStringW(pwsSect, L"RollbackGeo", nullptr,
+                                 (LPCWSTR)sCfg.utf16());
+    // 2026.08.28 冲刷 profile 写缓存（关键）：WritePrivateProfileStringW 的写入
+    //   先进系统缓存、延迟落盘——实测同一进程紧接着读回都不完整（RollbackWin
+    //   读到而 RollbackPane 丢，Qt 直读磁盘文件为空串），外部进程/热重载/下次
+    //   打开窗口更读到空 → 「布局没持久化」的直接根因。全 NULL + 文件名是该
+    //   API 的官方冲刷用法，立即把缓存写穿到磁盘。
+    ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, (LPCWSTR)sCfg.utf16());
 }
 
 void CRollbackDialog::RestoreLayoutState() {
@@ -448,28 +603,47 @@ void CRollbackDialog::RestoreLayoutState() {
         return;
     }
     const wchar_t* pwsSect = L"Layout";
-    const QByteArray aVer = QByteArray::fromBase64(
-        ReadProfileString(sCfg, pwsSect, L"RollbackVerHdr").toLatin1());
-    const QByteArray aFile = QByteArray::fromBase64(
-        ReadProfileString(sCfg, pwsSect, L"RollbackFileHdr").toLatin1());
-    const QByteArray aSplit = QByteArray::fromBase64(
-        ReadProfileString(sCfg, pwsSect, L"RollbackSplit").toLatin1());
-    const QByteArray aGeo = QByteArray::fromBase64(
-        ReadProfileString(sCfg, pwsSect, L"RollbackGeo").toLatin1());
-    if (!aVer.isEmpty()) {
-        m_pTableVersions->horizontalHeader()->restoreState(aVer);
+    // 列宽：个数与列数相符且逐列限幅 [24, 2000] 才应用（防坏档拉出 0 宽/巨宽）。
+    const QList<int> aColsV = SplitInts(
+        ReadProfileString(sCfg, pwsSect, L"RollbackColsV"),
+        m_pTableVersions->columnCount());
+    for (int i = 0; i < aColsV.size(); ++i) {
+        m_pTableVersions->setColumnWidth(i, qBound(24, aColsV[i], 2000));
     }
-    if (!aFile.isEmpty()) {
-        m_pTableFiles->horizontalHeader()->restoreState(aFile);
+    const QList<int> aColsF = SplitInts(
+        ReadProfileString(sCfg, pwsSect, L"RollbackColsF"),
+        m_pTableFiles->columnCount());
+    for (int i = 0; i < aColsF.size(); ++i) {
+        m_pTableFiles->setColumnWidth(i, qBound(24, aColsF[i], 2000));
     }
-    if (!aSplit.isEmpty()) {
-        m_pSplit->restoreState(aSplit);
+    // 分割条：两侧各 ≥60px 才应用（现场坏档 71/170 即未激活假值，两值过小
+    //   直接弃用默认分配，不让坏档把窗体挤成一条）。
+    const QList<int> aPane = SplitInts(
+        ReadProfileString(sCfg, pwsSect, L"RollbackPane"), 2);
+    if (aPane.size() == 2 && aPane[0] >= 60 && aPane[1] >= 60) {
+        m_pSplit->setSizes(aPane);
+        // 2026.08.28 关键：冻结值用「恢复的意图值」，绝不能用 sizes()——构造期
+        //   布局未激活，sizes() 返回 sizeHint 级假值（47,47 / 旧版现场 71,170），
+        //   ctor 的 selectRow→OnSelectionChanged→setSizes(假值) 会把恢复值当场
+        //   顶掉，每次打开分割条都被 sizeHint 比例重置——「布局没持久化」的根因。
+        m_aSplitSizes = aPane;
     }
-    if (!aGeo.isEmpty()) {
-        restoreGeometry(aGeo);
+    // 窗口几何：限幅到屏幕可用区内（宽 ≥620、高 ≥420、不超屏；坐标移入可见
+    //   区），多屏/分辨率变化后不数出屏外窗口。
+    const QList<int> aWin = SplitInts(
+        ReadProfileString(sCfg, pwsSect, L"RollbackWin"), 4);
+    if (aWin.size() == 4) {
+        const QRect rcDesk = QGuiApplication::primaryScreen()
+                                 ->availableVirtualGeometry();
+        const int iW = qBound(620, aWin[2], rcDesk.width());
+        const int iH = qBound(420, aWin[3], rcDesk.height());
+        setGeometry(QRect(
+            qBound(rcDesk.left(), aWin[0], rcDesk.right() - iW + 1),
+            qBound(rcDesk.top(), aWin[1], rcDesk.bottom() - iH + 1),
+            iW, iH));
     }
-    // 2026.08.22 冻结分割条分配：此后选中记录点（右表填充/清空、说明文字变化）
-    // 都按此处记录的分配强制回贴，窗体布局不再随选中内容跳动。
-    m_aSplitSizes = m_pSplit->sizes();
+    // 2026.08.22 冻结分割条分配：选中记录点（右表填充/清空、说明文字变化）按
+    //   冻结值回贴，窗体布局不随选中内容跳动。无恢复档时冻结值留空（跳过回贴），
+    //   showEvent 首次显示后刷成真实分配（见彼处注释）；恢复档时上面已设意图值。
     m_pSplit->setChildrenCollapsible(false);
 }

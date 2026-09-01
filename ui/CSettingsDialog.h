@@ -4,6 +4,7 @@
 #include <QList>
 
 #include "CProjectManager.h"   // SDshModelEntry（自定义大模型表）
+#include "CVersionDialog.h"    // FBusyCheck（后端版本管理入口性判据注入）
 
 class QComboBox;
 class QSpinBox;
@@ -28,7 +29,10 @@ class CSettingsDialog : public QDialog {
 
 public:
     // a_pPm 仅用于构造时读当前值（非拥有；空指针时全部用默认值）。
-    explicit CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent = nullptr);
+    //   a_fnBackendBusy：后端版本管理对话框的 D6 运行中拦截判据（由 CMainWindow
+    //   注入；空=放行，测试场景）。
+    explicit CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent = nullptr,
+                             CVersionDialog::FBusyCheck a_fnBackendBusy = {});
 
     // —— 确定后由主窗口读取并落盘/应用 ——
     int     MaxIter() const;
@@ -38,6 +42,8 @@ public:
     QString ClaudeCmd() const;
     int     AskTimeoutSec() const;
     bool    WebSearch() const;
+    // 2026.08.26 专家助手开关（[Adhoc] ExpertAssistant）：缺省启用，可手工禁用。
+    bool    ExpertAssistant() const;
     // 2026.08.18 Agent 后端与 DSH 参数（全局单选；1=claude，2=dsh）。
     int     AgentBackend() const;
     QString DshNodePath() const;
@@ -84,15 +90,24 @@ public:
     QString ScanExcludeDirs() const;
     QString BackupExcludeDirs() const;
 
+    // 2026.08.27 窗口几何持久化：accept / reject / 标题栏关闭都经 done()，在此统一
+    //   落盘 [SettingsWindow]（exe 同级 config.ini）；下次打开恢复位置与大小。
+    void done(int a_r) override;
+
 private:
     void SetupUi();
     void UpdateDshEnabled();   // 后端下拉联动：DSH 参数子组按选择启用/禁用
+    // 2026.09 后端版本管理入口（任务 23183ccb）：Agent 组按钮 → CVersionDialog。
+    void OnVersionManage();
     // 2026.08.18 自定义大模型列表维护（DSH 页）：列表文本/按钮态刷新 + 增改删/设为当前。
     void RefreshDshModelList();
     // 2026.08.19 列表改 QTreeWidget 后的当前行号（-1=无/占位行）。
     int CurDshModelRow() const;
     void OnDshModelAdd();
     void OnDshModelEdit();
+    // 2026.08.27 复制选中条目：预填编辑对话框（显示名加“-副本”后缀，可改），
+    //   确认后追加到列表末尾——快速建同网关的多个模型。
+    void OnDshModelCopy();
     void OnDshModelDel();
     void OnDshModelSetActive();
     // DSH 安装状态探测：根目录框显式值 → 空则 ProbeSiblingRoot 探测；命中且框为空时
@@ -111,6 +126,7 @@ private:
     int  CurPiModelRow() const;
     void OnPiModelAdd();
     void OnPiModelEdit();
+    void OnPiModelCopy();   // 2026.08.27 复制选中条目（口径同 DSH 页）
     void OnPiModelDel();
     void OnPiModelSetActive();
     // CodexHarness 安装探测/单装（口径同 Pi：DetectCodexInstalled 静默/手动两态；
@@ -125,6 +141,7 @@ private:
     int  CurCodexModelRow() const;
     void OnCodexModelAdd();
     void OnCodexModelEdit();
+    void OnCodexModelCopy();   // 2026.08.27 复制选中条目（口径同 DSH 页）
     void OnCodexModelDel();
     void OnCodexModelSetActive();
 
@@ -152,10 +169,12 @@ private:
     int         m_iDshActiveModel = -1;      // -1=未启用（走 Provider/模型固定路由）
     QTreeWidget* m_pTreeDshModels = nullptr;   // 2026.08.19 多列信息表（原 QListWidget 单行文本）
     QPushButton* m_pBtnModelAdd    = nullptr;
+    QPushButton* m_pBtnModelCopy   = nullptr;   // 2026.08.27 复制选中条目（新增…后侧）
     QPushButton* m_pBtnModelEdit   = nullptr;
     QPushButton* m_pBtnModelDel    = nullptr;
     QPushButton* m_pBtnModelActive = nullptr;
     QCheckBox*  m_pChkWebSearch     = nullptr;
+    QCheckBox*  m_pChkExpertAssistant = nullptr;   // 2026.08.26 专家助手开关
     // 2026.08.19 PIAgent Tab 控件（仿 DSH Tab：安装状态行 + node/root/provider/model/
     //   apiKey/thinking 编辑组；thinking 为下拉，空项=默认）。
     QLabel*     m_pLblPiState       = nullptr;
@@ -179,6 +198,7 @@ private:
     int         m_iPiActiveModel = -1;    // -1=未启用（走 Provider/模型固定路由）
     QTreeWidget* m_pTreePiModels = nullptr;
     QPushButton* m_pBtnPiModelAdd    = nullptr;
+    QPushButton* m_pBtnPiModelCopy   = nullptr;   // 2026.08.27 复制选中条目
     QPushButton* m_pBtnPiModelEdit   = nullptr;
     QPushButton* m_pBtnPiModelDel    = nullptr;
     QPushButton* m_pBtnPiModelActive = nullptr;
@@ -204,6 +224,7 @@ private:
     int         m_iCodexActiveModel = -1;    // -1=未启用（走固定路由）
     QTreeWidget* m_pTreeCodexModels = nullptr;
     QPushButton* m_pBtnCodexModelAdd    = nullptr;
+    QPushButton* m_pBtnCodexModelCopy   = nullptr;   // 2026.08.27 复制选中条目
     QPushButton* m_pBtnCodexModelEdit   = nullptr;
     QPushButton* m_pBtnCodexModelDel    = nullptr;
     QPushButton* m_pBtnCodexModelActive = nullptr;
@@ -212,4 +233,8 @@ private:
     QSpinBox*   m_pSpinCtxLimit     = nullptr;
     QLineEdit*  m_pEditScanDirs     = nullptr;
     QLineEdit*  m_pEditBackupDirs   = nullptr;
+    // 2026.08.27 几何持久化用的配置管理器引用（非拥有；构造时留存，done() 落盘用）。
+    CProjectManager* m_pPm = nullptr;
+    // 2026.09 后端版本管理 D6 判据（构造注入透传给 CVersionDialog；空=放行）。
+    CVersionDialog::FBusyCheck m_fnBackendBusy;
 };

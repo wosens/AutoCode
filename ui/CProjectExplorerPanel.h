@@ -9,6 +9,7 @@ class QTreeView;
 class QFileSystemModel;
 class QMenu;
 class QAction;
+class QDropEvent;
 
 // 工程资源管理器面板（FR-3）：以 QTreeView + QFileSystemModel 展示当前工程根目录树
 // （工程目录本身为顶层可见根节点），右键提供 9 项文件操作（通过资源管理器打开/剪切/复制/
@@ -52,6 +53,20 @@ private:
     void CopyRelativePath();// 相对工程根 → 剪贴板
     void AddToChat();       // emit sigAddToChat
     void OpenInExplorer();  // explorer.exe 打开：目录=打开该目录，文件=所在目录并选中
+    // 2026.08.28 非文本文件（exe 等）的系统打开：ShellExecuteW 显式传
+    //   lpDirectory=文件所在目录（对齐资源管理器双击；QDesktopServices::openUrl
+    //   目录参数 NULL 会继承 AutoCode cwd，相对路径读资源的 exe 启动即闪退）。
+    void OpenWithShell(const QString& a_sAbsPath);
+    // 2026.08.27 拖拽（Windows 资源管理器式）：拖出（CF_HDROP→系统资源管理器/
+    //   聊天发送框）+ 拖入/树内拖动（移动/复制文件）。事件统一走 viewport 的
+    //   eventFilter（拖拽事件目标是 viewport），不依赖 QAbstractItemView 内建 DnD。
+    void StartTreeDrag();                 // 按下项+多选 → QDrag(urls=CF_HDROP)
+    void HandleTreeDrop(QDropEvent* a_pEv); // 落点目录判定 + 移动/复制/同名编号
+    // 目标同名时生成 "base (n).ext" 唯一名（n≥2 递增），全部撞名返回空串。
+    static QString UniqueDstPath(const QString& a_sPath);
+
+protected:
+    bool eventFilter(QObject* a_pObj, QEvent* a_pEv) override;
     // 2026.08.21 「打开方式」子菜单：枚举该文件类型在注册表（HKCR）注册的程序，
     //   子菜单逐项列出，点击按其 command 模板调用对应程序打开文件。
     void BuildOpenWithMenu(QMenu* a_pParentMenu, const QString& a_sFilePath);
@@ -75,6 +90,10 @@ private:
     // 进程内粘贴板（剪切/复制目标）：存绝对路径 + 是否剪切态
     QString           m_sClipboardPath;
     bool              m_bCutMode = false;
+    // 拖出候选态：左键按下未超阈值时记录起点与按下项（超距才升级为 QDrag）。
+    QPoint                 m_ptDragStart;
+    bool                   m_bMaybeDrag = false;
+    QPersistentModelIndex  m_stDragIdx;
 
     // 生成目录过滤清单（Q1 默认，后续可由 FR-8 设置调）。
     static const QStringList& HiddenDirs();

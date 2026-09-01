@@ -104,11 +104,18 @@ void CMessageBlock::BuildAssistant() {
     // #1 自动换行（按视口宽度）：关横向滚动条后必须显式开换行，否则长行溢出视口不可见。
     m_pBrowser->setLineWrapMode(QTextEdit::WidgetWidth);
     m_pBrowser->setOpenExternalLinks(true);
+    // 2026.08.26 修复右键菜单黑底：QPalette::Window 透明会随子控件创建传播到
+    //   右键菜单（菜单背景用 Window 角色 → 透明/黑）。只保留 Base（浏览器自身
+    //   文本区背景），不再碰 Window。
     QPalette pal = m_pBrowser->palette();
     pal.setColor(QPalette::Base, Qt::transparent);
-    pal.setColor(QPalette::Window, Qt::transparent);
     m_pBrowser->setPalette(pal);
-    m_pBrowser->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+    // 2026.08.26 修复右键菜单黑底：旧写法无选择器（"background: transparent; ..."）
+    //   会级联到所有子控件——浏览器的标准右键菜单（createStandardContextMenu 的
+    //   QMenu parent 即本浏览器）背景被改成透明，控件级样式表又优先于全局 QMenu
+    //   样式 → 黑底黑字不可读。限定 QTextBrowser 选择器后不再波及菜单。
+    m_pBrowser->setStyleSheet(QStringLiteral(
+        "QTextBrowser { background: transparent; border: none; }"));
 
     connect(m_pBrowser->document()->documentLayout(),
             &QAbstractTextDocumentLayout::documentSizeChanged,

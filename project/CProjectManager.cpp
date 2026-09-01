@@ -1,4 +1,4 @@
-#include "CProjectManager.h"
+﻿#include "CProjectManager.h"
 
 #include <QDir>
 #include <QFile>
@@ -11,6 +11,7 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QThread>   // 2026.08.22 blob 临时名防并发碰撞（线程 id 掺入）
+#include <thread>     // 2026.08.26 指纹同步后台线程（大工程扫描不阻塞 UI）
 #include <QSet>
 
 #include <zstd.h>       // 备份压缩（#2）：第三方静态库 libzstd_static，逐文件 zstd 压缩/解压
@@ -241,7 +242,7 @@ void CProjectManager::BuildGuideAsync() {
     //   不再交给 Agent 扫描（无物可扫 → 臆造内容且不落盘 → 反复"生成失败"），改为本地
     //   确定性写一份最小 guide.md（新工程占位骨架）。后续 Develop 产出源码后，任务启动前
     //   的 SyncGuideIncremental 会自动补指纹表，菜单「生成 guide」也可全量重生成替换。
-    if (CGuideFingerprintScanner::ScanProject(m_sProjectDir).isEmpty()) {
+    if (!CGuideFingerprintScanner::HasAnyScannableFile(m_sProjectDir)) {
         const QString sGuide = QStringLiteral(
             "# 工程指南（guide.md）\n\n"
             "> 本工程为**新建空工程**：当前尚无任何源码文件，首个任务将**从零开始**创建全部代码。\n"
@@ -520,8 +521,11 @@ void CProjectManager::SaveGuideSyncLines(int a_iLines) {
 // ---- guide 文件指纹增量同步（FR1）----
 
 void CProjectManager::SyncGuideIncremental() {
-    // 编排扫描器四步（Scan → ReadGuide → Parse → Diff → WriteIncremental），
-    // 同步完成（扫描千级文件仅数百毫秒，不冻结 UI）。全程吞错，失败不阻断任务启动。
+    // 编排扫描器四步（Scan → ReadGuide → Parse → Diff → WriteIncremental）。
+    // 2026.08.26 卡死修复：大工程（缺省排除只剩隐藏目录后，build/Execute 等全入表，
+    //   十万级文件）ScanProject 枚举可达数秒～数十秒，在 UI 线程同步跑会冻结界面。
+    //   改为 std::thread 后台执行：任务启动立即返回，同步尽力而为、失败不阻断。
+    //   防重入：m_bFpSyncRunning 原子占用标志，上轮未完则跳过本轮（下轮任务启动补上，无损）。
     if (m_sProjectDir.isEmpty()) {
         return;
     }
@@ -531,31 +535,53 @@ void CProjectManager::SyncGuideIncremental() {
     if (m_pGuideSyncRunner != nullptr && m_pGuideSyncRunner->IsRunning()) {
         return;
     }
-    try {
-        const QList<SFileFingerprint> aCur = CGuideFingerprintScanner::ScanProject(m_sProjectDir);
-        const QString sGuide = ReadGuide();
-        if (sGuide.isEmpty()) {
-            return;   // 无 guide → 交全量流程
-        }
-        const QList<SFileFingerprint> aPrev = CGuideFingerprintScanner::ParseFingerprintTable(sGuide);
-        // guide 非空但无指纹段（首次全量生成的 guide 不含指纹表）→ 交全量流程，不强加段。
-        if (aPrev.isEmpty() && !sGuide.contains(CGuideFingerprintScanner::s_sBeginMarker)) {
-            return;
-        }
-        const SGuideChangeSet stChanges = CGuideFingerprintScanner::Diff(aPrev, aCur);
-        // FR1.4：三类均空 → 不动文件。
-        if (stChanges.aAdded.isEmpty() && stChanges.aModified.isEmpty() &&
-            stChanges.aDeleted.isEmpty()) {
-            return;
-        }
-        const QString sGuidePath = AutoDevDir() + QStringLiteral("/guide.md");
-        const QString sTs = QDateTime::currentDateTime().toString(Qt::ISODate);
-        // 回写失败忽略（尽力而为），不影响后续 InitTaskDir / RunCurrentStage。
-        CGuideFingerprintScanner::WriteIncremental(sGuidePath, aCur, stChanges, sTs);
-    } catch (...) {
-        // 任何异常吞掉：增量同步属增强项，绝不让它中断任务启动。
+    // 上轮后台同步未完 → 跳过（不排队，避免堆积）。
+    bool bExpected = false;
+    if (!m_bFpSyncRunning.compare_exchange_strong(bExpected, true)) {
         return;
     }
+    // 按值捕获所需路径，避免后台线程访问 this 成员的并发风险（析构竞态由程序生命周期保证）。
+    const QString sProjectDir = m_sProjectDir;
+    const QString sGuidePath  = AutoDevDir() + QStringLiteral("/guide.md");
+    std::thread([this, sProjectDir, sGuidePath]() {
+        // RAII 占用释放：任何 return/异常路径都复位标志（否则上轮提前返回后同步永久失效）。
+        struct SFlagGuard {
+            std::atomic<bool>& m_rFlag;
+            ~SFlagGuard() { m_rFlag = false; }
+        } stGuard{m_bFpSyncRunning};
+        try {
+            const QList<SFileFingerprint> aCur =
+                CGuideFingerprintScanner::ScanProject(sProjectDir);
+            // 读 guide.md 全文（后台线程直接读文件，不走 ReadGuide 的成员访问）。
+            QString sGuide;
+            {
+                QFile stGuide(sGuidePath);
+                if (stGuide.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    sGuide = QTextStream(&stGuide).readAll();
+                }
+            }
+            if (sGuide.isEmpty()) {
+                return;   // 无 guide → 交全量流程
+            }
+            const QList<SFileFingerprint> aPrev =
+                CGuideFingerprintScanner::ParseFingerprintTable(sGuide);
+            // guide 非空但无指纹段（首次全量生成的 guide 不含指纹表）→ 交全量流程，不强加段。
+            if (aPrev.isEmpty() && !sGuide.contains(CGuideFingerprintScanner::s_sBeginMarker)) {
+                return;
+            }
+            const SGuideChangeSet stChanges = CGuideFingerprintScanner::Diff(aPrev, aCur);
+            // FR1.4：三类均空 → 不动文件。
+            if (stChanges.aAdded.isEmpty() && stChanges.aModified.isEmpty() &&
+                stChanges.aDeleted.isEmpty()) {
+                return;
+            }
+            const QString sTs = QDateTime::currentDateTime().toString(Qt::ISODate);
+            // 回写失败忽略（尽力而为），不影响后续 InitTaskDir / RunCurrentStage。
+            CGuideFingerprintScanner::WriteIncremental(sGuidePath, aCur, stChanges, sTs);
+        } catch (...) {
+            // 任何异常吞掉：增量同步属增强项，绝不让它中断任务启动。
+        }
+    }).detach();   // detach：不同步等待，任务启动路径立即返回（卡死修复核心）
 }
 
 QList<SFileFingerprint> CProjectManager::ReadFingerprintTable() const {
@@ -762,6 +788,48 @@ bool CProjectManager::LoadWindowGeometry(QRect& a_stGeometry, bool& a_bMaximized
     return true;
 }
 
+// 2026.08.27 设置对话框几何持久化（[SettingsWindow] X/Y/W/H；无最大化态）：
+//   口径同主窗口 [Window]，对话类窗口不记 Maximized。
+bool CProjectManager::SaveSettingsDialogGeometry(const QRect& a_stGeometry) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const std::wstring wsSect = std::wstring(L"SettingsWindow");
+
+    WritePrivateProfileStringW(wsSect.c_str(), L"X",
+        QString::number(a_stGeometry.x()).toStdWString().c_str(), wsPath.c_str());
+    WritePrivateProfileStringW(wsSect.c_str(), L"Y",
+        QString::number(a_stGeometry.y()).toStdWString().c_str(), wsPath.c_str());
+    WritePrivateProfileStringW(wsSect.c_str(), L"W",
+        QString::number(a_stGeometry.width()).toStdWString().c_str(), wsPath.c_str());
+    WritePrivateProfileStringW(wsSect.c_str(), L"H",
+        QString::number(a_stGeometry.height()).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSettingsDialogGeometry(QRect& a_stGeometry) {
+    // 哨兵 = INT_MIN：区分「缺键」与合法坐标 0（同 LoadWindowGeometry 口径）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const std::wstring wsSect = std::wstring(L"SettingsWindow");
+
+    const int iSentinel = INT_MIN;
+    const int iX = GetPrivateProfileIntW(wsSect.c_str(), L"X", iSentinel, wsPath.c_str());
+    const int iY = GetPrivateProfileIntW(wsSect.c_str(), L"Y", iSentinel, wsPath.c_str());
+    const int iW = GetPrivateProfileIntW(wsSect.c_str(), L"W", iSentinel, wsPath.c_str());
+    const int iH = GetPrivateProfileIntW(wsSect.c_str(), L"H", iSentinel, wsPath.c_str());
+    if (iX == iSentinel || iY == iSentinel || iW == iSentinel || iH == iSentinel) {
+        return false;
+    }
+    a_stGeometry.setRect(iX, iY, iW, iH);
+    return true;
+}
+
 bool CProjectManager::SaveSplitterState(const QByteArray& a_stState) {
     // FR-4：把 QSplitter::saveState() 字节数组以 Base64 文本落 [Layout] Splitter；
     // 失败不抛（与 SaveWindowGeometry 一致）。Base64 文本无换行/特殊字符，适合 INI。
@@ -791,6 +859,29 @@ QByteArray CProjectManager::LoadSplitterState() {
     }
     const QString sB64 = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
     return QByteArray::fromBase64(sB64.toLatin1());
+}
+
+bool CProjectManager::SaveLayoutValue(const QString& a_sKey, const QString& a_sVal) {
+    // 2026.08.29 [Layout] 通用键值写（profile API，与该节其余键同一写入者家族）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty() || a_sKey.isEmpty()) {
+        return false;
+    }
+    WritePrivateProfileStringW(L"Layout", a_sKey.toStdWString().c_str(),
+                               a_sVal.toStdWString().c_str(), sPath.toStdWString().c_str());
+    return true;
+}
+
+QString CProjectManager::LoadLayoutValue(const QString& a_sKey) const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty() || a_sKey.isEmpty()) {
+        return QString();
+    }
+    wchar_t szBuf[8192] = {0};
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"Layout", a_sKey.toStdWString().c_str(), L"", szBuf, 8192,
+        sPath.toStdWString().c_str());
+    return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
 }
 
 bool CProjectManager::SaveVSplitState(const QByteArray& a_stState) {
@@ -1642,6 +1733,28 @@ bool CProjectManager::LoadWebSearch() {
     return GetPrivateProfileIntW(L"Agent", L"WebSearch", 1, wsPath.c_str()) != 0;
 }
 
+bool CProjectManager::SaveExpertAssistant(bool a_bOn) {
+    // 落 [Adhoc] ExpertAssistant（1=启用专家助手闭环验证，0=禁用）；失败不抛。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Adhoc", L"ExpertAssistant",
+        QString::number(a_bOn ? 1 : 0).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadExpertAssistant() const {
+    // 无 config.ini/缺键 → 默认启用（1）；0=手工禁用。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Adhoc", L"ExpertAssistant", 1, wsPath.c_str()) != 0;
+}
+
 bool CProjectManager::SaveAdhocContextLimit(qint64 a_iLimit) {
     // 落 [Adhoc] ContextLimit（0 表示未设/回退自动探测）；失败不抛。
     const QString sPath = ConfigFilePath();
@@ -1791,6 +1904,24 @@ bool ZstdDecompressFile(const QString& a_sSrc, const QString& a_sDst) {
     return bWrote;
 }
 
+// 2026.08.24 blob → 内存解压（「查看变更」用：不落临时文件，直接回给调用方 QByteArray）。
+bool ZstdDecompressBytes(const QByteArray& a_sSrc, QByteArray& a_dstOut) {
+    const unsigned long long uSize = ZSTD_getFrameContentSize(
+        a_sSrc.constData(), static_cast<size_t>(a_sSrc.size()));
+    if (uSize == ZSTD_CONTENTSIZE_ERROR || uSize == ZSTD_CONTENTSIZE_UNKNOWN ||
+        uSize > static_cast<unsigned long long>(INT_MAX)) {
+        return false;
+    }
+    a_dstOut.resize(static_cast<int>(uSize));
+    const size_t stOut = ZSTD_decompress(a_dstOut.data(), static_cast<size_t>(uSize),
+                                         a_sSrc.constData(), static_cast<size_t>(a_sSrc.size()));
+    if (ZSTD_isError(stOut) || stOut != static_cast<size_t>(uSize)) {
+        a_dstOut.clear();
+        return false;
+    }
+    return true;
+}
+
 // 递归压缩镜像：目录结构原样保留，每个文件压缩为 <file>.zst。排除清单仅顶层一级生效（同 MirrorTree）。
 bool CompressTree(const QString& a_sSrc, const QString& a_sDst, const QStringList& a_aExclude) {
     const QDir stSrc(a_sSrc);
@@ -1899,9 +2030,16 @@ QStringList CProjectManager::BackupExcludeDirs() const {
     if (!aTrimmed.isEmpty()) {
         return aTrimmed;
     }
+    // 2026.08.29 默认清单补依赖/缓存目录（修「窗口关闭后进程僵死」根因之一）：
+    //   pnpm/npm 单仓的 node_modules 动辄数万~数十万代码类文件（js/ts/json 命中
+    //   文件白名单），首轮 turn 快照读+SHA256 可达几十分钟——备份线程退出时被
+    //   无超时 join，窗口已关进程僵死（实测 DeepSeekHarness 5.6 万文件 25 分钟
+    //   未扫完、实例内存 2.9GB）。__pycache__/.pnpm-store 同理。
     return { QStringLiteral(".autodev"), QStringLiteral("build"),
              QStringLiteral("Execute"), QStringLiteral(".git"),
-             QStringLiteral(".vs"), QStringLiteral("x64") };
+             QStringLiteral(".vs"), QStringLiteral("x64"),
+             QStringLiteral("node_modules"), QStringLiteral(".pnpm-store"),
+             QStringLiteral("__pycache__") };
 }
 
 QString CProjectManager::BackupsDir(const QString& a_sTaskId) const {
@@ -2145,6 +2283,23 @@ QString BsMetaName(int a_iSeq) {
 QString BsMetaPath(const QString& a_sRoot, int a_iSeq) {
     return QDir(a_sRoot).filePath(BsMetaName(a_iSeq));
 }
+
+// 2026.08.29 无差异快照「同源引用版」解析：meta 不带 files 而是 "base"=<seq>（指向
+//   同 owner 的上一版本，链深 ≤1）；读侧经此函数解析出真实 manifest（链断/坏档 → 空）。
+//   背景：每次提交提示词触发的 turn 快照在「工程无任何改动」时原设计直接跳过建版
+//   （复用 lastSeq）——该条提示在回退列表里凭空消失（实测 $HOME/.claude 工程：
+//   连续两条提示无记录点，用户以为修改丢失无法回退）。
+QJsonObject BsResolveFiles(const QString& a_sRoot, int a_iSeq) {
+    QJsonObject oMeta = ReadJsonFile(BsMetaPath(a_sRoot, a_iSeq)).object();
+    for (int iHop = 0; iHop < 8 && oMeta.contains(QStringLiteral("base")); ++iHop) {
+        const int iBase = oMeta.value(QStringLiteral("base")).toInt();
+        if (iBase <= 0) {
+            return {};
+        }
+        oMeta = ReadJsonFile(BsMetaPath(a_sRoot, iBase)).object();
+    }
+    return oMeta.value(QStringLiteral("files")).toObject();
+}
 QString BsTmpDir(const QString& a_sRoot) {
     return QDir(a_sRoot).filePath(QStringLiteral("_restore_tmp"));
 }
@@ -2163,24 +2318,43 @@ int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
     }
     QDir().mkpath(BsStoreDir(m_sBackupsRoot));
 
+    // 2026.08.26 哈希缓存（turn 快照提速）：path → {h,z,m}。stat 未变（size+mtime）
+    //   的文件免读内容免 SHA256；全部未变时直接复用上次版本（不新建 meta，无差异快照无意义）。
+    //   大工程（万级文件）首轮全量后，后续 turn 快照从数十秒降到秒级。
+    const QString sCachePath = QDir(m_sBackupsRoot).filePath(QStringLiteral("hashcache.json"));
+    QJsonObject oCache = ReadJsonFile(sCachePath).object();
+    const qint64 iLastSeq = oCache.value(QStringLiteral("#lastSeq")).toVariant().toLongLong();
+    bool bAnyChanged = false;
+
     // 1) 遍历源码根（谓词过滤）→ manifest；未变内容 blob 已存在即跳过（FR-1.2 去重）。
+    //   2026.08.26（自 HarnessAgent 平移）：entryInfoList + NoSymLinks（防 pnpm 等的
+    //   junction/symlink 死循环）+ Hidden（隐藏文件如 .gitignore 亦入库）；目录级
+    //   剪枝改用 m_pfDirFilter（不套文件白名单，免误杀无扩展名目录整棵子树）。
     QStringList aFiles;
     std::function<void(const QString&, const QString&)> fnScan =
         [&](const QString& a_sAbsDir, const QString& a_sPrefix) {
+            if (m_bAbort.load()) {
+                return;   // 2026.08.29 析构/新快照请求中止：及时退出长扫描
+            }
             const QDir stDir(a_sAbsDir);
-            const QStringList aDirs = stDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-            for (const QString& sSub : aDirs) {
+            const QList<QFileInfo> aSubDirs = stDir.entryInfoList(
+                QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::NoSymLinks);
+            for (const QFileInfo& stSub : aSubDirs) {
                 const QString sRel = a_sPrefix.isEmpty()
-                    ? sSub : a_sPrefix + QLatin1Char('/') + sSub;
-                if (m_pfFilter && !m_pfFilter(sRel)) {
+                    ? stSub.fileName() : a_sPrefix + QLatin1Char('/') + stSub.fileName();
+                if (m_pfDirFilter) {
+                    if (!m_pfDirFilter(sRel))
+                        continue;
+                } else if (m_pfFilter && !m_pfFilter(sRel)) {
                     continue;
                 }
-                fnScan(stDir.filePath(sSub), sRel);
+                fnScan(stSub.absoluteFilePath(), sRel);
             }
-            const QStringList aNames = stDir.entryList(QDir::Files);
-            for (const QString& sName : aNames) {
+            const QList<QFileInfo> aNames = stDir.entryInfoList(
+                QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden | QDir::NoSymLinks);
+            for (const QFileInfo& stFi : aNames) {
                 const QString sRelFile = a_sPrefix.isEmpty()
-                    ? sName : a_sPrefix + QLatin1Char('/') + sName;
+                    ? stFi.fileName() : a_sPrefix + QLatin1Char('/') + stFi.fileName();
                 // 2026.08.23 文件级白名单：只备份代码相关文件（中间文件/产物跳过，
                 //   不入 manifest → 不产生 blob，历史版本里已存的旧产物 blob 由 GC 兜底回收）。
                 if (m_pfFileFilter && !m_pfFileFilter(sRelFile)) {
@@ -2190,18 +2364,42 @@ int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
             }
         };
     fnScan(m_sSourceRoot, QString());
+    if (m_bAbort.load()) {
+        return 0;   // 2026.08.29 扫描被请求中止（退出/新快照）：静默失败
+    }
 
     QJsonObject oFiles;
+    int iKept = 0;                     // 2026.08.26 实际入库（入 manifest/缓存）的文件数（无差异判定用）
     for (const QString& sRel : aFiles) {
-        const QString sAbs = QDir(m_sSourceRoot).filePath(sRel);
-        QFile stF(sAbs);
-        if (!stF.open(QIODevice::ReadOnly)) {
-            return 0;   // 读取失败整版作废（已写 blob 为无害孤儿，GC 兜底）
+        if (m_bAbort.load()) {
+            return 0;   // 2026.08.29 哈希循环同样可中止（首轮全量读+SHA256 最耗时）
         }
-        const QByteArray bufData = stF.readAll();
-        stF.close();
-        const QString sHash = QString::fromLatin1(
-            QCryptographicHash::hash(bufData, QCryptographicHash::Sha256).toHex());
+        const QString sAbs = QDir(m_sSourceRoot).filePath(sRel);
+        const QFileInfo stInfo(sAbs);
+        // 2026.08.26（自 HarnessAgent 平移）：单文件大小上限，超限不入库（不报错）。
+        if (m_iMaxFileBytes > 0 && stInfo.size() > m_iMaxFileBytes) {
+            continue;
+        }
+        const qint64 iSizeMs = static_cast<qint64>(stInfo.size());
+        const qint64 iMtimeMs = stInfo.lastModified().toMSecsSinceEpoch();
+        QString sHash;
+        // 2026.08.26 提速核心：stat 未变（size+mtime 同缓存）→ 免读内容免 SHA256。
+        const QJsonObject oHit = oCache.value(sRel).toObject();
+        if (!oHit.isEmpty()
+            && oHit.value(QStringLiteral("z")).toVariant().toLongLong() == iSizeMs
+            && oHit.value(QStringLiteral("m")).toVariant().toLongLong() == iMtimeMs) {
+            sHash = oHit.value(QStringLiteral("h")).toString();
+        } else {
+            bAnyChanged = true;
+            QFile stF(sAbs);
+            if (!stF.open(QIODevice::ReadOnly)) {
+                return 0;
+            }
+            const QByteArray bufData = stF.readAll();
+            stF.close();
+            sHash = QString::fromLatin1(
+                QCryptographicHash::hash(bufData, QCryptographicHash::Sha256).toHex());
+        }
         const QString sBlob = QDir(BsStoreDir(m_sBackupsRoot))
             .filePath(sHash + QStringLiteral(".zst"));
         // v3.1 blob 不可变落盘：先写唯一临时名再 rename（并发备份同一 hash 时，
@@ -2217,12 +2415,73 @@ int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
             }
             QFile::remove(sBlobTmp);   // rename 失败但 blob 已被并发对手落成 → 清自己的 tmp
         }
-        const QFileInfo stInfo(sAbs);
         QJsonObject oEnt;
         oEnt[QStringLiteral("h")] = sHash;
-        oEnt[QStringLiteral("z")] = static_cast<qint64>(stInfo.size());
-        oEnt[QStringLiteral("m")] = stInfo.lastModified().toMSecsSinceEpoch();
+        oEnt[QStringLiteral("z")] = iSizeMs;
+        oEnt[QStringLiteral("m")] = iMtimeMs;
         oFiles[sRel] = oEnt;
+        oCache[sRel] = oEnt;   // 2026.08.26 缓存项与 manifest 同构（h/z/m）
+        ++iKept;
+    }
+
+    // 2026.08.26→2026.08.29 全部未变（文件集与各文件 stat 均与上次快照一致）：
+    //   原设计直接跳过建版（复用 lastSeq）——该条提示在回退列表里凭空消失（实测
+    //   $HOME/.claude 工程连续两条提示无记录点，用户以为修改丢失）。改为写「同源
+    //   引用版」：meta 仅数百字节（"base" 指向同 owner 的上一实版，Read 侧
+    //   BsResolveFiles 解析），列表/回退/对比全链路透明；**仅同 owner 引用**——
+    //   跨 owner（如任务 stage 版）不引用（PurgeOwner 删基版会把引用版变孤儿），
+    //   退回旧口径。写失败同旧口径（回写缓存返回 lastSeq）。
+    if (!bAnyChanged && iLastSeq > 0 && oCache.size() == iKept + 1) {
+        int iBaseSeq = 0;
+        const QJsonObject oLast = ReadJsonFile(BsMetaPath(m_sBackupsRoot, static_cast<int>(iLastSeq))).object();
+        if (!oLast.isEmpty()
+            && oLast.value(QStringLiteral("owner")).toString() == a_sOwner) {
+            iBaseSeq = oLast.contains(QStringLiteral("base"))
+                ? oLast.value(QStringLiteral("base")).toInt()
+                : static_cast<int>(iLastSeq);
+        }
+        if (iBaseSeq > 0) {
+            for (int iAttempt = 0; iAttempt < 3; ++iAttempt) {
+                int iMaxSeq = 0;
+                const QStringList aMetas = QDir(m_sBackupsRoot)
+                    .entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+                for (const QString& sMeta : aMetas) {
+                    bool bOk = false;
+                    const int iDot = sMeta.indexOf(QLatin1Char('.'));
+                    const int iSeq = (iDot > 0 ? sMeta.left(iDot) : sMeta).toInt(&bOk);
+                    if (bOk && iSeq > iMaxSeq) {
+                        iMaxSeq = iSeq;
+                    }
+                }
+                const int iSeq = iMaxSeq + 1;
+                QJsonObject oAlias;
+                oAlias[QStringLiteral("seq")]    = iSeq;
+                oAlias[QStringLiteral("time")]   = QDateTime::currentDateTime().toString(Qt::ISODate);
+                oAlias[QStringLiteral("kind")]   = a_sKind;
+                oAlias[QStringLiteral("owner")]  = a_sOwner;
+                if (!a_sStage.isEmpty())  oAlias[QStringLiteral("stage")]  = a_sStage;
+                if (!a_sPrompt.isEmpty()) oAlias[QStringLiteral("prompt")] = a_sPrompt.left(2000);
+                if (a_iTarget > 0)        oAlias[QStringLiteral("target")] = a_iTarget;
+                oAlias[QStringLiteral("format")] = QStringLiteral("cas");
+                oAlias[QStringLiteral("base")]   = iBaseSeq;
+                const QString sFinal = BsMetaPath(m_sBackupsRoot, iSeq);
+                const QString sTmpF  = sFinal + QStringLiteral(".tmp");
+                if (WriteJsonFile(sTmpF, QJsonDocument(oAlias), m_bBom)
+                    && !QFile::exists(sFinal)
+                    && QFile::rename(sTmpF, sFinal)) {
+                    oCache[QStringLiteral("#lastSeq")] = static_cast<qint64>(iSeq);
+                    WriteJsonFile(sCachePath + QStringLiteral(".tmp"), QJsonDocument(oCache), m_bBom);
+                    QFile::remove(sCachePath);
+                    QFile::rename(sCachePath + QStringLiteral(".tmp"), sCachePath);
+                    return iSeq;
+                }
+                QFile::remove(sTmpF);   // 序号被并发占用/写失败 → 重试或退旧口径
+            }
+        }
+        WriteJsonFile(sCachePath + QStringLiteral(".tmp"), QJsonDocument(oCache), m_bBom);
+        QFile::remove(sCachePath);
+        QFile::rename(sCachePath + QStringLiteral(".tmp"), sCachePath);
+        return static_cast<int>(iLastSeq);
     }
 
     // 2) meta 原子提交：扫 max+1 → 临时文件 + rename；rename 失败=序号被并发占用 → 重试 ≤3。
@@ -2259,6 +2518,16 @@ int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
             continue;
         }
         if (QFile::rename(sTmpF, sFinal)) {
+            // 2026.08.26 哈希缓存回写：记录本次版本号，裁剪掉已不在备份范围（被删/
+            //   被排除）的旧条目。临时文件+rename 原子替换；并发备份下后写胜出（条目均为
+            //   有效指纹，互相覆盖无损坏）。写失败不影响备份结果（下次冷启动重算）。
+            oCache = oFiles;                     // 裁剪：仅保留本次在范围内的条目
+            oCache[QStringLiteral("#lastSeq")] = static_cast<qint64>(iSeq);
+            const QString sCacheTmp = sCachePath + QStringLiteral(".tmp");
+            if (WriteJsonFile(sCacheTmp, QJsonDocument(oCache), m_bBom)) {
+                QFile::remove(sCachePath);
+                QFile::rename(sCacheTmp, sCachePath);
+            }
             return iSeq;
         }
         QFile::remove(sTmpF);
@@ -2275,11 +2544,17 @@ bool CBackupStore::Restore(int a_iSeq, QString& a_sErr) {
         return false;
     }
     const QJsonObject oMeta = stDoc.object();
-    if (!oMeta.contains(QStringLiteral("files"))) {
-        a_sErr = QStringLiteral("版本 #%1 为旧格式（无 manifest）").arg(a_iSeq);
+    QJsonObject oFiles;
+    if (oMeta.contains(QStringLiteral("files"))) {
+        oFiles = oMeta.value(QStringLiteral("files")).toObject();
+    } else if (oMeta.contains(QStringLiteral("base"))) {
+        // 2026.08.29 同源引用版：files 取基版。
+        oFiles = BsResolveFiles(m_sBackupsRoot, a_iSeq);
+    }
+    if (oFiles.isEmpty()) {
+        a_sErr = QStringLiteral("版本 #%1 为旧格式或引用链损坏（无 manifest）").arg(a_iSeq);
         return false;
     }
-    const QJsonObject oFiles = oMeta.value(QStringLiteral("files")).toObject();
 
     const QString sTmp = BsTmpDir(m_sBackupsRoot);
     RemoveTree(sTmp);   // 清理上次残留（上层残留场景已先行处理）
@@ -2460,8 +2735,18 @@ QList<SBackupVersion> CBackupStore::List(const QString& a_sOwner) const {
         st.sOwner   = o.value(QStringLiteral("owner")).toString();
         st.sPrompt  = o.value(QStringLiteral("prompt")).toString();
         st.iTarget  = o.value(QStringLiteral("target")).toInt();
-        st.iFileCount = o.value(QStringLiteral("files")).toObject().size();
-        st.bLegacy  = !o.contains(QStringLiteral("files"));
+        // 2026.08.29 同源引用版：无 files 有 base → 数量取基版（解析失败按 0/非旧格式）。
+        if (o.contains(QStringLiteral("files"))) {
+            st.iFileCount = o.value(QStringLiteral("files")).toObject().size();
+            st.bLegacy = false;
+        } else if (o.contains(QStringLiteral("base"))) {
+            st.iFileCount = BsResolveFiles(m_sBackupsRoot,
+                                           o.value(QStringLiteral("base")).toInt()).size();
+            st.bLegacy = false;
+        } else {
+            st.iFileCount = 0;
+            st.bLegacy = true;
+        }
         if (st.iSeq > 0) {
             aVersions.append(st);
         }
@@ -2473,10 +2758,9 @@ QList<SBackupVersion> CBackupStore::List(const QString& a_sOwner) const {
 
 bool CBackupStore::Diff(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const {
     a_stOut = SDiffResult();
-    const QJsonObject oOld = ReadJsonFile(BsMetaPath(m_sBackupsRoot, a_iSeqOld))
-        .object().value(QStringLiteral("files")).toObject();
-    const QJsonObject oNew = ReadJsonFile(BsMetaPath(m_sBackupsRoot, a_iSeqNew))
-        .object().value(QStringLiteral("files")).toObject();
+    // 2026.08.29 同源引用版参与对比：经 base 解析（引用版 vs 基版 → 空差异，语义正确）。
+    const QJsonObject oOld = BsResolveFiles(m_sBackupsRoot, a_iSeqOld);
+    const QJsonObject oNew = BsResolveFiles(m_sBackupsRoot, a_iSeqNew);
     if (oOld.isEmpty() && oNew.isEmpty()) {
         return false;   // 版本不存在或旧格式 → 界面占位
     }
@@ -2509,6 +2793,48 @@ bool CBackupStore::Diff(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) cons
                 .value(QStringLiteral("z")).toVariant().toLongLong();
             a_stOut.aEntries.append(st);
         }
+    }
+    return true;
+}
+
+// 2026.08.24 回退窗口「查看变更」：读指定版本 manifest 中某文件的 blob 并解压到内存。
+bool CBackupStore::ReadFile(int a_iSeq, const QString& a_sRelPath,
+                            QByteArray& a_bufOut, QString& a_sErr) const {
+    a_bufOut.clear();
+    a_sErr.clear();
+    const QJsonObject oMeta = ReadJsonFile(BsMetaPath(m_sBackupsRoot, a_iSeq)).object();
+    if (oMeta.isEmpty()) {
+        a_sErr = QStringLiteral("版本 #%1 不存在或元数据损坏").arg(a_iSeq);
+        return false;
+    }
+    QJsonObject oFiles;
+    if (oMeta.contains(QStringLiteral("files"))) {
+        oFiles = oMeta.value(QStringLiteral("files")).toObject();
+    } else if (oMeta.contains(QStringLiteral("base"))) {
+        oFiles = BsResolveFiles(m_sBackupsRoot, a_iSeq);   // 2026.08.29 引用版解析
+    }
+    if (oFiles.isEmpty()) {
+        a_sErr = QStringLiteral("版本 #%1 为旧格式或引用链损坏（无 manifest）").arg(a_iSeq);
+        return false;
+    }
+    if (!oFiles.contains(a_sRelPath)) {
+        a_sErr = QStringLiteral("文件「%1」不在版本 #%2 中").arg(a_sRelPath).arg(a_iSeq);
+        return false;
+    }
+    const QString sHash = oFiles.value(a_sRelPath).toObject()
+        .value(QStringLiteral("h")).toString();
+    const QString sBlob = QDir(BsStoreDir(m_sBackupsRoot))
+        .filePath(sHash + QStringLiteral(".zst"));
+    QFile stBlob(sBlob);
+    if (!stBlob.open(QIODevice::ReadOnly)) {
+        a_sErr = QStringLiteral("blob 丢失或无法读取（%1）").arg(sHash.left(12));
+        return false;
+    }
+    const QByteArray aZst = stBlob.readAll();
+    stBlob.close();
+    if (!ZstdDecompressBytes(aZst, a_bufOut)) {
+        a_sErr = QStringLiteral("blob 解压失败（%1）").arg(sHash.left(12));
+        return false;
     }
     return true;
 }
@@ -2566,6 +2892,20 @@ int CBackupStore::GcOrphanBlobs() {
 
 bool CBackupStore::HasRestoreTmp() const {
     return QDir(BsTmpDir(m_sBackupsRoot)).exists();
+}
+
+// 2026.08.26（自 HarnessAgent 平移）：丢弃 _restore_tmp 残留现场（用户确认放弃还原时用）。
+bool CBackupStore::DiscardRestoreTmp(QString& a_sErr) {
+    a_sErr.clear();
+    const QString sTmp = BsTmpDir(m_sBackupsRoot);
+    if (!QDir(sTmp).exists()) {
+        return true;
+    }
+    if (!RemoveTree(sTmp)) {
+        a_sErr = QStringLiteral("删除恢复临时目录失败（目录保留，可重试）");
+        return false;
+    }
+    return true;
 }
 
 bool CBackupStore::LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const {
@@ -2679,6 +3019,18 @@ bool IsCodeRelatedFile(const QString& a_sRel) {
     return s_aCodeExts.contains(sExt) || s_aCodeNames.contains(sName);
 }
 
+void CProjectManager::RequestBackupAbort() {
+    if (m_pBackupStore != nullptr) {
+        m_pBackupStore->RequestAbort();
+    }
+}
+
+void CProjectManager::ResetBackupAbort() {
+    if (m_pBackupStore != nullptr) {
+        m_pBackupStore->ResetAbort();
+    }
+}
+
 CBackupStore* CProjectManager::BackupStore() const {
     QMutexLocker stLock(&m_MutexStore);
     if (m_pBackupStore == nullptr) {
@@ -2695,6 +3047,9 @@ CBackupStore* CProjectManager::BackupStore() const {
         m_pBackupStore->m_pfFileFilter = [](const QString& a_sRel) {
             return IsCodeRelatedFile(a_sRel);
         };
+        // 2026.08.27（自 HarnessAgent 平移）：单文件大小上限 10MB，超限不入库不报错
+        //（防误伤大体积数据文件拖慢快照/膨胀库）。
+        m_pBackupStore->m_iMaxFileBytes = 10 * 1024 * 1024;
     }
     return m_pBackupStore;
 }
@@ -2760,6 +3115,12 @@ QList<SBackupVersion> CProjectManager::ListUnifiedBackups(const QString& a_sOwne
 
 bool CProjectManager::DiffVersions(int a_iSeqOld, int a_iSeqNew, SDiffResult& a_stOut) const {
     return BackupStore()->Diff(a_iSeqOld, a_iSeqNew, a_stOut);
+}
+
+// 2026.08.24 回退窗口「查看变更」：转发统一库按版本读文件内容。
+bool CProjectManager::ReadUnifiedFile(int a_iSeq, const QString& a_sRelPath,
+                                      QByteArray& a_bufOut, QString& a_sErr) const {
+    return BackupStore()->ReadFile(a_iSeq, a_sRelPath, a_bufOut, a_sErr);
 }
 
 int CProjectManager::PurgeOwner(const QString& a_sOwner) {

@@ -70,6 +70,7 @@
 #include "CAgentRunnerFactory.h"   // 2026.08.18 后端单选分派（自带 CDeepSeekRunner.h）
 #include "CCodexRunner.h"         // 第四后端 CodexHarness 参数回填/探测自愈
 #include "CPiAgentRunner.h"        // 2026.08.19 第三后端 PIAgent 参数回填/探测自愈
+#include "CVersionDialog.h"       // 2026.09 后端版本管理（任务 23183ccb）
 #include "CTaskInfo.h"
 #include "core/StageDef.h"   // 2026.08.17 FindStage：中断恢复提示里显示阶段中文名
 #include "TaskTypes.h"
@@ -436,6 +437,9 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             m_pExecPanel, &CExecutionPanel::OnAdhocEvent);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocContext,
             m_pExecPanel, &CExecutionPanel::SetAdhocContext);
+    // 2026.08.27 本轮实时计量（任务/助手通用）→ 费用栏右侧“本轮 ↑x ↓y”。
+    connect(m_pOrch, &CTaskOrchestrator::sigLiveUsage,
+            m_pExecPanel, &CExecutionPanel::SetLiveUsage);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocModel,
             m_pExecPanel, &CExecutionPanel::OnAdhocModel);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocUndo,
@@ -598,6 +602,17 @@ void CMainWindow::CreateUi() {
         // 2026.08.18 恢复任务列表高度分隔条位置（左栏内部 垂直分隔条，[Layout] VSplit；
         //   无记录 → 保留面板 ctor setSizes 的默认比例）。
         m_pTaskPanel->RestoreVSplitState(m_pPm->LoadVSplitState());
+        // 2026.08.29 主界面布局碎片补齐：历史任务列宽 / 左栏 Tab 页 / 阶段产物分割条
+        //   （[Layout] TaskCols/TaskTab/ArtifactsSplit；坏档自弃回默认）。
+        m_pTaskPanel->RestoreTaskCols(m_pPm->LoadLayoutValue(QStringLiteral("TaskCols")));
+        m_pTaskPanel->RestoreTaskTab(m_pPm->LoadLayoutValue(QStringLiteral("TaskTab")).toInt());
+        if (m_pExecPanel != nullptr) {
+            const QString sArt = m_pPm->LoadLayoutValue(QStringLiteral("ArtifactsSplit"));
+            if (!sArt.isEmpty()) {
+                m_pExecPanel->RestoreArtifactsSplit(
+                    QByteArray::fromBase64(sArt.toLatin1()));
+            }
+        }
     }
     pV->addWidget(pSplit, 1);
 
@@ -677,10 +692,23 @@ void CMainWindow::CreateMenus() {
     pActSettings->setToolTip(QStringLiteral(
         "编辑运行策略、Agent 参数、评审与助手行为、目录排除等配置（保存到 exe 同级 config.ini）"));
     connect(pActSettings, &QAction::triggered, this, &CMainWindow::OnSettings);
+    // 2026.09 后端版本管理（任务 23183ccb）：四后端当前/最新版本与更新分派；
+    //   设置页 Agent 组有同源入口。
+    auto* pActVersion = pMenuFunc->addAction(QStringLiteral("后端版本管理..."));
+    pActVersion->setToolTip(QStringLiteral(
+        "查看四 Agent 后端当前版本与远端最新版，并提供各自更新入口"));
+    connect(pActVersion, &QAction::triggered, this, &CMainWindow::OnVersionManage);
     auto* pActInstallEnv = pMenuFunc->addAction(QStringLiteral("环境安装..."));
     pActInstallEnv->setToolTip(QStringLiteral(
         "自动安装 Claude Code 运行所需环境：Git、Node.js、Claude Code CLI"));
     connect(pActInstallEnv, &QAction::triggered, this, &CMainWindow::OnInstallEnv);
+    // 2026.08.26 恢复无任务也可用的回退入口：v1.0.224 删了助手侧入口后回退只剩任务列表
+    //   按钮（需选中任务），未选任务时功能彻底不可达。菜单入口走 OnRollbackTurnOpen：
+    //   选中任务 → 按该任务档列版本；无任务 → 工程全局档（owner=global）。
+    auto* pActRollback = pMenuFunc->addAction(QStringLiteral("回退历史版本..."));
+    pActRollback->setToolTip(QStringLiteral(
+        "查看/回退代码备份历史（选中任务时按任务档过滤，无任务时为工程全局档）"));
+    connect(pActRollback, &QAction::triggered, this, &CMainWindow::OnRollbackTurnOpen);
 
     // 帮助菜单（FR-9）
     auto* pMenuHelp = m_pMenuBar->addMenu(QStringLiteral("帮助(&H)"));
@@ -1193,11 +1221,34 @@ void CMainWindow::OnInstallEnv() {
     SetStatus(QStringLiteral("正在以管理员权限运行环境安装脚本，请在弹出的窗口中查看进度..."));
 }
 
+void CMainWindow::OnVersionManage() {
+    // 2026.09 后端版本管理（任务 23183ccb）：功能菜单入口（设置页 Agent 组同源）。
+    //   D6 判据：目标后端==当前全局后端 && (IsRunnerBusy()||IsAdhocRunning())
+    //   → 对话框更新前阻断式确认（口径同设置页后端切换保护，仅收敛到单后端）。
+    const int iCurBackend = CAgentRunnerFactory::IsDsh() ? 2
+                          : CAgentRunnerFactory::IsPi() ? 3
+                          : CAgentRunnerFactory::IsCodex() ? 4 : 1;
+    CVersionDialog::FBusyCheck fnBusy = [this, iCurBackend](int a_iBackend) {
+        return a_iBackend == iCurBackend && m_pOrch != nullptr
+            && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAdhocRunning());
+    };
+    CVersionDialog stDlg(fnBusy, this);
+    stDlg.exec();
+}
+
 void CMainWindow::OnSettings() {
     // 2026.08.15 设置对话框：构造时回填 config.ini 当前值；确定后统一落盘 + 应用运行期。
     //   策略/压缩比例/备份排除：消费方每次现读 ini，落盘即生效；
     //   联网开关/评审并行/claude 命令/提问超时/扫描排除：需同步到内存（编排器/CClaudeRunner/扫描器）。
-    CSettingsDialog stDlg(m_pPm, this);
+    // 2026.09 D6 判据注入（任务 23183ccb）：设置页 Agent 组「后端版本管理…」按钮
+    //   与功能菜单同源（同判据 lambda，口径同下方 OnVersionManage）。
+    CSettingsDialog stDlg(m_pPm, this, [this](int a_iBackend) {
+        const int iCurBackend = CAgentRunnerFactory::IsDsh() ? 2
+                              : CAgentRunnerFactory::IsPi() ? 3
+                              : CAgentRunnerFactory::IsCodex() ? 4 : 1;
+        return a_iBackend == iCurBackend && m_pOrch != nullptr
+            && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAdhocRunning());
+    });
     if (stDlg.exec() != QDialog::Accepted || m_pPm == nullptr) {
         return;
     }
@@ -1252,6 +1303,7 @@ void CMainWindow::OnSettings() {
     // 2026.08.18 自定义大模型表落盘（[DshModels] Count/Active/M<i>*）。
     m_pPm->SaveDshModels(stDlg.DshModels(), stDlg.DshActiveModel());
     m_pPm->SaveWebSearch(stDlg.WebSearch());
+    m_pPm->SaveExpertAssistant(stDlg.ExpertAssistant());
     m_pPm->SaveAutoCompactPct(stDlg.AutoCompactPct());
     m_pPm->SaveAdhocContextLimit(stDlg.ContextLimit());
     m_pPm->SaveScanExcludeDirs(stDlg.ScanExcludeDirs());
@@ -1621,11 +1673,7 @@ void CMainWindow::OnNewTask() {
     if (dlg.exec() != QDialog::Accepted) {
         return;   // AC-4.③ 取消 → 不创建任何任务
     }
-    if (dlg.UserRequest().isEmpty()) {
-        ExecMsgBox(QMessageBox::Warning, QStringLiteral("提示"),
-                   QStringLiteral("需求描述不能为空"), this);
-        return;
-    }
+    // 需求描述非空校验已在对话框内 Validate() 完成（2026.08.26：不通过不关窗、输入不丢）。
 
     auto* pTask = new CTaskInfo(this);
     pTask->SetId(QUuid::createUuid().toString(QUuid::WithoutBraces).left(8));
@@ -1668,6 +1716,9 @@ void CMainWindow::OnNewTask() {
     SwitchAssistantArchive(pTask);
     m_pTaskPanel->SelectTask(pTask);
     m_pExecPanel->SetCurrentTask(pTask);
+    // 2026.08.26 新建任务后自动切到助手日志页：用户下一步就是与助手对话（2026.08.23
+    //   的「保持原页」改掉——用户反馈新建后停在原页不符合常理）。
+    m_pExecPanel->ShowActiveAssistantPage();
 
     // FR-4「立刻启动」：勾选则创建后立即运行；不勾则仅选中（状态 Pending，未运行）。
     if (dlg.StartImmediately()) {
@@ -1705,6 +1756,7 @@ void CMainWindow::OnStartTask(CTaskInfo* a_pTask) {
     SwitchAssistantArchive(a_pTask);
     m_pTaskPanel->SelectTask(a_pTask);
     m_pExecPanel->SetCurrentTask(a_pTask);
+    m_pExecPanel->ShowTaskLogPage();   // 2026.08.24 开始任务切「日志」页（载助手档不再跳到助手 Tab）
 
     // 初始任务：guide.md 缺失则先自动扫描生成，完成后再续跑（不在打开工程时触发）。
     // 生成 guide.md 属于任务的一环（并入首阶段）：期间任务即置 Running——「继续」按钮置灰、
@@ -1730,16 +1782,41 @@ void CMainWindow::OnStartTask(CTaskInfo* a_pTask) {
 }
 
 void CMainWindow::OnPauseTask(CTaskInfo* a_pTask) {
+    // 2026.08.25 guide 生成等待期（初始任务缺 guide.md，无 runner）：暂停立即落 Paused
+    //   （旧实现只置标志，转圈不停；生成完成后 OnGuideFinished 按 PauseRequested 停续跑）。
+    if (!m_pTaskPendingGuide.isNull() && m_pTaskPendingGuide.data() == a_pTask) {
+        m_pOrch->PauseTask(a_pTask);   // 置 PauseRequested + 事件入日志
+        a_pTask->SetStatus(ETaskStatus::Paused);
+        OnTaskChanged(a_pTask);       // 刷新按钮/执行态指示器（转圈停）
+        return;
+    }
     m_pOrch->PauseTask(a_pTask);
 }
 
 void CMainWindow::OnStopTask(CTaskInfo* a_pTask) {
+    // 2026.08.25 guide 生成等待期（初始任务缺 guide.md，无 runner）：停止立即落 Stopped
+    //   并解除待续跑（旧实现只置标志，转圈不停；生成完仍会按 StopRequested 停但期间一直转）。
+    if (!m_pTaskPendingGuide.isNull() && m_pTaskPendingGuide.data() == a_pTask) {
+        m_pTaskPendingGuide = nullptr;   // 解除生成完自动续跑（OnGuideFinished 早退）
+        a_pTask->SetStopRequested(true);
+        a_pTask->SetStatus(ETaskStatus::Stopped);
+        m_pExecPanel->AppendEvent(a_pTask->Id(), QStringLiteral("init_guide"),
+            QStringLiteral("初始任务：guide.md 仍在生成，任务已停止（生成完成后不会自动启动）"));
+        OnTaskChanged(a_pTask);       // 刷新按钮/执行态指示器（转圈停）
+        return;
+    }
     m_pOrch->StopTask(a_pTask);
 }
 
 void CMainWindow::OnRollback(CTaskInfo* a_pTask) {
     // 统一回退界面（方案 §5）：任务侧入口——打开 master-detail 对话框，accept 后交引擎。
-    if (a_pTask == nullptr || m_pPm == nullptr) {
+    // 2026.08.26 空任务（取消选中）不再直接 return：落工程全局档（owner=global，
+    //   助手产生的 turn 快照所在），与「功能→回退历史版本」菜单同语义。
+    if (m_pPm == nullptr) {
+        return;
+    }
+    if (a_pTask == nullptr) {
+        OnRollbackTurnOpen();
         return;
     }
     if (a_pTask->Status() == ETaskStatus::Running) {
@@ -2222,6 +2299,14 @@ void CMainWindow::OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk) {
 
 void CMainWindow::OnAdhocSubmit(const QString& a_sText, bool a_bReadOnly) {
     if (m_pOrch != nullptr) {
+        // 2026.08.26 修复：提交前强制按「当前激活助手」换载会话链（sid/撤销栈/guide哈希）。
+        //   此前仅靠切 Tab 时的 OnAsstSwitched 换载，存在漏洞：切 Tab 发生在助手运行中
+        //   （不换载）或档切换路径未触发时，提交会沿用上一个助手的会话链——提示词被
+        //   发进了别的助手的上下文。提交时点同步 = 发送目标锥死激活助手。
+        const QString sAct = m_pExecPanel != nullptr ? m_pExecPanel->ActiveAsstId() : QString();
+        if (!sAct.isEmpty() && !m_pOrch->IsAdhocRunning()) {
+            LoadOrchFromPanel(sAct);
+        }
         // 传当前选中任务 id：助手档/经验记忆跟着任务走（空=无任务，走工程全局助手档）。
         m_pOrch->SubmitAdhoc(a_sText, a_bReadOnly, m_pCur != nullptr ? m_pCur->Id() : QString());
     }
@@ -2243,8 +2328,20 @@ void CMainWindow::OnAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost,
                                qint64 a_iElapsedMs, int a_iReqs) {
     // 2026.08.15 助手消耗归集到当前档任务（助手档按任务分档，消耗跟随档走）：
     //   费用/输入/输出/请求数并入任务累计；耗时只在任务非运行态累加（运行时段已含助手时间，防双计）。
-    //   工程级档（未选任务）无任务可挂，跳过。
+    // 2026.08.27 未选任务：不再丢弃，累计到助手自身的独立流量记录（随工程全局
+    //   assistant.json 持久化，切助手 Tab 可各自查看）；选了任务仍归集任务，历史记录不变。
     if (m_pCur == nullptr) {
+        if (m_pExecPanel != nullptr) {
+            // 归属：本轮运行的助手；无则激活助手。
+            QString sId = m_pExecPanel->RunningAsstId();
+            if (sId.isEmpty()) {
+                sId = m_pExecPanel->ActiveAsstId();
+            }
+            if (!sId.isEmpty()) {
+                m_pExecPanel->AddAsstUsage(sId, a_iIn, a_iOut, a_dCost, a_iElapsedMs, a_iReqs);
+                SaveAssistantState();   // 落盘工程全局档（m_pCur 为空 → WriteAssistantState）
+            }
+        }
         return;
     }
     // m_pCur 可能指向历史表 DB 副本——ReloadHistory 会整批 delete 重建，先校验指针仍有效。
@@ -2650,6 +2747,13 @@ void CMainWindow::SwitchAssistantArchive(CTaskInfo* a_pNewTask) {
         m_pCur = a_pNewTask;   // 同档（重复点选 / SelectTask 触发的二次 OnTaskSelected）：早退
         return;
     }
+    // 2026.08.26 取消选中（空白点击→a_pNewTask=nullptr）不再杀在跑助手：此前无条件
+    //   StopAdhoc——用户只是想看工程全局/取消选中，助手一轮被硬停。现在空目标且助手
+    //   在跑时跳过档切换（保持 m_pCur 与助手档不动，运行痕迹继续落旧档），本轮结束后
+    //   用户再点一次空白即完成真正的切档。任务→任务的切换仍按原语义停跑换档。
+    if (a_pNewTask == nullptr && m_pOrch != nullptr && m_pOrch->IsAdhocRunning()) {
+        return;
+    }
     // 1) 在跑的助手先停：⏹ 停止事件经 AppendAdhocBlock → sigAdhocBlocksChanged →
     //    SaveAssistantState 写入【旧】key 文件（此时 m_pCur 仍指向旧任务，痕迹留在旧对话里）。
     if (m_pOrch != nullptr && m_pOrch->IsAdhocRunning()) {
@@ -2712,6 +2816,18 @@ void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
         // 2026.08.18 任务列表高度分隔条（左栏内部）位置一并持久化。
         if (m_pTaskPanel != nullptr) {
             m_pPm->SaveVSplitState(m_pTaskPanel->VSplitState());
+        }
+        // 2026.08.29 布局碎片：历史任务列宽 / 左栏 Tab 页 / 阶段产物分割条。
+        if (m_pTaskPanel != nullptr) {
+            m_pPm->SaveLayoutValue(QStringLiteral("TaskCols"),
+                                   m_pTaskPanel->TaskColsState());
+            m_pPm->SaveLayoutValue(QStringLiteral("TaskTab"),
+                                   QString::number(m_pTaskPanel->TaskTabIndex()));
+        }
+        if (m_pExecPanel != nullptr) {
+            m_pPm->SaveLayoutValue(
+                QStringLiteral("ArtifactsSplit"),
+                QString::fromLatin1(m_pExecPanel->ArtifactsSplitState().toBase64()));
         }
     }
     QMainWindow::closeEvent(a_pEvent);

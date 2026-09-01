@@ -217,7 +217,9 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
         if (m_pCur) { emit sigStopTask(m_pCur); }
     });
     connect(m_pBtnRollback, &QPushButton::clicked, this, [this]() {
-        if (m_pCur) { emit sigRollback(m_pCur); }   // FR-6
+        // 2026.08.26 空选择也可回退：emit nullptr，CMainWindow::OnRollback 空任务落
+        //   工程全局档（owner=global，助手产生的 turn 快照）。
+        emit sigRollback(m_pCur);
     });
     // #3 当前表右键「移除」：把任务从当前栏移到历史（保留记录，可再次执行）
     m_pListCur->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -245,6 +247,50 @@ void CTaskListPanel::ReportTaskListBottom() {
     // m_pTab 经布局后 geometry() 方准确；首帧 height()<=0 时跳过，待下次 resize 再报。
     if (m_pTab != nullptr && m_pTab->height() > 0) {
         emit sigTaskListBottom(m_pTab->geometry().bottom() + 1);
+    }
+}
+
+QString CTaskListPanel::TaskColsState() const {
+    // 2026.08.29 历史任务表 10 列宽 → "w0,w1,..."（末列 Stretch，存值仅作参考）。
+    if (m_pTreeHis == nullptr) {
+        return QString();
+    }
+    QString s;
+    for (int i = 0; i < m_pTreeHis->columnCount(); ++i) {
+        if (!s.isEmpty()) {
+            s += QLatin1Char(',');
+        }
+        s += QString::number(m_pTreeHis->header()->sectionSize(i));
+    }
+    return s;
+}
+
+void CTaskListPanel::RestoreTaskCols(const QString& a_sState) {
+    // 恰好 10 个非负整数才应用（坏档/旧格式自弃）；逐列限幅 [24,2000] 防拉出 0/巨宽。
+    if (m_pTreeHis == nullptr || a_sState.isEmpty()) {
+        return;
+    }
+    const QStringList aParts = a_sState.split(QLatin1Char(','));
+    if (aParts.size() != m_pTreeHis->columnCount()) {
+        return;
+    }
+    for (int i = 0; i < aParts.size(); ++i) {
+        bool bOk = false;
+        const int iW = aParts[i].trimmed().toInt(&bOk);
+        if (!bOk || iW < 0) {
+            return;
+        }
+        m_pTreeHis->header()->resizeSection(i, qBound(24, iW, 2000));
+    }
+}
+
+int CTaskListPanel::TaskTabIndex() const {
+    return m_pTab != nullptr ? m_pTab->currentIndex() : 0;
+}
+
+void CTaskListPanel::RestoreTaskTab(int a_iIndex) {
+    if (m_pTab != nullptr && (a_iIndex == 0 || a_iIndex == 1)) {
+        m_pTab->setCurrentIndex(a_iIndex);
     }
 }
 
@@ -354,7 +400,9 @@ void CTaskListPanel::UpdateButtons() {
         m_pBtnStart->setEnabled(false);
         m_pBtnPause->setEnabled(false);
         m_pBtnStop->setEnabled(false);
-        m_pBtnRollback->setEnabled(false);   // FR-6 无当前任务：禁用回退
+        // 2026.08.26 无当前任务也可回退：空选择 → OnRollback 落工程全局档（v1.2.55
+        //   菜单入口同语义；此处让按钮与菜单一致，取消选择不再断掉回退入口）。
+        m_pBtnRollback->setEnabled(true);
         return;
     }
 

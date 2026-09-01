@@ -33,17 +33,26 @@ public:
     int SelectedSeq() const { return m_pSelected ? m_pSelected->iSeq : -1; }
 
 protected:
-    void hideEvent(QHideEvent* a_pEvent) override;   // 统一持久化列宽/分割条/几何
+    void hideEvent(QHideEvent* a_pEvent) override;   // 统一持久化窗口/分割条/列宽
+    // 2026.08.28 布局激活后刷新冻结值：构造期（未显示）sizes() 是 sizeHint 级假值
+    //   （旧版曾把 71/170 这种未激活值存档，恢复后分割条不可用）；首次显示/
+    //   窗口 resize 后的真实分配才是该冻结的布局，点选记录点不再弹回旧位置。
+    void showEvent(QShowEvent* a_pEvent) override;
+    void resizeEvent(QResizeEvent* a_pEvent) override;
 
 private slots:
     void OnSelectionChanged();
-    void OnCellDoubleClicked(int a_iRow, int a_iCol);
+    // 2026.08.24 文件列表右键菜单（「查看变更」）。
+    void OnFilesContextMenu(const QPoint& a_pos);
+    void OnFilesCellDoubleClicked(int a_iRow, int a_iCol);
 
 private:
     void BuildUi();
     void LoadData();
     void FillVersionTable();
     void FillFilesTable(int a_iRow);
+    // 2026.08.24 弹出双栏对比（CDiffViewDialog）：读两个记录点中该文件的内容。
+    void ShowFileDiff(int a_iRow);
     void SaveLayoutState();
     void RestoreLayoutState();
     // kind 派生显示（§5.3）。
@@ -57,6 +66,7 @@ private:
     QList<SBackupVersion> m_aVersions;             // 倒序（最新在前）
     bool m_bLayoutSaved = false;   // 2026.08.22 hide/析构双路径防重复写盘
     QMap<int, SDiffResult> m_aDiffBySeq;           // seq → 相对上一记录点的 diff
+    QList<SDiffEntry>      m_aShownEntries;        // 2026.08.24 右表当前展示的 diff 条目（排序后，行号对齐）
     const SBackupVersion* m_pSelected = nullptr;
 
     QLabel*      m_pLblSummary = nullptr;

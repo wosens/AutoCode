@@ -10,6 +10,7 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -24,6 +25,7 @@
 #include <QHeaderView>
 #include <QProcess>
 #include <QProgressDialog>
+#include <QScreen>
 #include <QVBoxLayout>
 
 #include <windows.h>
@@ -33,6 +35,21 @@
 #include "CProjectManager.h"
 #include "CCodexRunner.h"
 #include "CPiAgentRunner.h"
+
+// 2026.08.27 几何在屏校验（口径同 CMainWindow::IsGeometryOnScreen）：与任一屏幕的
+//   可用区（排除任务栏）相交即视为在屏——换显示器/改分辨率后的陈旧坐标丢弃。
+static bool IsGeoOnScreen(const QRect& a_stGeo) {
+    if (!a_stGeo.isValid() || a_stGeo.width() <= 0 || a_stGeo.height() <= 0) {
+        return false;
+    }
+    const QList<QScreen*> aScreens = QGuiApplication::screens();
+    for (const QScreen* pSc : aScreens) {
+        if (pSc != nullptr && pSc->availableGeometry().intersects(a_stGeo)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // 2026.08.18 自定义大模型条目编辑对话框（无 Q_OBJECT：纯表单 + exec/lambda 连接，
 //   不进 moc/构建系统）。校验：模型 ID / 接入点必填（空则拦截 accept 并提示）；
@@ -45,13 +62,15 @@ public:
     // a_bCodex = true → CodexHarness 条目模式（2026.08.21：API 格式下拉换成
     //   wire_api（chat/responses），默认 chat；密钥落点 ~/.codex）。
     explicit CDshModelEditDialog(QWidget* a_pParent, const SDshModelEntry* a_pEntry,
-                                 bool a_bPi = false, bool a_bCodex = false)
+                                 bool a_bPi = false, bool a_bCodex = false,
+                                 bool a_bCopy = false)
         : QDialog(a_pParent) {
         m_bCodex = a_bCodex;
         const QString sTail = a_bCodex ? QStringLiteral("（CodexHarness）")
                          : a_bPi ? QStringLiteral("（PiAgent）") : QString();
-        setWindowTitle((a_pEntry != nullptr ? QStringLiteral("编辑自定义模型")
-                                            : QStringLiteral("新增自定义模型")) + sTail);
+        setWindowTitle((a_bCopy ? QStringLiteral("复制自定义模型")
+                       : (a_pEntry != nullptr ? QStringLiteral("编辑自定义模型")
+                                              : QStringLiteral("新增自定义模型"))) + sTail);
         setMinimumWidth(460);
         auto* pForm = new QFormLayout(this);
         m_pEditDisp = new QLineEdit(this);
@@ -179,8 +198,10 @@ private:
     bool       m_bCodex     = false;   // 2026.08.21 Codex 条目模式（wire_api 下拉/默认值）
 };
 
-CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent)
-    : QDialog(a_pParent) {
+CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
+                                 CVersionDialog::FBusyCheck a_fnBackendBusy)
+    : QDialog(a_pParent), m_fnBackendBusy(std::move(a_fnBackendBusy)) {
+    m_pPm = a_pPm;   // 2026.08.27 几何持久化用（done() 落盘）；非拥有。
     SetupUi();
 
     // 构造时回填当前值（a_pPm 为空 → 全默认，仅调试/极端场景）。
@@ -194,6 +215,7 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent)
     const bool bDefWeb = (a_pPm != nullptr) ? a_pPm->LoadWebSearch() : true;
     const int iDefPct = (a_pPm != nullptr) ? a_pPm->LoadAutoCompactPct() : 75;
     const qint64 iDefCtx = (a_pPm != nullptr) ? a_pPm->LoadAdhocContextLimit() : 0;
+    const bool bDefExpert = (a_pPm != nullptr) ? a_pPm->LoadExpertAssistant() : true;
     const QString sDefScan = (a_pPm != nullptr) ? a_pPm->LoadScanExcludeDirs() : QString();
     const QString sDefBackup = (a_pPm != nullptr) ? a_pPm->LoadBackupExcludeDirs() : QString();
     // 2026.08.18 Agent 后端 + DSH 参数回填（默认 1=claude；路径空=未配置）。
@@ -290,6 +312,7 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent)
     m_pEditClaudeCmd->setText(sDefCmd);
     m_pSpinAskTimeout->setValue(iDefAskTimeout);
     m_pChkWebSearch->setChecked(bDefWeb);
+    m_pChkExpertAssistant->setChecked(bDefExpert);
     m_pSpinCompactPct->setValue(iDefPct);
     // 上下文上限以「千 token」展示更友好：内部 0=自动；展示 0 也表示自动（suffix 提示）。
     m_pSpinCtxLimit->setValue(
@@ -300,6 +323,36 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent)
     m_aDshModels = (a_pPm != nullptr) ? a_pPm->LoadDshModels(&m_iDshActiveModel)
                                       : QList<SDshModelEntry>();
     RefreshDshModelList();
+
+    // 2026.08.27 窗口几何：优先恢复上次保存的（[SettingsWindow]）；无记录/已出屏则用
+    //   默认尺寸。默认取 sizeHint（含最高页签的完整内容）夹在父窗口所在屏工作区 95% 内——
+    //   QDialog::exec 的 adjustSize 会把窗口夹到屏幕 2/3，PiAgent 页内容较高时窗口被
+    //   压到布局最小尺寸以下，出现按钮行叠进大模型列表（本次修复目标）。
+    QRect stGeo;
+    if (m_pPm != nullptr && m_pPm->LoadSettingsDialogGeometry(stGeo)
+        && IsGeoOnScreen(stGeo)) {
+        setGeometry(stGeo);   // 尺寸小于布局最小值时 Qt 自动钳位到最小，安全
+    } else {
+        QSize szDef = sizeHint();
+        const QScreen* pSc = (parentWidget() != nullptr && parentWidget()->screen() != nullptr)
+                                 ? parentWidget()->screen()
+                                 : QGuiApplication::primaryScreen();
+        if (pSc != nullptr) {
+            const QRect rcWork = pSc->availableGeometry();
+            szDef = szDef.boundedTo(QSize(rcWork.width() * 95 / 100,
+                                          rcWork.height() * 95 / 100));
+        }
+        resize(szDef.expandedTo(QSize(620, 460)));
+    }
+}
+
+void CSettingsDialog::done(int a_r) {
+    // 2026.08.27 几何落盘：accept / reject / 标题栏 X 关闭（触发 reject）都经 done()，
+    //   在此统一保存；失败静默（下次用默认几何，不影响功能）。
+    if (m_pPm != nullptr) {
+        m_pPm->SaveSettingsDialogGeometry(geometry());
+    }
+    QDialog::done(a_r);
 }
 
 void CSettingsDialog::SetupUi() {
@@ -361,6 +414,16 @@ void CSettingsDialog::SetupUi() {
         "关闭后所有阶段的 --disallowedTools 追加 WebSearch、WebFetch（离线/内网环境用；[Agent] WebSearch）。\n"
         "仅 Claude Code 后端生效（DSH 侧忽略该参数，该项禁用）"));
     pFormAgent->addRow(QString(), m_pChkWebSearch);
+
+    // 2026.09 后端版本管理入口（任务 23183ccb）：四后端当前/最新版本与更新一站式；
+    //   与主窗功能菜单同源（D6 判据由 CMainWindow 注入透传）。
+    auto* pBtnVersion = new QPushButton(
+        QStringLiteral("后端版本管理…"), pGroupAgent);
+    pBtnVersion->setToolTip(QStringLiteral(
+        "查看四 Agent 后端（Claude Code/DSH/PIAgent/Codex）当前版本与远端最新版，\n"
+        "并提供各自更新入口（结果仅本次会话有效，不落盘）"));
+    connect(pBtnVersion, &QPushButton::clicked, this, &CSettingsDialog::OnVersionManage);
+    pFormAgent->addRow(QString(), pBtnVersion);
 
     // —— DeepSeekHarness 参数（后端选中 DSH 时才可用）——
     // 2026.08.18 轻量自动配置：路径收敛为两行——node（留空走 PATH）+ DSH 根目录
@@ -456,15 +519,22 @@ void CSettingsDialog::SetupUi() {
     m_pSpinCtxLimit->setToolTip(QStringLiteral(
         "助手上下文窗口上限（千 token）；0=按模型自动探测（[Adhoc] ContextLimit）"));
     pFormReview->addRow(QStringLiteral("上下文窗口上限："), m_pSpinCtxLimit);
+    // 2026.08.26 专家助手开关：启用后助手提交改码提示词时自动验证（编译/测试）并回注重试。
+    m_pChkExpertAssistant = new QCheckBox(QStringLiteral("启用专家助手"), pGroupReview);
+    m_pChkExpertAssistant->setToolTip(QStringLiteral(
+        "启用后，助手提交改码类提示词时自动执行编译/测试验证，失败自动回注重试（上限 3 次）；\n"
+        "禁用则回到纯对话模式，验证由人工完成（[Adhoc] ExpertAssistant，默认启用）"));
+    pFormReview->addRow(QString(), m_pChkExpertAssistant);
 
     // —— 目录排除 ——
     auto* pGroupDirs = new QGroupBox(QStringLiteral("目录排除"), this);
     auto* pFormDirs = new QFormLayout(pGroupDirs);
     m_pEditScanDirs = new QLineEdit(pGroupDirs);
-    m_pEditScanDirs->setPlaceholderText(QStringLiteral(
-        ".autodev,build,Execute,.git,.vs,node_modules,doc"));
+    m_pEditScanDirs->setPlaceholderText(QStringLiteral(".autodev"));
     m_pEditScanDirs->setToolTip(QStringLiteral(
-        "guide 指纹扫描排除的目录名，逗号分隔；留空 = 内置默认（[Scan] ExcludeDirs）"));
+        "guide 指纹扫描额外排除的目录名，逗号分隔；留空 = 内置默认。"
+        "内置规则：隐藏文件/文件夹（'.' 开头，含 .git/.vs）始终排除，不可关闭；"
+        ".autodev 正常扫描，仅指纹表自身 guide.md 不参与比对（防自我变更死循环）"));
     pFormDirs->addRow(QStringLiteral("指纹扫描排除："), m_pEditScanDirs);
     m_pEditBackupDirs = new QLineEdit(pGroupDirs);
     m_pEditBackupDirs->setPlaceholderText(QStringLiteral(
@@ -558,7 +628,7 @@ void CSettingsDialog::SetupUi() {
     QFont fntModelsHdr = pHdrModels->font();
     fntModelsHdr.setPointSize(11);
     pHdrModels->setFont(fntModelsHdr);
-    m_pTreeDshModels->setMinimumHeight(150);
+    m_pTreeDshModels->setMinimumHeight(120);
     m_pTreeDshModels->setToolTip(QStringLiteral(
         "自定义模型条目（配置随程序走，存 exe 同级 config.ini 的 [DshModels] 节）。\n"
         "「当前」列打 ● 的条目生效，忽略上方 Provider/模型（组合改走 autocode-active\n"
@@ -575,6 +645,11 @@ void CSettingsDialog::SetupUi() {
     m_pBtnModelAdd = new QPushButton(QStringLiteral("新增…"), pRowModelBtns);
     m_pBtnModelAdd->setToolTip(QStringLiteral("新增一个自定义模型条目（对话框编辑各项后加入列表）"));
     connect(m_pBtnModelAdd, &QPushButton::clicked, this, [this]() { OnDshModelAdd(); });
+    m_pBtnModelCopy = new QPushButton(QStringLiteral("复制…"), pRowModelBtns);
+    m_pBtnModelCopy->setToolTip(QStringLiteral(
+        "复制选中条目：预填编辑对话框（显示名加“-副本”，可改），确认后追加到列表末尾——"
+        "适合在同一网关下快速建多个模型"));
+    connect(m_pBtnModelCopy, &QPushButton::clicked, this, [this]() { OnDshModelCopy(); });
     m_pBtnModelEdit = new QPushButton(QStringLiteral("编辑…"), pRowModelBtns);
     m_pBtnModelEdit->setToolTip(QStringLiteral("编辑选中条目（双击条目同效）"));
     connect(m_pBtnModelEdit, &QPushButton::clicked, this, [this]() { OnDshModelEdit(); });
@@ -586,6 +661,7 @@ void CSettingsDialog::SetupUi() {
         "将选中条目设为当前生效模型（再点一次取消，回上方 Provider/模型固定路由）"));
     connect(m_pBtnModelActive, &QPushButton::clicked, this, [this]() { OnDshModelSetActive(); });
     pLayModelBtns->addWidget(m_pBtnModelAdd);
+    pLayModelBtns->addWidget(m_pBtnModelCopy);
     pLayModelBtns->addWidget(m_pBtnModelEdit);
     pLayModelBtns->addWidget(m_pBtnModelDel);
     pLayModelBtns->addWidget(m_pBtnModelActive);
@@ -756,7 +832,7 @@ void CSettingsDialog::SetupUi() {
     QFont fntPiModelsHdr = pHdrPiModels->font();
     fntPiModelsHdr.setPointSize(11);
     pHdrPiModels->setFont(fntPiModelsHdr);
-    m_pTreePiModels->setMinimumHeight(150);
+    m_pTreePiModels->setMinimumHeight(120);
     m_pTreePiModels->setToolTip(QStringLiteral(
         "自定义模型条目（正本存 exe 同级 config.ini 的 [PiModels] 节，确定保存时合成写\n"
         "~/.pi/agent/models.json 的 autocode-<n> provider 槽位）。\n"
@@ -772,6 +848,11 @@ void CSettingsDialog::SetupUi() {
     m_pBtnPiModelAdd = new QPushButton(QStringLiteral("新增…"), pRowPiModelBtns);
     m_pBtnPiModelAdd->setToolTip(QStringLiteral("新增一个自定义模型条目（对话框编辑各项后加入列表）"));
     connect(m_pBtnPiModelAdd, &QPushButton::clicked, this, [this]() { OnPiModelAdd(); });
+    m_pBtnPiModelCopy = new QPushButton(QStringLiteral("复制…"), pRowPiModelBtns);
+    m_pBtnPiModelCopy->setToolTip(QStringLiteral(
+        "复制选中条目：预填编辑对话框（显示名加“-副本”，可改），确认后追加到列表末尾——"
+        "适合在同一网关下快速建多个模型"));
+    connect(m_pBtnPiModelCopy, &QPushButton::clicked, this, [this]() { OnPiModelCopy(); });
     m_pBtnPiModelEdit = new QPushButton(QStringLiteral("编辑…"), pRowPiModelBtns);
     m_pBtnPiModelEdit->setToolTip(QStringLiteral("编辑选中条目（双击条目同效）"));
     connect(m_pBtnPiModelEdit, &QPushButton::clicked, this, [this]() { OnPiModelEdit(); });
@@ -783,6 +864,7 @@ void CSettingsDialog::SetupUi() {
         "将选中条目设为当前生效模型（再点一次取消，回上方 Provider/模型固定路由）"));
     connect(m_pBtnPiModelActive, &QPushButton::clicked, this, [this]() { OnPiModelSetActive(); });
     pLayPiModelBtns->addWidget(m_pBtnPiModelAdd);
+    pLayPiModelBtns->addWidget(m_pBtnPiModelCopy);
     pLayPiModelBtns->addWidget(m_pBtnPiModelEdit);
     pLayPiModelBtns->addWidget(m_pBtnPiModelDel);
     pLayPiModelBtns->addWidget(m_pBtnPiModelActive);
@@ -940,7 +1022,7 @@ void CSettingsDialog::SetupUi() {
     QFont fntCodexModelsHdr = pHdrCodexModels->font();
     fntCodexModelsHdr.setPointSize(11);
     pHdrCodexModels->setFont(fntCodexModelsHdr);
-    m_pTreeCodexModels->setMinimumHeight(150);
+    m_pTreeCodexModels->setMinimumHeight(120);
     m_pTreeCodexModels->setToolTip(QStringLiteral(
         "自定义模型条目（正本存 exe 同级 config.ini 的 [CodexModels] 节，确定保存时合成写\n"
         "~/.codex 的 config.toml autocode-<n> provider 槽位与 auth.json）。\n"
@@ -958,6 +1040,11 @@ void CSettingsDialog::SetupUi() {
     m_pBtnCodexModelAdd->setToolTip(QStringLiteral(
         "新增一个自定义模型条目（对话框编辑各项后加入列表）"));
     connect(m_pBtnCodexModelAdd, &QPushButton::clicked, this, [this]() { OnCodexModelAdd(); });
+    m_pBtnCodexModelCopy = new QPushButton(QStringLiteral("复制…"), pRowCodexModelBtns);
+    m_pBtnCodexModelCopy->setToolTip(QStringLiteral(
+        "复制选中条目：预填编辑对话框（显示名加“-副本”，可改），确认后追加到列表末尾——"
+        "适合在同一网关下快速建多个模型"));
+    connect(m_pBtnCodexModelCopy, &QPushButton::clicked, this, [this]() { OnCodexModelCopy(); });
     m_pBtnCodexModelEdit = new QPushButton(QStringLiteral("编辑…"), pRowCodexModelBtns);
     m_pBtnCodexModelEdit->setToolTip(QStringLiteral("编辑选中条目（双击条目同效）"));
     connect(m_pBtnCodexModelEdit, &QPushButton::clicked, this, [this]() { OnCodexModelEdit(); });
@@ -971,6 +1058,7 @@ void CSettingsDialog::SetupUi() {
     connect(m_pBtnCodexModelActive, &QPushButton::clicked,
             this, [this]() { OnCodexModelSetActive(); });
     pLayCodexModelBtns->addWidget(m_pBtnCodexModelAdd);
+    pLayCodexModelBtns->addWidget(m_pBtnCodexModelCopy);
     pLayCodexModelBtns->addWidget(m_pBtnCodexModelEdit);
     pLayCodexModelBtns->addWidget(m_pBtnCodexModelDel);
     pLayCodexModelBtns->addWidget(m_pBtnCodexModelActive);
@@ -1107,6 +1195,7 @@ void CSettingsDialog::RefreshDshModelList() {
     const bool bHasSel = (iRow >= 0 && iRow < m_aDshModels.size());
     const bool bEnabled = m_pTreeDshModels->isEnabled();   // 组级开关（UpdateDshEnabled 已设）
     if (m_pBtnModelAdd != nullptr)  { m_pBtnModelAdd->setEnabled(bEnabled); }
+    if (m_pBtnModelCopy != nullptr) { m_pBtnModelCopy->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnModelEdit != nullptr) { m_pBtnModelEdit->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnModelDel != nullptr)  { m_pBtnModelDel->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnModelActive != nullptr) {
@@ -1136,6 +1225,27 @@ void CSettingsDialog::OnDshModelAdd() {
             m_pTreeDshModels->topLevelItem(m_pTreeDshModels->topLevelItemCount() - 1));
     }
     UpdateDshEnabled();   // 按钮态 +（当前条目变化时的）Provider/模型置灰联动
+}
+
+// 2026.08.27 复制选中条目：预填编辑对话框（显示名加“-副本”可改），确认后追加末尾。
+void CSettingsDialog::OnDshModelCopy() {
+    const int iRow = CurDshModelRow();
+    if (iRow < 0 || iRow >= m_aDshModels.size()) {
+        return;   // 空表占位行 / 无选中
+    }
+    SDshModelEntry stCopy = m_aDshModels.at(iRow);
+    stCopy.sDisp += QStringLiteral("-副本");
+    CDshModelEditDialog dlg(this, &stCopy, false, false, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aDshModels.append(dlg.Entry());
+    RefreshDshModelList();
+    if (m_pTreeDshModels->topLevelItemCount() > 0) {
+        m_pTreeDshModels->setCurrentItem(
+            m_pTreeDshModels->topLevelItem(m_pTreeDshModels->topLevelItemCount() - 1));
+    }
+    UpdateDshEnabled();
 }
 
 void CSettingsDialog::OnDshModelEdit() {
@@ -1195,8 +1305,13 @@ void CSettingsDialog::DetectDshInstalled(bool a_bSilent) {
     m_bDshInstalled = !sRoot.isEmpty() && CDeepSeekRunner::LooksLikeDshRoot(sRoot);
     if (m_pLblDshState != nullptr) {
         if (m_bDshInstalled) {
+            // FR-1.3：状态行在「安装状态+路径」基础上追加版本（T1 现成 API，
+            //   读不出→版本未知；空→不回退，口径同对话框「未知」）。
+            const QString sVer = CDeepSeekRunner::ResolveDshVersion(sRoot);
             m_pLblDshState->setText(QStringLiteral("已安装：")
-                + QDir::toNativeSeparators(sRoot));
+                + QDir::toNativeSeparators(sRoot)
+                + (sVer.isEmpty() ? QStringLiteral("，版本未知")
+                                  : QStringLiteral("，版本 %1").arg(sVer)));
             m_pLblDshState->setStyleSheet(QStringLiteral("color: #1a7f37;"));
         } else {
             m_pLblDshState->setText(QStringLiteral(
@@ -1250,6 +1365,13 @@ void CSettingsDialog::OnInstallDsh() {
                        "窗口出现「[OK] DeepSeekHarness 安装完成」才算装好（出现 [错误] "
                        "按提示处理后重跑，可续装）；完成后回到本页点「重新检测」，"
                        "检测通过即可选用该后端（根目录自动填入，无需手填）。"));
+}
+
+void CSettingsDialog::OnVersionManage() {
+    // 独立对话框（D1=B）：本地版本直读 + 联网查询 + 更新分派；D6 判据由主窗
+    //   构造时注入透传（空=放行）。
+    CVersionDialog stDlg(m_fnBackendBusy, this);
+    stDlg.exec();
 }
 
 void CSettingsDialog::UpdatePiEnabled() {
@@ -1335,6 +1457,7 @@ void CSettingsDialog::RefreshPiModelList() {
     const bool bHasSel = (iRow >= 0 && iRow < m_aPiModels.size());
     const bool bEnabled = m_pTreePiModels->isEnabled();
     if (m_pBtnPiModelAdd != nullptr)  { m_pBtnPiModelAdd->setEnabled(bEnabled); }
+    if (m_pBtnPiModelCopy != nullptr) { m_pBtnPiModelCopy->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnPiModelEdit != nullptr) { m_pBtnPiModelEdit->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnPiModelDel != nullptr)  { m_pBtnPiModelDel->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnPiModelActive != nullptr) {
@@ -1353,6 +1476,27 @@ int CSettingsDialog::CurPiModelRow() const {
 
 void CSettingsDialog::OnPiModelAdd() {
     CDshModelEditDialog dlg(this, nullptr, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aPiModels.append(dlg.Entry());
+    RefreshPiModelList();
+    if (m_pTreePiModels->topLevelItemCount() > 0) {
+        m_pTreePiModels->setCurrentItem(
+            m_pTreePiModels->topLevelItem(m_pTreePiModels->topLevelItemCount() - 1));
+    }
+    UpdatePiEnabled();
+}
+
+// 2026.08.27 复制选中条目（口径同 DSH 页）：预填编辑对话框，确认后追加末尾。
+void CSettingsDialog::OnPiModelCopy() {
+    const int iRow = CurPiModelRow();
+    if (iRow < 0 || iRow >= m_aPiModels.size()) {
+        return;
+    }
+    SDshModelEntry stCopy = m_aPiModels.at(iRow);
+    stCopy.sDisp += QStringLiteral("-副本");
+    CDshModelEditDialog dlg(this, &stCopy, true, false, true);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
@@ -1449,11 +1593,23 @@ void CSettingsDialog::DetectPiInstalled(bool a_bSilent) {
     }
     if (m_pLblPiState != nullptr) {
         if (m_bPiInstalled && !sNpmCli.isEmpty()) {
-            m_pLblPiState->setText(QStringLiteral("已安装 ✓（npm 全局：%1）").arg(sNpmCli));
+            // FR-1.3：npm 分支追加版本（ResolvePiVersion() 按形态自动分派读包；
+            //   读不出→版本未知）。
+            const QString sVer = CPiAgentRunner::ResolvePiVersion();
+            m_pLblPiState->setText(
+                QStringLiteral("已安装 ✓（npm 全局：%1，%2）")
+                    .arg(sNpmCli,
+                         sVer.isEmpty() ? QStringLiteral("版本未知")
+                                        : QStringLiteral("版本 %1").arg(sVer)));
             m_pLblPiState->setStyleSheet(QStringLiteral("color: green;"));
         } else if (m_bPiInstalled) {
-            m_pLblPiState->setText(QStringLiteral("已安装 ✓（%1）").arg(
-                QDir::toNativeSeparators(sRoot)));
+            // FR-1.3：root 分支追加版本（显式根直读，读不到不回退）。
+            const QString sVer = CPiAgentRunner::ResolvePiVersion(sRoot);
+            m_pLblPiState->setText(
+                QStringLiteral("已安装 ✓（%1，%2）")
+                    .arg(QDir::toNativeSeparators(sRoot),
+                         sVer.isEmpty() ? QStringLiteral("版本未知")
+                                        : QStringLiteral("版本 %1").arg(sVer)));
             m_pLblPiState->setStyleSheet(QStringLiteral("color: green;"));
         } else if (!sRoot.isEmpty()) {
             m_pLblPiState->setText(QStringLiteral("安装未完成：目录存在但缺 pi\\packages\\"
@@ -1647,6 +1803,10 @@ int CSettingsDialog::PiActiveModel() const {
 
 bool CSettingsDialog::WebSearch() const {
     return m_pChkWebSearch->isChecked();
+}
+
+bool CSettingsDialog::ExpertAssistant() const {
+    return (m_pChkExpertAssistant != nullptr) && m_pChkExpertAssistant->isChecked();
 }
 
 int CSettingsDialog::AutoCompactPct() const {
@@ -1883,6 +2043,7 @@ void CSettingsDialog::RefreshCodexModelList() {
     const bool bHasSel = (iRow >= 0 && iRow < m_aCodexModels.size());
     const bool bEnabled = m_pTreeCodexModels->isEnabled();
     if (m_pBtnCodexModelAdd != nullptr)  { m_pBtnCodexModelAdd->setEnabled(bEnabled); }
+    if (m_pBtnCodexModelCopy != nullptr) { m_pBtnCodexModelCopy->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnCodexModelEdit != nullptr) { m_pBtnCodexModelEdit->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnCodexModelDel != nullptr)  { m_pBtnCodexModelDel->setEnabled(bEnabled && bHasSel); }
     if (m_pBtnCodexModelActive != nullptr) {
@@ -1901,6 +2062,27 @@ int CSettingsDialog::CurCodexModelRow() const {
 
 void CSettingsDialog::OnCodexModelAdd() {
     CDshModelEditDialog dlg(this, nullptr, false, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aCodexModels.append(dlg.Entry());
+    RefreshCodexModelList();
+    if (m_pTreeCodexModels->topLevelItemCount() > 0) {
+        m_pTreeCodexModels->setCurrentItem(
+            m_pTreeCodexModels->topLevelItem(m_pTreeCodexModels->topLevelItemCount() - 1));
+    }
+    UpdateCodexEnabled();
+}
+
+// 2026.08.27 复制选中条目（口径同 DSH 页）：预填编辑对话框，确认后追加末尾。
+void CSettingsDialog::OnCodexModelCopy() {
+    const int iRow = CurCodexModelRow();
+    if (iRow < 0 || iRow >= m_aCodexModels.size()) {
+        return;
+    }
+    SDshModelEntry stCopy = m_aCodexModels.at(iRow);
+    stCopy.sDisp += QStringLiteral("-副本");
+    CDshModelEditDialog dlg(this, &stCopy, false, true, true);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }

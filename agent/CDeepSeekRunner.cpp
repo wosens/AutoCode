@@ -184,6 +184,35 @@ QString CDeepSeekRunner::DshInstallDiagnosis() {
                           "克隆可能失败（网络/Git），请查看安装窗口的输出按提示处理后重装。");
 }
 
+// —— 2026.09 版本管理：DSH 本地版本与远端仓屿 URL（头文件注释为准） ——
+
+QString CDeepSeekRunner::ResolveDshVersion(const QString& a_sRoot) {
+    // 读 <root>/package.json 的 version；open 失败/解析错/无 version 字段→空串
+    //   （＝「未知」，JSON 解析样板同 CCodexRunner::ResolveCodexVersion）。
+    const QString sRoot = QDir::fromNativeSeparators(
+        (a_sRoot.isEmpty() ? DshRootPath() : a_sRoot).trimmed());
+    if (sRoot.isEmpty()) {
+        return QString();
+    }
+    QFile stFile(sRoot + QStringLiteral("/package.json"));
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    QJsonParseError stErr;
+    const QJsonDocument oDoc = QJsonDocument::fromJson(stFile.readAll(), &stErr);
+    stFile.close();
+    if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
+        return QString();
+    }
+    return oDoc.object().value(QStringLiteral("version")).toString();
+}
+
+QString CDeepSeekRunner::DshRepoUrl() {
+    // 与 install_env.bat 的 git clone 命令同一 URL（单一口径锚点；bat 侧更新段 fetch
+    //   走 origin 远端不需要它，此处供 C++ 侧 ls-remote 最新版查询/提示共用）。
+    return QStringLiteral("https://github.com/deepseek-ai/deepseek-harness.git");
+}
+
 void CDeepSeekRunner::SetDshNodePath(const QString& a_sPath) {
     s_sDshNodePath = a_sPath.trimmed();
 }
@@ -330,6 +359,8 @@ void CDeepSeekRunner::ResetTurnState() {
     m_sTurnReasonKind.clear();
     m_iSumInTok = 0;
     m_iSumOutTok = 0;
+    m_iLiveEmitIn = 0;    // 2026.08.27 实时计量已发累计复位
+    m_iLiveEmitOut = 0;
     m_iSumPlainInTok = 0;
     m_iSumCacheReadTok = 0;
     m_iSumCacheWriteTok = 0;
@@ -459,10 +490,20 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
             m_iCtxWindow = stM.iCtx;   // 窗口种子（request/context 上报后覆盖）
         }
     }
-    // 技能库目录随用户走（组合 yml 的 customSkillDirs 从这里取；跨机器不再写死路径）。
-    const QString sSkillsDir = QDir::homePath() + QStringLiteral("/.claude/skills");
-    if (QDir(sSkillsDir).exists()) {
-        oEnv.insert(QStringLiteral("DSH_SKILLS_DIR"), QDir::toNativeSeparators(sSkillsDir));
+    // 2026.08.24 便携资产注入（三后端统一口径，见 CAgentRunnerBase 注释）：
+    //   技能目录 = <exe>\skills（便携）+ ~/.claude/skills（存在者），';' 连接经
+    //   DSH_SKILLS_DIRS 传入组合 yml（customSkillDirs 按分隔符拆分）；
+    //   全局规则 = <exe>\CLAUDE.md 或 ~/.claude/CLAUDE.md 内容，经 DSH_GLOBAL_CONTEXT
+    //   并入 persona。全程不向用户主目录写任何文件（便携部署目标）。
+    const QStringList aSkillDirs = CAgentRunnerBase::SharedSkillDirs();
+    if (!aSkillDirs.isEmpty()) {
+        oEnv.insert(QStringLiteral("DSH_SKILLS_DIRS"), aSkillDirs.join(QLatin1Char(';')));
+    }
+    const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
+    if (!sGlobalCtx.isEmpty()) {
+        oEnv.insert(QStringLiteral("DSH_GLOBAL_CONTEXT"), sGlobalCtx);
+        emit sigInfo(QStringLiteral("[system/dsh] 已注入全局规则（%1 字符）")
+                         .arg(QString::number(sGlobalCtx.size())));
     }
     m_pProc->setProcessEnvironment(oEnv);
     m_pProc->setWorkingDirectory(a_sWorkDir);
@@ -789,6 +830,12 @@ void CDeepSeekRunner::HandleSessionEvent(const QJsonObject& oParams) {
             m_iSumPlainInTok += iPlainIn;
             m_iSumCacheReadTok += iCacheRead;
             m_iSumCacheWriteTok += iCacheWrite;
+            // 2026.08.27 逐消息实时计量上抛（本轮 ↑↓ 显示）；收尾 sigFinished 据已发累计报 0 防双计。
+            if (iIn > 0 || iOut > 0) {
+                m_iLiveEmitIn += iIn;
+                m_iLiveEmitOut += iOut;
+                emit sigUsageDelta(iIn, iOut);
+            }
             const qint64 iWinCap = 2 * (m_iCtxWindow > 0
                 ? m_iCtxWindow : CClaudeRunner::ContextWindowForModel(m_sLastModel));
             if (iIn > 0 && iIn != m_iLastContextFill && iIn <= iWinCap) {
@@ -914,7 +961,10 @@ void CDeepSeekRunner::FinishTurn() {
         }
     }
     m_sLastSubtype = sSub;
-    emit sigFinished(bOk, sMsg, m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sSessionId);
+    emit sigFinished(bOk, sMsg,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                     ComputeTurnCost(), m_sSessionId);
     // 2026.08.19 配置热生效：轮次中收到自定义模型变更（RestartForCfgChange 挂的脏标），
     //   本轮已完整送达，落幕后杀旧进程——下一轮以新配置冷启动（免重启 AutoCode）。
     //   两类竞态守卫：①emit 期间编排器已冷启动新代进程（=新配置）→ 不动；②emit 期间
@@ -1064,5 +1114,8 @@ void CDeepSeekRunner::EmitFailed(const QString& a_sMsg) {
         m_pStallTimer->stop();
     }
     emit sigInfo(QStringLiteral("[错误] ") + sMsg);
-    emit sigFinished(false, sMsg, m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sSessionId);
+    emit sigFinished(false, sMsg,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                     ComputeTurnCost(), m_sSessionId);
 }

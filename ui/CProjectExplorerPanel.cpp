@@ -15,7 +15,6 @@
 #include <QMessageBox>
 #include <QClipboard>
 #include <QGuiApplication>
-#include <QDesktopServices>
 #include <QUrl>
 #include <QModelIndex>
 #include <QFont>
@@ -25,13 +24,34 @@
 #include <QSet>
 #include <QRegularExpression>
 #include <QProcessEnvironment>
+#include <QApplication>
+#include <QMouseEvent>
+#include <QDrag>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QMimeData>
+#include <QList>
+#include <QUrl>
+
+// 2026.08.28 非文本文件的系统打开改走 ShellExecuteW（显式传工作目录，对齐
+//   Windows 资源管理器双击口径）；同项目其他文件，NOMINMAX 防 min/max 宏污染。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>   // ShellExecuteW（本翻译单元 windows.h 未带入，显式包含）
 
 const QStringList& CProjectExplorerPanel::HiddenDirs() {
     // Q1 默认：隐藏常见生成目录（后续可由 FR-8 设置调）。
     // 生效方式：rowsInserted 钩子 → HideGeneratedDirs 逐行隐藏（2026-08-17 接通，此前未挂接）。
+    // 2026.08.26：.autodev 移出隐藏清单（用户要求可见：任务目录/record 等需要浏览）。
+    // 2026.08.27：Execute 移出隐藏清单（用户要求可见：部署产物/config.ini/prompts/
+    //   help 等常需浏览拷贝；它与备份排除 [Backup] ExcludeDirs 是两回事，互不影响）。
     static const QStringList s_aHidden {
-        QStringLiteral(".autodev"), QStringLiteral("build"),
-        QStringLiteral("Execute"), QStringLiteral(".git"),
+        QStringLiteral("build"),
+        QStringLiteral(".git"),
+        QStringLiteral(".vs"),
         QStringLiteral("node_modules")
     };
     return s_aHidden;
@@ -70,11 +90,14 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
     pV->setSpacing(0);
 
     m_pModel = new QFileSystemModel(this);
-    m_pModel->setFilter(QDir::AllDirs | QDir::Files | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+    m_pModel->setFilter(QDir::AllDirs | QDir::Files | QDir::NoDotAndDotDot |
+                        QDir::NoSymLinks | QDir::Hidden);
     // 文件不做类型过滤、全部显示（2026-08-17 修正：旧 setNameFilters(*.o 等)+
     // setNameFilterDisables(false) 的真实语义是「只显示匹配项」，曾导致源码/文档
-    // 全部被隐藏、树里只剩构建产物，与意图相反）。生成目录（build/Execute/.git 等）
+    // 全部被隐藏、树里只剩构建产物，与意图相反）。生成目录（build/.git 等）
     // 仍由 HiddenDirs 按目录整体隐藏。
+    // 2026.08.26 补 QDir::Hidden：否则点开头的目录/文件（.autodev 等）在模型层就不出现，
+    // HiddenDirs 丬不到行可隐藏/显示；.git/.vs 等仍由 HiddenDirs 名单按目录隐藏。
 
     m_pTree = new QTreeView(this);
     m_pTree->setModel(m_pModel);
@@ -93,6 +116,13 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
         m_pTree->setColumnHidden(iCol, true);
     }
     m_pTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    // 2026.08.27 拖拽（Windows 资源管理器式）：多选 + 拖出（urls→CF_HDROP，可拖到
+    // 系统资源管理器/聊天软件发送框）+ 拖入/树内拖动（移动/复制）。拖拽事件
+    // 目标是 viewport，统一在 eventFilter 处理并消耗，绕开 QAbstractItemView
+    // 内建 DnD（那套走 model 插行，QFileSystemModel 不适用）。
+    m_pTree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_pTree->setAcceptDrops(true);   // QAbstractScrollArea 自动转发到 viewport
+    m_pTree->viewport()->installEventFilter(this);
     connect(m_pTree, &QTreeView::customContextMenuRequested,
             this, &CProjectExplorerPanel::OnCustomContextMenu);
     connect(m_pTree, &QTreeView::doubleClicked,
@@ -102,7 +132,7 @@ CProjectExplorerPanel::CProjectExplorerPanel(QWidget* a_pParent)
     connect(m_pTree, &QTreeView::clicked,
             this, &CProjectExplorerPanel::OnSingleClicked);
     // 父目录行随模型异步陆续插入：新到的兄弟行若非工程根则继续隐藏（见 SetRoot）；
-    // 同时做目录级隐藏——命中 HiddenDirs 清单的目录（build/Execute/.git 等）整棵不显示。
+    // 同时做目录级隐藏——命中 HiddenDirs 清单的目录（build/.git 等）整棵不显示。
     connect(m_pModel, &QFileSystemModel::rowsInserted, this,
             [this](const QModelIndex& a_stParent, int a_iFirst, int a_iLast) {
         HideGeneratedDirs(a_stParent, a_iFirst, a_iLast);
@@ -276,7 +306,7 @@ void CProjectExplorerPanel::OnDoubleClicked(const QModelIndex& a_stIdx) {
         emit sigFileOpen(sPath, /*a_bSwitchTab=*/true);
         return;
     }
-    QDesktopServices::openUrl(QUrl::fromLocalFile(sPath));
+    OpenWithShell(sPath);
 }
 
 void CProjectExplorerPanel::OnSingleClicked(const QModelIndex& a_stIdx) {
@@ -299,7 +329,246 @@ void CProjectExplorerPanel::OnSingleClicked(const QModelIndex& a_stIdx) {
         emit sigFileOpen(sPath, /*a_bSwitchTab=*/false);
         return;
     }
-    QDesktopServices::openUrl(QUrl::fromLocalFile(sPath));
+    OpenWithShell(sPath);
+}
+
+void CProjectExplorerPanel::OpenWithShell(const QString& a_sAbsPath) {
+    // 2026.08.28 对齐 Windows 资源管理器双击口径：ShellExecuteW 显式传
+    //   lpDirectory=文件所在目录。此前走 QDesktopServices::openUrl，其内部
+    //   ShellExecute 的目录参数为 NULL → 子进程继承 AutoCode 的当前工作目录
+    //   （Execute\ 等）而非 exe 自己的文件夹——用相对路径读资源/配置的程序
+    //   （游戏/便携软件常见）启动即找不到文件退出，表现为「点了没反应」，
+    //   而在系统资源管理器双击同一 exe 正常（实测两种口径子进程 cwd 差异
+    //   确认：NULL 目录=继承调用方 cwd；传目录=exe 所在目录）。
+    //   附带收益：失败（返回值≤32）弹窗可见真因，旧 openUrl 只写调试输出。
+    const QString sNative = QDir::toNativeSeparators(a_sAbsPath);
+    const QString sDir = QDir::toNativeSeparators(
+        QFileInfo(a_sAbsPath).absolutePath());
+    const HINSTANCE hInst = ShellExecuteW(
+        nullptr, nullptr,
+        reinterpret_cast<LPCWSTR>(sNative.utf16()),
+        nullptr,
+        reinterpret_cast<LPCWSTR>(sDir.utf16()),
+        SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(hInst) <= 32) {
+        QMessageBox::warning(this, QStringLiteral("打开失败"),
+            QStringLiteral("无法用系统默认程序打开（错误码 %1）：\n%2")
+                .arg(QString::number(reinterpret_cast<INT_PTR>(hInst)))
+                .arg(sNative));
+    }
+}
+
+QString CProjectExplorerPanel::UniqueDstPath(const QString& a_sPath) {
+    // 目标同名自动加 " (n)" 序号（n 从 2 递增），全部撞名返回空串（调用方按失败计）。
+    const QFileInfo stFi(a_sPath);
+    const QDir stDir(stFi.absolutePath());
+    const QString sBase = stFi.completeBaseName();
+    const QString sSuffix = stFi.suffix();
+    for (int i = 2; i < 1000; ++i) {
+        const QString sCand = sSuffix.isEmpty()
+            ? QStringLiteral("%1 (%2)").arg(sBase).arg(i)
+            : QStringLiteral("%1 (%2).%3").arg(sBase).arg(i).arg(sSuffix);
+        const QString sFull = stDir.filePath(sCand);
+        if (!QFileInfo::exists(sFull)) {
+            return sFull;
+        }
+    }
+    return QString();
+}
+
+void CProjectExplorerPanel::StartTreeDrag() {
+    // 拖出（源）：按下项 + 树内已多选项 → QMimeData::setUrls。Windows 平台 Qt 自动
+    // 把 urls 转成 CF_HDROP OLE 数据源：拖到系统资源管理器=复制/移动文件，
+    // 拖到聊天软件发送框=作为附件，与从 Windows 资源管理器拖出的行为一致。
+    QModelIndexList aIdx = m_pTree->selectionModel()->selectedRows(0);
+    if (!aIdx.contains(QModelIndex(m_stDragIdx))) {
+        aIdx.clear();
+        aIdx << QModelIndex(m_stDragIdx);
+    }
+    QList<QUrl> aUrls;
+    for (const QModelIndex& stIdx : aIdx) {
+        const QString sPath = m_pModel->filePath(stIdx);
+        if (IsUnderRoot(sPath)) {
+            aUrls << QUrl::fromLocalFile(sPath);
+        }
+    }
+    if (aUrls.isEmpty()) {
+        return;
+    }
+    auto* pMime = new QMimeData;
+    pMime->setUrls(aUrls);
+    QDrag stDrag(this);
+    stDrag.setMimeData(pMime);
+    const QIcon stIcon = m_pModel->fileIcon(QModelIndex(m_stDragIdx));
+    if (!stIcon.isNull()) {
+        stDrag.setPixmap(stIcon.pixmap(16, 16));
+    }
+    // exec 是模态循环；目标在外部移走文件（同盘 Move）时 QFileSystemModel 的
+    // 目录监视会自动刷新树，返回值无需再处理。
+    stDrag.exec(Qt::CopyAction | Qt::MoveAction, Qt::CopyAction);
+}
+
+void CProjectExplorerPanel::HandleTreeDrop(QDropEvent* a_pEv) {
+    // 拖入（目标）：落点目录判定——命中目录=其内部；命中文件=所在目录；
+    // 空白=工程根。内部拖动默认移动（资源管理器同盘语义，Ctrl=复制），
+    // 外部（系统资源管理器等）拖入=复制。同名目标自动 " (n)" 编号。
+    const QMimeData* pMime = a_pEv->mimeData();
+    if (m_sRootDir.isEmpty() || pMime == nullptr || !pMime->hasUrls()) {
+        a_pEv->ignore();
+        return;
+    }
+    QString sDstDir;
+    const QModelIndex stIdx = m_pTree->indexAt(a_pEv->position().toPoint());
+    if (stIdx.isValid() && m_pModel->isDir(stIdx)) {
+        sDstDir = m_pModel->filePath(stIdx);
+    } else if (stIdx.isValid()) {
+        sDstDir = QFileInfo(m_pModel->filePath(stIdx)).absolutePath();
+    } else {
+        sDstDir = m_sRootDir;
+    }
+    if (!IsUnderRoot(sDstDir)) {
+        a_pEv->ignore();
+        return;
+    }
+    const bool bInternal = (a_pEv->source() == this);
+    const bool bMove = bInternal
+        && !(a_pEv->modifiers() & Qt::ControlModifier);
+    int iDone = 0, iFailed = 0;
+    QStringList aFailed;
+    for (const QUrl& stUrl : pMime->urls()) {
+        const QString sSrc = stUrl.toLocalFile();
+        if (sSrc.isEmpty()) {
+            continue;
+        }
+        const QFileInfo stSrc(sSrc);
+        if (!stSrc.exists()) {
+            continue;
+        }
+        // 移动禁止落点=源自身/源子目录（目录拖入自己的子树）；原地复制忽略。
+        const QString sSrcC = QDir::cleanPath(sSrc);
+        const QString sDstC = QDir::cleanPath(sDstDir);
+        if (bMove && (sDstC == sSrcC || sDstC.startsWith(sSrcC + QLatin1Char('/')))) {
+            iFailed++;
+            aFailed << stSrc.fileName();
+            continue;
+        }
+        QString sDst = QDir(sDstDir).filePath(stSrc.fileName());
+        if (QFileInfo::exists(sDst)) {
+            if (QDir::cleanPath(sDst) == sSrcC) {
+                continue;   // 复制到自身原位置：忽略
+            }
+            const QString sUnique = UniqueDstPath(sDst);
+            if (sUnique.isEmpty()) {
+                iFailed++;
+                aFailed << stSrc.fileName();
+                continue;
+            }
+            sDst = sUnique;
+        }
+        bool bOk = false;
+        if (bMove) {
+            bOk = QFile::rename(sSrc, sDst);
+            if (!bOk) {
+                // 跨盘 rename 失败 → 复制后删源（目录递归）。
+                bOk = stSrc.isDir() ? CopyDirRecursively(sSrc, sDst)
+                                    : QFile::copy(sSrc, sDst);
+                if (bOk) {
+                    if (stSrc.isDir()) {
+                        QDir(sSrc).removeRecursively();
+                    } else {
+                        QFile::remove(sSrc);
+                    }
+                }
+            }
+        } else {
+            bOk = stSrc.isDir() ? CopyDirRecursively(sSrc, sDst)
+                                : QFile::copy(sSrc, sDst);
+        }
+        if (bOk) {
+            ++iDone;
+        } else {
+            ++iFailed;
+            aFailed << stSrc.fileName();
+        }
+    }
+    if (iDone > 0) {
+        a_pEv->acceptProposedAction();
+    } else {
+        a_pEv->ignore();
+    }
+    if (iFailed > 0) {
+        QMessageBox::warning(this, QStringLiteral("拖放"),
+            QStringLiteral("以下 %1 项未完成：%2\n（可能原因：目录移入自身子树、"
+                            "同名冲突无法编号、文件被占用）")
+                .arg(iFailed)
+                .arg(aFailed.join(QStringLiteral("、"))));
+    }
+}
+
+bool CProjectExplorerPanel::eventFilter(QObject* a_pObj, QEvent* a_pEv) {
+    // 只接管树 viewport 的拖拽相关事件；其余默认处理。
+    if (a_pObj != m_pTree->viewport()) {
+        return QWidget::eventFilter(a_pObj, a_pEv);
+    }
+    switch (a_pEv->type()) {
+    case QEvent::MouseButtonPress: {
+        auto* pEv = static_cast<QMouseEvent*>(a_pEv);
+        if (pEv->button() == Qt::LeftButton) {
+            m_ptDragStart = pEv->position().toPoint();
+            m_stDragIdx = QPersistentModelIndex(
+                m_pTree->indexAt(pEv->position().toPoint()));
+            m_bMaybeDrag = true;
+        }
+        return false;   // 交还 QTreeView 正常处理（选中/展开箭头等）
+    }
+    case QEvent::MouseMove: {
+        auto* pEv = static_cast<QMouseEvent*>(a_pEv);
+        if (m_bMaybeDrag && (pEv->buttons() & Qt::LeftButton)
+            && m_stDragIdx.isValid()) {
+            const QPoint stDelta = pEv->position().toPoint() - m_ptDragStart;
+            if (stDelta.manhattanLength()
+                >= QApplication::startDragDistance()) {
+                m_bMaybeDrag = false;
+                StartTreeDrag();
+                return true;   // 本帧消耗，拖动不触发点击/展开
+            }
+        }
+        if (!(pEv->buttons() & Qt::LeftButton)) {
+            m_bMaybeDrag = false;
+        }
+        return false;
+    }
+    case QEvent::MouseButtonRelease:
+        m_bMaybeDrag = false;
+        return false;
+    case QEvent::DragEnter: {
+        auto* pEv = static_cast<QDragEnterEvent*>(a_pEv);
+        if (!m_sRootDir.isEmpty() && pEv->mimeData()->hasUrls()) {
+            pEv->acceptProposedAction();
+        } else {
+            pEv->ignore();
+        }
+        return true;   // 消耗，阻止 QAbstractItemView 默认 model drop
+    }
+    case QEvent::DragMove: {
+        auto* pEv = static_cast<QDragMoveEvent*>(a_pEv);
+        if (!m_sRootDir.isEmpty() && pEv->mimeData()->hasUrls()) {
+            pEv->acceptProposedAction();
+        } else {
+            pEv->ignore();
+        }
+        return true;
+    }
+    case QEvent::DragLeave:
+        return true;
+    case QEvent::Drop: {
+        auto* pEv = static_cast<QDropEvent*>(a_pEv);
+        HandleTreeDrop(pEv);
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 bool CProjectExplorerPanel::IsTextFile(const QString& a_sAbsPath) {

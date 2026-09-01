@@ -652,6 +652,28 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
     oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
     m_pProc->setProcessEnvironment(oEnv);
+    // 2026.08.24 全局规则运行时注入（便携口径，不写 ~/.codex）：codex 只认
+    //   AGENTS.md（二进制实测无 CLAUDE.md 候选），为免向用户主目录复制文件，改为把
+    //   共享全局规则（<exe>\CLAUDE.md 或 ~/.claude/CLAUDE.md）直接前置进本阶段 prompt。
+    QString sPrompt = a_sPrompt;
+    const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
+    if (!sGlobalCtx.isEmpty()) {
+        sPrompt.prepend(QStringLiteral(
+            "以下是全局工程约定（CLAUDE.md），在整个任务中始终遵守：\n\n%1\n\n---\n\n")
+            .arg(sGlobalCtx));
+        emit sigInfo(QStringLiteral("[system/codex] 已注入全局规则（%1 字符）")
+                         .arg(QString::number(sGlobalCtx.size())));
+    }
+    // 工程 CLAUDE.md 提示：codex 只发现工程根 AGENTS.md（不读 CLAUDE.md）。工程只有
+    //   CLAUDE.md 时在 prompt 前加一行指引，让模型先读它（零配置、低开销）。
+    if (QFileInfo::exists(a_sWorkDir + QStringLiteral("/CLAUDE.md"))
+        && !QFileInfo::exists(a_sWorkDir + QStringLiteral("/AGENTS.md"))) {
+        sPrompt.prepend(QStringLiteral(
+            "注意：工程根目录存在 CLAUDE.md（本工程无 AGENTS.md）。开工前先用文件读取"
+            "工具完整阅读 CLAUDE.md 并在整个任务中遵守其中的约定。\n\n"));
+        emit sigInfo(QStringLiteral(
+            "[system/codex] 工程根存在 CLAUDE.md（无 AGENTS.md），已指示先阅读"));
+    }
     emit sigInfo(QStringLiteral("[system/codex] 启动：%1 %2").arg(
         QDir::toNativeSeparators(ResolveCodexJsPath()),
         QDir::toNativeSeparators(a_sWorkDir)));
@@ -667,7 +689,7 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
         m_pStallTimer->start();
     }
     // prompt 经 stdin 投递后关闭写通道（"-" = 从 stdin 读 prompt，--help 实测确认）。
-    m_pProc->write(a_sPrompt.toUtf8());
+    m_pProc->write(sPrompt.toUtf8());
     m_pProc->closeWriteChannel();
 }
 

@@ -59,6 +59,8 @@ private slots:
     void OnInstallEnv();
     // 2026.08.15 设置对话框：编辑 config.ini 全部可调参数，确定后落盘并应用到运行期。
     void OnSettings();
+    // 2026.09 后端版本管理对话框（任务 23183ccb）：四后端版本查看/查询/更新入口。
+    void OnVersionManage();
 
     // 帮助菜单（FR-9）
     void OnHelp();

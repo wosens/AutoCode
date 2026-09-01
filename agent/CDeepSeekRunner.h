@@ -82,6 +82,15 @@ public:
     //   看安装窗口输出（克隆/构建失败）。
     static QString DshInstallDiagnosis();
 
+    // —— 2026.09 版本管理（任务 23183ccb）——
+    // 本地版本：读 <root>/package.json 的 version（open 失败/解析错/无 version 字段
+    //   → 空串＝「未知」，样板同 CCodexRunner::ResolveCodexVersion）。a_sRoot 非空
+    //   → 只读该根（读不到不回退）；空→当前静态 DshRootPath()。
+    static QString ResolveDshVersion(const QString& a_sRoot = QString());
+    // DSH 远端仓库 URL（与 install_env.bat 的 git clone 命令同一口径；最新版查询
+    //   git ls-remote 与更新段共用，单一锚点防双实现漂移）。
+    static QString DshRepoUrl();
+
     static void SetDshNodePath(const QString& a_sPath);
     static QString DshNodePath();
     static void SetDshBinJsPath(const QString& a_sPath);
@@ -212,6 +221,8 @@ private:
     QString     m_sTurnReasonKind;        // turn/end 的 reason.kind
     qint64      m_iSumInTok  = 0;         // 轮内 Σ input（含 cache 读/写，账单口径）
     qint64      m_iSumOutTok = 0;         // 轮内 Σ output
+    qint64      m_iLiveEmitIn = 0;    // 2026.08.27 已 sigUsageDelta 实时上抛的输入累计（防收尾双计）
+    qint64      m_iLiveEmitOut = 0;   // 同上，输出累计
     // 计费分量（usage 四项拆开累计，单价各不同；m_iSumInTok = 三输入项之和）
     qint64      m_iSumPlainInTok  = 0;    // 纯 inputTokens
     qint64      m_iSumCacheReadTok  = 0;  // cacheReadTokens

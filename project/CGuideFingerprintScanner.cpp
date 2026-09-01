@@ -18,19 +18,27 @@ const QString CGuideFingerprintScanner::s_sChangeLogHeader =
 // Q1：默认 size+mtime 方案（不读内容，NFR3）。开启哈希需自行在 ScanProject 补实现。
 bool CGuideFingerprintScanner::s_bEnableHash = false;
 
-// design §0 Q5 内置默认排除清单：生成物 / 工具目录 / 本工具自身数据。
-// 2026.08.18 提取为独立函数：[Scan] ExcludeDirs 空/缺键的兜底，以及 SetExcludeDirs
-//   传空清单时恢复默认的来源（此前空被忽略，用户清空配置要重启才回默认）。
+// 缺省指纹扫描排除规则（2026.08.26 用户需求二次修正）：只排除隐藏文件/文件夹（名称以 '.'
+// 开头，自然涵盖 .git / .vs / .gitignore 等），其余一律不排——.autodev 也入表（用户明确要求）。
+// 唯一例外：.autodev/guide.md 是指纹表自身所在文件，不参与 Diff（否则每次回写都自我判定
+// 修改→永久假变更；它在 Diff 内单独过滤，扫描层不排，见 Diff 注释）。
 static QStringList DefaultScanExcludeDirs() {
-    return {
-        QStringLiteral(".autodev"),     // 本工具自身数据（含 guide.md / tasks）
-        QStringLiteral("build"),       // CMake / 构建输出
-        QStringLiteral("Execute"),     // exe 输出目录
-        QStringLiteral(".git"),        // 版本控制
-        QStringLiteral(".vs"),         // VS IDE 缓存
-        QStringLiteral("node_modules"),// npm 依赖
-        QStringLiteral("doc"),         // 文档目录
-    };
+    return {};
+}
+
+// 隐藏路径判定：相对路径任一层组件以 '.' 开头（即隐藏文件或位于隐藏文件夹内）→ 排除。
+static bool IsHiddenRelPath(const QString& a_sRelPath) {
+    int iStart = 0;
+    const int n = a_sRelPath.size();
+    for (int i = 0; i <= n; ++i) {
+        if (i == n || a_sRelPath.at(i) == QLatin1Char('/')) {
+            if (i > iStart && a_sRelPath.at(iStart) == QLatin1Char('.')) {
+                return true;
+            }
+            iStart = i + 1;
+        }
+    }
+    return false;
 }
 
 QStringList& CGuideFingerprintScanner::ExcludedDirs() {
@@ -57,6 +65,20 @@ qint64 CGuideFingerprintScanner::MtimeToUtcMs(const QDateTime& a_dt) {
 bool CGuideFingerprintScanner::IsExcluded(const QString& a_sRelPath) {
     // a_sRelPath 为正斜杠相对根路径。落在任一排除目录下 → 排除。
     // 比较前缀 "<dir>/" 或整路径 == "<dir>"，避免误伤同前缀名（如 buildfoo）。
+    // 2026.08.26：隐藏文件/文件夹（含 .git/.vs）改为内置规则，与 [Scan] ExcludeDirs 无关。
+    //   例外：首层 .autodev（本工具工作目录，点开头但用户明确要求不排除）不做隐藏判定，
+    //   仅其内部更深层仍按隐藏规则（如 .autodev/.tmp/x）。
+    if (IsHiddenRelPath(a_sRelPath)) {
+        if (a_sRelPath != QStringLiteral(".autodev") &&
+            !a_sRelPath.startsWith(QStringLiteral(".autodev/"))) {
+            return true;
+        }
+        // .autodev 内部：只查第二层及以后的组件是否隐藏。
+        const QString sInner = a_sRelPath.mid(QStringLiteral(".autodev/").size());
+        if (!sInner.isEmpty() && IsHiddenRelPath(sInner)) {
+            return true;
+        }
+    }
     for (const QString& sDir : ExcludedDirs()) {
         if (a_sRelPath == sDir ||
             a_sRelPath.startsWith(sDir + QLatin1Char('/'))) {
@@ -75,6 +97,34 @@ QString CGuideFingerprintScanner::FormatFpLine(const SFileFingerprint& a_stFp) {
         .arg(a_stFp.iSize)
         .arg(MtimeToUtcMs(a_stFp.dtMtime))
         .arg(sHash);
+}
+
+bool CGuideFingerprintScanner::HasAnyScannableFile(const QString& a_sRoot) {
+    // 空工程快速探测：找到首个通过排除规则的文件即返回 true（提前退出）。
+    // 用于 BuildGuideAsync 的空工程分支——大工程全量 ScanProject 枚举十万级文件
+    // 会阻塞 UI 线程数秒（2026.08.26 卡死修复），空判只关心「有没有」，不需全表。
+    const QDir stRoot(a_sRoot);
+    if (!stRoot.exists()) {
+        return false;
+    }
+    QDirIterator it(a_sRoot,
+                    QDir::Files | QDir::NoDotAndDotDot | QDir::NoSymLinks,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QString sRel = stRoot.relativeFilePath(it.fileInfo().absoluteFilePath())
+                                 .replace(QLatin1Char('\\'), QLatin1Char('/'));
+        if (!IsExcluded(sRel)) {
+            // 空工程判定只关心用户源码：.autodev 是本工具自建工作目录（EnsureAutoDev 先建），
+            // 不能把它的存在当成「工程非空」（2026.08.26 .autodev 不再排除后专门防护）。
+            if (sRel == QStringLiteral(".autodev") ||
+                sRel.startsWith(QStringLiteral(".autodev/"))) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 QList<SFileFingerprint> CGuideFingerprintScanner::ScanProject(const QString& a_sRoot) {
@@ -160,6 +210,14 @@ SGuideChangeSet CGuideFingerprintScanner::Diff(const QList<SFileFingerprint>& a_
                                                const QList<SFileFingerprint>& a_aCur) {
     SGuideChangeSet stOut;
 
+    // 2026.08.26 .autodev 不再缺省排除（用户需求）：但 .autodev/guide.md 是指纹表自身，
+    //   写入动作本身就会改它，参与 Diff 会产生永久假变更（每次同步都报"修改：guide.md"
+    //   并重写文件，永不收敛）。这里统一过滤：guide.md 不适 Added/Modified/Deleted，
+    //   也不进指纹表（其余 .autodev 文件正常跟踪，写入后收敛）。
+    auto isSelfFile = [](const QString& s) {
+        return s == QStringLiteral(".autodev/guide.md");
+    };
+
     // prev 按路径建索引（保序：相同路径取首个）。
     QHash<QString, const SFileFingerprint*> mapPrev;
     for (const SFileFingerprint& rFp : a_aPrev) {
@@ -173,6 +231,9 @@ SGuideChangeSet CGuideFingerprintScanner::Diff(const QList<SFileFingerprint>& a_
 
     // 遍历 cur：prev 无 → Added；prev 有但指纹变 → Modified。
     for (const SFileFingerprint& rFp : a_aCur) {
+        if (isSelfFile(rFp.sRelPath)) {
+            continue;
+        }
         const auto itPrev = mapPrev.constFind(rFp.sRelPath);
         if (itPrev == mapPrev.constEnd()) {
             stOut.aAdded.append(rFp);
@@ -188,6 +249,9 @@ SGuideChangeSet CGuideFingerprintScanner::Diff(const QList<SFileFingerprint>& a_
     }
     // 遍历 prev：cur 无 → Deleted。
     for (const SFileFingerprint& rFp : a_aPrev) {
+        if (isSelfFile(rFp.sRelPath)) {
+            continue;
+        }
         if (!mapCur.contains(rFp.sRelPath)) {
             stOut.aDeleted.append(rFp.sRelPath);
         }
@@ -246,6 +310,10 @@ bool CGuideFingerprintScanner::WriteIncremental(const QString& a_sGuidePath,
     QStringList aNewBodyLines;
     QSet<QString> setEmitted;   // 已输出的路径（防 aAdded 与 prev 重复）
     for (const SFileFingerprint& rPrev : aPrev) {
+        // 2026.08.26 指纹表自身（.autodev/guide.md）不入表：旧表残留行也不回填（与 Diff 过滤同步）。
+        if (rPrev.sRelPath == QStringLiteral(".autodev/guide.md")) {
+            continue;
+        }
         const auto itCur = mapCur.constFind(rPrev.sRelPath);
         if (itCur == mapCur.constEnd()) {
             continue;   // 已删除，跳过（不进新表）

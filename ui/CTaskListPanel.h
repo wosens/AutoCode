@@ -55,6 +55,12 @@ public:
     // 2026.08.18 任务列表高度分隔条：上段(任务Tab+按钮行)/资源管理器之间的垂直 QSplitter
     //   状态存取（CMainWindow 在启动时恢复、关闭时保存，经 CProjectManager 落 [Layout] VSplit）。
     QByteArray VSplitState() const;
+    // 2026.08.29 历史任务表列宽（10 列整型串）与左栏 Tab 页（0=当前任务/1=历史任务）
+    //   持久化（[Layout] TaskCols/TaskTab；重启不再回默认列宽/当前任务页）。
+    QString TaskColsState() const;
+    void RestoreTaskCols(const QString& a_sState);
+    int TaskTabIndex() const;
+    void RestoreTaskTab(int a_iIndex);
     void RestoreVSplitState(const QByteArray& a_stState);
 
 signals:
