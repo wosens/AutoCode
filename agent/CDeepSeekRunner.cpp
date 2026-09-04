@@ -1,4 +1,4 @@
-#include "CDeepSeekRunner.h"
+﻿#include "CDeepSeekRunner.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -21,7 +21,7 @@ static QString s_sDshNodePath;    // node.exe 绝对路径（空=走 PATH 的 "n
 static QString s_sDshBinJsPath;   // bin.js 绝对路径（空=按根目录推导；显式键优先，旧档回退）
 static QString s_sDshCordisPath;  // cordis.yml 绝对路径（空=按根目录推导；显式键优先，旧档回退）
 static QString s_sDshProvider;    // provider 名（空回退 glm-custom）
-static QString s_sDshModel;       // 模型名（空回退 glm-5.2）
+static QString s_sDshModel;       // 模型名（固定路由项已删，仅作 [DshModels] 缺省占位）
 // 计费单价（$/百万 token；DSH 协议只报 token 不报金额，客户端折算）。
 //   默认对齐 claude 后端经同一网关显示的 Sonnet 档价目；全 0 = 不折算（费用列回 "-"）。
 static double s_dDshPriceInPerM        = 3.0;
@@ -115,6 +115,26 @@ QString CDeepSeekRunner::DshConfigError() {
             "AutoCode 仓库 agent/dsh/cordis.autocode.yml 复制为 "
             "<DSH根>/examples/autocode-agent/cordis.yml。").arg(
                 sCordis.isEmpty() ? QStringLiteral("(空)") : sCordis);
+    }
+    // 2026.09.01 组合依赖包可达性（版本兼容探测，任务握手前拦截）：cordis.yml 引用的
+    //   dsh-agent-spine-demo 是上游 dsh-v0.1.2 起移除的示例包（官方删包无别名）——
+    //   DSH 被「后端版本管理」更新到该版本后，git reset 删 tracked 源、旧 bin.js 幸存，
+    //   探测两件套（bin.js/cordis.yml）都还在，直到任务启动握手才 ERR_MODULE_NOT_FOUND
+    //   反复退出（实测任务 3213cdbf 两次失败）。这里直接探组合树内的包入口文件，
+    //   不可达即报不兼容并给回退命令。
+    const QString sRootForProbe = DshRootPath();
+    if (!sRootForProbe.isEmpty()) {
+        const QString sSpinePkg = QDir::fromNativeSeparators(sRootForProbe) + QStringLiteral(
+            "/examples/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json");
+        if (!QFile::exists(sSpinePkg)) {
+            return QStringLiteral(
+                "DSH 版本与 AutoCode 集成不兼容：组合依赖的 "
+                "@deepseek-ai/dsh-agent-spine-demo 不可达（上游 dsh-v0.1.2 起已移除"
+                "全部示例包，多由「后端版本管理」更新到该版本导致）。\n"
+                "处理：命令行运行 install_env.bat /update-dsh %1 \"%2\""
+                "回退到受支持版本，完成后重试。")
+                .arg(SupportedDshTag(), QDir::toNativeSeparators(sRootForProbe));
+        }
     }
     return QString();
 }
@@ -211,6 +231,285 @@ QString CDeepSeekRunner::DshRepoUrl() {
     // 与 install_env.bat 的 git clone 命令同一 URL（单一口径锚点；bat 侧更新段 fetch
     //   走 origin 远端不需要它，此处供 C++ 侧 ls-remote 最新版查询/提示共用）。
     return QStringLiteral("https://github.com/deepseek-ai/deepseek-harness.git");
+}
+
+QString CDeepSeekRunner::SupportedDshTag() {
+    // 2026.09.01 见头文件注释：AutoCode 集成绑定的基线 tag（回退/安装命令用）。
+    return QStringLiteral("dsh-v0.1.0-rc.7");
+}
+
+QVersionNumber CDeepSeekRunner::SupportedDshVersion() {
+    // 数值比较基线（0.1.2-alpha.3 的 fromString=0.1.2 > 0.1.0 判“超基线”；
+    //   rc.7 == 0.1.0 不高于自身）。适配新版后同步抬升两常量。
+    return QVersionNumber::fromString(QStringLiteral("0.1.0"));
+}
+
+// ===== 2026.09.01 DSH 环境自愈：纯函数与文件修复 =====
+
+namespace {
+// 剥 YAML 标量首尾成对引号（单/双）。
+QString StripQuotes(const QString& a_s) {
+    QString s = a_s.trimmed();
+    while (s.size() >= 2
+           && ((s.startsWith(QLatin1Char('"')) && s.endsWith(QLatin1Char('"')))
+            || (s.startsWith(QLatin1Char('\'')) && s.endsWith(QLatin1Char('\''))))) {
+        s = s.mid(1, s.size() - 2).trimmed();
+    }
+    return s;
+}
+}   // namespace
+
+bool CDeepSeekRunner::ParseWrappedCredentials(const QString& a_sText,
+                                               QStringList* a_pOutPairs) {
+    // 仅识别已知坏格式（version/refs 包装，DSH credentials-local 期望纯平铺）：
+    //   形态 A（flow map，单行）：refs: { K: v, K2: v2 }
+    //   形态 B（块式缩进）：refs:\n  K: v\n  K2: v2
+    // 平铺/其它格式一律返回 false（不动文件，避免误伤合法凭据）。
+    if (a_pOutPairs != nullptr) {
+        a_pOutPairs->clear();
+    }
+    const QStringList aLines = a_sText.split(QLatin1Char('\n'));
+    bool bWrapped = false;
+    QString sFlow;
+    int iBlockStart = -1;
+    int iRefsLine = -1;
+    for (int i = 0; i < aLines.size(); ++i) {
+        const QString sT = aLines[i].trimmed();
+        if (sT.startsWith(QStringLiteral("version:"))) {
+            bWrapped = true;
+        } else if (sT.startsWith(QStringLiteral("refs:"))) {
+            bWrapped = true;
+            iRefsLine = i;
+            const QString sRest = sT.mid(QStringLiteral("refs:").size()).trimmed();
+            if (sRest.startsWith(QLatin1Char('{'))) {
+                sFlow = sRest;
+            } else if (!sRest.isEmpty()) {
+                return false;   // refs: 后跟其它标量：不认识的形态，不动
+            } else {
+                iBlockStart = i + 1;
+            }
+        }
+    }
+    if (!bWrapped) {
+        return false;
+    }
+    // 形态 A 变体（实测备份文件形态）：refs: 下一行起的缩进 flow map，可跨行到 '}'。
+    //   收集 refs: 行之后到 EOF 的文本统一找 {…}，块式分支不再吃掉它。
+    if (sFlow.isEmpty() && iRefsLine >= 0) {
+        QString sCollected;
+        for (int i = iRefsLine + 1; i < aLines.size(); ++i) {
+            sCollected += aLines[i].trimmed() + QLatin1Char(' ');
+        }
+        const int iOpen = sCollected.indexOf(QLatin1Char('{'));
+        if (iOpen >= 0) {
+            sFlow = sCollected;
+        }
+    }
+    QStringList aPairs;
+    const auto fnAddPair = [&aPairs](const QString& a_sK, const QString& a_sV) {
+        const QString sK = StripQuotes(a_sK);
+        const QString sV = StripQuotes(a_sV);
+        if (!sK.isEmpty() && !sV.isEmpty()) {
+            aPairs.append(sK + QLatin1Char('\t') + sV);
+        }
+    };
+    if (!sFlow.isEmpty()) {
+        // 形态 A：{ K: v, K2: v2, ... }（右大括号可能同行收尾）
+        const int iOpen = sFlow.indexOf(QLatin1Char('{'));
+        const int iClose = sFlow.lastIndexOf(QLatin1Char('}'));
+        if (iOpen < 0 || iClose <= iOpen) {
+            return false;
+        }
+        const QStringList aItems = sFlow.mid(iOpen + 1, iClose - iOpen - 1)
+                                       .split(QLatin1Char(','));
+        for (const QString& sItem : aItems) {
+            const int iColon = sItem.indexOf(QLatin1Char(':'));
+            if (iColon <= 0) {
+                continue;
+            }
+            fnAddPair(sItem.left(iColon), sItem.mid(iColon + 1));
+        }
+    } else if (iBlockStart >= 0) {
+        // 形态 B：refs: 之后的缩进行 K: v（退到顶格/EOF 停）
+        for (int i = iBlockStart; i < aLines.size(); ++i) {
+            const QString& sRaw = aLines[i];
+            if (sRaw.trimmed().isEmpty()) {
+                break;   // 空行收尾
+            }
+            const bool bIndent = sRaw.startsWith(QLatin1Char(' '))
+                              || sRaw.startsWith(QLatin1Char('\t'));
+            const QString sT2 = sRaw.trimmed();
+            const int iColon = sT2.indexOf(QLatin1Char(':'));
+            if (!bIndent || iColon <= 0) {
+                break;   // 顶格或无冒号：refs 块结束
+            }
+            fnAddPair(sT2.left(iColon), sT2.mid(iColon + 1));
+        }
+    } else {
+        return false;   // 只有 version 无 refs：没有可迁移内容
+    }
+    if (aPairs.isEmpty()) {
+        return false;
+    }
+    if (a_pOutPairs != nullptr) {
+        *a_pOutPairs = aPairs;
+    }
+    return true;
+}
+
+QString CDeepSeekRunner::RenderFlatCredentials(const QStringList& a_aPairs) {
+    QString sOut;
+    for (const QString& sP : a_aPairs) {
+        const int iTab = sP.indexOf(QLatin1Char('\t'));
+        if (iTab <= 0) {
+            continue;
+        }
+        sOut += sP.left(iTab) + QStringLiteral(": ") + sP.mid(iTab + 1)
+              + QLatin1Char('\n');
+    }
+    return sOut;
+}
+
+int CDeepSeekRunner::HealCredentialsFile(QString* a_pOutWhy) {
+    // 预检预修：StartStage 前置（任务/助手统一入口）调用。文件不存在→0（DSH 自己
+    //   会生成/或走 env 阶梯）；平铺或解析不出的格式→0（不动）；已知坏格式→备份
+    //   .autosave（覆盖旧备份）+ 改写平铺 →1。凭据值逐对原样迁移，不重排不丢失。
+    const QString sPath = QDir::home().filePath(QStringLiteral(".dsh/.credentials.yaml"));
+    QFile stFile(sPath);
+    if (!stFile.exists()) {
+        if (a_pOutWhy != nullptr) {
+            *a_pOutWhy = QStringLiteral("文件不存在");
+        }
+        return 0;
+    }
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        if (a_pOutWhy != nullptr) {
+            *a_pOutWhy = QStringLiteral("无法读取");
+        }
+        return 0;
+    }
+    const QString sText = QString::fromUtf8(stFile.readAll());
+    stFile.close();
+    QStringList aPairs;
+    if (!ParseWrappedCredentials(sText, &aPairs)) {
+        if (a_pOutWhy != nullptr) {
+            *a_pOutWhy = QStringLiteral("非已知坏格式，未改动");
+        }
+        return 0;
+    }
+    const QString sBak = sPath + QStringLiteral(".autosave");
+    if (QFile::exists(sBak)) {
+        QFile::remove(sBak);
+    }
+    if (!QFile::copy(sPath, sBak)) {
+        if (a_pOutWhy != nullptr) {
+            *a_pOutWhy = QStringLiteral("备份失败");
+        }
+        return 0;
+    }
+    QFile stWrite(sPath);
+    if (!stWrite.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (a_pOutWhy != nullptr) {
+            *a_pOutWhy = QStringLiteral("写入失败");
+        }
+        return 0;
+    }
+    stWrite.write(RenderFlatCredentials(aPairs).toUtf8());
+    stWrite.close();
+    if (a_pOutWhy != nullptr) {
+        *a_pOutWhy = QStringLiteral("已从 version/refs 包装迁移为平铺（原文件备份于 %1）")
+                         .arg(sBak);
+    }
+    return 1;
+}
+
+QStringList CDeepSeekRunner::ComputeHollowDirs(const QString& a_sRoot,
+                                                const QString& a_sLsFilesOut) {
+    // 空壳目录：packages/*/*、vendor/*、apps/cli 候选中不含任何 tracked 文件的目录。
+    //   背景：DSH 被更新到高版本后回退（git reset --hard 基线），高版本新增包的
+    //   tracked 文件被删、只乘 node_modules 残壳——tsdown workspace glob 匹配到
+    //   空壳、无 package.json 回溯到根包名报 Cannot find entry 卡死 build:lib
+    //   （实测 0.1.2-alpha.3 → rc.7 回退后 40 个空壳目录）。返回绝对路径（可直接删）。
+    QSet<QString> setHaveTracked;   // 含 tracked 文件（含自身被直接跟踪）的相对目录
+    const QStringList aLines = a_sLsFilesOut.split(QLatin1Char('\n'));
+    for (const QString& sLine : aLines) {
+        const QString sRel = sLine.trimmed();
+        if (sRel.isEmpty()) {
+            continue;
+        }
+        int ix = sRel.lastIndexOf(QLatin1Char('/'));
+        while (ix > 0) {
+            setHaveTracked.insert(sRel.left(ix));
+            ix = sRel.lastIndexOf(QLatin1Char('/'), ix - 1);
+        }
+    }
+    QStringList aHollow;
+    const QDir stRoot(a_sRoot);
+    const auto fnCheck = [&setHaveTracked, &aHollow, &stRoot](const QString& a_sRelDir) {
+        if (!setHaveTracked.contains(a_sRelDir)) {
+            aHollow.append(stRoot.filePath(a_sRelDir));
+        }
+    };
+    const QString sPkgs = QStringLiteral("packages");
+    const QDir stPkgs(stRoot.filePath(sPkgs));
+    const QStringList aTiers = stPkgs.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString& sTier : aTiers) {
+        if (sTier.startsWith(QLatin1Char('.'))) {
+            continue;
+        }
+        const QDir stTier(stPkgs.filePath(sTier));   // 2026.09.01 绝对路径（相对 cwd 枚举恒空）
+        const QStringList aSubs = stTier.entryList(
+            QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString& sSub : aSubs) {
+            if (sSub.startsWith(QLatin1Char('.'))) {
+                continue;
+            }
+            fnCheck(sPkgs + QLatin1Char('/') + sTier + QLatin1Char('/') + sSub);
+        }
+    }
+    const QDir stVendor(stRoot.filePath(QStringLiteral("vendor")));
+    const QStringList aVendors = stVendor.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString& sV : aVendors) {
+        if (!sV.startsWith(QLatin1Char('.'))) {
+            fnCheck(QStringLiteral("vendor/") + sV);
+        }
+    }
+    fnCheck(QStringLiteral("apps/cli"));
+    return aHollow;
+}
+
+int CDeepSeekRunner::CleanBuildResidue(const QString& a_sRoot) {
+    // 同步清理：packages 树内（跳过 node_modules）名为 lib 的目录 + *.tsbuildinfo。
+    //   高版本构建产物与低版本源码混态会让 tsc -b 增量缓存（tsbuildinfo 残留而产物
+    //   已删）跳过 emit、tsdown 找不到 entry——实测回退后必须清残留重全量构建。
+    int iRemoved = 0;
+    std::function<void(const QString&)> fnVisit = [&](const QString& a_sDir) {
+        QDir stDir(a_sDir);
+        const QFileInfoList aEntries = stDir.entryInfoList(
+            QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden);
+        for (const QFileInfo& stE : aEntries) {
+            if (stE.isDir()) {
+                if (stE.fileName() == QStringLiteral("node_modules")) {
+                    continue;
+                }
+                if (stE.fileName() == QStringLiteral("lib")) {
+                    if (QDir(stE.absoluteFilePath()).removeRecursively()) {
+                        ++iRemoved;
+                    }
+                    continue;
+                }
+                fnVisit(stE.absoluteFilePath());
+            } else if (stE.fileName().endsWith(QStringLiteral(".tsbuildinfo"))) {
+                if (QFile::remove(stE.absoluteFilePath())) {
+                    ++iRemoved;
+                }
+            }
+        }
+    };
+    fnVisit(QDir(a_sRoot).filePath(QStringLiteral("packages")));
+    return iRemoved;
 }
 
 void CDeepSeekRunner::SetDshNodePath(const QString& a_sPath) {
@@ -402,8 +701,34 @@ void CDeepSeekRunner::StartStage(const QString& a_sWorkDir,
     //   与启动警告/设置保存兜底同一口径——用户看到的第一条消息就说清怎么处理。
     const QString sCfgErr = DshConfigError();
     if (!sCfgErr.isEmpty()) {
+        // 2026.09.01 版本不兼容自愈：组合包缺失（多为「后端版本管理」更新到
+        //   dsh-v0.1.2+ 所致）→ 自动回滚基线+重建（每进程限一次，失败回落人工指引），
+        //   修复期间占用运行态防重复提交，完成后自动重入本函数继续原阶段。
+        if (sCfgErr.contains(QStringLiteral("版本与 AutoCode 集成不兼容"))
+            && m_iHealAttempts == 0) {
+            ++m_iHealAttempts;
+            SHealArgs stArgs;
+            stArgs.sWorkDir = a_sWorkDir;
+            stArgs.sPrompt = a_sPrompt;
+            stArgs.sDisallowedTools = a_sDisallowedTools;
+            stArgs.sResumeSid = a_sResumeSid;
+            stArgs.iMaxTurns = a_iMaxTurns;
+            stArgs.bFork = a_bFork;
+            stArgs.iAutocompactK = a_iAutocompactK;
+            stArgs.bEnableAskUser = a_bEnableAskUser;
+            BeginSelfHeal(stArgs);
+            return;
+        }
         EmitFailed(sCfgErr);
         return;
+    }
+    // 2026.09.01 credentials 坏格式预检（秒级）：version/refs 包装 → 自动迁移平铺
+    //   （备份 .autosave）。不动其它格式，失败留握手报错带指引。
+    QString sWhy;
+    if (HealCredentialsFile(&sWhy) == 1) {
+        emit sigInfo(QStringLiteral("[system/dsh] 已自动修复 ~/.dsh/.credentials.yaml"
+                                    " 格式（%1），继续启动。")
+                         .arg(sWhy));
     }
 
     // 会话判定：resumeSid 在本进程创建过且非 fork → 复用（同进程多轮=协议内续跑）；
@@ -413,10 +738,15 @@ void CDeepSeekRunner::StartStage(const QString& a_sWorkDir,
         && m_eProcState == ProcReady) {
         m_sSessionId = a_sResumeSid;
     } else {
-        if (!a_sResumeSid.isEmpty()) {
+        if (!a_sResumeSid.isEmpty() && !m_bCtxNoticeShown) {
+            m_bCtxNoticeShown = true;
+            // 2026.09.02 改 [ctx/dsh] 前缀穿透上层 [system 过滤（此前被静默吞掉，
+            //   用户无法感知每轮失忆）；每实例只发一次。上下文回灌由编排器
+            //   StartAdhocStage 注入最近对话记录（KeepsContextAcrossTurns()==false）。
             emit sigInfo(QStringLiteral(
-                "[system/dsh] resumeSid=%1 不属于当前 DSH 进程（跨进程恢复是协议限制），"
-                "换新会话续跑，上下文依赖 prompt 回灌").arg(a_sResumeSid));
+                "[ctx/dsh] DSH 协议不支持跨轮会话续接（fork/跨进程均换新会话），"
+                "上下文由 AutoCode 按轮回灌最近对话记录（resumeSid=%1 已忽略）")
+                .arg(a_sResumeSid));
         }
         m_sSessionId = NewSid();
         m_aLiveSids.insert(m_sSessionId);
@@ -431,6 +761,233 @@ void CDeepSeekRunner::StartStage(const QString& a_sWorkDir,
         return;
     }
     EnsureProcess(a_sWorkDir);   // 失败走 EmitFailed（m_bTurnReported 守卫放行）
+}
+
+// ===== 2026.09.01 版本不兼容自动修复流水线 =====
+
+void CDeepSeekRunner::BeginSelfHeal(const SHealArgs& a_stArgs) {
+    // 入口前置：StartStage 已判「版本不兼容」且首次修复。占用运行态（IsRunnerBusy
+    //   可见，防修复中重复提交）；原阶段参数缓存，修复成功后自动重入。
+    m_stHealArgs = a_stArgs;
+    m_bSelfHealing = true;
+    m_eRunState = RunPrompting;
+    m_sPromptWorkDir = a_stArgs.sWorkDir;
+    m_bTurnReported = false;
+    m_bTurnEnded = false;
+    emit sigInfo(QStringLiteral(
+        "🔧 检测到 DSH 版本与 AutoCode 集成不兼容（组合依赖的示例包不可达，多为"
+        "更新到 dsh-v0.1.2+ 所致）。启动自动修复：回滚基线 %1 + 清理残留 + 依赖重建，"
+        "预计 5~15 分钟，完成后自动继续本阶段…")
+            .arg(SupportedDshTag()));
+
+    // 多实例互斥锁：<root>/.autocode-heal.lock 独占创建。已存在且 60 分钟内→
+    //   另一实例正在修复（放弃，人工稍后重试）；陈旧锁→接管（删除重建）。
+    const QString sRoot = DshRootPath();
+    m_sHealLockPath = QDir(sRoot).filePath(QStringLiteral(".autocode-heal.lock"));
+    if (m_pHealLock != nullptr) {
+        m_pHealLock->close();
+        delete m_pHealLock;
+        m_pHealLock = nullptr;
+    }
+    QFileInfo stLockInfo(m_sHealLockPath);
+    if (stLockInfo.exists()
+        && stLockInfo.lastModified().msecsTo(QDateTime::currentDateTime())
+               < 60LL * 60 * 1000) {
+        FinishHeal(false, QStringLiteral(
+            "另一 AutoCode 实例正在修复 DSH（锁文件 %1 未过期）。请等待其完成后"
+            "重试本阶段。").arg(m_sHealLockPath));
+        return;
+    }
+    if (stLockInfo.exists()) {
+        QFile::remove(m_sHealLockPath);   // 陈旧锁接管
+    }
+    auto* pLock = new QFile(m_sHealLockPath, this);
+    if (!pLock->open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+        delete pLock;
+        FinishHeal(false, QStringLiteral("无法创建修复锁文件 %1（权限？），"
+                                         "请手动修复。").arg(m_sHealLockPath));
+        return;
+    }
+    pLock->write(QStringLiteral("pid=%1 time=%2")
+                     .arg(QCoreApplication::applicationPid())
+                     .arg(QDateTime::currentDateTime().toString(Qt::ISODate))
+                     .toUtf8());
+    pLock->flush();
+    m_pHealLock = pLock;
+    HealRunStep(1);
+}
+
+void CDeepSeekRunner::HealRunStep(int a_iStep) {
+    // 串行状态机：1=git reset 基线 2=git ls-files（退出后同步删空壳+清残留）
+    //   3=pnpm install 4=build:lib 5=复检。每步独立超时；stdout/stderr 分开收。
+    m_iHealStep = a_iStep;
+    m_sHealStdout.clear();
+    m_sHealErrTail.clear();
+    if (m_pHealProc == nullptr) {
+        m_pHealProc = new QProcess(this);
+        connect(m_pHealProc,
+                static_cast<void(QProcess::*)(int, QProcess::ExitStatus)>(
+                    &QProcess::finished),
+                this, &CDeepSeekRunner::OnHealFinished);
+        connect(m_pHealProc, &QProcess::readyReadStandardOutput, this, [this]() {
+            m_sHealStdout.append(QString::fromUtf8(
+                m_pHealProc->readAllStandardOutput()));
+            if (m_sHealStdout.size() > 8 * 1024 * 1024) {
+                m_sHealStdout = m_sHealStdout.right(4 * 1024 * 1024);   // ls-files 大仓八挂上限
+            }
+        });
+        connect(m_pHealProc, &QProcess::readyReadStandardError, this, [this]() {
+            const QStringList aNew = QString::fromUtf8(
+                m_pHealProc->readAllStandardError()).split(QLatin1Char('\n'));
+            for (const QString& sL : aNew) {
+                if (!sL.trimmed().isEmpty()) {
+                    m_sHealErrTail = sL.trimmed();   // 只留最后一行非空（失败消息用）
+                }
+            }
+        });
+    }
+    if (m_pHealTimer == nullptr) {
+        m_pHealTimer = new QTimer(this);
+        m_pHealTimer->setSingleShot(true);
+        connect(m_pHealTimer, &QTimer::timeout, this, [this]() {
+            if (m_bSelfHealing && m_pHealProc != nullptr
+                && m_pHealProc->state() != QProcess::NotRunning) {
+                emit sigInfo(QStringLiteral("⚠ 自动修复步骤 %1 超时，终止并转手动指引…")
+                                 .arg(m_iHealStep));
+                m_pHealProc->kill();   // → OnHealFinished(-1)
+            }
+        });
+    }
+    const QString sRoot = DshRootPath();
+    const int kiStepTimeoutMs[] = {0, 60 * 1000, 60 * 1000,
+                                   15 * 60 * 1000, 30 * 60 * 1000, 30 * 1000};
+    QProcessEnvironment stEnv = QProcessEnvironment::systemEnvironment();
+    stEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+    stEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+    stEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
+    stEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
+    m_pHealProc->setProcessEnvironment(stEnv);
+    m_pHealProc->setWorkingDirectory(sRoot);
+    m_pHealProc->setProcessChannelMode(QProcess::SeparateChannels);
+    switch (a_iStep) {
+        case 1:
+            emit sigInfo(QStringLiteral("🔧 [1/5] git 回滚基线 %1（丢弃 DSH 仓库内"
+                                        "未提交改动）…").arg(SupportedDshTag()));
+            m_pHealProc->start(QStringLiteral("git"),
+                { QStringLiteral("reset"), QStringLiteral("--hard"),
+                  SupportedDshTag() });
+            break;
+        case 2:
+            emit sigInfo(QStringLiteral("🔧 [2/5] 检测残留空壳目录与构建产物…"));
+            m_pHealProc->start(QStringLiteral("git"),
+                { QStringLiteral("ls-files") });
+            break;
+        case 3:
+            emit sigInfo(QStringLiteral("🔧 [3/5] pnpm install（依赖对齐基线，约 1~5 分钟）…"));
+            m_pHealProc->start(QStringLiteral("cmd"),
+                { QStringLiteral("/c"), QStringLiteral("pnpm install") });
+            break;
+        case 4:
+            emit sigInfo(QStringLiteral("🔧 [4/5] pnpm run build:lib（全量重建，约 3~10 分钟）…"));
+            m_pHealProc->start(QStringLiteral("cmd"),
+                { QStringLiteral("/c"), QStringLiteral("pnpm run build:lib") });
+            break;
+        default:
+            FinishHeal(false, QStringLiteral("内部错误：未知修复步骤 %1").arg(a_iStep));
+            return;
+    }
+    m_pHealTimer->start(kiStepTimeoutMs[a_iStep]);
+}
+
+void CDeepSeekRunner::OnHealFinished(int a_iExitCode) {
+    if (!m_bSelfHealing) {
+        return;   // 迟到信号（Stop 已收尾）：忽略
+    }
+    m_pHealTimer->stop();
+    const int iStep = m_iHealStep;
+    if (a_iExitCode != 0) {
+        FinishHeal(false, QStringLiteral("步骤 %1 失败（退出码=%2）：%3")
+                             .arg(iStep)
+                             .arg(a_iExitCode)
+                             .arg(m_sHealErrTail.isEmpty()
+                                      ? QStringLiteral("（无 stderr 输出）")
+                                      : m_sHealErrTail));
+        return;
+    }
+    switch (iStep) {
+        case 1:
+            HealRunStep(2);
+            return;
+        case 2: {
+            // 同步清理：空壳目录（高版本残壳，卡死 tsdown 的根因）+ 构建残留
+            //   （lib/tsbuildinfo 混态，卡死 tsc -b 增量）。
+            const QStringList aHollow = ComputeHollowDirs(DshRootPath(), m_sHealStdout);
+            int iRm = 0;
+            for (const QString& sDir : aHollow) {
+                if (QDir(sDir).removeRecursively()) {
+                    ++iRm;
+                }
+            }
+            const int iResidue = CleanBuildResidue(DshRootPath());
+            emit sigInfo(QStringLiteral("🔧 已清理 %1 个空壳目录、%2 项构建残留")
+                             .arg(iRm).arg(iResidue));
+            HealRunStep(3);
+            return;
+        }
+        case 3:
+            HealRunStep(4);
+            return;
+        case 4: {
+            // 复检：配置错误清零才算修好（组合包可达 + 其余探测项）
+            const QString sErr = DshConfigError();
+            if (!sErr.isEmpty()) {
+                FinishHeal(false, QStringLiteral("重建完成但校验仍报错：%1").arg(sErr));
+                return;
+            }
+            FinishHeal(true, QString());
+            return;
+        }
+        default:
+            FinishHeal(false, QStringLiteral("内部错误：未知完成步骤 %1").arg(iStep));
+    }
+}
+
+void CDeepSeekRunner::FinishHeal(bool a_bOk, const QString& a_sMsg) {
+    // 终态统一收口：解锁 → 复位修复态 → 成功重入 StartStage / 失败 EmitFailed（带
+    //   手动回退命令）。锁文件始终删除（失败也允许下次/其它实例重试）。
+    if (m_pHealTimer != nullptr) {
+        m_pHealTimer->stop();
+    }
+    if (m_pHealProc != nullptr && m_pHealProc->state() != QProcess::NotRunning) {
+        m_pHealProc->kill();
+        m_pHealProc->waitForFinished(3000);
+    }
+    if (m_pHealLock != nullptr) {
+        m_pHealLock->close();
+        m_pHealLock->deleteLater();
+        m_pHealLock = nullptr;
+    }
+    if (!m_sHealLockPath.isEmpty()) {
+        QFile::remove(m_sHealLockPath);
+    }
+    m_bSelfHealing = false;
+    m_iHealStep = 0;
+    if (a_bOk) {
+        emit sigInfo(QStringLiteral("✅ DSH 自动修复完成，继续执行原阶段…"));
+        const SHealArgs stArgs = m_stHealArgs;
+        m_eRunState = RunIdle;   // 重入 StartStage 自己重占
+        StartStage(stArgs.sWorkDir, stArgs.sPrompt, stArgs.sDisallowedTools,
+                   stArgs.iMaxTurns, stArgs.sResumeSid, stArgs.bFork,
+                   stArgs.iAutocompactK, stArgs.bEnableAskUser);
+        return;
+    }
+    emit sigInfo(QStringLiteral("⚠ DSH 自动修复中止：%1").arg(a_sMsg));
+    EmitFailed(QStringLiteral(
+        "DSH 自动修复失败：%1\n"
+        "手动修复：命令行运行 install_env.bat /update-dsh %2 \"%3\""
+        "（失败重跑即修复），完成后重试本阶段。")
+                   .arg(a_sMsg, SupportedDshTag(),
+                        QDir::toNativeSeparators(DshRootPath())));
 }
 
 bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
@@ -648,9 +1205,32 @@ void CDeepSeekRunner::Stop() {
     // 静默收尾（同 claude 语义）：先置终态再 kill——kill 触发的 finished/事件一律吞掉，
     //   不发 sigFinished；上层 StopTask 直接落 Stopped。DSH 无逐轮取消，只能杀进程；
     //   进程死后下轮 StartStage 冷启动换新 sid（协议限制，StartStage 内有提示）。
+    //   2026.09.01 修复中停止：终止修复子进程并静默收尾（不发失败，锁文件释放）。
     m_bTurnReported = true;
     m_bRetryPending = false;
     m_eRunState = RunIdle;
+    if (m_bSelfHealing) {
+        if (m_pHealTimer != nullptr) {
+            m_pHealTimer->stop();
+        }
+        if (m_pHealProc != nullptr && m_pHealProc->state() != QProcess::NotRunning) {
+            m_pHealProc->kill();
+            m_pHealProc->waitForFinished(3000);
+        }
+        if (m_pHealLock != nullptr) {
+            m_pHealLock->close();
+            m_pHealLock->deleteLater();
+            m_pHealLock = nullptr;
+        }
+        if (!m_sHealLockPath.isEmpty()) {
+            QFile::remove(m_sHealLockPath);
+        }
+        m_bSelfHealing = false;
+        m_iHealStep = 0;
+        emit sigInfo(QStringLiteral("🔧 DSH 自动修复已被用户停止（锁已释放，"
+                                    "下次启动阶段会重新检测）"));
+        return;
+    }
     if (m_pStallTimer != nullptr && m_pStallTimer->isActive()) {
         m_pStallTimer->stop();
     }
@@ -1039,8 +1619,22 @@ void CDeepSeekRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSt
             });
             return;
         }
-        EmitFailed(QStringLiteral("DSH 进程在握手阶段反复退出（退出码=%1），"
-                                  "请检查 node/bin.js/cordis.yml 路径与组合文件").arg(a_iExitCode));
+        QString sBootFailMsg = QStringLiteral(
+            "DSH 进程在握手阶段反复退出（退出码=%1），"
+            "请检查 node/bin.js/cordis.yml 路径与组合文件").arg(a_iExitCode);
+        // 2026.09.01 组合包缺失自含真因（EmitFailed 虽附 stderr 尾部，但 node 堆栈
+        //   对用户不可读）：Cannot find package = 组合引用的包不可达，多为 DSH 被更新
+        //   到 dsh-v0.1.2+（上游移除示例包）——直接给回退命令，不再让用户对着堆栈猜。
+        const QString sTailJoined = m_aStderrTail.join(QLatin1Char('|'));
+        if (sTailJoined.contains(QStringLiteral("Cannot find package"))) {
+            sBootFailMsg += QStringLiteral(
+                "\n根因：组合依赖的包缺失（ERR_MODULE_NOT_FOUND）——DSH 版本与 AutoCode "
+                "集成不兼容（dsh-v0.1.2+ 移除了示例包）。\n"
+                "处理：命令行运行 install_env.bat /update-dsh %1 \"<DSH 根目录>\" "
+                "回退到受支持版本。")
+                .arg(SupportedDshTag());
+        }
+        EmitFailed(sBootFailMsg);
         return;
     }
     if (m_eRunState != RunPrompting) {

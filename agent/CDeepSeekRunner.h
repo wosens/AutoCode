@@ -6,7 +6,9 @@
 #include <QSet>
 #include <QStringList>
 #include <QTimer>
+#include <QFile>
 #include <QVector>
+#include <QVersionNumber>
 
 #include "CAgentRunnerBase.h"
 
@@ -39,7 +41,8 @@
 // 跨进程会话限制（协议）：SDK server 只 agents.create 不 resume，持久化层要求
 // 磁盘日志是 live 会话的前缀才采纳，否则 id collision。故 resumeSid 仅在本进程
 // 创建过（m_aLiveSids）时复用；跨进程（AutoCode 重启/进程被杀后续跑）自动换新
-// sid 并提示（上下文靠上层 prompt 回灌，协议所限）。
+// sid 并提示（上下文靠上层 prompt 回灌——2026.09.02 起编排器已实现，见
+// KeepsContextAcrossTurns 与 StartAdhocStage 回灌块）。
 //
 // claude 专属参数降级：a_sDisallowedTools / a_iMaxTurns / a_iAutocompactK /
 // a_bEnableAskUser 在本后端忽略（组合已带 compaction-basic 自动压缩；工具默认
@@ -90,6 +93,33 @@ public:
     // DSH 远端仓库 URL（与 install_env.bat 的 git clone 命令同一口径；最新版查询
     //   git ls-remote 与更新段共用，单一锚点防双实现漂移）。
     static QString DshRepoUrl();
+
+    // 2026.09.01 DSH 版本兼容硬约束（防复发）：AutoCode 的 DSH 集成（组合 cordis.yml +
+    //   jsonrpc-demo 入口 + dsh-agent-spine-demo 等示例包）绑死 dsh-v0.1.0-rc.7 的包
+    //   结构；上游 dsh-v0.1.2 起移除了 packages/examples 全组（官方 note：remove-
+    //   agent-spine-demo，无别名替代）——更新到该版本后任务握手必炸（ERR_MODULE_NOT_
+    //   FOUND）。版本管理对话框更新分派与 Verdict 用 SupportedDshVersion() 判定上限、
+    //   DshConfigError 用组合包可达性兜底探测，三处同源本常量。
+    static QString SupportedDshTag();       // "dsh-v0.1.0-rc.7"（回退/安装命令用）
+    static QVersionNumber SupportedDshVersion();   // 0.1.0（数值比较用，rc.7 == 基线）
+
+    // ===== 2026.09.01 DSH 环境自愈（版本不兼容自动回滚重建 + credentials 坏格式修复）=====
+    // credentials.yaml 坏格式解析/渲染（纯函数，单测靶点）：旧/第三方工具写的
+    //   version+refs 包装格式 → DSH credentials-local 期望的平铺映射（键→非空字符串）。
+    //   a_pOutPairs 收 "KEY\tVALUE" 序列（tab 分隔，避免值含冒号歧义）。
+    static bool ParseWrappedCredentials(const QString& a_sText, QStringList* a_pOutPairs);
+    static QString RenderFlatCredentials(const QStringList& a_aPairs);
+    // 检查并就地修复 ~/.dsh/.credentials.yaml（version/refs 包装 → 备份 .autosave 后
+    //   改写平铺）。返回：0=无需修复或无法识别（不动文件）；1=已修复。
+    static int HealCredentialsFile(QString* a_pOutWhy = nullptr);
+    // 空壳目录计算（纯函数，单测靶点）：git ls-files 输出 → a_sRoot 下 packages/*/*、
+    //   vendor/*、apps/cli 中不含任何 tracked 文件的目录（版本回退后只乘 node_modules
+    //   残壳的目录，tsdown workspace 误认导致 build:lib 卡死的根因）。返回绝对路径。
+    static QStringList ComputeHollowDirs(const QString& a_sRoot, const QString& a_sLsFilesOut);
+    // 构建残留清理：packages 树内（跳过 node_modules）删 lib 目录与 *.tsbuildinfo，
+    //   返回清理项数（高版本产物+低版本源码混态会让 tsc -b 增量缓存跳过 emit、tsdown
+    //   找不到 entry——回退后必须清残留重全量构建；公开供单测）。
+    static int CleanBuildResidue(const QString& a_sRoot);
 
     static void SetDshNodePath(const QString& a_sPath);
     static QString DshNodePath();
@@ -204,6 +234,39 @@ private:
     QProcess*   m_pProc = nullptr;
     EProcState  m_eProcState = ProcNotCreated;
     ERunState   m_eRunState  = RunIdle;
+
+    // ===== 2026.09.01 版本不兼容自动修复流水线（BeginSelfHeal 起，串行状态机）=====
+    // 触发：StartStage 前置 DshConfigError 报「版本与 AutoCode 集成不兼容」且本进程
+    //   未修过（m_iHealAttempts 每进程限 1 次——修一次仍坏说明环境有更深问题，回落
+    //   人工指引）。步骤：锁文件 → git reset --hard 基线 → git ls-files 算空壳目录
+    //   →删空壳+清 lib/tsbuildinfo 残留 → pnpm install → build:lib → 复检 → 重入
+    //   StartStage。每步 sigInfo 上报；任一步失败 EmitFailed 带手动回退命令。
+    struct SHealArgs {
+        QString sWorkDir, sPrompt, sDisallowedTools, sResumeSid;
+        int  iMaxTurns = 30;
+        bool bFork = false;
+        int  iAutocompactK = 0;
+        bool bEnableAskUser = false;
+    };
+    SHealArgs  m_stHealArgs;              // 修复成功后重入 StartStage 的原参数
+    QProcess*  m_pHealProc = nullptr;     // 修复子进程（git/pnpm 复用同一实例串行）
+    QTimer*    m_pHealTimer = nullptr;    // 步骤超时（超时 kill → 失败）
+    QString    m_sHealLockPath;           // <root>/.autocode-heal.lock（多实例互斥）
+    QFile*     m_pHealLock = nullptr;     // 锁句柄（修复期间持有；结束删除）
+    QString    m_sHealStdout;             // 当前步 stdout（ls-files 步骤用）
+    QString    m_sHealErrTail;            // 当前步 stderr 尾部（失败消息用）
+    int        m_iHealStep = 0;           // 0=未在修复；1..6=流水线步骤
+    int        m_iHealAttempts = 0;       // 本进程已自动修复次数（上限 1）
+    // 2026.09.02 跨轮换新会话提示已发标志（每实例一次）：助手链 fork 恒真→每轮换
+    //   新 sid，上下文由编排器回灌弥补；提示改 [ctx/dsh] 前缀（穿透上层 [system 过滤）
+    //   且仅首轮发一次，防每轮瞬音。
+    bool       m_bCtxNoticeShown = false;
+    bool       m_bSelfHealing = false;    // 修复中（Stop 拦截/StartStage 重入守卫）
+    void BeginSelfHeal(const SHealArgs& a_stArgs);
+    void HealRunStep(int a_iStep);        // 启动第 N 步子进程/同步动作
+    void OnHealFinished(int a_iExitCode); // 子进程退出驱动状态机
+    void FinishHeal(bool a_bOk, const QString& a_sMsg);   // 终态：解锁/复位/重入或报失败
+
     QByteArray  m_buf;                    // stdout 跨 readyRead 行缓冲
     int         m_iNextRpcId = 1;         // JSON-RPC 请求 id 发号器
     int         m_iInitId    = 0;         // initialize 请求 id（响应配对）

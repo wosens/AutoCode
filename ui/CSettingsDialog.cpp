@@ -11,6 +11,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QGuiApplication>
+#include <QInputDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -35,6 +36,7 @@
 #include "CProjectManager.h"
 #include "CCodexRunner.h"
 #include "CPiAgentRunner.h"
+#include "CHermesRunner.h"
 
 // 2026.08.27 几何在屏校验（口径同 CMainWindow::IsGeometryOnScreen）：与任一屏幕的
 //   可用区（排除任务栏）相交即视为在屏——换显示器/改分辨率后的陈旧坐标丢弃。
@@ -63,11 +65,13 @@ public:
     //   wire_api（chat/responses），默认 chat；密钥落点 ~/.codex）。
     explicit CDshModelEditDialog(QWidget* a_pParent, const SDshModelEntry* a_pEntry,
                                  bool a_bPi = false, bool a_bCodex = false,
-                                 bool a_bCopy = false)
+                                 bool a_bCopy = false, bool a_bHermes = false)
         : QDialog(a_pParent) {
         m_bCodex = a_bCodex;
+        m_bHermes = a_bHermes;
         const QString sTail = a_bCodex ? QStringLiteral("（CodexHarness）")
-                         : a_bPi ? QStringLiteral("（PiAgent）") : QString();
+                         : a_bPi ? QStringLiteral("（PiAgent）")
+                         : a_bHermes ? QStringLiteral("（Hermes）") : QString();
         setWindowTitle((a_bCopy ? QStringLiteral("复制自定义模型")
                        : (a_pEntry != nullptr ? QStringLiteral("编辑自定义模型")
                                               : QStringLiteral("新增自定义模型"))) + sTail);
@@ -96,6 +100,10 @@ public:
         m_pEditKey->setToolTip(a_bPi
             ? QStringLiteral("API Key。注意：以明文写入 ~/.pi/agent/models.json 的 provider 配置，"
                              "请勿外传该文件；密钥不进命令行与日志")
+            : a_bHermes
+            ? QStringLiteral("API Key。注意：以明文保存在 config.ini 的 [HermesModels] 节与"
+                             "~/.hermes/agent/config.json，请勿把该文件明文外传；"
+                             "密钥不进命令行与日志")
             : QStringLiteral(
                 "API 密钥。注意：以明文保存在 exe 同级 config.ini 的 [DshModels] 节，"
                 "请勿把该文件明文外传到共享目录"));
@@ -133,7 +141,7 @@ public:
             "该模型的上下文窗口（token），用于上下文占用估算与压缩阈值"));
         pForm->addRow(QStringLiteral("上下文窗口(token)："), m_pSpinCtx);
         m_pSpinMax = new QSpinBox(this);
-        m_pSpinMax->setRange(1024, 1000000);
+        m_pSpinMax->setRange(1024, a_bHermes ? 131072 : 1000000);   // Hermes 钳位 131072（网关上限）
         m_pSpinMax->setSingleStep(1024);
         m_pSpinMax->setValue(32768);
         m_pSpinMax->setToolTip(QStringLiteral("单次请求最大输出 token（网关侧上限）"));
@@ -184,6 +192,9 @@ public:
         }
         stE.iCtx    = m_pSpinCtx->value();
         stE.iMaxTok = m_pSpinMax->value();
+        if (m_bHermes) {   // 双侧收口（与 CHermesRunner::ClampMaxTok 同口径）
+            stE.iMaxTok = qMin(stE.iMaxTok, 131072);
+        }
         return stE;
     }
 
@@ -196,6 +207,7 @@ private:
     QSpinBox*  m_pSpinCtx   = nullptr;
     QSpinBox*  m_pSpinMax   = nullptr;
     bool       m_bCodex     = false;   // 2026.08.21 Codex 条目模式（wire_api 下拉/默认值）
+    bool       m_bHermes    = false;   // 任务 3213cdbf Hermes 条目模式（maxTok 上限 131072）
 };
 
 CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
@@ -234,8 +246,6 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     }
     const QString sDefDshProvider = (a_pPm != nullptr) ? a_pPm->LoadDshProvider()
                                                        : QStringLiteral("glm-custom");
-    const QString sDefDshModel = (a_pPm != nullptr) ? a_pPm->LoadDshModel()
-                                                    : QStringLiteral("glm-5.2");
     const double dDefPriceIn = (a_pPm != nullptr) ? a_pPm->LoadDshPriceInPerM() : 3.0;
     const double dDefPriceCr = (a_pPm != nullptr) ? a_pPm->LoadDshPriceCacheReadPerM() : 0.3;
     const double dDefPriceCw = (a_pPm != nullptr) ? a_pPm->LoadDshPriceCacheWritePerM() : 3.75;
@@ -251,7 +261,6 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pEditDshNode->setText(sDefDshNode);
     m_pEditDshRoot->setText(sDefDshRoot);
     m_pEditDshProvider->setText(sDefDshProvider);
-    m_pEditDshModel->setText(sDefDshModel);
     m_pSpinDshPriceIn->setValue(dDefPriceIn);
     m_pSpinDshPriceCacheRead->setValue(dDefPriceCr);
     m_pSpinDshPriceCacheWrite->setValue(dDefPriceCw);
@@ -264,8 +273,6 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pEditPiRoot->setText((a_pPm != nullptr) ? a_pPm->LoadPiRoot() : QString());
     m_pEditPiProvider->setText((a_pPm != nullptr) ? a_pPm->LoadPiProvider()
                                                   : QStringLiteral("anthropic"));
-    m_pEditPiModel->setText((a_pPm != nullptr) ? a_pPm->LoadPiModel() : QString());
-    m_pEditPiApiKey->setText((a_pPm != nullptr) ? a_pPm->LoadPiApiKey() : QString());
     const QString sDefPiThinking = (a_pPm != nullptr) ? a_pPm->LoadPiThinking() : QString();
     m_pComboPiThinking->setCurrentIndex(
         m_pComboPiThinking->findText(sDefPiThinking) < 0 ? 0
@@ -289,9 +296,6 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pEditCodexRoot->setText((a_pPm != nullptr) ? a_pPm->LoadCodexRoot() : QString());
     m_pEditCodexProvider->setText((a_pPm != nullptr) ? a_pPm->LoadCodexProvider()
                                                      : QString());
-    m_pEditCodexModel->setText((a_pPm != nullptr) ? a_pPm->LoadCodexModel() : QString());
-    m_pEditCodexApiKey->setText((a_pPm != nullptr) ? a_pPm->LoadCodexApiKey() : QString());
-    m_pEditCodexBaseUrl->setText((a_pPm != nullptr) ? a_pPm->LoadCodexBaseUrl() : QString());
     m_pComboCodexWireApi->setCurrentIndex(
         m_pComboCodexWireApi->findText((a_pPm != nullptr) ? a_pPm->LoadCodexWireApi()
                                                           : QStringLiteral("chat")) < 0
@@ -303,6 +307,19 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_aCodexModels = (a_pPm != nullptr) ? a_pPm->LoadCodexModels(&m_iCodexActiveModel)
                                         : QList<SDshModelEntry>();
     RefreshCodexModelList();
+    // 任务 3213cdbf Hermes 第五后端回填（[Agent] Hermes* / [HermesModels]）。
+    m_pEditHermesNode->setText((a_pPm != nullptr) ? a_pPm->LoadHermesNodePath() : QString());
+    m_pEditHermesRoot->setText((a_pPm != nullptr) ? a_pPm->LoadHermesRoot() : QString());
+    m_pSpinHermesPriceIn->setValue((a_pPm != nullptr) ? a_pPm->LoadHermesPriceInPerM() : 3.0);
+    m_pSpinHermesPriceCacheRead->setValue(
+        (a_pPm != nullptr) ? a_pPm->LoadHermesPriceCacheReadPerM() : 0.3);
+    m_pSpinHermesPriceCacheWrite->setValue(
+        (a_pPm != nullptr) ? a_pPm->LoadHermesPriceCacheWritePerM() : 3.75);
+    m_pSpinHermesPriceOut->setValue((a_pPm != nullptr) ? a_pPm->LoadHermesPriceOutPerM() : 15.0);
+    DetectHermesInstalled(true);
+    m_aHermesModels = (a_pPm != nullptr) ? a_pPm->LoadHermesModels(&m_iHermesActiveModel)
+                                         : QList<SDshModelEntry>();
+    RefreshHermesModelList();
     // 2026.08.20 PiAgent 自定义大模型表回填（[PiModels]；空表/无激活 = 走固定路由）。
     m_aPiModels = (a_pPm != nullptr) ? a_pPm->LoadPiModels(&m_iPiActiveModel)
                                      : QList<SDshModelEntry>();
@@ -387,6 +404,7 @@ void CSettingsDialog::SetupUi() {
     m_pComboBackend->addItem(QStringLiteral("DeepSeekHarness"), 2);
     m_pComboBackend->addItem(QStringLiteral("PIAgent"), 3);
     m_pComboBackend->addItem(QStringLiteral("CodexHarness"), 4);
+    m_pComboBackend->addItem(QStringLiteral("Hermes"), 5);   // 任务 3213cdbf 第五后端
     m_pComboBackend->setToolTip(QStringLiteral(
         "编排器使用的 Agent 后端（全局单选，[Agent] Backend）。\n"
         "DeepSeekHarness：JSON-RPC 完整接入（流式过程/token 统计/多轮会话），"
@@ -395,7 +413,8 @@ void CSettingsDialog::SetupUi() {
         "参数在本页 PiAgent 页签配置"));
     pFormAgent->addRow(QStringLiteral("Agent 后端："), m_pComboBackend);
     connect(m_pComboBackend, qOverload<int>(&QComboBox::currentIndexChanged),
-            this, [this](int) { UpdateDshEnabled(); UpdatePiEnabled(); UpdateCodexEnabled(); });
+            this, [this](int) { UpdateDshEnabled(); UpdatePiEnabled(); UpdateCodexEnabled();
+                             UpdateHermesEnabled(); });
     m_pEditClaudeCmd = new QLineEdit(pGroupAgent);
     m_pEditClaudeCmd->setPlaceholderText(QStringLiteral("claude"));
     m_pEditClaudeCmd->setToolTip(QStringLiteral(
@@ -466,11 +485,6 @@ void CSettingsDialog::SetupUi() {
     m_pEditDshProvider->setToolTip(QStringLiteral(
         "LLM provider 名（组合 llm-pi-ai 内联 providers 键；[Agent] DshProvider，默认 glm-custom）"));
     pFormDsh->addRow(QStringLiteral("Provider："), m_pEditDshProvider);
-    m_pEditDshModel = new QLineEdit(pGroupDsh);
-    m_pEditDshModel->setPlaceholderText(QStringLiteral("glm-5.2"));
-    m_pEditDshModel->setToolTip(QStringLiteral(
-        "模型名（provider 下的 models id；[Agent] DshModel，默认 glm-5.2）"));
-    pFormDsh->addRow(QStringLiteral("模型："), m_pEditDshModel);
     // 2026.08.18 DSH 计费单价（$/M token）：协议只报 token 不报金额，按单价折算，
     //   默认对齐 claude 后端 Sonnet 档价目（同网关口径）；全 0 = 不折算（费用列回 "-"）。
     auto* pRowPrice = new QWidget(pGroupDsh);
@@ -743,26 +757,18 @@ void CSettingsDialog::SetupUi() {
                    QStringLiteral("PIAgent 仓库根目录（其下 pi\\ 为 monorepo，cli.js 按固定布局"
                                   " pi\\packages\\coding-agent\\dist\\cli.js 推导）。留空时启动自动"
                                   "探测 exe 同级 PIAgent 目录（[Agent] PiRoot）"), true);
-    m_pEditPiProvider = new QLineEdit(pGroupPi);
+    // 2026.09 布局瘦身：Provider/模型/思考强度三短项并一行（设置窗高度优化，
+    //   减两行；各控件 tooltip 不变）。
+    auto* pRowPiPmt = new QWidget(pGroupPi);
+    auto* pLayPiPmt = new QHBoxLayout(pRowPiPmt);
+    pLayPiPmt->setContentsMargins(0, 0, 0, 0);
+    m_pEditPiProvider = new QLineEdit(pRowPiPmt);
     m_pEditPiProvider->setPlaceholderText(QStringLiteral("anthropic"));
     m_pEditPiProvider->setToolTip(QStringLiteral(
         "LLM provider 名（如 anthropic/openai/google/deepseek/openrouter；[Agent] PiProvider，"
         "默认 anthropic）。API key 按该名映射环境变量注入；未覆盖的 provider 走 pi 自身登录"
         "（命令行 pi auth / /login）"));
-    pFormPi->addRow(QStringLiteral("Provider："), m_pEditPiProvider);
-    m_pEditPiModel = new QLineEdit(pGroupPi);
-    m_pEditPiModel->setPlaceholderText(QStringLiteral("（空 = 用 pi 默认模型）"));
-    m_pEditPiModel->setToolTip(QStringLiteral(
-        "模型 id（该 provider 下的模型；[Agent] PiModel，空 = 用 pi 默认）"));
-    pFormPi->addRow(QStringLiteral("模型："), m_pEditPiModel);
-    m_pEditPiApiKey = new QLineEdit(pGroupPi);
-    m_pEditPiApiKey->setPlaceholderText(QStringLiteral("sk-…（走 pi 自身登录可留空）"));
-    m_pEditPiApiKey->setToolTip(QStringLiteral(
-        "API key。注意：以明文保存在 exe 同级 config.ini 的 [Agent] PiApiKey，请勿把该文件"
-        "明文外传到共享目录。经子进程环境变量注入（如 ANTHROPIC_API_KEY），不进命令行与日志。\n"
-        "未映射的 provider 请在命令行执行 pi 完成登录后留空"));
-    pFormPi->addRow(QStringLiteral("API Key："), m_pEditPiApiKey);
-    m_pComboPiThinking = new QComboBox(pGroupPi);
+    m_pComboPiThinking = new QComboBox(pRowPiPmt);
     m_pComboPiThinking->addItem(QString());   // 空 = 默认（不传 --thinking）
     m_pComboPiThinking->addItems(QStringList()
         << QStringLiteral("off") << QStringLiteral("minimal") << QStringLiteral("low")
@@ -771,7 +777,10 @@ void CSettingsDialog::SetupUi() {
     m_pComboPiThinking->setItemText(0, QStringLiteral("（默认）"));
     m_pComboPiThinking->setToolTip(QStringLiteral(
         "思考强度（--thinking 级别，仅推理模型生效；[Agent] PiThinking，空 = 用模型默认）"));
-    pFormPi->addRow(QStringLiteral("思考强度："), m_pComboPiThinking);
+    pLayPiPmt->addWidget(m_pEditPiProvider, 2);
+    pLayPiPmt->addWidget(new QLabel(QStringLiteral("思考强度："), pRowPiPmt));
+    pLayPiPmt->addWidget(m_pComboPiThinking, 1);
+    pFormPi->addRow(QStringLiteral("Provider："), pRowPiPmt);
     // 2026.08.20 PIAgent 计费单价（$/M token）：pi 协议只报 token 分量不报金额，
     //   费用 = 各分量 × 此单价累计；默认对齐 claude 后端 Sonnet 档价目（同 DSH 口径）。
     auto* pRowPiPrice = new QWidget(pGroupPi);
@@ -965,21 +974,6 @@ void CSettingsDialog::SetupUi() {
         "provider id（写入 ~/.codex/config.toml 的 [model_providers.<provider>] 槽位；"
         "[Agent] CodexProvider，空 = autocode）。不与用户手写 provider 冲突时可用任意名"));
     pFormCodex->addRow(QStringLiteral("Provider："), m_pEditCodexProvider);
-    m_pEditCodexModel = new QLineEdit(pGroupCodex);
-    m_pEditCodexModel->setToolTip(QStringLiteral(
-        "模型 id（网关侧模型名；[Agent] CodexModel，必填）"));
-    pFormCodex->addRow(QStringLiteral("模型："), m_pEditCodexModel);
-    m_pEditCodexApiKey = new QLineEdit(pGroupCodex);
-    m_pEditCodexApiKey->setPlaceholderText(QStringLiteral("sk-…"));
-    m_pEditCodexApiKey->setToolTip(QStringLiteral(
-        "API key。注意：以明文保存在 exe 同级 config.ini 的 [Agent] CodexApiKey；保存时"
-        "写入 ~/.codex/auth.json（仅 OPENAI_API_KEY 键），不进命令行与日志"));
-    pFormCodex->addRow(QStringLiteral("API Key："), m_pEditCodexApiKey);
-    m_pEditCodexBaseUrl = new QLineEdit(pGroupCodex);
-    m_pEditCodexBaseUrl->setPlaceholderText(QStringLiteral("http://192.168.x.x:9000/v1"));
-    m_pEditCodexBaseUrl->setToolTip(QStringLiteral(
-        "网关 base_url（写入 ~/.codex/config.toml 的 provider 槽位；[Agent] CodexBaseUrl，必填）"));
-    pFormCodex->addRow(QStringLiteral("BaseUrl："), m_pEditCodexBaseUrl);
     m_pComboCodexWireApi = new QComboBox(pGroupCodex);
     m_pComboCodexWireApi->addItem(QStringLiteral("chat"));
     m_pComboCodexWireApi->addItem(QStringLiteral("responses"));
@@ -1083,10 +1077,182 @@ void CSettingsDialog::SetupUi() {
     pLayCodex->addStretch(1);
 
     auto* pTabs = new QTabWidget(this);
+    // —— Hermes 第五后端 Tab（任务 3213cdbf，仿 Pi Tab 布局）——
+    //   2026.09 补安装入口：本机源离线安装（robocopy，口径同 Codex 本机源——
+    //   Hermes 无 npm 包/远端发布源，装更一体走本机源重部署，无需管理员/网络）。
+    auto* pTabHermes = new QWidget(this);
+    auto* pLayHermes = new QVBoxLayout(pTabHermes);
+    pLayHermes->setContentsMargins(0, 0, 0, 0);
+    auto* pRowHermesState = new QWidget(pTabHermes);
+    auto* pLayHermesState = new QHBoxLayout(pRowHermesState);
+    pLayHermesState->setContentsMargins(0, 0, 0, 0);
+    m_pLblHermesState = new QLabel(pRowHermesState);
+    m_pLblHermesState->setWordWrap(true);
+    m_pBtnDetectHermes = new QPushButton(QStringLiteral("重新检测"), pRowHermesState);
+    m_pBtnDetectHermes->setToolTip(QStringLiteral(
+        "重新探测 Hermes CLI（探测序：根目录 → exe 同级 HermesHarness\\dist\\cli.js → PATH）"));
+    connect(m_pBtnDetectHermes, &QPushButton::clicked, this,
+            [this]() { DetectHermesInstalled(false); });
+    m_pBtnInstallHermesLocal = new QPushButton(QStringLiteral("本机源安装（离线）"),
+                                               pRowHermesState);
+    m_pBtnInstallHermesLocal->setToolTip(QStringLiteral(
+        "从本机已有的 Hermes Harness 源目录（其下 dist\\cli.js）robocopy 复制到"
+        " exe 同级 HermesHarness。\n无需网络与管理员权限；已装时重跑 = 用源目录"
+        "覆盖更新。\n完成后自动重新检测"));
+    connect(m_pBtnInstallHermesLocal, &QPushButton::clicked, this,
+            [this]() { OnInstallHermesLocal(); });
+    // 2026.09 联网安装（git）：提权运行 install_env.bat /hermes <仓库地址>（口径同
+    //   DSH 的「安装 DeepSeekHarness」：git 浅克隆 + pnpm 依赖构建，已装时为
+    //   fetch+reset 更新）。仓库地址点击按钮时输入框现场给定（不设配置项）。
+    m_pBtnInstallHermesNet = new QPushButton(QStringLiteral("联网安装（git）"),
+                                             pRowHermesState);
+    m_pBtnInstallHermesNet->setToolTip(QStringLiteral(
+        "以管理员权限联网安装：点击后输入 Hermes Harness 的 git 仓库地址（或本机"
+        " 仓库路径），git 克隆到 exe 同级 HermesHarness，并 pnpm 安装依赖 + 构建"
+        " dist\\cli.js。\n"
+        "已装时重跑 = git 拉取更新（fetch+reset，保留本地文件）。\n"
+        "需 Node.js 与 Git（缺失时脚本会自动安装）；完成后回到本页点「重新检测」"));
+    connect(m_pBtnInstallHermesNet, &QPushButton::clicked, this,
+            [this]() { OnInstallHermesNet(); });
+    pLayHermesState->addWidget(m_pLblHermesState, 1);
+    pLayHermesState->addWidget(m_pBtnDetectHermes);
+    pLayHermesState->addWidget(m_pBtnInstallHermesLocal);
+    pLayHermesState->addWidget(m_pBtnInstallHermesNet);
+    pLayHermes->addWidget(pRowHermesState);
+    auto* pGroupHermes = new QGroupBox(QStringLiteral("Hermes 参数"), pTabHermes);
+    auto* pFormHermes = new QFormLayout(pGroupHermes);
+    auto fnAddHermesPathRow = [this, pGroupHermes, pFormHermes](
+            const QString& a_sLabel, QLineEdit** a_ppEdit, const QString& a_sTip, bool a_bDir) {
+        auto* pRow = new QWidget(pGroupHermes);
+        auto* pLay = new QHBoxLayout(pRow);
+        pLay->setContentsMargins(0, 0, 0, 0);
+        *a_ppEdit = new QLineEdit(pRow);
+        (*a_ppEdit)->setToolTip(a_sTip);
+        auto* pBtnBrowse = new QPushButton(QStringLiteral("浏览…"), pRow);
+        connect(pBtnBrowse, &QPushButton::clicked, this, [this, a_ppEdit, a_bDir]() {
+            const QString sSel = a_bDir
+                ? QFileDialog::getExistingDirectory(this, QString(), (*a_ppEdit)->text())
+                : QFileDialog::getOpenFileName(this, QString(), (*a_ppEdit)->text());
+            if (!sSel.isEmpty()) {
+                (*a_ppEdit)->setText(QDir::toNativeSeparators(sSel));
+            }
+        });
+        pLay->addWidget(*a_ppEdit, 1);
+        pLay->addWidget(pBtnBrowse);
+        pFormHermes->addRow(a_sLabel, pRow);
+    };
+    fnAddHermesPathRow(QStringLiteral("node 路径："), &m_pEditHermesNode,
+                       QStringLiteral("node.exe 绝对路径；留空使用 PATH 中的 node"
+                                      "（[Agent] HermesNodePath）"), false);
+    m_pEditHermesNode->setPlaceholderText(QStringLiteral("留空使用 PATH 中的 node"));
+    fnAddHermesPathRow(QStringLiteral("Hermes 根目录："), &m_pEditHermesRoot,
+                       QStringLiteral("Hermes Harness 根目录（其下 dist\\cli.js 为入口）。"
+                                      "留空时自动探测 exe 同级 HermesHarness"
+                                      "（[Agent] HermesRoot）"), true);
+    // 2026.09 联网安装（git）：Hermes 无 npm 包/固定远端发布源，仓库地址不设
+    //   持久配置项（口径对齐 DSH/Pi 等其他后端设置页均无此项）——点击
+    //   「联网安装（git）」时经 QInputDialog 现场输入（git URL 或本机仓库路径）。
+    // 计费单价（$/M token，口径同 Pi/Codex）。
+    auto* pRowHermesPrice = new QWidget(pGroupHermes);
+    auto* pLayHermesPrice = new QHBoxLayout(pRowHermesPrice);
+    pLayHermesPrice->setContentsMargins(0, 0, 0, 0);
+    const QString sHermesPriceTip = QStringLiteral(
+        "Hermes 只报 token 分量，费用 = 各分量 × 此单价累计（$/百万 token）。\n"
+        "四项全 0 = 不折算（费用列显示“-”）。[Agent] HermesPrice*PerM");
+    auto fnHermesPriceSpin = [pRowHermesPrice, pLayHermesPrice,
+                              &sHermesPriceTip](const QString& a_sLbl) {
+        auto* pLbl = new QLabel(a_sLbl, pRowHermesPrice);
+        auto* pSpin = new QDoubleSpinBox(pRowHermesPrice);
+        pSpin->setRange(0.0, 1000.0);
+        pSpin->setDecimals(2);
+        pSpin->setSingleStep(0.05);
+        pSpin->setToolTip(sHermesPriceTip);
+        pLayHermesPrice->addWidget(pLbl);
+        pLayHermesPrice->addWidget(pSpin, 1);
+        return pSpin;
+    };
+    m_pSpinHermesPriceIn = fnHermesPriceSpin(QStringLiteral("输入"));
+    m_pSpinHermesPriceCacheRead = fnHermesPriceSpin(QStringLiteral("缓存读"));
+    m_pSpinHermesPriceCacheWrite = fnHermesPriceSpin(QStringLiteral("缓存写"));
+    m_pSpinHermesPriceOut = fnHermesPriceSpin(QStringLiteral("输出"));
+    pFormHermes->addRow(QStringLiteral("计费单价($/M)："), pRowHermesPrice);
+    pLayHermes->addWidget(pGroupHermes);
+    // 自定义大模型（[HermesModels]，7 列口径同 Pi/Codex 树）。
+    auto* pGroupHermesModels = new QGroupBox(QStringLiteral("自定义大模型"), pTabHermes);
+    auto* pLayHermesModels = new QVBoxLayout(pGroupHermesModels);
+    m_pTreeHermesModels = new QTreeWidget(pGroupHermesModels);
+    m_pTreeHermesModels->setColumnCount(7);
+    m_pTreeHermesModels->setHeaderLabels(QStringList()
+        << QStringLiteral("显示名")
+        << QStringLiteral("请求地址")
+        << QStringLiteral("API 格式")
+        << QStringLiteral("模型名称")
+        << QStringLiteral("上下文")
+        << QStringLiteral("最大输出")
+        << QStringLiteral("当前"));
+    m_pTreeHermesModels->setRootIsDecorated(false);
+    m_pTreeHermesModels->setAlternatingRowColors(true);
+    QHeaderView* pHdrHermesModels = m_pTreeHermesModels->header();
+    pHdrHermesModels->setSectionsMovable(false);
+    pHdrHermesModels->setSectionResizeMode(QHeaderView::Interactive);
+    pHdrHermesModels->setSectionResizeMode(1, QHeaderView::Stretch);
+    pHdrHermesModels->resizeSection(0, 130);
+    pHdrHermesModels->resizeSection(2, 125);
+    pHdrHermesModels->resizeSection(3, 100);
+    pHdrHermesModels->resizeSection(4, 75);
+    pHdrHermesModels->resizeSection(5, 75);
+    pHdrHermesModels->resizeSection(6, 42);
+    QFont fntHermesModels = m_pTreeHermesModels->font();
+    fntHermesModels.setPointSize(11);
+    m_pTreeHermesModels->setFont(fntHermesModels);
+    QFont fntHermesHdr = pHdrHermesModels->font();
+    fntHermesHdr.setPointSize(11);
+    pHdrHermesModels->setFont(fntHermesHdr);
+    m_pTreeHermesModels->setMinimumHeight(120);
+    m_pTreeHermesModels->setToolTip(QStringLiteral(
+        "自定义模型条目（正本存 config.ini 的 [HermesModels] 节）。\n"
+        "「当前」列打 ● 的条目生效，忽略上方模型/API Key 固定路由。双击编辑。\n"
+        "最大输出上限 131072（网关 2^17 上限，保存时钳位）"));
+    connect(m_pTreeHermesModels, &QTreeWidget::itemDoubleClicked,
+            this, [this](QTreeWidgetItem*, int) { OnHermesModelEdit(); });
+    connect(m_pTreeHermesModels, &QTreeWidget::currentItemChanged,
+            this, [this](QTreeWidgetItem*, QTreeWidgetItem*) { RefreshHermesModelList(); });
+    pLayHermesModels->addWidget(m_pTreeHermesModels);
+    auto* pRowHermesModelBtns = new QWidget(pGroupHermesModels);
+    auto* pLayHermesModelBtns = new QHBoxLayout(pRowHermesModelBtns);
+    pLayHermesModelBtns->setContentsMargins(0, 0, 0, 0);
+    m_pBtnHermesModelAdd = new QPushButton(QStringLiteral("新增…"), pRowHermesModelBtns);
+    connect(m_pBtnHermesModelAdd, &QPushButton::clicked, this, [this]() { OnHermesModelAdd(); });
+    m_pBtnHermesModelCopy = new QPushButton(QStringLiteral("复制…"), pRowHermesModelBtns);
+    connect(m_pBtnHermesModelCopy, &QPushButton::clicked, this, [this]() { OnHermesModelCopy(); });
+    m_pBtnHermesModelEdit = new QPushButton(QStringLiteral("编辑…"), pRowHermesModelBtns);
+    connect(m_pBtnHermesModelEdit, &QPushButton::clicked, this, [this]() { OnHermesModelEdit(); });
+    m_pBtnHermesModelDel = new QPushButton(QStringLiteral("删除"), pRowHermesModelBtns);
+    connect(m_pBtnHermesModelDel, &QPushButton::clicked, this, [this]() { OnHermesModelDel(); });
+    m_pBtnHermesModelActive = new QPushButton(QStringLiteral("设为当前"), pRowHermesModelBtns);
+    connect(m_pBtnHermesModelActive, &QPushButton::clicked,
+            this, [this]() { OnHermesModelSetActive(); });
+    pLayHermesModelBtns->addWidget(m_pBtnHermesModelAdd);
+    pLayHermesModelBtns->addWidget(m_pBtnHermesModelCopy);
+    pLayHermesModelBtns->addWidget(m_pBtnHermesModelEdit);
+    pLayHermesModelBtns->addWidget(m_pBtnHermesModelDel);
+    pLayHermesModelBtns->addWidget(m_pBtnHermesModelActive);
+    pLayHermesModelBtns->addStretch(1);
+    pLayHermesModels->addWidget(pRowHermesModelBtns);
+    auto* pLblHermesHint = new QLabel(QStringLiteral(
+        "Hermes（第五后端）以独立 CLI 子进程 + 网关调用接入（一阶段一进程，NDJSON 流式）。\n"
+        "启动时幂等写 ~/.hermes/agent/config.json（contextWindow/200000、maxTokens/131072 "
+        "钳位）。\nAPI Key 明文存 config.ini 与 ~/.hermes，注意文件外发安全。"), pTabHermes);
+    pLblHermesHint->setWordWrap(true);
+    pLayHermes->addWidget(pGroupHermesModels);
+    pLayHermes->addWidget(pLblHermesHint);
+    pLayHermes->addStretch(1);
+
     pTabs->addTab(pTabCommon, QStringLiteral("常用"));
     pTabs->addTab(pTabDsh, QStringLiteral("DeepSeekHarness参数设置"));
     pTabs->addTab(pTabPi, QStringLiteral("PiAgent参数设置"));
     pTabs->addTab(pTabCodex, QStringLiteral("CodexHarness参数设置"));
+    pTabs->addTab(pTabHermes, QStringLiteral("Hermes参数设置"));
 
     auto* pLayoutMain = new QVBoxLayout(this);
     pLayoutMain->addWidget(pTabs, 1);
@@ -1106,7 +1272,6 @@ void CSettingsDialog::UpdateDshEnabled() {
     if (m_pEditDshNode != nullptr)     { m_pEditDshNode->setEnabled(true); }   // 2026.08.21 始终可编辑（同 Codex 死锁修复）
     if (m_pEditDshRoot != nullptr)     { m_pEditDshRoot->setEnabled(true); }
     if (m_pEditDshProvider != nullptr) { m_pEditDshProvider->setEnabled(bDsh && !bCustomActive); }
-    if (m_pEditDshModel != nullptr)    { m_pEditDshModel->setEnabled(bDsh && !bCustomActive); }
     if (m_pSpinDshPriceIn != nullptr)        { m_pSpinDshPriceIn->setEnabled(bDsh); }
     if (m_pSpinDshPriceCacheRead != nullptr) { m_pSpinDshPriceCacheRead->setEnabled(bDsh); }
     if (m_pSpinDshPriceCacheWrite != nullptr) { m_pSpinDshPriceCacheWrite->setEnabled(bDsh); }
@@ -1183,7 +1348,7 @@ void CSettingsDialog::RefreshDshModelList() {
     }
     if (m_aDshModels.isEmpty()) {
         auto* pItem = new QTreeWidgetItem(QStringList{
-            QStringLiteral("（空：使用上方 Provider/模型 固定路由）")});
+            QStringLiteral("（空：使用上方 Provider 固定路由）")});
         pItem->setDisabled(true);
         m_pTreeDshModels->addTopLevelItem(pItem);
     }
@@ -1219,6 +1384,9 @@ void CSettingsDialog::OnDshModelAdd() {
         return;
     }
     m_aDshModels.append(dlg.Entry());
+    if (m_aDshModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iDshActiveModel = 0;
+    }
     RefreshDshModelList();   // 先重建（新行落位），再选中末行
     if (m_pTreeDshModels->topLevelItemCount() > 0) {
         m_pTreeDshModels->setCurrentItem(
@@ -1240,6 +1408,9 @@ void CSettingsDialog::OnDshModelCopy() {
         return;
     }
     m_aDshModels.append(dlg.Entry());
+    if (m_aDshModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iDshActiveModel = 0;
+    }
     RefreshDshModelList();
     if (m_pTreeDshModels->topLevelItemCount() > 0) {
         m_pTreeDshModels->setCurrentItem(
@@ -1276,6 +1447,9 @@ void CSettingsDialog::OnDshModelDel() {
         m_iDshActiveModel = -1;          // 删的正是「当前」→ 取消当前
     } else if (m_iDshActiveModel > iRow) {
         --m_iDshActiveModel;             // 其后条目下标前移
+    }
+    if (m_aDshModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
+        m_iDshActiveModel = 0;
     }
     UpdateDshEnabled();
 }
@@ -1390,8 +1564,6 @@ void CSettingsDialog::UpdatePiEnabled() {
     if (m_pEditPiNode != nullptr)    { m_pEditPiNode->setEnabled(true); }
     if (m_pEditPiRoot != nullptr)    { m_pEditPiRoot->setEnabled(true); }
     if (m_pEditPiProvider != nullptr){ m_pEditPiProvider->setEnabled(bPi && !bPiCustomActive); }
-    if (m_pEditPiModel != nullptr)   { m_pEditPiModel->setEnabled(bPi && !bPiCustomActive); }
-    if (m_pEditPiApiKey != nullptr)  { m_pEditPiApiKey->setEnabled(bPi && !bPiCustomActive); }
     if (m_pComboPiThinking != nullptr){ m_pComboPiThinking->setEnabled(bPi); }
     if (m_pSpinPiPriceIn != nullptr)        { m_pSpinPiPriceIn->setEnabled(bPi); }
     if (m_pSpinPiPriceCacheRead != nullptr) { m_pSpinPiPriceCacheRead->setEnabled(bPi); }
@@ -1445,7 +1617,7 @@ void CSettingsDialog::RefreshPiModelList() {
     }
     if (m_aPiModels.isEmpty()) {
         auto* pItem = new QTreeWidgetItem(QStringList{
-            QStringLiteral("（空：使用上方 Provider/模型 固定路由）")});
+            QStringLiteral("（空：使用上方 Provider 固定路由）")});
         pItem->setDisabled(true);
         m_pTreePiModels->addTopLevelItem(pItem);
     }
@@ -1480,6 +1652,9 @@ void CSettingsDialog::OnPiModelAdd() {
         return;
     }
     m_aPiModels.append(dlg.Entry());
+    if (m_aPiModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iPiActiveModel = 0;
+    }
     RefreshPiModelList();
     if (m_pTreePiModels->topLevelItemCount() > 0) {
         m_pTreePiModels->setCurrentItem(
@@ -1501,6 +1676,9 @@ void CSettingsDialog::OnPiModelCopy() {
         return;
     }
     m_aPiModels.append(dlg.Entry());
+    if (m_aPiModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iPiActiveModel = 0;
+    }
     RefreshPiModelList();
     if (m_pTreePiModels->topLevelItemCount() > 0) {
         m_pTreePiModels->setCurrentItem(
@@ -1537,6 +1715,9 @@ void CSettingsDialog::OnPiModelDel() {
         m_iPiActiveModel = -1;
     } else if (m_iPiActiveModel > iRow) {
         --m_iPiActiveModel;
+    }
+    if (m_aPiModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
+        m_iPiActiveModel = 0;
     }
     UpdatePiEnabled();
 }
@@ -1717,9 +1898,6 @@ QString CSettingsDialog::DshProvider() const {
     return m_pEditDshProvider->text().trimmed();
 }
 
-QString CSettingsDialog::DshModel() const {
-    return m_pEditDshModel->text().trimmed();
-}
 
 double CSettingsDialog::DshPriceInPerM() const {
     return m_pSpinDshPriceIn->value();
@@ -1760,13 +1938,6 @@ QString CSettingsDialog::PiProvider() const {
     return s.isEmpty() ? QStringLiteral("anthropic") : s;
 }
 
-QString CSettingsDialog::PiModel() const {
-    return m_pEditPiModel != nullptr ? m_pEditPiModel->text().trimmed() : QString();
-}
-
-QString CSettingsDialog::PiApiKey() const {
-    return m_pEditPiApiKey != nullptr ? m_pEditPiApiKey->text().trimmed() : QString();
-}
 
 QString CSettingsDialog::PiThinking() const {
     // 下拉首项「（默认）」＝ 空（不传 --thinking）。
@@ -1840,17 +2011,6 @@ QString CSettingsDialog::CodexProvider() const {
     return s.isEmpty() ? QStringLiteral("autocode") : s;
 }
 
-QString CSettingsDialog::CodexModel() const {
-    return m_pEditCodexModel != nullptr ? m_pEditCodexModel->text().trimmed() : QString();
-}
-
-QString CSettingsDialog::CodexApiKey() const {
-    return m_pEditCodexApiKey != nullptr ? m_pEditCodexApiKey->text().trimmed() : QString();
-}
-
-QString CSettingsDialog::CodexBaseUrl() const {
-    return m_pEditCodexBaseUrl != nullptr ? m_pEditCodexBaseUrl->text().trimmed() : QString();
-}
 
 QString CSettingsDialog::CodexWireApi() const {
     return m_pComboCodexWireApi != nullptr ? m_pComboCodexWireApi->currentText()
@@ -1883,9 +2043,6 @@ void CSettingsDialog::UpdateCodexEnabled() {
     if (m_pEditCodexNode != nullptr)     { m_pEditCodexNode->setEnabled(true); }
     if (m_pEditCodexRoot != nullptr)     { m_pEditCodexRoot->setEnabled(true); }
     if (m_pEditCodexProvider != nullptr) { m_pEditCodexProvider->setEnabled(bCodex && !bCodexCustomActive); }
-    if (m_pEditCodexModel != nullptr)    { m_pEditCodexModel->setEnabled(bCodex && !bCodexCustomActive); }
-    if (m_pEditCodexApiKey != nullptr)   { m_pEditCodexApiKey->setEnabled(bCodex && !bCodexCustomActive); }
-    if (m_pEditCodexBaseUrl != nullptr)  { m_pEditCodexBaseUrl->setEnabled(bCodex && !bCodexCustomActive); }
     if (m_pComboCodexWireApi != nullptr) { m_pComboCodexWireApi->setEnabled(bCodex && !bCodexCustomActive); }
     if (m_pTreeCodexModels != nullptr)   { m_pTreeCodexModels->setEnabled(bCodexSel); }
     auto* pStdModel = qobject_cast<QStandardItemModel*>(m_pComboBackend->model());
@@ -2031,7 +2188,7 @@ void CSettingsDialog::RefreshCodexModelList() {
     }
     if (m_aCodexModels.isEmpty()) {
         auto* pItem = new QTreeWidgetItem(QStringList{
-            QStringLiteral("（空：使用上方 Provider/模型 固定路由）")});
+            QStringLiteral("（空：使用上方 Provider 固定路由）")});
         pItem->setDisabled(true);
         m_pTreeCodexModels->addTopLevelItem(pItem);
     }
@@ -2066,6 +2223,9 @@ void CSettingsDialog::OnCodexModelAdd() {
         return;
     }
     m_aCodexModels.append(dlg.Entry());
+    if (m_aCodexModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iCodexActiveModel = 0;
+    }
     RefreshCodexModelList();
     if (m_pTreeCodexModels->topLevelItemCount() > 0) {
         m_pTreeCodexModels->setCurrentItem(
@@ -2087,6 +2247,9 @@ void CSettingsDialog::OnCodexModelCopy() {
         return;
     }
     m_aCodexModels.append(dlg.Entry());
+    if (m_aCodexModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iCodexActiveModel = 0;
+    }
     RefreshCodexModelList();
     if (m_pTreeCodexModels->topLevelItemCount() > 0) {
         m_pTreeCodexModels->setCurrentItem(
@@ -2124,6 +2287,9 @@ void CSettingsDialog::OnCodexModelDel() {
     } else if (m_iCodexActiveModel > iRow) {
         --m_iCodexActiveModel;
     }
+    if (m_aCodexModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
+        m_iCodexActiveModel = 0;
+    }
     RefreshCodexModelList();
     UpdateCodexEnabled();
 }
@@ -2144,7 +2310,7 @@ void CSettingsDialog::OnInstallCodexLocal() {
     const QString sDefSrc = QDir(QCoreApplication::applicationDirPath())
         .filePath(QStringLiteral("../CodexHarness"));
     const QString sSrc = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("选择本机 CodexHarness 源目录（其下应有 node_modules\@openai\codex）"),
+        this, QStringLiteral("选择本机 CodexHarness 源目录（其下应有 node_modules/@openai/codex）"),
         QFile::exists(sDefSrc) ? sDefSrc : QString());
     if (sSrc.isEmpty()) {
         return;
@@ -2152,7 +2318,7 @@ void CSettingsDialog::OnInstallCodexLocal() {
     if (!CCodexRunner::LooksLikeCodexRoot(sSrc)) {
         QMessageBox::warning(this, QStringLiteral("CodexHarness"),
             QStringLiteral("所选目录不是有效的 CodexHarness 安装源：\n%1\n\n"
-                           "其下未找到 node_modules\@openai\codex。").arg(sSrc));
+                           "其下未找到 node_modules/@openai/codex。").arg(sSrc));
         return;
     }
     // 目标：exe 同级 Execute\CodexHarness（固定锚点，与探测/路由一致）。
@@ -2204,4 +2370,388 @@ void CSettingsDialog::OnInstallCodexLocal() {
         return;
     }
     DetectCodexInstalled(false);   // 自动重检 + 结果提示（命中自动回填根目录）
+}
+
+
+// ======================= Hermes 第五后端（任务 3213cdbf） =======================
+// 口径同 Pi 页：参数组按「后端选中」启用（Hermes 项不做安装态禁选——探测失败时
+// StartStage 带具体缺失路径报错，配置错误不应变成静默回退）；模型树与四方法同构。
+void CSettingsDialog::UpdateHermesEnabled() {
+    if (m_pComboBackend == nullptr) {
+        return;
+    }
+    const bool bHermes = (m_pComboBackend->currentData() == 5);
+    const bool bCustomActive = m_iHermesActiveModel >= 0
+        && m_iHermesActiveModel < m_aHermesModels.size();
+    if (m_pEditHermesNode != nullptr)    { m_pEditHermesNode->setEnabled(true); }
+    if (m_pEditHermesRoot != nullptr)    { m_pEditHermesRoot->setEnabled(true); }
+    if (m_pSpinHermesPriceIn != nullptr)        { m_pSpinHermesPriceIn->setEnabled(bHermes); }
+    if (m_pSpinHermesPriceCacheRead != nullptr) { m_pSpinHermesPriceCacheRead->setEnabled(bHermes); }
+    if (m_pSpinHermesPriceCacheWrite != nullptr){ m_pSpinHermesPriceCacheWrite->setEnabled(bHermes); }
+    if (m_pSpinHermesPriceOut != nullptr)       { m_pSpinHermesPriceOut->setEnabled(bHermes); }
+    if (m_pTreeHermesModels != nullptr) { m_pTreeHermesModels->setEnabled(bHermes); }
+    RefreshHermesModelList();
+}
+
+void CSettingsDialog::DetectHermesInstalled(bool a_bSilent) {
+    // 探测：显式根目录下 dist\cli.js（Harness）或 hermes-agent\venv\Scripts\
+    //   hermes.exe（Python 版）存在才算装好；空则看 ResolveHermesCli()（含
+    //   HERMES_HOME、exe 同级 HermesHarness 与 PATH 兜底）。2026.09 补本机源
+    //   安装入口：按钮恒可用（未装=安装 / 已装=覆盖更新，无 npm/远端源）。
+    const QString sRoot = m_pEditHermesRoot != nullptr ? m_pEditHermesRoot->text().trimmed()
+                                                       : QString();
+    // 探测前临时回填编辑框当前值（CR-v2 minor：ResolveHermesCli 读 Runner 静态
+    //   s_sHermesRoot——未保存前点「重新检测」会拿到过期 config 值），探测后还原。
+    const QString sSavedRoot = CHermesRunner::HermesRoot();
+    if (!sRoot.isEmpty()) {
+        CHermesRunner::SetHermesRoot(sRoot);
+    }
+    const QString sCli = CHermesRunner::ResolveHermesCli();
+    if (!sRoot.isEmpty()) {
+        CHermesRunner::SetHermesRoot(sSavedRoot);
+    }
+    m_bHermesInstalled = !sCli.isEmpty();
+    if (m_pLblHermesState != nullptr) {
+        if (!sCli.isEmpty()) {
+            m_pLblHermesState->setText(QStringLiteral("已检测到 Hermes CLI ✓（%1）").arg(
+                QDir::toNativeSeparators(sCli)));
+            m_pLblHermesState->setStyleSheet(QStringLiteral("color: green;"));
+        } else if (!sRoot.isEmpty()) {
+            m_pLblHermesState->setText(QStringLiteral(
+                "安装未完成：根目录存在但缺 dist\\cli.js 与 "
+                "hermes-agent\\venv\\Scripts\\hermes.exe（%1）").arg(
+                QDir::toNativeSeparators(sRoot)));
+            m_pLblHermesState->setStyleSheet(QStringLiteral("color: #b00;"));
+        } else {
+            m_pLblHermesState->setText(QStringLiteral(
+                "未安装（未配置根目录，且未探测到 HERMES_HOME、exe 同级 "
+                "HermesHarness 与 PATH 的 hermes）。点右侧「本机源安装（离线）」"
+                "可从本机源安装"));
+            m_pLblHermesState->setStyleSheet(QStringLiteral("color: #b00;"));
+        }
+    }
+    UpdateHermesEnabled();
+    if (!a_bSilent) {
+        if (m_bHermesInstalled) {
+            QMessageBox::information(this, QStringLiteral("Hermes"),
+                QStringLiteral("Hermes 安装检测通过（%1）。").arg(
+                    QDir::toNativeSeparators(sCli)));
+        } else {
+            QMessageBox::warning(this, QStringLiteral("Hermes"),
+                QStringLiteral("未检测到可用的 Hermes 安装。\n\n%1").arg(
+                    CHermesRunner::HermesConfigError()));
+        }
+    }
+}
+
+// —— 2026.09 Hermes 本机源离线安装（robocopy；无需管理员/网络，口径同 Codex）——
+void CSettingsDialog::OnInstallHermesLocal() {
+    // 默认源：exe 上级 HermesHarness（与本机源部署约定一致），可浏览改选。
+    const QString sDefSrc = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("../HermesHarness"));
+    const QString sSrc = QFileDialog::getExistingDirectory(
+        this, QStringLiteral("选择本机 Hermes Harness 源目录（其下应有 dist\\cli.js）"),
+        QFile::exists(sDefSrc) ? sDefSrc : QString());
+    if (sSrc.isEmpty()) {
+        return;
+    }
+    if (!CHermesRunner::LooksLikeHermesRoot(sSrc)) {
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("所选目录不是有效的 Hermes Harness 源：\n%1\n\n"
+                           "其下未找到 dist\\cli.js。").arg(sSrc));
+        return;
+    }
+    // 目标：exe 同级 HermesHarness（固定锚点，与 ResolveHermesCli 探测序一致）。
+    //   源≠目标（浏览误选安装目标本身时直接视为重装完成，不 robocopy 自拷）。
+    const QString sDst = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("HermesHarness"));
+    if (QDir(sSrc).absolutePath() == QDir(sDst).absolutePath()) {
+        QMessageBox::information(this, QStringLiteral("Hermes"),
+            QStringLiteral("所选目录就是安装目标本身，无需复制。"));
+        DetectHermesInstalled(false);
+        return;
+    }
+    if (!QDir().mkpath(sDst)) {
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("无法创建目标目录：\n%1").arg(sDst));
+        return;
+    }
+    QProgressDialog stProg(QStringLiteral("正在从本机源复制 Hermes（robocopy）…"),
+                           QStringLiteral("取消"), 0, 0, this);
+    stProg.setWindowTitle(QStringLiteral("Hermes 安装"));
+    stProg.setWindowModality(Qt::WindowModal);
+    stProg.setMinimumDuration(0);
+    stProg.show();
+    QCoreApplication::processEvents();
+    // robocopy <src> <dst> /E：整树复制；退出码 0-7 均为成功（8+ 才是错误）。
+    QProcess stProc;
+    stProc.start(QStringLiteral("robocopy"),
+                 { QDir::toNativeSeparators(sSrc), QDir::toNativeSeparators(sDst),
+                   QStringLiteral("/E"), QStringLiteral("/NFL"), QStringLiteral("/NDL"),
+                   QStringLiteral("/NJH"), QStringLiteral("/NJS"), QStringLiteral("/NP"),
+                   QStringLiteral("/R:2"), QStringLiteral("/W:2") });
+    if (!stProc.waitForStarted(10000)) {
+        stProg.cancel();
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("无法启动 robocopy（系统组件缺失？）"));
+        return;
+    }
+    while (!stProc.waitForFinished(1000)) {
+        if (stProc.state() != QProcess::Running) {
+            break;
+        }
+        QCoreApplication::processEvents();
+        if (stProg.wasCanceled()) {
+            stProc.kill();
+            stProc.waitForFinished(3000);
+            stProg.cancel();
+            return;
+        }
+    }
+    stProg.cancel();
+    const int iRc = stProc.exitCode();
+    if (iRc >= 8) {
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("robocopy 复制失败（退出码 %1）：\n%2")
+                .arg(QString::number(iRc), QString::fromUtf8(stProc.readAllStandardError())));
+        return;
+    }
+    DetectHermesInstalled(false);   // 自动重检 + 结果提示
+}
+
+// —— 2026.09 Hermes 联网安装（git 克隆 + pnpm 构建；提权口径同 OnInstallDsh）——
+void CSettingsDialog::OnInstallHermesNet() {
+    // Hermes 无固定远端发布源，仓库地址不设持久配置项（对齐 DSH/Pi 等后端设置页
+    //   均无此项）——安装时经输入框现场给定：git URL（https:// 或 git@）或本机
+    //   仓库路径（git clone 支持本地路径，离线机/内网源同样可用）。
+    bool bOk = false;
+    const QString sRepo = QInputDialog::getText(this, QStringLiteral("Hermes 联网安装"),
+        QStringLiteral("Hermes Harness 的 git 仓库地址或本机仓库路径："),
+        QLineEdit::Normal,
+        QStringLiteral("https://github.com/nousresearch/hermes-agent"), &bOk).trimmed();
+    if (!bOk) {
+        return;   // 用户取消
+    }
+    const bool bRemote = sRepo.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)
+                      || sRepo.startsWith(QStringLiteral("git@"));
+    if (sRepo.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("Hermes"),
+            QStringLiteral("仓库地址不能为空（缺省源 https://github.com/"
+                           "nousresearch/hermes-agent，或本机 Hermes 仓库路径）。"));
+        return;
+    }
+    if (!bRemote) {
+        // 本机路径：须是存在的目录且为 git 仓库（其下 .git 或 dist\cli.js）。
+        const QString sGitDir = sRepo + QStringLiteral("/.git");
+        const QString sCli = sRepo + QStringLiteral("/dist/cli.js");
+        if (!QDir(sRepo).exists() || (!QFileInfo::exists(sGitDir) && !QFileInfo::exists(sCli))) {
+            QMessageBox::warning(this, QStringLiteral("Hermes"),
+                QStringLiteral("输入既不是 https:// 或 git@ 开头的 git URL，"
+                               "也不是有效的本机 Hermes 仓库目录（其下应有 .git "
+                               "或 dist\\cli.js）：\n%1").arg(sRepo));
+            return;
+        }
+    }
+    // 提权启动 exe 同级 install_env.bat 的 /hermes 单装模式（地址作第 2 参传入）。
+    //   cmd /k 保持窗口：git/pnpm/失败输出可查。
+    const QString sScript = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/install_env.bat");
+    if (!QFile::exists(sScript)) {
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整（安装脚本随"
+                           "构建同步到 exe 同级）。").arg(QDir::toNativeSeparators(sScript)));
+        return;
+    }
+    const QString sArgs = QStringLiteral("/k \"")
+        + QDir::toNativeSeparators(sScript) + QStringLiteral("\" /hermes \"")
+        + sRepo + QStringLiteral("\"");
+    const HINSTANCE hInst = ShellExecuteW(nullptr, L"runas", L"cmd.exe",
+                                           sArgs.toStdWString().c_str(),
+                                           nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(hInst) <= 32) {   // <=32 = 提权被拒/失败
+        QMessageBox::warning(this, QStringLiteral("Hermes"),
+            QStringLiteral("未能以管理员权限启动安装脚本（UAC 被取消或被拒）。"));
+        return;
+    }
+    QMessageBox::information(this, QStringLiteral("Hermes"),
+        QStringLiteral("已在管理员窗口中启动联网安装，请在该窗口查看进度。\n\n"
+                       "窗口出现「[OK] Hermes 安装完成」才算装好（出现 [错误] "
+                       "按提示处理后重跑，可续装）；完成后回到本页点「重新检测」，"
+                       "检测通过即可选用该后端（exe 同级 HermesHarness 自动命中）。"));
+}
+
+void CSettingsDialog::RefreshHermesModelList() {
+    if (m_pTreeHermesModels == nullptr) {
+        return;
+    }
+    const int iSel = CurHermesModelRow();
+    m_pTreeHermesModels->blockSignals(true);
+    m_pTreeHermesModels->clear();
+    for (int i = 0; i < m_aHermesModels.size(); ++i) {
+        const SDshModelEntry& stE = m_aHermesModels.at(i);
+        auto* pItem = new QTreeWidgetItem(QStringList()
+            << stE.sDisp
+            << stE.sBaseURL
+            << stE.sApi
+            << stE.sModelId
+            << QString::number(stE.iCtx)
+            << QString::number(stE.iMaxTok)
+            << (i == m_iHermesActiveModel ? QStringLiteral("●") : QString()));
+        pItem->setToolTip(0, QStringLiteral("双击编辑；API Key：%1").arg(
+            stE.sApiKey.isEmpty() ? QStringLiteral("未配置")
+                                  : QStringLiteral("已配置（明文存 config.ini）")));
+        pItem->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
+        pItem->setTextAlignment(5, Qt::AlignRight | Qt::AlignVCenter);
+        pItem->setTextAlignment(6, Qt::AlignCenter);
+        m_pTreeHermesModels->addTopLevelItem(pItem);
+    }
+    if (m_aHermesModels.isEmpty()) {
+        auto* pItem = new QTreeWidgetItem(QStringList{
+            QStringLiteral("（空：使用上方模型列表当前条目）")});
+        pItem->setDisabled(true);
+        m_pTreeHermesModels->addTopLevelItem(pItem);
+    }
+    if (iSel >= 0 && iSel < m_pTreeHermesModels->topLevelItemCount()) {
+        m_pTreeHermesModels->setCurrentItem(m_pTreeHermesModels->topLevelItem(iSel));
+    }
+    m_pTreeHermesModels->blockSignals(false);
+    const int iRow = CurHermesModelRow();
+    const bool bHasSel = (iRow >= 0 && iRow < m_aHermesModels.size());
+    const bool bEnabled = m_pTreeHermesModels->isEnabled();
+    if (m_pBtnHermesModelAdd != nullptr)  { m_pBtnHermesModelAdd->setEnabled(bEnabled); }
+    if (m_pBtnHermesModelCopy != nullptr) { m_pBtnHermesModelCopy->setEnabled(bEnabled && bHasSel); }
+    if (m_pBtnHermesModelEdit != nullptr) { m_pBtnHermesModelEdit->setEnabled(bEnabled && bHasSel); }
+    if (m_pBtnHermesModelDel != nullptr)  { m_pBtnHermesModelDel->setEnabled(bEnabled && bHasSel); }
+    if (m_pBtnHermesModelActive != nullptr) {
+        m_pBtnHermesModelActive->setEnabled(bEnabled && bHasSel);
+        m_pBtnHermesModelActive->setText((bHasSel && iRow == m_iHermesActiveModel)
+            ? QStringLiteral("取消当前") : QStringLiteral("设为当前"));
+    }
+}
+
+int CSettingsDialog::CurHermesModelRow() const {
+    if (m_pTreeHermesModels == nullptr) {
+        return -1;
+    }
+    return m_pTreeHermesModels->indexOfTopLevelItem(m_pTreeHermesModels->currentItem());
+}
+
+void CSettingsDialog::OnHermesModelAdd() {
+    CDshModelEditDialog dlg(this, nullptr, false, false, false, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aHermesModels.append(dlg.Entry());
+    if (m_aHermesModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iHermesActiveModel = 0;
+    }
+    RefreshHermesModelList();
+    if (m_pTreeHermesModels->topLevelItemCount() > 0) {
+        m_pTreeHermesModels->setCurrentItem(
+            m_pTreeHermesModels->topLevelItem(m_pTreeHermesModels->topLevelItemCount() - 1));
+    }
+    UpdateHermesEnabled();
+}
+
+void CSettingsDialog::OnHermesModelCopy() {
+    const int iRow = CurHermesModelRow();
+    if (iRow < 0 || iRow >= m_aHermesModels.size()) {
+        return;
+    }
+    SDshModelEntry stCopy = m_aHermesModels.at(iRow);
+    stCopy.sDisp += QStringLiteral("-副本");
+    CDshModelEditDialog dlg(this, &stCopy, false, false, true, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aHermesModels.append(dlg.Entry());
+    if (m_aHermesModels.size() == 1) {   // 仅此一条 → 自动设为缺省
+        m_iHermesActiveModel = 0;
+    }
+    RefreshHermesModelList();
+    if (m_pTreeHermesModels->topLevelItemCount() > 0) {
+        m_pTreeHermesModels->setCurrentItem(
+            m_pTreeHermesModels->topLevelItem(m_pTreeHermesModels->topLevelItemCount() - 1));
+    }
+    UpdateHermesEnabled();
+}
+
+void CSettingsDialog::OnHermesModelEdit() {
+    const int iRow = CurHermesModelRow();
+    if (iRow < 0 || iRow >= m_aHermesModels.size()) {
+        return;
+    }
+    CDshModelEditDialog dlg(this, &m_aHermesModels[iRow], false, false, false, true);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    m_aHermesModels[iRow] = dlg.Entry();
+    UpdateHermesEnabled();
+}
+
+void CSettingsDialog::OnHermesModelDel() {
+    const int iRow = CurHermesModelRow();
+    if (iRow < 0 || iRow >= m_aHermesModels.size()) {
+        return;
+    }
+    const SDshModelEntry& stE = m_aHermesModels.at(iRow);
+    if (QMessageBox::question(this, QStringLiteral("自定义模型"),
+            QStringLiteral("删除条目「%1」？").arg(stE.sDisp)) != QMessageBox::Yes) {
+        return;
+    }
+    m_aHermesModels.removeAt(iRow);
+    if (m_iHermesActiveModel == iRow) {
+        m_iHermesActiveModel = -1;
+    } else if (m_iHermesActiveModel > iRow) {
+        --m_iHermesActiveModel;
+    }
+    if (m_aHermesModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
+        m_iHermesActiveModel = 0;
+    }
+    UpdateHermesEnabled();
+}
+
+void CSettingsDialog::OnHermesModelSetActive() {
+    const int iRow = CurHermesModelRow();
+    if (iRow < 0 || iRow >= m_aHermesModels.size()) {
+        return;
+    }
+    m_iHermesActiveModel = (m_iHermesActiveModel == iRow) ? -1 : iRow;
+    UpdateHermesEnabled();
+}
+
+// Hermes 参数 getters（保存路径在 CMainWindow::OnSettings 统一落盘）。
+QString CSettingsDialog::HermesNodePath() const {
+    return m_pEditHermesNode != nullptr ? m_pEditHermesNode->text().trimmed() : QString();
+}
+
+QString CSettingsDialog::HermesRoot() const {
+    return m_pEditHermesRoot != nullptr ? m_pEditHermesRoot->text().trimmed() : QString();
+}
+
+
+
+
+double CSettingsDialog::HermesPriceInPerM() const {
+    return m_pSpinHermesPriceIn != nullptr ? m_pSpinHermesPriceIn->value() : 0.0;
+}
+
+double CSettingsDialog::HermesPriceCacheReadPerM() const {
+    return m_pSpinHermesPriceCacheRead != nullptr ? m_pSpinHermesPriceCacheRead->value() : 0.0;
+}
+
+double CSettingsDialog::HermesPriceCacheWritePerM() const {
+    return m_pSpinHermesPriceCacheWrite != nullptr ? m_pSpinHermesPriceCacheWrite->value() : 0.0;
+}
+
+double CSettingsDialog::HermesPriceOutPerM() const {
+    return m_pSpinHermesPriceOut != nullptr ? m_pSpinHermesPriceOut->value() : 0.0;
+}
+
+QList<SDshModelEntry> CSettingsDialog::HermesModels() const {
+    return m_aHermesModels;
+}
+
+int CSettingsDialog::HermesActiveModel() const {
+    return m_iHermesActiveModel;
 }

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -416,7 +416,7 @@
   <tr><th style="width:180px">操作</th><th>说明</th></tr>
   <tr><td>新建工程目录...</td><td>选一个空目录新建工程，自动初始化 .autodev 并生成 guide.md。</td></tr>
   <tr><td>打开工程目录...</td><td>打开已有代码目录；首次打开自动扫描生成 guide.md（耗时数分钟）。</td></tr>
-  <tr><td>最近打开</td><td>最近工程一键直达（子菜单最多 10 条，末尾「...」打开全量历史对话框）；启动时自动恢复上次工程。</td></tr>
+  <tr><td>最近打开</td><td>最近工程一键直达（子菜单最多 10 条，末尾「...」打开全量历史对话框，对话框顶部搜索框实时按名称/路径过滤列表）；启动时自动恢复上次工程。</td></tr>
   <tr><td>同步 Guide</td><td>按 record.md 中的改动流水增量更新 guide.md（任务完成后也会自动触发，此处为手动入口）。</td></tr>
   <tr><td>任务右键菜单</td><td>当前任务：查看任务内容 / 移除；历史任务：查看任务内容 / 再次执行。</td></tr>
   <tr><td>回退按钮</td><td>打开统一回退界面：左侧记录点列表（任务阶段 / 助手轮次双粒度，增量备份），右侧文件变动明细，选中记录点后点「回退到此记录点」把工程源码回退到该时点（双击不执行回退，防误触）。回退前会先把当前现场自动快照留底，随时可再撤销回来。</td></tr>
@@ -457,9 +457,9 @@
 
 <table class="tbl">
   <tr><th style="width:130px">页签</th><th>内容</th></tr>
-  <tr><td><b>日志</b></td><td>任务执行的完整对话流：Claude 的分析文本、每次工具调用（Read/Edit/Bash...）及结果，底部可发「介入指令」中途纠偏（仅任务运行中可用）。</td></tr>
+  <tr><td><b>日志</b></td><td>任务执行的完整对话流：Claude 的分析文本、每次工具调用（Read/Edit/Bash...）及结果，底部可发「介入指令」中途纠偏（仅任务运行中可用）。<b>折叠显示</b>：工具调用卡片默认折叠、点击展开（Edit 红绿 diff），连续多次工具调用自动合并为一张卡（标题显示首条摘要 + ×N，展开逐条查看）；连续的系统/提示信息行合并为一个灰色折叠组（标题显示首行摘要与行数），错误行独立标红不折叠。<br><b>反向分页（2026.09.03 新增）</b>：历史较长的会话切档/重开时初始只挂载最近 200 条消息（大幅降低切档耗时与内存），更早的消息<b>滚动到顶部时自动加载</b>（每次追加 100 条，视口位置锥定不动，不跳动）；提示词下拉跳转到更早提问时也会自动补齐加载。<br><b>流畅加载（2026.09.04）</b>：历史块分小帧渐进构建（每帧限定耗时预算，不卡界面）；消息的 Markdown 排版在<b>后台线程</b>预渲染（界面线程只做轻量落地），切任务/切助手/滚动加载大量历史时界面保持响应。</td></tr>
   <tr><td><b>阶段产物</b></td><td>按阶段列出 .autodev/tasks/&lt;id&gt;/ 下生成的 .md 文档（需求书、设计书、计划书、审查报告...），右侧直接渲染阅读。</td></tr>
-  <tr><td><b>助手 1 / 助手 2 / …</b></td><td>动态多助手 Tab，每个 Tab 一条独立问答会话（互不串流）：<b>「＋」页</b>新增助手；Tab 上 <b>×</b> 关闭（会话保留可恢复）；右上角 <b>▾</b> 弹出已关闭助手列表选名恢复；<b>拖动</b>排序、<b>双击</b>改名。运行中的助手独立累计日志，切走再看也不丢。Tab 标题标记：<b>●</b> 运行中、<b>⏳</b> 有排队指令。<br><b>跨助手排队（2026.08.27 新增）</b>：助手 A 运行中切到/新建助手 B 后发送，指令不会串进 A 的会话，而是排队到 B（按钮变「⏳ 排队发送」）；A 本轮结束后自动发送到 B。多条排队按先后依次发送。</td></tr>
+  <tr><td><b>助手 1 / 助手 2 / …</b></td><td>动态多助手 Tab，每个 Tab 一条独立问答会话（互不串流）：<b>「＋」页</b>新增助手；Tab 上 <b>×</b> 关闭（会话保留可恢复）；右上角 <b>▾</b> 弹出已关闭助手列表选名恢复；<b>拖动</b>排序、<b>双击</b>改名。运行中的助手独立累计日志，切走再看也不丢。Tab 标题标记：<b>●</b> 运行中。<br><b>多助手并发（2026.09.03 新增）</b>：每个助手是一个完全独立的 Agent（各自的 CLI 进程、会话链、上下文与消耗统计）。助手 A 运行中切到/新建助手 B 后发送，指令<b>立即在 B 开始执行</b>（B 起自己的进程），不排队、不等 A 结束；多个助手可同时亮 ● 并行干活，各自的输出落到各自的日志流。在<b>同一</b>助手运行中发送仍是「追加指令」（注入当前轮或本轮结束后自动续发）。</td></tr>
   <tr><td><b>文件预览</b></td><td>资源管理器单击文件生成预览页，双击切到该页（多文件并存）。</td></tr>
 </table>
 
@@ -471,7 +471,7 @@
 <table class="tbl">
   <tr><th style="width:150px"></th><th>介入指令（日志页下方）</th><th>助手输入（助手页下方）</th></tr>
   <tr><td><b>对象</b></td><td>正在运行的任务</td><td>独立助手会话</td></tr>
-  <tr><td><b>时机</b></td><td>仅任务 Running 时可用</td><td>打开工程后随时可用；助手运行中仍可打字，发送变「➤ 追加指令」（向运行中的助手本轮追加，立即注入/本轮结束后自动发出）或「⏹ 停止」；若当前显示的是另一助手则变「⏳ 排队发送」（当前轮结束后自动发到该助手）</td></tr>
+  <tr><td><b>时机</b></td><td>仅任务 Running 时可用</td><td>打开工程后随时可用；<b>当前助手</b>运行中仍可打字，发送变「➤ 追加指令」（向该助手当前轮追加，立即注入/本轮结束后自动发出）或「⏹ 停止」（只停该助手，不影响其他并发助手）；当前助手空闲则显示「发送」，点击立即执行——即使其他助手正在跑（2026.09.03 起多助手并发，互不排队）</td></tr>
   <tr><td><b>典型用途</b></td><td>「测试不用跑 XX」「换个方案实现」</td><td>「这个函数干嘛的」「帮我加个注释」</td></tr>
   <tr><td><b>附属功能</b></td><td>—</td><td><b>只读</b>开关（禁止改文件）、<b>↶ 撤销</b>（对话层撤销最后一条提问，连带其回复一并移除；与源码回退正交）、上下文条（绿≤70%/红&gt;70%，<b>点击或右键</b>弹出「立即压缩上下文 / 设置上下文大小」——上下文过大时手动压缩可显著提速降费）</td></tr>
 </table>
@@ -574,23 +574,29 @@
     <td>设置页「本机源安装（离线）」</td>
     <td>浏览选本机已有 Codex 安装源 → robocopy 整树复制到 exe 同级 <code>Execute\CodexHarness\</code>，<b>无需管理员/网络</b>——npm 联网卡死时的可靠替代。</td>
   </tr>
+  <tr>
+    <td><b>Hermes</b></td>
+    <td>设置页 Hermes 页「本机源安装（离线）」/「联网安装（git）」</td>
+    <td><b>联网（git）</b>：点击按钮后弹输入框现场填仓库地址（Hermes Harness 的 git 仓库 URL 或本机仓库路径，不落配置文件）→ 提权运行 <code>install_env.bat /hermes &lt;仓库地址&gt;</code>：git 浅克隆 + pnpm 依赖 + 构建 <code>dist\cli.js</code> 到 exe 同级 <code>HermesHarness\</code>（Hermes 无 npm 包，缺省获取源为 <code>https://github.com/nousresearch/hermes-agent</code>，输入框已预填，可改填其他 git URL 或本机仓库路径；已装时重跑 = 自动改 git fetch+reset 更新，保留本地文件）。<b>本机源（离线）</b>：浏览选本机已有 Hermes Harness 源目录（其下有 <code>dist\cli.js</code>）→ robocopy 整树复制，<b>无需管理员/网络</b>。完成后均自动/手动重新检测。</td>
+  </tr>
 </table>
 <div class="tip">装好后安装按钮置灰不隐藏（仍可「重新检测」）。根目录输入框<b>输入即自动重检</b>：直接填本机已有安装路径（含全局 npm 目录）即可解锁后端下拉，不必非走安装按钮。</div>
 
 <h3>🧭 后端版本管理</h3>
-<p><b>后端版本管理</b> — 菜单 <code>功能(F) → 后端版本管理...</code> 或设置页「Agent」组「后端版本管理…」按钮：四 Agent 后端（Claude Code / DeepSeekHarness / PIAgent / CodexHarness）的<b>当前版本 / 最新版本 / 结论 / 更新入口</b>一站式表格。</p>
+<p><b>后端版本管理</b> — 菜单 <code>功能(F) → 后端版本管理...</code> 或设置页「Agent」组「后端版本管理…」按钮：五 Agent 后端（Claude Code / DeepSeekHarness / PIAgent / CodexHarness / Hermes）的<b>当前版本 / 最新版本 / 结论 / 更新入口</b>一站式表格。</p>
 <table class="tbl">
   <tr><th style="width:150px">操作</th><th>说明</th></tr>
-  <tr><td><b>当前版本</b></td><td>打开即自动读取：DSH / Pi / Codex 直读本机安装文件；Claude 子进程探测（约 1–2 秒）。「刷新版本」随时重读。</td></tr>
-  <tr><td><b>查询最新版(联网)</b></td><td>手动触发（不自动联网）：npm registry 查三包 + git ls-remote 查 DSH 远端 tag，约 5–15 秒；显示的是<b>查询时刻</b>的远端值，仅本次会话有效，不落盘。</td></tr>
+  <tr><td><b>当前版本</b></td><td>打开即自动读取：DSH / Pi / Codex / Hermes 直读本机安装文件；Claude 子进程探测（约 1–2 秒）。「刷新版本」随时重读。</td></tr>
+  <tr><td><b>查询最新版(联网)</b></td><td>手动触发（不自动联网）：npm registry 查三包 + git ls-remote 查 DSH 远端 tag，约 5–15 秒；显示的是<b>查询时刻</b>的远端值，仅本次会话有效，不落盘。Hermes 无远端发布源，「最新版本」恒显「未查询」。</td></tr>
   <tr><td><b>更新</b></td><td>按行分派：见下表。均弹<b>可见管理员命令窗口</b>执行，完成后窗口保持打开（cmd /k）供核对输出。</td></tr>
 </table>
 <table class="tbl">
   <tr><th style="width:150px">后端</th><th>更新方式</th></tr>
   <tr><td><b>Claude Code</b></td><td><code>npm install -g @anthropic-ai/claude-code@latest</code>（装/更一体，未安装也可直接装）。</td></tr>
-  <tr><td><b>DeepSeekHarness</b></td><td>先查远端最新 tag → <code>install_env.bat /update-dsh &lt;tag&gt; &lt;dsh根&gt;</code>：git fetch+reset 切版本 + pnpm 重建，<b>保留本地</b>（node_modules、组合文件不受影响）；更新目标优先用设置页配置的根目录（多实例共享外部 DshRoot 也生效），未配置时回落程序目录 <code>DeepSeekHarness\</code>；未安装时按钮置灰（先走安装）。失败重跑即修复（幂等）。</td></tr>
+  <tr><td><b>DeepSeekHarness</b></td><td>先查远端最新 tag → <code>install_env.bat /update-dsh &lt;tag&gt; &lt;dsh根&gt;</code>：git fetch+reset 切版本 + pnpm 重建，<b>保留本地</b>（node_modules、组合文件不受影响）；<b>版本上限锁</b>：AutoCode 集成绑定的最高版本为 dsh-v0.1.0-rc.7——上游 dsh-v0.1.2 起移除了 AutoCode 组合依赖的全部示例包，高于该版本的更新会被阻断（结论列显示「不受支持」）；若本机已处于不兼容版本，用 <code>/update-dsh dsh-v0.1.0-rc.7</code> 回退；<b>自动修复</b>：任务/助手启动时检测到版本不兼容会自动执行「回滚基线→清残留→依赖重建」（约 5~15 分钟，日志逐步显示 🔧 进度，完成后自动继续原阶段；每进程限一次，失败转手动指引）；另 <code>~/.dsh/.credentials.yaml</code> 为旧 version/refs 包装格式时启动前自动迁移为平铺（备份 .autosave）。更新目标优先用设置页配置的根目录（多实例共享外部 DshRoot 也生效），未配置时回落程序目录 <code>DeepSeekHarness\</code>；未安装时按钮置灰（先走安装）。失败重跑即修复（幂等）。</td></tr>
   <tr><td><b>PIAgent</b></td><td><b>按安装形态自动分派</b>（点击时自动判定）：源码形态（exe 同级 PIAgent\pi 布局）→ 重跑安装脚本 <code>/pi</code> 模式 robocopy 全量重部署，<b>更新前请先自行拉取本机 PIAgent 源仓到新版本，否则复制到的仍是旧源</b>（点更新时会弹确认提醒）；npm 全局形态 → <code>npm install -g @earendil-works/pi-coding-agent</code> 直接更新 npm 全局包。未安装时按钮置灰（先走安装）。</td></tr>
   <tr><td><b>CodexHarness</b></td><td>始终重装锁定版 <code>npm install @openai/codex@0.87.0 --save-exact</code>（工程根内，提权窗口执行）。v0.88+ 已移除 <code>wire_api="chat"</code>，<b>不提供升级</b>，结论列恒显锁定说明。</td></tr>
+  <tr><td><b>Hermes</b></td><td>无固定联网更新源（无远端 tag/npm 包可解析），行内更新按钮恒禁用——安装/更新统一走设置页 Hermes 组：「联网安装（git）」（已装时自动 fetch+reset）或「本机源安装（离线）」重部署（robocopy 覆盖）。</td></tr>
 </table>
 <div class="tip"><b>更新闭环</b>：命令窗口出现 [OK] 并<b>关闭窗口后</b>，回到版本管理窗点「刷新版本」重读（或重开设置页「重新检测」）。Claude/DSH 更新后若设置页仍显旧值，重开一次设置页即可。<br>
 <b>运行中拦截</b>：当前全局后端有任务/助手在跑时点更新会弹确认——<b>建议先停掉该后端任务再更新</b>，避免半更新态干扰执行中任务。</div>
@@ -634,7 +640,7 @@
 </details>
 <details>
   <summary>多个助手 Tab 怎么用？会互相干扰吗？</summary>
-  <p>点助手区的「＋」可开多个助手，各自独立会话与日志，互不串流（一个在跑时切到另一个提问也不冲突）。Tab 可拖动排序、双击改名；点 × 关闭的助手会话仍保留，右上角 ▾ 可随时恢复；全部助手页都关掉前至少保留一个。会话随任务档自动保存，重开工程后原样恢复。</p>
+  <p>点助手区的「＋」可开多个助手，<b>每个助手是独立 Agent</b>（独立进程/会话链/上下文），可多个同时运行互不干扰——A 在跑时切到 B 发指令立即执行，不等 A（2026.09.03 起不再排队）。各自独立会话与日志，互不串流。Tab 可拖动排序、双击改名；点 × 关闭的助手会话仍保留，右上角 ▾ 可随时恢复；全部助手页都关掉前至少保留一个。会话随任务档自动保存，重开工程后原样恢复。</p>
 </details>
 <details>
   <summary>费用在哪看？会超支吗？</summary>

@@ -8,6 +8,8 @@ class CMessageBlock;
 // 对话流容器：QScrollArea + 垂直布局，承放 CMessageBlock。
 //   - 跟随尾部：新块到达时若用户停在底部则自动滚到底；用户手动上滚则暂停跟随（Claude Code 行为）
 //   - 上限保护：block 超过阈值时从顶部丢弃最旧（widget 比 text 行重，阈值保守）
+//   - 反向分页（2026.09.03）：初始只挂最近一段块，滚动到顶发 sigTopReached 由外层
+//     补建更早块并 PrependBlocks 锚定插回——活件数≈可视窗口+已翻页量，长会话不再全量建件
 class CMessageView : public QScrollArea {
     Q_OBJECT
 
@@ -27,6 +29,16 @@ public:
     // FR-4：重建型大批量追加前重置跟随标志（重建等同「跳到最新」，应强制跟随到底）。
     void ResetFollow() { m_bFollow = true; }
 
+    // 反向分页：把一批更早的块插入视图顶部。锚定原首块（插前布局首块插后仍滚到
+    //   视口顶），原可视内容纹丝不动，新块在其上方可继续上滚；分帧重锚吸收 Markdown
+    //   高度异步收敛（120ms 内高度逐块落定，早锚会漂移几个像素/块）。
+    void PrependBlocks(const QList<CMessageBlock*>& a_aBlocks);
+    int BlockCount() const;   // 当前挂载块数（测试/外层分页判断用）
+
+signals:
+    void sigTopReached();   // 垂直滚动条到达 0（仅可滚内容且"非顶→顶"边沿触发一次）——外层补建更早块
+    void sigBlockDropped(CMessageBlock* a_pBlock);   // 超上限丢弃最旧块前发出——外层同步并行 widget 列表
+
 private slots:
     void slotScrolled(int a_iValue);   // 跟随尾部启发式
 
@@ -34,4 +46,5 @@ private:
     QWidget*     m_pContent  = nullptr;
     QVBoxLayout* m_pLayout   = nullptr;
     bool         m_bFollow   = true;    // 是否自动跟随到底部
+    bool         m_bTopNotified = false;   // 已发过 sigTopReached（在顶期间不重复发，离开顶部后复位）
 };

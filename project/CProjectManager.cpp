@@ -1030,8 +1030,9 @@ bool CProjectManager::SaveAgentBackend(int a_iBackend) {
         return false;
     }
     const std::wstring wsPath = sPath.toStdWString();
+    // 任务 3213cdbf 第五后端 Hermes：扩为 1..5（越界仍兜底回 1，非 qBound 夹边界）。
     WritePrivateProfileStringW(L"Agent", L"Backend",
-        QString::number((a_iBackend >= 1 && a_iBackend <= 4) ? a_iBackend : 1).toStdWString().c_str(),
+        QString::number((a_iBackend >= 1 && a_iBackend <= 5) ? a_iBackend : 1).toStdWString().c_str(),
         wsPath.c_str());
     return true;
 }
@@ -1045,7 +1046,8 @@ int CProjectManager::LoadAgentBackend() {
     }
     const std::wstring wsPath = sPath.toStdWString();
     const int iBackend = GetPrivateProfileIntW(L"Agent", L"Backend", 1, wsPath.c_str());
-    return (iBackend >= 1 && iBackend <= 4) ? iBackend : 1;
+    // 任务 3213cdbf 同 SaveAgentBackend 扩为 1..5（5=hermes；越界兜底回 1）。
+    return (iBackend >= 1 && iBackend <= 5) ? iBackend : 1;
 }
 
 // 2026.08.18 DSH 三路径 + provider/model 的存取（[Agent] 段）。路径空=未配置
@@ -1255,6 +1257,9 @@ QList<SDshModelEntry> CProjectManager::LoadDshModels(int* a_pActive) {
     if (a_pActive) {
         const int iActive = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Active", -1, wsPath.c_str()));
         *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
+            *a_pActive = 0;
+        }
     }
     return aModels;
 }
@@ -1403,6 +1408,9 @@ QList<SDshModelEntry> CProjectManager::LoadPiModels(int* a_pActive) {
     if (a_pActive) {
         const int iActive = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Active", -1, wsPath.c_str()));
         *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
+            *a_pActive = 0;
+        }
     }
     return aModels;
 }
@@ -1499,6 +1507,9 @@ QList<SDshModelEntry> CProjectManager::LoadCodexModels(int* a_pActive) {
     if (a_pActive) {
         const int iActive = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Active", -1, wsPath.c_str()));
         *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
+            *a_pActive = 0;
+        }
     }
     return aModels;
 }
@@ -1600,6 +1611,185 @@ QString CProjectManager::LoadCodexWireApi() {
     const QString sApi = LoadDshStrKey(ConfigFilePath(), L"CodexWireApi",
                                        QStringLiteral("chat"));
     return sApi.isEmpty() ? QStringLiteral("chat") : sApi;
+}
+
+// ---------------------------------------------------------------------------
+// Hermes 第五后端键（任务 3213cdbf，[Agent] Hermes* / [HermesModels]）：存取口径
+//   与 Pi/Codex 同（SaveDshStrKey/LoadDshStrKey/SaveDshDblKey/LoadDshDblKey 走
+//   [Agent] 节 + Win32 profile API，GBK 安全）；模型表口径同 [PiModels]。
+// ---------------------------------------------------------------------------
+bool CProjectManager::SaveHermesRoot(const QString& a_sRoot) {
+    return SaveDshStrKey(ConfigFilePath(), L"HermesRoot", a_sRoot);
+}
+
+QString CProjectManager::LoadHermesRoot() {
+    return LoadDshStrKey(ConfigFilePath(), L"HermesRoot", QString());
+}
+
+bool CProjectManager::SaveHermesNodePath(const QString& a_sPath) {
+    return SaveDshStrKey(ConfigFilePath(), L"HermesNodePath", a_sPath);
+}
+
+QString CProjectManager::LoadHermesNodePath() {
+    return LoadDshStrKey(ConfigFilePath(), L"HermesNodePath", QString());
+}
+
+bool CProjectManager::SaveHermesModel(const QString& a_sModel) {
+    return SaveDshStrKey(ConfigFilePath(), L"HermesModel", a_sModel);
+}
+
+QString CProjectManager::LoadHermesModel() {
+    return LoadDshStrKey(ConfigFilePath(), L"HermesModel", QString());
+}
+
+bool CProjectManager::SaveHermesApiKey(const QString& a_sKey) {
+    return SaveDshStrKey(ConfigFilePath(), L"HermesApiKey", a_sKey);
+}
+
+QString CProjectManager::LoadHermesApiKey() {
+    return LoadDshStrKey(ConfigFilePath(), L"HermesApiKey", QString());
+}
+
+bool CProjectManager::SaveHermesBaseUrl(const QString& a_sUrl) {
+    return SaveDshStrKey(ConfigFilePath(), L"HermesBaseUrl", a_sUrl);
+}
+
+QString CProjectManager::LoadHermesBaseUrl() {
+    // 空回退内网网关基址（与既有四后端网关口径一致；设置页可改）。
+    return LoadDshStrKey(ConfigFilePath(), L"HermesBaseUrl",
+                         QStringLiteral("http://192.168.118.128:9000"));
+}
+
+bool CProjectManager::SaveHermesPriceInPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceInPerM", a_d);
+}
+
+double CProjectManager::LoadHermesPriceInPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceInPerM", 3.0);
+}
+
+bool CProjectManager::SaveHermesPriceCacheReadPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceCacheReadPerM", a_d);
+}
+
+double CProjectManager::LoadHermesPriceCacheReadPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceCacheReadPerM", 0.3);
+}
+
+bool CProjectManager::SaveHermesPriceCacheWritePerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceCacheWritePerM", a_d);
+}
+
+double CProjectManager::LoadHermesPriceCacheWritePerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceCacheWritePerM", 3.75);
+}
+
+bool CProjectManager::SaveHermesPriceOutPerM(double a_d) {
+    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceOutPerM", a_d);
+}
+
+double CProjectManager::LoadHermesPriceOutPerM() {
+    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceOutPerM", 15.0);
+}
+
+// Hermes 自定义大模型表（[HermesModels]；口径同 [PiModels]，默认 API 格式
+//   anthropic-messages；maxTokens 保存侧不在此钳位——设置页与 CHermesRunner
+//   EnsureRuntimeConfig 双侧 qMin(131072) 收口，本层保持透传）。
+QList<SDshModelEntry> CProjectManager::LoadHermesModels(int* a_pActive) {
+    QList<SDshModelEntry> aModels;
+    if (a_pActive) {
+        *a_pActive = -1;
+    }
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return aModels;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Count", 0, wsPath.c_str()));
+    if (iCount <= 0) {
+        return aModels;
+    }
+    wchar_t szBuf[1024] = { 0 };
+    for (int i = 0; i < iCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            const DWORD dwCopied = GetPrivateProfileStringW(L"HermesModels", wsKey.c_str(), L"",
+                                                            szBuf, 1024, wsPath.c_str());
+            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        };
+        SDshModelEntry stE;
+        stE.sDisp    = fnReadStr(L"Disp");
+        stE.sBaseURL = fnReadStr(L"URL");
+        stE.sApiKey  = fnReadStr(L"Key");
+        stE.sApi     = fnReadStr(L"Api");
+        stE.sModelId = fnReadStr(L"Model");
+        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        if (stE.iCtx <= 0) {
+            stE.iCtx = 200000;
+        }
+        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        if (stE.iMaxTok <= 0) {
+            stE.iMaxTok = 32768;
+        }
+        if (stE.sApi.isEmpty()) {
+            stE.sApi = QStringLiteral("anthropic-messages");
+        }
+        if (stE.sDisp.isEmpty()) {
+            stE.sDisp = stE.sModelId;
+        }
+        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
+            continue;   // 无模型 id / 请求地址的残缺条目不进表
+        }
+        aModels.append(stE);
+    }
+    if (a_pActive) {
+        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Active", -1, wsPath.c_str()));
+        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
+            *a_pActive = 0;
+        }
+    }
+    return aModels;
+}
+
+bool CProjectManager::SaveHermesModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Count", 0, wsPath.c_str()));
+    const int iNewCount = a_aModels.size();
+    WritePrivateProfileStringW(L"HermesModels", L"Count",
+                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            WritePrivateProfileStringW(L"HermesModels", wsKey.c_str(),
+                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+        };
+        fnWrite(L"Disp",  stE.sDisp);
+        fnWrite(L"URL",   stE.sBaseURL);
+        fnWrite(L"Key",   stE.sApiKey);
+        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
+        fnWrite(L"Model", stE.sModelId);
+        fnWrite(L"Ctx",   QString::number(stE.iCtx));
+        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    }
+    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
+            const std::wstring wsKey = wsPrefix + lpszSuffix;
+            WritePrivateProfileStringW(L"HermesModels", wsKey.c_str(), nullptr, wsPath.c_str());
+        }
+    }
+    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
+    WritePrivateProfileStringW(L"HermesModels", L"Active",
+                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    return true;
 }
 
 bool CProjectManager::SaveClaudeCmd(const QString& a_sCmd) {

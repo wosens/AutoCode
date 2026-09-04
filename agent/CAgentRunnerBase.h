@@ -25,6 +25,14 @@ public:
     // 后端标识（"claude" / "dsh"）：日志展示与后端漂移检测用。
     virtual QString BackendName() const = 0;
 
+    // 2026.09.02 跨轮上下文能力（助手回灌依据）：true = 下一轮 StartStage 带
+    // resumeSid 时上下文原生延续（claude --resume+--fork-session 复制上下文、
+    // pi --session-id 磁盘会话跨进程续接）；false = 每轮全新会话（DSH fork 换新
+    // sid、Codex/Hermes 忽略 resumeSid），编排器须把最近对话回灌进 prompt，
+    // 否则第 2 轮起模型完全失忆（实测「作为默认值」轮只看到 4 个字）。
+    // 默认 false：新后端未声明即按"无跨轮上下文"安全侧处理。
+    virtual bool KeepsContextAcrossTurns() const { return false; }
+
     // 启动一次阶段执行（参数语义见 CClaudeRunner 同名函数；claude 专属参数在后端
     // 不支持时降级忽略，由各实现自行说明）。
     virtual void StartStage(const QString& a_sWorkDir,

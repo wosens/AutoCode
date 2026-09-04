@@ -1,4 +1,4 @@
-﻿// CVersionDialog.cpp —— 后端版本管理对话框（任务 23183ccb）。
+// CVersionDialog.cpp —— 后端版本管理对话框（任务 23183ccb）。
 // T3：骨架 + 本地版本加载（DSH/Pi/Codex 同步直读，Claude 异步探测 + npm 回退）
 //     + 纯函数（PickLatestTag/TagToVersion/Verdict，T6 单测靶点）。
 // T4：QueryLatestAll 联网查询与 OnUpdateBackend 更新分派（占位实装见各 TODO）。
@@ -8,9 +8,12 @@
 #include "CClaudeRunner.h"
 #include "CCodexRunner.h"
 #include "CDeepSeekRunner.h"
+#include "CHermesRunner.h"
 #include "CPiAgentRunner.h"
 
 #include <QCoreApplication>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -36,7 +39,7 @@
 
 namespace {
 
-// 行号 ↔ 后端号恒等（1..4 行序即后端号，表格行直接用后端号索引）。
+// 行号 ↔ 后端号恒等（1..5 行序即后端号，表格行直接用后端号索引）。
 const int kiColBackend = 0;   // 后端
 const int kiColLocal   = 1;   // 当前版本
 const int kiColLatest  = 2;   // 最新版本
@@ -98,12 +101,13 @@ void CVersionDialog::SetupUi() {
     stFont.setPointSize(11);
     setFont(stFont);
 
-    m_pTable = new QTableWidget(4, 5, this);
+    m_pTable = new QTableWidget(5, 5, this);
     m_pTable->setHorizontalHeaderLabels(QStringList()
         << QStringLiteral("后端") << QStringLiteral("当前版本")
         << QStringLiteral("最新版本") << QStringLiteral("结论") << QStringLiteral("操作"));
     m_pTable->setVerticalHeaderLabels(QStringList()
-        << QStringLiteral("1") << QStringLiteral("2") << QStringLiteral("3") << QStringLiteral("4"));
+        << QStringLiteral("1") << QStringLiteral("2") << QStringLiteral("3")
+        << QStringLiteral("4") << QStringLiteral("5"));
     m_pTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_pTable->horizontalHeader()->setStretchLastSection(true);
@@ -113,14 +117,15 @@ void CVersionDialog::SetupUi() {
         m_pTable->setColumnWidth(iCol, aiColWidth[iCol]);
     }
 
-    const QString asNames[5] = {
+    const QString asNames[6] = {
         QString(),
         QStringLiteral("Claude Code"),
         QStringLiteral("DeepSeekHarness"),
         QStringLiteral("PIAgent"),
         QStringLiteral("CodexHarness"),
+        QStringLiteral("Hermes"),
     };
-    for (int iBackend = 1; iBackend <= 4; ++iBackend) {
+    for (int iBackend = 1; iBackend <= 5; ++iBackend) {
         const int iRow = iBackend - 1;
         QTableWidgetItem* pItem = new QTableWidgetItem(asNames[iBackend]);
         pItem->setFlags(pItem->flags() & ~Qt::ItemIsEditable & ~Qt::ItemIsSelectable);
@@ -162,7 +167,7 @@ void CVersionDialog::SetupUi() {
     });
     connect(m_pBtnClose, &QPushButton::clicked, this, &QDialog::reject);
 
-    resize(760, 320);
+    resize(760, 345);   // 2026.09 增 Hermes 行 5：随行数加高
     UpdateInfoLine();
 }
 
@@ -211,6 +216,17 @@ void CVersionDialog::RefreshLocalVersions() {
     SetLocalCell(4, !bCodexInstalled ? QStringLiteral("未安装")
                 : sCodexVer.isEmpty() ? QStringLiteral("未知")
                 : QStringLiteral("v%1").arg(sCodexVer));
+
+    // —— 行 5 Hermes（2026.09 增补）：ResolveHermesCli 探测（根目录/同级
+    //   HermesHarness/PATH 三态，同设置页 DetectHermesInstalled）→ 根包
+    //   package.json 直读；无远端发布源，「最新版本」恒「未查询」。
+    const bool bHermesInstalled = !CHermesRunner::ResolveHermesCli().isEmpty();
+    const QString sHermesVer = bHermesInstalled ? CHermesRunner::ResolveHermesVersion()
+                                                : QString();
+    m_asLocalVer[5] = sHermesVer;
+    SetLocalCell(5, !bHermesInstalled ? QStringLiteral("未安装")
+                : sHermesVer.isEmpty() ? QStringLiteral("未知")
+                : QStringLiteral("v%1").arg(sHermesVer));
 
     // 结论列随本地版本联动（Claude 行待探测收尾回调补算）。
     m_asLocalVer[1].clear();
@@ -321,13 +337,14 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
     //   Npm→npm 全局重装）；Codex=绕 bat 直发 npm 本地工程重装锁定版
     //   （工作目录=CodexRoot，提权：程序目录位于受保护路径时 npm 写入需管理员，
     //   design §3.3 全表 runas 口径，评审 v3 M3）。
-    const QString s_asWhat[5] = {
+    const QString s_asWhat[6] = {
         QString(), QStringLiteral("更新 Claude Code"),
         QStringLiteral("更新 DeepSeekHarness（fetch+reset 到远端最新 tag，"
                        "git reset --hard 会丢弃仓库内已跟踪文件的本地修改）"),
         QStringLiteral("更新 PIAgent"),
         QStringLiteral("更新 CodexHarness（修复重装锁定版 %1）")
             .arg(CCodexRunner::ExpectedCodexVersion()),
+        QStringLiteral("在线安装 Hermes Harness（git 克隆 + pnpm 构建）"),
     };
     if (!ConfirmIfBusy(a_iBackend, s_asWhat[a_iBackend])) {
         return;
@@ -428,6 +445,67 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
                 .arg(CCodexRunner::ExpectedCodexVersion()));
         break;
     }
+    case 5: {
+        // 未安装态直达「在线安装」（口径同设置页 OnInstallHermesNet）：提权跑
+        //   exe 同级 install_env.bat /hermes <仓库地址>（git 克隆 + pnpm 构建；
+        //   已装时脚本自动改 fetch+reset，本窗已装态按钮禁用走设置页，双保险）。
+        //   仓库地址不落 config（对齐其他后端无此项），点击时输入框现场给定。
+        if (!CHermesRunner::ResolveHermesCli().isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Hermes"),
+                QStringLiteral("已检测到本机 Hermes 安装。\n\n"
+                               "更新请到设置页 Hermes 组用「联网安装（git）」"
+                               "拉取更新（已装时自动 fetch+reset），或"
+                               "「本机源安装（离线）」重部署。"));
+            return;
+        }
+        bool bOk = false;
+        const QString sRepo = QInputDialog::getText(this,
+            QStringLiteral("Hermes 在线安装"),
+            QStringLiteral("Hermes Harness 的 git 仓库地址或本机仓库路径："),
+            QLineEdit::Normal,
+            QStringLiteral("https://github.com/nousresearch/hermes-agent"), &bOk).trimmed();
+        if (!bOk) {
+            return;   // 用户取消
+        }
+        const bool bRemote = sRepo.startsWith(QStringLiteral("https://"), Qt::CaseInsensitive)
+                          || sRepo.startsWith(QStringLiteral("git@"));
+        if (sRepo.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Hermes"),
+                QStringLiteral("仓库地址不能为空（缺省源 https://github.com/"
+                               "nousresearch/hermes-agent，或本机 Hermes 仓库路径）。"));
+            return;
+        }
+        if (!bRemote) {
+            const QString sGitDir = sRepo + QStringLiteral("/.git");
+            const QString sCli = sRepo + QStringLiteral("/dist/cli.js");
+            if (!QDir(sRepo).exists()
+                    || (!QFileInfo::exists(sGitDir) && !QFileInfo::exists(sCli))) {
+                QMessageBox::warning(this, QStringLiteral("Hermes"),
+                    QStringLiteral("输入既不是 https:// 或 git@ 开头的 git URL，"
+                                   "也不是有效的本机 Hermes 仓库目录（其下应有 "
+                                   ".git 或 dist\\cli.js）：\n%1").arg(sRepo));
+                return;
+            }
+        }
+        if (!QFile::exists(sBat)) {
+            QMessageBox::warning(this, QStringLiteral("Hermes"),
+                QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。")
+                    .arg(sBatNative));
+            return;
+        }
+        if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 在线安装 Hermes"),
+                QStringLiteral("\"%1\" /hermes \"%2\"").arg(sBatNative, sRepo))) {
+            QMessageBox::warning(this, QStringLiteral("Hermes"),
+                QStringLiteral("未能以管理员权限启动安装脚本（UAC 被取消或被拒）。"));
+            return;
+        }
+        QMessageBox::information(this, QStringLiteral("Hermes"),
+            QStringLiteral("已在管理员窗口中启动在线安装。\n\n"
+                           "窗口出现「[OK] Hermes 安装完成」才算装好（出现 [错误] "
+                           "按提示处理后重跑，可续装）；完成后回到本窗点"
+                           "「刷新版本」（exe 同级 HermesHarness 自动命中）。"));
+        break;
+    }
     default:
         break;
     }
@@ -469,6 +547,26 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
                     QStringLiteral("远端未找到可识别的版本 tag，未做任何修改。"));
                 return;
             }
+            // 2026.09.01 版本兼容硬约束（同 codex 锁 0.87.0 先例，但 DSH 是“上限锁”）：
+            //   AutoCode 集成（组合 cordis.yml + jsonrpc-demo 入口 + 示例包）绑死
+            //   SupportedDshTag 基线的包结构，上游 dsh-v0.1.2 起移除全部示例包——
+            //   更新过去任务握手必炸（实测：更新到 0.1.2-alpha.3 后任务反复失败）。
+            //   高于基线的 tag 一律阻断，适配新版后再抬常量。
+            const QVersionNumber vTarget = QVersionNumber::fromString(
+                TagToVersion(sTag));
+            if (!vTarget.isNull()
+                && vTarget > CDeepSeekRunner::SupportedDshVersion()) {
+                QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
+                    QStringLiteral(
+                        "目标版本 %1 高于 AutoCode 集成受支持的 %2。\n\n"
+                        "上游 dsh-v0.1.2 起移除了 AutoCode 组合依赖的全部示例包"
+                        "（含 dsh-agent-spine-demo），更新后 DSH 任务将无法启动"
+                        "（ERR_MODULE_NOT_FOUND）。\n\n"
+                        "未做任何修改；待 AutoCode 适配新版后开放更新，或使用"
+                        "基线版本 %2。")
+                        .arg(sTag, CDeepSeekRunner::SupportedDshTag()));
+                return;
+            }
             const QString sCmdUpdate = sDshRootNative.isEmpty()
                 ? QStringLiteral("\"%1\" /update-dsh %2").arg(sBatNative, sTag)
                 : QStringLiteral("\"%1\" /update-dsh %2 \"%3\"")
@@ -498,7 +596,10 @@ void CVersionDialog::UpdateUpdateButtons() {
         CDeepSeekRunner::LooksLikeDshRoot(CDeepSeekRunner::DshRootPath());
     m_aBtnUpdate[2]->setEnabled(bDshInstalled);
     m_aBtnUpdate[2]->setToolTip(bDshInstalled
-        ? QStringLiteral("更新本机 DeepSeekHarness（fetch+reset 到远端最新 tag）")
+        ? QStringLiteral("更新本机 DeepSeekHarness（fetch+reset 到远端 tag；"
+                         "高于受支持版 %1 的 tag 会被阻断——上游已移除"
+                         "AutoCode 集成依赖的示例包）")
+              .arg(CDeepSeekRunner::SupportedDshTag())
         : QStringLiteral("未安装：请先在设置页 Agent 组「安装 DeepSeekHarness…」"));
 
     // D5：Pi 按检测到的形态分派更新命令，未装两形态皆未命中→禁用。
@@ -517,6 +618,22 @@ void CVersionDialog::UpdateUpdateButtons() {
         ? QStringLiteral("修复重装锁定版 %1（npm 本地工程重装，工作目录=Codex 根）")
               .arg(CCodexRunner::ExpectedCodexVersion())
         : QStringLiteral("未安装：请先在设置页 Agent 组「安装 CodexHarness…」"));
+
+    // Hermes：无固定远端发布源（无 ls-remote 可解析的 tag/npm 包），已装时行内
+    //   「更新」恒禁用——更新统一走设置页 Hermes 组：「联网安装（git）」（已装时
+    //   脚本自动改 fetch+reset 更新）或「本机源安装（离线）」（robocopy 重部署）。
+    //   未安装时按钮改「在线安装」并直达同一条 git 安装链路（OnUpdateBackend
+    //   case 5，仓库地址点击时输入框现场给定，不落 config）。
+    const bool bHermesInstalled = !CHermesRunner::ResolveHermesCli().isEmpty();
+    m_aBtnUpdate[5]->setText(bHermesInstalled ? QStringLiteral("更新")
+                                              : QStringLiteral("在线安装"));
+    m_aBtnUpdate[5]->setEnabled(!bHermesInstalled);
+    m_aBtnUpdate[5]->setToolTip(bHermesInstalled
+        ? QStringLiteral(
+            "Hermes 无固定联网更新源：请到设置页 Hermes 组用「联网安装（git）」"
+            "拉取更新（已装时自动 fetch+reset），或「本机源安装（离线）」重部署")
+        : QStringLiteral("联网安装 Hermes Harness（git 克隆 + pnpm 构建，提权）；"
+                         "仓库地址点击后输入（git URL 或本机仓库路径）"));
 }
 
 bool CVersionDialog::LaunchCmdWindow(bool a_bRunAs, const QString& a_sTitle,
@@ -652,7 +769,7 @@ void CVersionDialog::SetVerdictCell(int a_iRow, const QString& a_sText) {
 }
 
 void CVersionDialog::RefreshVerdicts() {
-    for (int iBackend = 1; iBackend <= 4; ++iBackend) {
+    for (int iBackend = 1; iBackend <= 5; ++iBackend) {
         // Claude 行本地值未知且探测在飞：冻结结论为「读取中…」，避免短暂显示
         //   「与远端不同：→ x.y.z」误读（评审 v1 n3 瞬态）。
         if (iBackend == 1 && m_asLocalVer[1].isEmpty()
@@ -803,9 +920,27 @@ QString CVersionDialog::TagToVersion(const QString& a_sTag) {
 
 QString CVersionDialog::Verdict(const QString& a_sLocal, const QString& a_sLatest,
                                 int a_iBackend) {
-    // 优先级链：相等 → backend==4 锁定 → latest 空 → 新版 → 其它不等。
+    // 优先级链：backend==2 超基线不兼容（先于“相等”——不兼容版本即便==远端
+    //   也不能误导为“已是最新”）→ 相等 → backend==4 锁定 → latest 空 →
+    //   新版 → 其它不等。
     const QString sLocal = a_sLocal.trimmed();
     const QString sLatest = a_sLatest.trimmed();
+    // 2026.09.01 DSH 上限锁（上游 dsh-v0.1.2+ 移除示例包，集成不兼容）：本地已超基线
+    //   → 指引回退；远端最新超基线 → 明示不提供升级（不算“有新版本”）。
+    if (a_iBackend == 2) {
+        const QVersionNumber vBase = CDeepSeekRunner::SupportedDshVersion();
+        const QVersionNumber vLoc = QVersionNumber::fromString(sLocal);
+        if (!vLoc.isNull() && vLoc > vBase) {
+            return QStringLiteral("不兼容：高于受支持版 %1（上游已移除示例包），"
+                                   "请用 /update-dsh %2 回退")
+                .arg(vBase.toString(), CDeepSeekRunner::SupportedDshTag());
+        }
+        const QVersionNumber vLat = QVersionNumber::fromString(sLatest);
+        if (!vLat.isNull() && vLat > vBase) {
+            return QStringLiteral("最新版 %1 不受支持（上游移除示例包），保持 %2")
+                .arg(sLatest, CDeepSeekRunner::SupportedDshTag());
+        }
+    }
     if (!sLocal.isEmpty() && sLocal == sLatest) {
         return QStringLiteral("已是最新");
     }

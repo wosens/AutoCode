@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QDialog>
 #include <QList>
@@ -63,8 +63,6 @@ public:
     QString PiNodePath() const;
     QString PiRoot() const;
     QString PiProvider() const;
-    QString PiModel() const;
-    QString PiApiKey() const;
     QString PiThinking() const;
     // 2026.08.20 PIAgent 计费单价（$/百万 token）：pi 只报 token，客户端按单价折算费用。
     double  PiPriceInPerM() const;
@@ -78,13 +76,19 @@ public:
     QString CodexNodePath() const;
     QString CodexRoot() const;
     QString CodexProvider() const;
-    QString CodexModel() const;
-    QString CodexApiKey() const;
-    QString CodexBaseUrl() const;
     QString CodexWireApi() const;
     // 2026.08.21 Codex 自定义大模型表（[CodexModels]；口径同 Pi 同名对）。
     QList<SDshModelEntry> CodexModels() const;
     int     CodexActiveModel() const;
+    // Hermes 第五后端参数（任务 3213cdbf，[Agent] Hermes* / [HermesModels]）。
+    QString HermesNodePath() const;
+    QString HermesRoot() const;
+    double  HermesPriceInPerM() const;
+    double  HermesPriceCacheReadPerM() const;
+    double  HermesPriceCacheWritePerM() const;
+    double  HermesPriceOutPerM() const;
+    QList<SDshModelEntry> HermesModels() const;
+    int     HermesActiveModel() const;
     int     AutoCompactPct() const;
     qint64  ContextLimit() const;
     QString ScanExcludeDirs() const;
@@ -144,6 +148,23 @@ private:
     void OnCodexModelCopy();   // 2026.08.27 复制选中条目（口径同 DSH 页）
     void OnCodexModelDel();
     void OnCodexModelSetActive();
+    // Hermes 第五后端（任务 3213cdbf）：安装探测（口径同 Pi；自动安装待澄清 3
+    //   落地，安装按钮不设——只检测）+ 模型列表维护（口径同 Pi 页）。
+    void UpdateHermesEnabled();
+    void DetectHermesInstalled(bool a_bSilent);
+    // 2026.09 Hermes 本机源离线安装（robocopy 到 exe 同级 HermesHarness；口径同
+    //   Codex 本机源安装——无 npm 包源/仓库发布形态，装更一体走本机源重部署）。
+    void OnInstallHermesLocal();
+    // 2026.09 Hermes 联网安装（git）：提权运行 install_env.bat /hermes <仓库地址>
+    //   （口径同 DSH 安装——git 浅克隆 + pnpm 依赖构建；已装时 fetch+reset 更新）。
+    void OnInstallHermesNet();
+    void RefreshHermesModelList();
+    int  CurHermesModelRow() const;
+    void OnHermesModelAdd();
+    void OnHermesModelEdit();
+    void OnHermesModelCopy();
+    void OnHermesModelDel();
+    void OnHermesModelSetActive();
 
     QSpinBox*   m_pSpinMaxIter      = nullptr;
     QSpinBox*   m_pSpinMaxResume    = nullptr;
@@ -159,7 +180,6 @@ private:
     QLineEdit*  m_pEditDshNode      = nullptr;
     QLineEdit*  m_pEditDshRoot      = nullptr;
     QLineEdit*  m_pEditDshProvider  = nullptr;
-    QLineEdit*  m_pEditDshModel     = nullptr;
     QDoubleSpinBox* m_pSpinDshPriceIn        = nullptr;   // 计费单价：纯输入
     QDoubleSpinBox* m_pSpinDshPriceCacheRead = nullptr;   // 计费单价：缓存读
     QDoubleSpinBox* m_pSpinDshPriceCacheWrite = nullptr;  // 计费单价：缓存写
@@ -185,8 +205,6 @@ private:
     QLineEdit*  m_pEditPiNode       = nullptr;
     QLineEdit*  m_pEditPiRoot       = nullptr;
     QLineEdit*  m_pEditPiProvider   = nullptr;
-    QLineEdit*  m_pEditPiModel      = nullptr;
-    QLineEdit*  m_pEditPiApiKey     = nullptr;
     QComboBox*  m_pComboPiThinking  = nullptr;
     QDoubleSpinBox* m_pSpinPiPriceIn        = nullptr;   // 2026.08.20 计费单价：纯输入
     QDoubleSpinBox* m_pSpinPiPriceCacheRead = nullptr;   // 计费单价：缓存读
@@ -214,9 +232,6 @@ private:
     QLineEdit*  m_pEditCodexNode   = nullptr;
     QLineEdit*  m_pEditCodexRoot   = nullptr;
     QLineEdit*  m_pEditCodexProvider = nullptr;
-    QLineEdit*  m_pEditCodexModel  = nullptr;
-    QLineEdit*  m_pEditCodexApiKey = nullptr;
-    QLineEdit*  m_pEditCodexBaseUrl = nullptr;
     QComboBox*  m_pComboCodexWireApi = nullptr;
     // 2026.08.21 Codex 自定义大模型表（[CodexModels]；生效经 ~/.codex 的
     //   autocode-<n> provider 槽位，CCodexRunner 合成写）+ 本机源离线安装按钮。
@@ -229,6 +244,27 @@ private:
     QPushButton* m_pBtnCodexModelDel    = nullptr;
     QPushButton* m_pBtnCodexModelActive = nullptr;
     QPushButton* m_pBtnInstallCodexLocal = nullptr;
+    // Hermes 第五后端（[Agent] Hermes*）：安装状态行 + 表单五项（Root/Node/Model/
+    // ApiKey/BaseUrl）+ 计费单价四项 + 模型树（[HermesModels]）。
+    QLabel*     m_pLblHermesState   = nullptr;
+    QPushButton* m_pBtnDetectHermes = nullptr;
+    QPushButton* m_pBtnInstallHermesLocal = nullptr;   // 本机源安装（离线，robocopy）
+    QPushButton* m_pBtnInstallHermesNet = nullptr;     // 联网安装（git 克隆 + pnpm 构建）
+    bool        m_bHermesInstalled = false;
+    QLineEdit*  m_pEditHermesNode   = nullptr;
+    QLineEdit*  m_pEditHermesRoot   = nullptr;
+    QDoubleSpinBox* m_pSpinHermesPriceIn        = nullptr;
+    QDoubleSpinBox* m_pSpinHermesPriceCacheRead = nullptr;
+    QDoubleSpinBox* m_pSpinHermesPriceCacheWrite = nullptr;
+    QDoubleSpinBox* m_pSpinHermesPriceOut       = nullptr;
+    QList<SDshModelEntry> m_aHermesModels;
+    int         m_iHermesActiveModel = -1;   // -1=未启用（走 HermesModel 固定路由）
+    QTreeWidget* m_pTreeHermesModels = nullptr;
+    QPushButton* m_pBtnHermesModelAdd    = nullptr;
+    QPushButton* m_pBtnHermesModelCopy   = nullptr;
+    QPushButton* m_pBtnHermesModelEdit   = nullptr;
+    QPushButton* m_pBtnHermesModelDel    = nullptr;
+    QPushButton* m_pBtnHermesModelActive = nullptr;
     QSpinBox*   m_pSpinCompactPct   = nullptr;
     QSpinBox*   m_pSpinCtxLimit     = nullptr;
     QLineEdit*  m_pEditScanDirs     = nullptr;

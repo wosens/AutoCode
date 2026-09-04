@@ -124,6 +124,19 @@ int main(int argc, char* argv[]) {
                                       QStringLiteral("apple"), 2)
                   == QStringLiteral("与远端不同：banana → apple"),
               QStringLiteral("不可解析且不等应判与远端不同"));
+        // 2026.09.01 DSH 上限锁：本地超基线→不兼容指引回退；远端超基线→不算有新版本。
+        Check(CVersionDialog::Verdict(QStringLiteral("0.1.2-alpha.3"),
+                                      QStringLiteral("0.1.2-alpha.3"), 2)
+                  .contains(QStringLiteral("不兼容")),
+              QStringLiteral("DSH 本地超基线应判不兼容并指引回退"));
+        Check(CVersionDialog::Verdict(QStringLiteral("0.1.0"),
+                                      QStringLiteral("0.1.2-alpha.3"), 2)
+                  .contains(QStringLiteral("不受支持")),
+              QStringLiteral("DSH 远端超基线应判不受支持而非有新版本"));
+        Check(CVersionDialog::Verdict(QStringLiteral("0.1.0"),
+                                      QStringLiteral("0.1.0"), 2)
+                  == QStringLiteral("已是最新"),
+              QStringLiteral("DSH 本地==远端==基线仍应判已是最新"));
     }
 
     // —— 4. ResolveDshVersion（QTemporaryDir 四态 + 静态根空参分派）——

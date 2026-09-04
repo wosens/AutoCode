@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 
 # 提示：若 CMake 找不到 Qt6，使用 CMakePresets.json 的 "qt6" preset，
 # 或显式 -DCMAKE_PREFIX_PATH=D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64
@@ -56,6 +56,8 @@ qt_add_executable(AutoCode WIN32
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     agent/CMcpAskServer.h
     agent/CMcpAskServer.cpp
     orch/CTaskOrchestrator.h
@@ -76,6 +78,10 @@ qt_add_executable(AutoCode WIN32
     ui/CArtifactView.cpp
     ui/CMessageView.h
     ui/CMessageView.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
     ui/CMessageBlock.h
     ui/CMessageBlock.cpp
     ui/CRecentProjectsDialog.h
@@ -165,6 +171,9 @@ add_custom_command(TARGET AutoCode POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_env.bat"
         "$<TARGET_FILE_DIR:AutoCode>/install_env.bat"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/hermes_oneshot_patch.py"
+        "$<TARGET_FILE_DIR:AutoCode>/hermes_oneshot_patch.py"
     COMMENT "Copy install_env.bat to output dir"
 )
 
@@ -220,6 +229,8 @@ qt_add_executable(test_projectmanager
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/CTaskInfo.h
@@ -249,6 +260,10 @@ qt_add_executable(test_execpanel
     ui/CExecutionPanel.cpp
     ui/CMessageView.h
     ui/CMessageView.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
     ui/CMessageBlock.h
     ui/CMessageBlock.cpp
     ui/CArtifactView.h
@@ -372,6 +387,8 @@ qt_add_executable(test_rollback
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/CStageMachine.h
@@ -457,6 +474,8 @@ qt_add_executable(test_pirunner
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
 )
 target_include_directories(test_pirunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -481,6 +500,8 @@ qt_add_executable(test_versiondlg
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     ui/CVersionDialog.h
     ui/CVersionDialog.cpp
 )
@@ -506,6 +527,8 @@ qt_add_executable(test_codexrunner
     agent/CCodexRunner.cpp
     agent/CCodexProxy.h
     agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     agent/CPiAgentRunner.h
     agent/CPiAgentRunner.cpp
 )
@@ -516,9 +539,52 @@ target_include_directories(test_codexrunner PRIVATE
 target_link_libraries(test_codexrunner PRIVATE Qt6::Core Qt6::Network)
 add_test(NAME test_codexrunner COMMAND test_codexrunner)
 
+# ---- Hermes 第五后端离线单元测试（不联网，挂 ctest；任务 3213cdbf）----
+qt_add_executable(test_hermesrunner
+    tests/test_hermesrunner.cpp
+    core/CModelEntry.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(test_hermesrunner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${ZSTD_INCLUDE_DIR}
+)
+target_link_libraries(test_hermesrunner PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+set_target_properties(test_hermesrunner PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_hermesrunner COMMAND test_hermesrunner)
+
 # ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
 # 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
 set_tests_properties(
     test_projectmanager test_execpanel test_historydb test_verify_flow
     test_record_verify test_rollback test_pirunner test_versiondlg test_codexrunner
+    test_hermesrunner
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

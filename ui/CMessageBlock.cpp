@@ -1,5 +1,4 @@
-#include "CMessageBlock.h"
-#include "../agent/CAgentRunnerFactory.h"
+﻿#include "CMessageBlock.h"
 
 #include <QLabel>
 #include <QVBoxLayout>
@@ -11,6 +10,8 @@
 #include <QTimer>
 #include <QAbstractTextDocumentLayout>
 #include <QTextDocument>
+#include <QPointer>
+#include "ui/CMarkdownPreloader.h"
 #include <QTextCursor>
 #include <QTextCharFormat>
 #include <QPalette>
@@ -89,12 +90,14 @@ void CMessageBlock::BuildAssistant() {
     pV->setContentsMargins(0, 0, 0, 0);
     pV->setSpacing(4);
 
-    // 2026.08.18 说话人标签随当前 Agent 后端显示（旧版硬编码 "⏺ Claude"，DSH 后端下误导）。
-    auto* pSpeaker = new QLabel(
-        QStringLiteral("⏺ ") + CAgentRunnerFactory::BackendDisplayName(), this);
+    // 2026.09.02 说话人标签改用块内记录的产出后端（SetSpeakerBackend 回填；
+    //   旧版取渲染时刻的全局后端，切后端后重建视图会把历史回复整体改标）。
+    //   默认 "Agent"＝旧数据/未知，绝不用当前后端冒充。
+    auto* pSpeaker = new QLabel(QStringLiteral("⏺ Agent"), this);
     pSpeaker->setStyleSheet(QStringLiteral(
         "color: #d97757; font-weight: 600; padding: 0;"));
     pV->addWidget(pSpeaker);
+    m_pSpeaker = pSpeaker;
 
     m_pBrowser = new QTextBrowser(this);
     m_pBrowser->setReadOnly(true);
@@ -173,6 +176,60 @@ void CMessageBlock::SetAssistantText(const QString& a_sMarkdown) {
     slotAdjustBrowserHeight();
 }
 
+void CMessageBlock::SetAssistantTextAsync(const QString& a_sMarkdown, qreal a_dEstWidth) {
+    if (m_pBrowser == nullptr) {
+        return;
+    }
+    // 先纯文本占位（廉价）：块立即有内容与大致高度，避免预排版回来前的空白闪烁；
+    //   预排版完成（或失败）后覆盖为富文本。占位用纯文本不做 Markdown parse（正点）。
+    m_pBrowser->setPlainText(a_sMarkdown);
+    slotAdjustBrowserHeight();
+    m_sPendingMarkdown = a_sMarkdown;   // 失败回退用（落地成功后清空）
+    QPointer<CMessageBlock> pSelf = this;
+    CMarkdownPreloader::Instance()->Submit(a_sMarkdown, a_dEstWidth,
+        [pSelf](QTextDocument* a_pDoc) {
+            if (pSelf == nullptr) {
+                delete a_pDoc;   // 块已销毁（切档竞态）：doc 无主自清，防泄漏
+                return;
+            }
+            pSelf->ApplyPreloadedDoc(a_pDoc, /*a_bFallbackSync=*/true);
+        });
+}
+
+void CMessageBlock::ApplyPreloadedDoc(QTextDocument* a_pDoc, bool a_bFallbackSync) {
+    // 预排版文档落地（主线程）：setDocument 接管显示。nullptr=预排版失败——
+    //   a_bFallbackSync 时回退同步 setMarkdown（保内容正确，该块不加速）。
+    if (m_pBrowser == nullptr) {
+        delete a_pDoc;
+        return;
+    }
+    if (a_pDoc == nullptr) {
+        if (a_bFallbackSync && m_sPendingMarkdown.isEmpty() == false) {
+            SetAssistantText(m_sPendingMarkdown);
+        }
+        return;
+    }
+    m_sPendingMarkdown.clear();
+    a_pDoc->setParent(m_pBrowser);   // 所有权：随浏览器销毁（QTextBrowser 不强制收养）
+    m_pBrowser->setDocument(a_pDoc);
+    // 旧 document 被 setDocument 释放，其 layout 上的 documentSizeChanged 连接随之失效——
+    //   对新 doc 的 layout 重连（自适应高度链路继续工作）。
+    disconnect(m_pBrowser->document()->documentLayout(), nullptr, this, nullptr);
+    connect(m_pBrowser->document()->documentLayout(),
+            &QAbstractTextDocumentLayout::documentSizeChanged,
+            this, &CMessageBlock::slotAdjustBrowserHeight);
+    slotAdjustBrowserHeight();   // 真实宽度微调重排（预排版按预估宽度，此处校正）
+}
+
+void CMessageBlock::SetSpeakerBackend(const QString& a_sName) {
+    // 2026.09.02 块内记录的产出后端回填说话人标签（CreateWidget 在 Assistant 块
+    //   构建时调用）；空串不生效，保持默认"Agent"（旧数据/未知，不用当前后端冒充）。
+    if (m_pSpeaker == nullptr || a_sName.trimmed().isEmpty()) {
+        return;
+    }
+    m_pSpeaker->setText(QStringLiteral("⏺ ") + a_sName);
+}
+
 // ---------------------------------------------------------------------------
 // ToolUse：可折叠卡片
 // ---------------------------------------------------------------------------
@@ -191,6 +248,9 @@ void CMessageBlock::BuildToolCard() {
         "QToolButton:checked { background: #e5e7eb; border-color: #9ca3af; }"));
     connect(m_pHeader, &QToolButton::toggled, this, [this](bool a_bChecked) {
         m_bExpanded = a_bChecked;
+        if (a_bChecked) {
+            RebuildToolContent();   // 展开时重建：折叠期间回填的结果/新并入条目此时才呈现
+        }
         m_pContent->setVisible(a_bChecked);
         m_pHeader->setText(HeaderText(a_bChecked));   // 刷新 ▶/▼ 箭头与 ×N 计数
     });
@@ -425,23 +485,82 @@ void CMessageBlock::SetEvent(const QString& a_sKind, const QString& a_sText) {
 }
 
 // ---------------------------------------------------------------------------
-// System / Error：弱化小字
+// System：连续行折叠组（2026.08.29 反向借鉴 HarnessAgent，组头首行摘要+行数）
+// Error：不折叠（错误重要且少见，保持独立红字）
 // ---------------------------------------------------------------------------
 void CMessageBlock::BuildSystem(bool a_bError) {
     auto* pV = new QVBoxLayout(this);
     pV->setContentsMargins(10, 0, 0, 0);
-    pV->setSpacing(0);
+    pV->setSpacing(2);
+
+    if (a_bError) {
+        pV->setSpacing(0);
+        m_pLabel = new QLabel(this);
+        m_pLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);   // 支持鼠标选中复制
+        m_pLabel->setWordWrap(true);
+        m_pLabel->setStyleSheet(QStringLiteral("color: #dc2626;"));
+        pV->addWidget(m_pLabel);
+        return;
+    }
+
+    m_pHeader = new QToolButton(this);
+    m_pHeader->setCheckable(true);
+    m_pHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    m_pHeader->setStyleSheet(QStringLiteral(
+        "QToolButton { text-align: left; background: transparent; border: none;"
+        "              padding: 1px 0; color: #9ca3af; font-style: italic; }"
+        "QToolButton:hover { color: #6b7280; }"));
+    m_pHeader->setCursor(Qt::PointingHandCursor);
+    connect(m_pHeader, &QToolButton::toggled, this, [this](bool a_bOn) {
+        if (m_pLabel != nullptr) {
+            m_pLabel->setVisible(a_bOn);
+        }
+        RefreshSysHeader();
+    });
+    pV->addWidget(m_pHeader);
+
     m_pLabel = new QLabel(this);
     m_pLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);   // 支持鼠标选中复制
     m_pLabel->setWordWrap(true);
-    m_pLabel->setStyleSheet(QStringLiteral("%1")
-        .arg(a_bError ? QStringLiteral("color: #dc2626;")
-                      : QStringLiteral("color: #9ca3af; font-style: italic;")));
+    m_pLabel->setStyleSheet(QStringLiteral("color: #9ca3af; font-style: italic;"));
     pV->addWidget(m_pLabel);
+    m_pLabel->setVisible(false);   // 默认折叠
 }
 
 void CMessageBlock::SetSystemText(const QString& a_sText) {
-    if (m_pLabel != nullptr) {
-        m_pLabel->setText(a_sText);
+    if (m_pLabel == nullptr) {
+        return;
     }
+    if (m_eKind == System) {
+        // System 折叠组：首行入组（后续行由面板层 AppendSystemLine 并入）
+        m_aSysLines.clear();
+        m_aSysLines.append(a_sText);
+        m_pLabel->setText(a_sText);
+        RefreshSysHeader();
+    } else {
+        m_pLabel->setText(a_sText);   // Error：单条红字不折叠
+    }
+}
+
+// 2026.08.29 连续 System 行并入本卡（面板层 TryMergeWidget 调用）
+void CMessageBlock::AppendSystemLine(const QString& a_sText) {
+    if (m_eKind != System) {
+        return;
+    }
+    m_aSysLines.append(a_sText);
+    if (m_pLabel != nullptr) {
+        m_pLabel->setText(m_aSysLines.join(QLatin1Char('\n')));
+    }
+    RefreshSysHeader();
+}
+
+void CMessageBlock::RefreshSysHeader() {
+    if (m_pHeader == nullptr || m_aSysLines.isEmpty()) {
+        return;
+    }
+    const bool bOn = m_pHeader->isChecked();
+    const QString sBrief = m_aSysLines.first().simplified().left(60);
+    m_pHeader->setText(QStringLiteral("%1 %2（共 %3 行，点击展开）")
+        .arg(bOn ? QStringLiteral("▾") : QStringLiteral("▸"),
+             sBrief.toHtmlEscaped()).arg(m_aSysLines.size()));
 }

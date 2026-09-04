@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QObject>
 #include <QString>
@@ -50,16 +50,25 @@ public:
     bool IsRunnerBusy() const;
 
     // —— 提示词 agent（独立于状态机的常驻助手会话，#1/#2/#3/#4）——
-    // 向助手投递一条指令；a_bReadOnly=true 时仅 Read/Grep/Glob（无 Edit/Write/Bash）。
+    // 2026.09.03 多助手并发：每个助手一个独立 SAdhocSession（runner 进程/会话链/撤销栈/
+    //   回灌缓存/模式状态机），按助手 id 索引、常驻编排器（切助手不再换载）。跨助手提交
+    //   各起各的进程立即运行，互不排队；同助手运行中追加仍为注入/续发语义。
+    // 向指定助手投递一条指令；a_bReadOnly=true 时仅 Read/Grep/Glob（无 Edit/Write/Bash）。
     //   a_sTaskId 非空 = 当前选中任务：注入该任务 memory.md 经验 + 非只读轮附追加规则（记忆跟着任务走）。
-    void SubmitAdhoc(const QString& a_sText, bool a_bReadOnly, const QString& a_sTaskId = QString());
-    // 撤销最后一条提问（fork-session sid 链 O(1) 回退，#4）。
-    void UndoAdhoc();
-    // 手动压缩上下文（摘要→开新会话重播种，#3）。
-    void CompactAdhoc();
-    // 停止当前助手调用（不影响任务 runner）。
-    void StopAdhoc();
-    bool IsAdhocRunning() const;
+    //   2026.09.02 a_pTranscript 非空 = 外部提交（面板传入权威对话记录，整体重建回灌缓存；
+    //   空 = 编排器内部续发——排队指令/max-turns 续跑，沿用缓存并轮内追加）。
+    void SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly,
+                     const QString& a_sTaskId = QString(), const QStringList* a_pTranscript = nullptr);
+    // 撤销指定助手最后一条提问（fork-session sid 链 O(1) 回退，#4）。
+    void UndoAdhoc(const QString& a_sAsstId);
+    // 手动压缩指定助手上下文（摘要→开新会话重播种，#3）。
+    void CompactAdhoc(const QString& a_sAsstId);
+    // 停止指定助手的当前调用（不影响任务 runner 与其他助手）。
+    void StopAdhoc(const QString& a_sAsstId);
+    // 停止全部助手（档切换/切工程/关闭前整组停；⏹ 痕迹各自落自己的流）。
+    void StopAllAdhoc();
+    bool IsAsstAdhocRunning(const QString& a_sAsstId) const;   // 指定助手是否在跑一轮
+    bool IsAnyAdhocRunning() const;                            // 是否有任一助手在跑（旧 IsAdhocRunning 语义）
 
     // 2026.08.22 阶段后台备份线程（m_thBackup）是否运行中：CMainWindow::ExecuteRollback
     // 互斥守卫用（备份期间 IsRunnerBusy 可能为 false，需单独挡住，防回退与并发备份同写统一库）。
@@ -69,7 +78,9 @@ public:
     //   guide.md 拼提示词经 adhoc 助手（只读、独立 AutoNaming 模式）交 Agent 生成一句话
     //   简短名称，OnAdhocFinished 清洗后 SetName 回填并发 sigAutoNameDone；助手忙时
     //   同步回退本地启发式 MaybeAutoNameTask。返回 true=已提交 Agent 或本地已命名。
-    bool AutoNameNow(CTaskInfo* a_pTask);
+    //   2026.09.03 多助手并发：命名借用 a_sAsstId 助手的会话链（fork 一次性分支，不动其
+    //   撤销栈）；该助手忙则本地回退（其余助手照常并发，不受影响）。
+    bool AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId = QString());
 
     // 设置评审阶段并行视角数（1=串行回退；>1=多视角并行 fan-out/fan-in）。
     void SetReviewParallel(int a_iN);
@@ -83,12 +94,17 @@ public:
     //   非 Running → StageEvent("inject_ignored")（不静默丢弃）。确定性 C++ 路由（NFR-7）。
     void InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_sText);
 
-    // —— 助手会话链持久化（#1）：sid + (prompt,sid) 撤销栈的存取 ——
-    QString AdhocSid() const { return m_sAdhocSid; }
-    QString AdhocGuideHash() const { return m_sLastGuideHash; }   // 上次投喂 guide.md 的内容哈希
-    void    SetAdhocGuideHash(const QString& a_sHash) { m_sLastGuideHash = a_sHash; }
-    QJsonArray AdhocStackToJson() const;
-    void LoadAdhocState(const QString& a_sSid, const QJsonArray& a_aStack);   // 恢复（不发信号）
+    // —— 助手会话链持久化（#1）：sid + (prompt,sid) 撤销栈的存取（2026.09.03 起按助手 id）——
+    QString AsstAdhocSid(const QString& a_sAsstId) const;
+    QString AsstAdhocGuideHash(const QString& a_sAsstId) const;   // 该助手上次投喂 guide.md 的哈希
+    QJsonArray AsstAdhocStackToJson(const QString& a_sAsstId) const;
+    // 助手组恢复（档载入/新建助手）时装入该助手的会话链（不发信号；首条提问前调用）。
+    void LoadAsstAdhoc(const QString& a_sAsstId, const QString& a_sSid,
+                       const QJsonArray& a_aStack, const QString& a_sGuideHash = QString());
+    // 删除/丢弃助手时清理其会话（含在跑 runner；调用方 UI 已挡运行中删除，此处兜底停）。
+    void RemoveAsstAdhoc(const QString& a_sAsstId);
+    // 档切换/切工程：停全部助手并清空全部会话（新档经 LoadAsstAdhoc 重装）。
+    void ResetAdhocSessions();
 
 signals:
     void sigTaskChanged(CTaskInfo* a_pTask);
@@ -107,24 +123,24 @@ signals:
     void sigTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
 
     // —— 提示词 agent 专属信号（不经任务，路由到「助手」Tab）——
-    void sigAdhocLog(const QString& a_sLine);                          // 原始/系统日志
-    void sigAdhocAssistantText(const QString& a_sText);                // 助手文本
-    void sigAdhocToolUse(const QString& a_sTool, const QString& a_sInput);
-    void sigAdhocToolResult(const QString& a_sResult);
-    void sigAdhocEvent(const QString& a_sKind, const QString& a_sText);  // 结构化事件徽章
-    void sigAdhocContext(qint64 a_iFill);                              // 上下文占用（token）；-1=未知
-    void sigAdhocModel(const QString& a_sModel);                       // 助手所用模型名（供面板查上下文窗口）
+    void sigAdhocLog(const QString& a_sAsstId, const QString& a_sLine);           // 原始/系统日志
+    void sigAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText); // 助手文本
+    void sigAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool, const QString& a_sInput);
+    void sigAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult);
+    void sigAdhocEvent(const QString& a_sAsstId, const QString& a_sKind, const QString& a_sText);  // 结构化事件徽章
+    void sigAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 上下文占用（token）；-1=未知
+    void sigAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 助手所用模型名（供面板查上下文窗口）
     // 2026.08.27 运行中实时计量（任务阶段/助手轮次通用）：本轮累计 输入/输出 token，
     //   每完成一次 API 请求发一次（Claude Code 式“当前指令消耗”直观反馈）；-1/-1=本轮结束清零。
     void sigLiveUsage(qint64 a_iIn, qint64 a_iOut);
-    void sigAdhocUndo();                                               // 撤销最后一条提问（面板清尾块）
-    void sigAdhocFinished();                                           // 一次助手调用结束（启用输入栏）
-    void sigAdhocRunning();                                            // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
-    void sigAdhocStateChanged();                                       // sid/撤销栈变化（#1 存盘触发）
+    void sigAdhocUndo(const QString& a_sAsstId);                       // 撤销该助手最后一条提问（面板清尾块）
+    void sigAdhocFinished(const QString& a_sAsstId);                   // 该助手一次调用结束（启用输入栏）
+    void sigAdhocRunning(const QString& a_sAsstId);                    // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
+    void sigAdhocStateChanged(const QString& a_sAsstId);               // 该助手 sid/撤销栈变化（#1 存盘触发）
     // 2026.08.15 一次成功助手调用的消耗（输入含缓存读/写，与账单同口径）+ 本次调用耗时（ms）
     //   + API 请求数，由 CMainWindow 归集到当前档任务（助手档按任务分档，消耗跟随档走）。
-    void sigAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs,
-                       int a_iReqs);
+    void sigAdhocUsage(const QString& a_sAsstId, qint64 a_iIn, qint64 a_iOut, double a_dCost,
+                       qint64 a_iElapsedMs, int a_iReqs);
     // 2026.08.20 Agent 自动命名：一次自动命名调用完成（含失败）→ 主窗口做 DB 副本
     //   镜像 + 刷新两表。a_bOk=false 时 a_sName 为空。
     void sigAutoNameDone(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sName);
@@ -137,12 +153,13 @@ private slots:
     void OnRunnerFinished(bool a_bOk, const QString& a_sResult,
                           qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
 
-    // —— 提示词 agent 槽：仅 emit sigAdhoc*，不触碰 m_pCurTask、不调 Advance ——
-    void OnAdhocInfo(const QString& a_sLine);
-    void OnAdhocAssistantText(const QString& a_sText);
-    void OnAdhocToolUse(const QString& a_sTool, const QString& a_sInput);
-    void OnAdhocToolResult(const QString& a_sResult);
-    void OnAdhocFinished(bool a_bOk, const QString& a_sResult,
+    // —— 提示词 agent 槽：仅 emit sigAdhoc*（带助手 id），不触碰 m_pCurTask、不调 Advance ——
+    // 2026.09.03 多助手并发：id 由 per-会话 runner 连接处的 lambda 注入（见 EnsureAdhocRunner）。
+    void OnAdhocInfo(const QString& a_sAsstId, const QString& a_sLine);
+    void OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText);
+    void OnAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool, const QString& a_sInput);
+    void OnAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult);
+    void OnAdhocFinished(const QString& a_sAsstId, bool a_bOk, const QString& a_sResult,
                          qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
 
 private:
@@ -234,13 +251,35 @@ private:
     QString StageNameZh(EStage a_eStage) const;
 
     // —— 提示词 agent 内部 ——
-    void EnsureAdhocRunner();                          // 懒创建 m_pAdhocRunner 并连信号
-    void StartAdhocStage(const QString& a_sPrompt);    // 按 m_sAdhocSid/m_bAdhocReadOnly 组装 argv 起一次
-
     // 提示词 agent 运行模式：Idle=空闲；Submitting=用户提问中；
     // CompactSummarize=压缩第一步（生成摘要）；CompactReseed=压缩第二步（摘要投新会话）；
     // AutoNaming=自动命名（拼任务内容+guide.md 提示词交 Agent 起名，不动用户会话栈）。
     enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming };
+
+    // —— 助手会话（2026.09.03 多助手并发）：每助手独立 runner 进程 + 会话链 + 状态机 ——
+    //   会话常驻 m_aAdhoc（id→堆指针，QHash 重哈希不移动指向体）；档切换/切工程整体
+    //   Reset；后端漂移在 EnsureAdhocRunner 内按会话清链（runner 空闲时）。
+    struct SAdhocSession {
+        QString               sId;             // 助手 id（索引键）
+        CAgentRunnerBase*     pRunner = nullptr;   // 该助手的 runner（独立 QProcess，懒建）
+        QString               sSid;            // 会话链基点 sid（首条前为空）
+        QString               sGuideHash;      // 上次投喂 guide.md 的 SHA256（变更重投判定）
+        QList<QPair<QString, QString>> aStack; // (prompt, sid) 撤销链；撤销=弹栈回基点
+        QStringList           aTranscript;     // 跨轮上下文回灌缓存（DSH/Codex/Hermes 用）
+        bool                  bReadOnly = false;    // 本轮只读开关
+        EAdhocMode            eMode = Idle;    // 异步流程状态机（多助手各一份，互不干扰）
+        CTaskInfo*            pAutoNameTask = nullptr;   // AutoNaming 模式待命名任务
+        QString               sPendingPrompt;  // Submitting 模式当前 prompt（压栈用）
+        QString               sSummary;        // CompactSummarize 产出、CompactReseed 投递
+        QString               sLastTaskId;     // 最近一次 Submit 的任务档 id（续发记忆沿用）
+        QDateTime             dtStart;         // 本轮起点（耗时归集）
+        int                   iResume = 0;     // max-turns 自动续跑计数（上限 2，新提问清零）
+        QStringList           aPendingInjects; // 同助手运行中排队指令（本轮结束自动续发）
+    };
+    SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
+    void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
+    void StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
+                         bool a_bDropLastUser = false);   // 按会话 sSid/bReadOnly 组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）
 
     CProjectManager* m_pPm;
     CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
@@ -268,32 +307,31 @@ private:
     QTimer m_tGuideSyncIdle;
 
     // 2026.08.26 助手轮 turn 快照改后台线程：不阻塞提交（失败仅事件提示，不阻断本轮）。
-    void AsyncAdhocBackup(const QString& a_sOwner, const QString& a_sPrompt);
+    void AsyncAdhocBackup(const QString& a_sAsstId, const QString& a_sOwner, const QString& a_sPrompt);
 
-    // —— 提示词 agent 状态 ——
-    CAgentRunnerBase* m_pAdhocRunner = nullptr;                    // 第二个 runner 实例（独立会话/进程）
-    QString        m_sAdhocSid;                                    // 当前助手会话 sid（首条前为空）
+    // —— 提示词 agent 状态（2026.09.03 多助手并发：per-助手会话收拢进 SAdhocSession）——
+    QHash<QString, SAdhocSession*> m_aAdhoc;                       // 助手 id → 会话（常驻；档切换 Reset）
     // 2026.08.27 本轮实时计量累计（任务阶段/助手轮次通用；阶段/轮次开始清零）
     qint64         m_iLiveIn  = 0;
     qint64         m_iLiveOut = 0;
     void ResetLiveUsage() { m_iLiveIn = 0; m_iLiveOut = 0; emit sigLiveUsage(0, 0); }
-    QString        m_sLastGuideHash;                               // 上次投喂 guide.md 的 SHA256（变更检测基线）
-    bool           m_bAdhocReadOnly = false;                       // 本轮只读开关（决定 deny 黑名单内容）
-    EAdhocMode     m_eAdhocMode = Idle;                            // 异步流程状态机
-    CTaskInfo*     m_pAutoNameTask = nullptr;                      // 2026.08.20 AutoNaming 模式待命名任务
-    QString        m_sAdhocPendingPrompt;                          // Submitting 模式记当前 prompt（压栈用）
-    QString        m_sAdhocSummary;                                // CompactSummarize 产出、CompactReseed 投递
-    QList<QPair<QString, QString>> m_aAdhocStack;                  // (prompt, sid) 链；撤销=弹栈回 m_sAdhocSid
-    QDateTime      m_dtAdhocStart;                                 // 2026.08.15 本次助手调用起点（耗时归集用）
-    int            m_iAdhocResume = 0;                             // 2026.08.15 本条提问 max-turns 已自动续跑次数（上限 2，新提问清零）
+    // ↑ 以上 per-助手 状态（guideHash/只读/模式/命名任务/pending/摘要/撤销栈）已全部
+    //   迁入 SAdhocSession（多助手各持一份）。
+    // 2026.09.02 跨轮上下文回灌：最近对话记录（"用户：…"/"助手：…"，时间升序）。
+    //   DSH/Codex/Hermes 每轮全新会话（KeepsContextAcrossTurns()==false），第 2 轮起
+    //   由 StartAdhocStage 把此记录注入 prompt 头部恢复上下文；权威源=面板对话流块
+    //   （每次外部提交整体重建，含重启后恢复的历史），轮内 assistant 行由
+    //   OnAdhocAssistantText 追加、内部续发沿用缓存。claude/pi 原生续接，不注入。
+    // 回灌块/追加行按会话操作（成员移入 SAdhocSession：aTranscript）
+    QString        BuildAdhocHistoryBlock(const SAdhocSession& a_S, bool a_bDropLastUser) const;   // 回灌块（无历史/后端可续接→空串）
+    void           AppendAdhocTranscriptLine(SAdhocSession& a_S, const QString& a_sLine);    // 追加一行 + 预算裁剪（保尾部）
     // 2026.08.19 运行中介入：
     //   任务侧——DSH 后端协议不支持轮中插话，InjectUserTurn 返回 false 时排队，
     //     LaunchStage 时前置并入下一阶段 prompt（换任务/停止即作废）。
     //   助手侧——运行中收到的追加指令：claude 后端走 InjectUserTurn 轮中注入即时不达此
     //     队列；DSH 后端排队，本轮成功收尾（OnAdhocFinished）后自动按同会话续发下一条。
     QStringList    m_aPendingTaskInjects;
-    QStringList    m_aAdhocPendingInjects;
-    QString        m_sAdhocLastTaskId;   // 最近一次 Submit 的任务档 id（自动续发时记忆注入沿用）
+    // （助手侧排队指令/最近任务档 id 已迁 SAdhocSession：aPendingInjects/sLastTaskId）
 
     // —— 评审多视角并行（fan-out / fan-in）状态 ——
     struct SViewResult {       // 单视角评审 runner 的完成结果

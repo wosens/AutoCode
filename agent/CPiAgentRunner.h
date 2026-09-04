@@ -112,6 +112,9 @@ public:
 
     QString BackendName() const override { return QStringLiteral("pi"); }
 
+    // --session-id 磁盘会话跨进程可续（fork 虽忽略，同 sid 续跑仍携带全部上下文）。
+    bool KeepsContextAcrossTurns() const override { return true; }
+
     // 启动一次阶段执行：每次冷启动一个 pi 子进程，进程退出即本轮结束。
     void StartStage(const QString& a_sWorkDir,
                     const QString& a_sPrompt,

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 
@@ -7,6 +7,7 @@
 #include "CCodexRunner.h"
 #include "CDeepSeekRunner.h"
 #include "CPiAgentRunner.h"
+#include "CHermesRunner.h"
 
 // Agent 后端工厂（header-only）。
 //
@@ -25,7 +26,8 @@ public:
         BackendClaude,   // Claude Code CLI（原路径）
         BackendDsh,      // DeepSeekHarness（JSON-RPC 完整接入）
         BackendPi,         // PIAgent（pi coding-agent，--mode json 流式接入）
-        BackendCodex       // CodexHarness（OpenAI Codex CLI 0.87.0，exec --json 接入）
+        BackendCodex,     // CodexHarness（OpenAI Codex CLI 0.87.0，exec --json 接入）
+        BackendHermes    // Hermes（第五后端，任务 3213cdbf；CLI 子进程+网关基线）
     };
 
     static void SetBackend(EBackend a_eBackend) { s_eBackend = a_eBackend; }
@@ -33,12 +35,14 @@ public:
     static bool IsDsh() { return s_eBackend == BackendDsh; }
     static bool IsPi() { return s_eBackend == BackendPi; }
     static bool IsCodex() { return s_eBackend == BackendCodex; }
+    static bool IsHermes() { return s_eBackend == BackendHermes; }
     // 当前后端名（与各 runner BackendName() 同词汇表，漂移检测直接字符串比较）。
     static QString BackendName() {
         switch (s_eBackend) {
             case BackendDsh:   return QStringLiteral("dsh");
             case BackendPi:    return QStringLiteral("pi");
             case BackendCodex: return QStringLiteral("codex");
+            case BackendHermes: return QStringLiteral("hermes");
             default:           return QStringLiteral("claude");
         }
     }
@@ -48,6 +52,7 @@ public:
             case BackendDsh:   return QStringLiteral("DSH");
             case BackendPi:    return QStringLiteral("PIAgent");
             case BackendCodex: return QStringLiteral("CodexHarness");
+            case BackendHermes: return QStringLiteral("Hermes");
             default:           return QStringLiteral("Claude");
         }
     }
@@ -59,6 +64,7 @@ public:
             case BackendDsh:   return new CDeepSeekRunner(a_pParent);
             case BackendPi:    return new CPiAgentRunner(a_pParent);
             case BackendCodex: return new CCodexRunner(a_pParent);
+            case BackendHermes: return new CHermesRunner(a_pParent);
             default:           return new CClaudeRunner(a_pParent);
         }
     }

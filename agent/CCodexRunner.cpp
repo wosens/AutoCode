@@ -1,4 +1,4 @@
-#include "CCodexRunner.h"
+﻿#include "CCodexRunner.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -41,8 +41,7 @@ static QString CodexEffProvider() {
 static QString CodexEffModel() {
     return CodexActiveEntry() != nullptr ? CodexActiveEntry()->sModelId
                                          : CCodexRunner::CodexModel();
-}
-static QString CodexEffBaseUrl() {
+}static QString CodexEffBaseUrl() {
     return CodexActiveEntry() != nullptr ? CodexActiveEntry()->sBaseURL
                                          : CCodexRunner::CodexBaseUrl();
 }
@@ -277,14 +276,14 @@ QString CCodexRunner::CodexConfigError() {
     if (CodexEffModel().isEmpty()) {
         return QStringLiteral(
             "CodexHarness 模型未配置。\n"
-            "处理：「设置 → CodexHarness 参数 → 模型」填网关侧模型 id"
-            "（或自定义大模型里「设为当前」一条）。");
+            "处理：「设置 → CodexHarness 参数」自定义大模型列表里新增一条并"
+            "「设为当前」。");
     }
     if (CodexEffBaseUrl().isEmpty()) {
         return QStringLiteral(
             "CodexHarness 网关地址未配置。\n"
-            "处理：「设置 → CodexHarness 参数 → BaseUrl」填网关 base_url"
-            "（如 http://192.168.x.x:9000/v1）。");
+            "处理：「设置 → CodexHarness 参数」自定义大模型列表条目里填接入点"
+            "（如 http://192.168.x.x:9000/v1）并「设为当前」。");
     }
     return QString();
 }

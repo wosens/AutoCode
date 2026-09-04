@@ -88,15 +88,15 @@ private:
     void RefreshVerdicts();       // 按 m_asLocalVer/m_asLatestVer 重填结论列
     void UpdateInfoLine();        // 信息栏：查询时刻/提示文案
 
-    QTableWidget* m_pTable = nullptr;      // 4 行 × 5 列
-    QPushButton* m_aBtnUpdate[5] = {};     // [1..4] 行内更新按钮；[0] 弃用（后端号
-                                           //   1..4 直接作下标，防越界占位）
+    QTableWidget* m_pTable = nullptr;      // 5 行 × 5 列（2026.09 增 Hermes 行 5）
+    QPushButton* m_aBtnUpdate[6] = {};     // [1..5] 行内更新按钮；[0] 弃用（后端号
+                                           //   1..5 直接作下标，防越界占位）
     QPushButton* m_pBtnRefresh = nullptr;  // 刷新版本（本地重读）
     QPushButton* m_pBtnQuery   = nullptr;  // 查询最新版(联网)（手动触发，D2）
     QPushButton* m_pBtnClose   = nullptr;  // 关闭
     QLabel*      m_pLblInfo    = nullptr;  // 查询时刻/失败提示/刷新闭环提示
-    QString      m_asLocalVer[5];          // 会话内存本地版本（NFR-2 不落盘）
-    QString      m_asLatestVer[5];         // 会话内存最新版（失败保留上次已知值）
+    QString      m_asLocalVer[6];          // 会话内存本地版本（NFR-2 不落盘）
+    QString      m_asLatestVer[6];         // 会话内存最新版（失败保留上次已知值）
     QDateTime    m_tQueryAt;               // 「查询时刻」时点语义（D2 手动触发）
     QHash<int, QProcess*> m_aProc;         // 信号驱动异步子进程池（键=EProcKey）
     QHash<int, QTimer*>   m_aTimer;        // 硬超时 kill 表（析构统一停净）

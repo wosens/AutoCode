@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QHash>
@@ -7,8 +7,10 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QColor>
+#include <QElapsedTimer>
 
-#include "ui/CMessageBlock.h"   // SBlockData 复用 CMessageBlock::EKind
+#include "ui/CMessageBlock.h"   // 块控件（SBlockData 现居 CStreamPresenter.h）
+#include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 亦在此）
 
 class QTreeWidget;
 class QTreeWidgetItem;
@@ -37,6 +39,7 @@ class CExecutionPanel : public QWidget {
 
 public:
     explicit CExecutionPanel(QWidget* a_pParent = nullptr);
+    ~CExecutionPanel() override;   // 2026.09.03 释放全部任务流（CStreamPresenter 堆对象；助手流随 SAsst/shared_ptr 自清）
 
     // —— 结构化对话流（直接接编排器信号）——
     // 末尾 a_sViewId 为评审多视角并行的视角标识（空=单 runner 串行路径，向后兼容）。
@@ -63,19 +66,23 @@ public:
     void RefreshStageOutputs(CTaskInfo* a_pTask);
 
     // —— 提示词 agent（「助手」Tab，独立于任务的对话流）——
-    void OnAdhocAssistantText(const QString& a_sText);
-    void OnAdhocToolUse(const QString& a_sTool, const QString& a_sInputJson);
-    void OnAdhocToolResult(const QString& a_sResult);
-    void OnAdhocLog(const QString& a_sLine);
-    void OnAdhocEvent(const QString& a_sKind, const QString& a_sText);
-    void OnAdhocUndo();                // 撤销：移除最后一条 prompt 块 + 其回复/工具块并重建
-    void OnAdhocFinished();            // 一次助手调用结束：重新启用输入栏
+    // 2026.09.03 多助手并发：槽首参 = 产出助手 id，各流直投各的助手 Tab；
+    //   运行态 per-助手（SAsst::bRunning），跨助手发送立即执行不再排队。
+    void OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText);
+    void OnAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool, const QString& a_sInputJson);
+    void OnAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult);
+    void OnAdhocLog(const QString& a_sAsstId, const QString& a_sLine);
+    void OnAdhocEvent(const QString& a_sAsstId, const QString& a_sKind, const QString& a_sText);
+    void OnAdhocUndo(const QString& a_sAsstId);   // 撤销：移除该助手最后一条 prompt 块 + 其回复/工具块并重建
+    void OnAdhocFinished(const QString& a_sAsstId);   // 该助手一次调用结束：恢复其输入态
     // 2026.08.19 运行态对外置位：编排器自动续发排队指令起新轮时广播（见 sigAdhocRunning），
     //   手动发送路径面板已自置、此处幂等。原 private，升 public 供主窗口连接。
-    void SetAdhocRunning(bool a_bRunning);
-    void SetAdhocContext(qint64 a_iFill);   // 更新上下文进度条（<0 视为占用未知，进度归零）
-    qint64 LastContextFill() const { return m_iLastContextFill; }   // 供主窗口存盘：当前上下文占用快照
-    void OnAdhocModel(const QString& a_sModel);   // 收到模型名 → 查表更新上下文窗口分母
+    //   2026.09.03 多助手并发：置位/清除均按助手 id，互不影响其他助手的运行态。
+    void SetAsstRunning(const QString& a_sAsstId, bool a_bRunning);
+    bool AsstRunning(const QString& a_sAsstId) const;      // 指定助手是否运行中
+    bool AnyAsstRunning() const;                            // 是否有任一助手运行中（旧 m_bAdhocRunning 语义）
+    void SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 更新该助手上下文快照+进度条（<0 视为未知）
+    void OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 该助手收到模型名 → 查表更新窗口分母
     void SetUserContextLimit(qint64 a_iLimit);    // 右键设窗口上限（>0 覆盖探测；0/负回退自动）
     void SetAdhocEnabled(bool a_bEnabled);  // 工程未打开时禁用输入栏
     // FR-3：资源管理器「添加到聊天框」→ 把文本追加到 adhoc 助手输入框末尾。
@@ -108,25 +115,29 @@ public:
     void SetLiveUsage(qint64 a_iIn, qint64 a_iOut);
     void ApplyLiveUsage(qint64 a_iIn, qint64 a_iOut);   // 限频到点实际上屏
     QString ActiveAsstId() const { return m_sActiveAsst; }  // 当前激活（显示中）的助手 id
-    QString RunningAsstId() const { return m_sRunningAsst; }// 正在执行一轮的助手 id（无则空）
-    int QueuedAdhocCount() const { return m_aAdhocQueue.size(); }   // 2026.08.27 跨助手排队指令数（测试断言用）
-    // 2026.08.27 升 public 供测试驱动（test_execpanel 跨助手排队用例）：发送当前输入。
-    // 运行中且激活助手≠运行助手 → 排队到激活助手（QueueAdhocPrompt），不注入运行轮。
+    // 2026.09.02 跨轮上下文回灌：提取指定助手最近对话记录（"用户：…"/"助手：…"
+    //   交替，时间升序，已去时间戳前缀并按预算截断），供不支持会话续接的后端
+    //   （DSH/Codex/Hermes）每轮把历史回灌进 prompt。a_sCurText = 本次即将提交的
+    //   提问（末尾周着它的 user 块已上屏，剔除防重复）；助手不存在/无历史返回空。
+    QStringList BuildAsstTranscript(const QString& a_sAsstId, const QString& a_sCurText) const;
+    // 2026.08.27 升 public 供测试驱动（test_execpanel 用例）：发送当前输入。
+    // 2026.09.03 多助手并发：激活助手在跑 → 注入/续发（同助手追加）；空闲 → 立即提交
+    // 该助手自己的会话（其他助手在跑与否无关）。
     void DoAdhocSend();
-    void ClearRunningAsst();                                // 结束态：清运行中助手（主窗口在读取后调用）
     void ResetAssistants();                                 // 复位为单个默认助手（清空会话/对话流）
     void ClearAsstTabs();                                   // 拆除全部助手 Tab + 清模型（不建默认助手；载档/复位共用，含「+」页再入防护）
     int AsstCount() const { return m_aAssts.size(); }
     QJsonArray TaskBlocksToJson(const QString& a_sTaskId) const;
     void LoadTaskBlocksFromJson(const QString& a_sTaskId, const QJsonArray& a_aBlocks);
-    bool HasTaskBlocks(const QString& a_sTaskId) const { return m_aBlocks.contains(a_sTaskId); }
+    bool HasTaskBlocks(const QString& a_sTaskId) const { return m_aStreams.contains(a_sTaskId); }
     void ClearAllBlocks();   // 切工程：清空全部内存对话流（任务 + 各助手）
 
 signals:
-    void sigAdhocSubmit(const QString& a_sText, bool a_bReadOnly);
-    void sigAdhocUndo();
-    void sigAdhocCompact();
-    void sigAdhocStop();
+    // 2026.09.03 多助手并发：提交/撤销/压缩/停止均带目标助手 id（编排器按 id 路由会话）。
+    void sigAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly);
+    void sigAdhocUndo(const QString& a_sAsstId);
+    void sigAdhocCompact(const QString& a_sAsstId);
+    void sigAdhocStop(const QString& a_sAsstId);
     void sigAdhocBlocksChanged();                         // 助手流变化（#1 存盘）
     // 2026.08.22 多助手事件：新增/删除/切换/重命名/拖动排序 → 主窗口换载编排器会话或落盘。
     void sigAsstAdded(const QString& a_sId);                          // 新增助手（已激活）
@@ -154,30 +165,23 @@ protected:
     QHash<QString, qint64> m_aLastStampSecs;   // 各流（taskId/助手流哨兵键）最后输出的时间戳
 
 private:
-    // 单条对话流的数据快照（任务切换时据此重建 widget）
-    struct SBlockData {
-        CMessageBlock::EKind eKind = CMessageBlock::Assistant;
-        QString sText;        // Assistant/Event/System/Error 文本
-        QString sTool;        // ToolUse 工具名
-        QString sInput;       // ToolUse 入参 JSON
-        QString sResult;      // 工具结果（到达后回填）
-        QString sEventKind;   // Event 的 kind
-        QString sViewId;      // 评审多视角并行的视角标识（v1/v2/...；空=串行路径）
-    };
+    struct SAsst;   // 前置声明（定义在下方；AsstStream 等签名需先引用）
 
-    CMessageBlock* CreateWidget(const SBlockData& a_stData);   // 由数据快照构建一个块 widget
-    // 2026.08.22 连续工具调用合并上屏：新块与前一块同为 ToolUse 且同视角时并入上一 widget（×N 折叠卡），
-    //   返回 false=不满足合并条件（由调用方正常新建 widget）
-    bool TryMergeToolWidget(const QList<SBlockData>& aBlocks, QList<CMessageBlock*>& aWidgets,
-                            int a_iNewIdx, const SBlockData& a_stData);
-    void AppendData(const QString& a_sTaskId, const SBlockData& a_stData);   // 入缓存 + 当前任务则上屏
-    void RebuildView();        // 按 m_sCurId 重建整条对话流（分帧渐进，避免数百块同步创建卡死 UI）
-    void RebuildChunk(quint32 a_uGen);   // 渐进重建一帧（代际号不符=已被新重建顶替，立即终止）
-    void AppendAdhocBlock(const SBlockData& a_stData, const QString& a_sTargetId = QString());   // ad-hoc 块入缓存 + 上屏助手 Tab（目标 id 空=运行中助手，否则激活助手；2026.08.27 增 id 直投——跨助手排队徽标要落到指定助手）
-    void RebuildAdhocView();   // 按激活助手数据重建其对话流（分帧渐进，撤销/切档后调用）
+    // —— 对话流呈现（2026.09.03 统一收拢：任务日志与各助手日志共用 CStreamPresenter，
+    //    数据/并行件/反向分页前沿/分帧重建状态全部在流对象内，面板只做路由与生命周期）——
+    // 任务侧：每任务一个流（堆上指针，QHash 重哈希不移动指向体）；共享同一个 m_pView，
+    //    当前流 Bind+Rebuild，切出流 Unbind（弃件保数据）。
+    CStreamPresenter* EnsureStream(const QString& a_sTaskId);   // 取/建任务流（fnDirty→MarkTaskDirty）
+    QHash<QString, CStreamPresenter*> m_aStreams;   // taskId → 任务流（数据常驻，不随切换丢失）
+    CStreamPresenter* m_pCurStream = nullptr;       // 当前任务流（绑 m_pView；空=无选中任务）
+
+    void AppendData(const QString& a_sTaskId, const SBlockData& a_stData);   // 入流数据 + 当前任务则上屏（路由到 EnsureStream(id)->Append）
+    void RebuildView();        // 重建当前任务流视图（m_pCurStream->Rebuild；无当前流时空操作）
+    void AppendAdhocBlock(const SBlockData& a_stData, const QString& a_sTargetId = QString());   // ad-hoc 块入助手流 + 上屏（目标 id 空=运行中助手，否则指定助手；2026.08.27 增 id 直投——跨助手排队徽标要落到指定助手）
+    void RebuildAdhocView();   // 按激活助手数据重建其对话流（撤销/切档后调用）
     void RebuildAsstView(const QString& a_sId);   // 2026.08.23 按指定助手重建（多助手各自独立控件，加载后预建防切换卡顿）
-    void RebuildAdhocChunk(const QString& a_sId, quint32 a_uGen);   // 助手视图渐进重建一帧（id/代际号不符=被顶替，立即终止）
-    void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/m_bAdhocRunning 刷新输入栏可用性
+    CStreamPresenter* AsstStream(SAsst& a_stAsst);   // 取/建助手流（fnDirty→sigAdhocBlocksChanged；懒建，SAsst 值拷贝后共享同一流）
+    void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/激活助手运行态刷新输入栏可用性
     void OnAdhocTextChanged();      // 多行输入框高度自适应（按内容行数，上限 10 行）
     // 输入框高度自适应通用版：按字体度量算单行高、按 blockCount 线性增长、封顶 a_iMaxLines 行。
     // 介入栏与助手栏共用，保证两框初始高度与增长行为完全一致（#3）。
@@ -195,8 +199,6 @@ private:
     void UpdateCostLabel();         // 2026.08.15 刷新底部费用/状态栏（含运行耗时）
     void OnRunTimer();              // 2026.08.15 运行中每秒刷新耗时显示
     static qint64 ContextLimitForModel(const QString& a_sModel);  // 模型名 → 上下文窗口 token 上限
-    static QJsonObject BlockToJson(const SBlockData& a_stData);   // SBlockData ↔ JSON
-    static SBlockData BlockFromJson(const QJsonObject& a_o);
     void MarkTaskDirty(const QString& a_sTaskId);   // 标脏 + 启动去抖 timer（#6）
     void FlushTaskChat();                            // 去抖到期：逐脏 id 发 sigTaskChatChanged
     void LoadStageOutputs(CTaskInfo* a_pTask);  // 「阶段产物」页：按任务流程阶段列出已生成的 .md
@@ -221,7 +223,8 @@ private:
     qint64          m_iPendingLiveIn = 0;   // 暂存的最新流式值
     qint64          m_iPendingLiveOut = 0;
     CBusyIndicator* m_pBusy    = nullptr;   // 执行态动画指示器（费用文本前，#4）
-    QTimer*         m_pRunTimer = nullptr;  // 2026.08.15 运行耗时 1s 刷新定时器（仅当前任务 Running 时跑）
+    QTimer*         m_pRunTimer = nullptr;  // 2026.08.15 运行耗时 1s 刷新定时器（任务 Running 或助手运行中跑）
+    QElapsedTimer   m_tAdhocClock;         // 2026.09 助手本轮起始钟（无任务时费用栏「耗时」实时跳动）
     bool            m_bTaskRunning = false; // 当前选中任务是否运行中（#4 指示器用）
     QColor          m_colIdle;             // 指示器空闲态颜色（随任务状态）
     QString         m_sAdhocModel;                 // 助手当前所用模型名（按钮 tooltip 显示）
@@ -231,18 +234,12 @@ private:
 
     QString                          m_sCurId;
     CTaskInfo*                       m_pCurTask = nullptr;  // 需求3：当前显示任务（供阶段表右键取）
-    QHash<QString, QList<SBlockData>> m_aBlocks;       // 任务 id → block 数据列表
-    QList<CMessageBlock*>            m_aCurWidgets;    // 当前任务的块 widget（与 m_aBlocks[m_sCurId] 一一对齐）
-    // 渐进重建状态：任务对话流可达数百块（Markdown/工具卡均重），同步重建卡 UI ~10s。
-    // 分帧创建（每帧小批量 + 回事件循环），期间新到的当前任务块也走分帧路径防重复上屏。
-    int                               m_iRebuildIdx = 0;    // 重建进度（已创建的 block 下标）
-    quint32                           m_uRebuildGen = 0;    // 重建代际号（切任务/重建重启时 +1 作废旧帧）
-    bool                              m_bRebuilding = false; // 渐进重建中（AppendData 新块交分帧循环按序创建）
-    // 2026.08.22 助手视图分帧重建状态移入各助手（SAsst::iRebuildIdx/uGen/bRebuilding）。
+    // 对话流状态已在 CStreamPresenter 内（2026.09.03 收拢）：任务侧见上方 m_aStreams/m_pCurStream，
+    //   助手侧见 SAsst::pStream。渐进重建/反向分页前沿/并行件列表不再散落面板成员。
 
     // —— 提示词 agent（独立对话流，按「助手」分 Tab，不受任务切换影响）——
     // 2026.08.22 多助手：每个助手一个 Tab（标题=助手名，可关闭/拖动排序/双击重命名），
-    //   各自持有独立对话流与分帧重建状态；「+」角标按钮新增助手。
+    //   各自持有独立对话流；2026.09.03 流本体收拢为 CStreamPresenter（与任务日志共用）。
     struct SAsst {
         QString               sId;            // 助手 id（uuid，跨重命名稳定）
         QString               sName;          // 助手名（Tab 标题）
@@ -250,17 +247,17 @@ private:
         QString               sGuideHash;     // guide.md 投喂哈希基线
         QJsonArray            aStack;         // 撤销栈 JSON（prompt,sid 链）
         qint64                iCtxFill = 0;   // 上下文占用快照（恢复进度条用）
+        bool                  bRunning = false;  // 2026.09.03 多助手并发：该助手运行中（Tab ●、按钮态）
+        QString               sModel;            // 2026.09.03 该助手最近所用模型名（切 Tab 还原上下文窗口显示）
         // 2026.08.27 未选任务时的独立消耗累计（选任务时消耗归任务，不进这里）
         double                dCost = 0.0;
         qint64                iInTok = 0;
         qint64                iOutTok = 0;
         int                   iReqs = 0;
         qint64                iElapsedMs = 0;
-        QList<SBlockData>     aBlocks;        // 对话流数据快照
-        QList<CMessageBlock*> aWidgets;       // 与 aBlocks 一一对齐
-        int                   iRebuildIdx = 0;    // 分帧重建进度
-        quint32               uGen = 0;           // 分帧重建代际号
-        bool                  bRebuilding = false;// 分帧重建中（新块交分帧循环按序创建）
+        // 2026.09.03 对话流收拢：数据/件/前沿/重建状态全在流对象内（shared：SAsst 值拷贝
+        //   搬移场景（ReopenAsst 等）共享同一流，不产生双份）。懒建（AsstStream），未建时为空。
+        CStreamPresenterPtr   pStream;
         CMessageView*         pView = nullptr;    // 该助手的对话流视图（Tab 页本体；关闭后为 null，重开重建）
         QToolButton*          pBtnPrompts = nullptr;  // FR-3 右上角提示词按钮（parent=pView）
         QToolButton*          pBtnBottom  = nullptr;  // 提示词按钮正下方「↓」按钮（点击滚动到日志最底）
@@ -269,19 +266,18 @@ private:
     SAsst* AsstById(const QString& a_sId);
     const SAsst* AsstById(const QString& a_sId) const;
     SAsst* ActiveAsst();              // 当前激活助手（无助手时 nullptr）
-    SAsst* RunningTargetAsst();       // 块归属目标：运行中助手 → 否则激活助手
+    // （RunningTargetAsst 已删：编排器信号带助手 id，直投对应助手流。）
     SAsst* AsstByView(QWidget* a_pView);   // 按视图反查助手（Tab 事件定位）
-    // —— 2026.08.27 跨助手排队发送：运行中助手 ≠ 激活助手时，提示词不再误注入运行轮 ——
-    //   入队（徽标 + ⏳ Tab 标记）；本轮结束（含编排器同会话续发链）后自动发送：
-    //   切到目标助手 Tab（触发会话换载）→ 上屏 user 块 → sigAdhocSubmit。
-    struct SQueuedAdhoc {
-        QString sAsstId;              // 目标助手 id
-        QString sText;                // 提示词原文
-        bool    bReadOnly = false;    // 只读开关（入队时快照）
-    };
-    void QueueAdhocPrompt(SAsst* a_pAsst, const QString& a_sText, bool a_bReadOnly);  // 入队 + 徽标
-    void ProcessAdhocQueue();        // 空闲时取队首发送（OnAdhocFinished 延迟触发）
-    bool AsstQueued(const QString& a_sId) const;   // 该助手是否有排队指令（Tab ⏳ 标记/关阷拦截用）
+    // 2026.09.03 反向分页（助手流版，依赖 SAsst 故在此声明）：滚动到顶补建更早一段；
+    //   BuildOlderChunk 为两流共用实现——补 [frontier-100, frontier) 入临时列表（块内
+    //   合并仍生效），再前插对齐外层并行列表并推进前沿；EnsureAsstCoverage 供提示词
+    //   跳转目标早于前沿时分轮补建至覆盖后滚动到位。
+    void PrependAsstOlder(SAsst* a_pAsst);
+    void BuildOlderChunk(const QList<SBlockData>& aBlocks, QList<CMessageBlock*>& aWidgets,
+                         int& a_ioFrontier, QList<CMessageBlock*>& a_aNewWidgets);
+    void EnsureAsstCoverage(const QString& a_sId, int a_iTargetIdx);
+    // 2026.09.03 跨助手排队机制已删（多助手并发下不再排队，激活助手空闲即发）；
+    //   同助手运行中追加的排队在编排器会话内（aPendingInjects，续发语义不变）。
     QString AsstTabText(const SAsst& a_st) const;  // Tab 标题（运行 ● / 排队 ⏳ / 纯名）
     void RefreshAsstTabTexts();      // 统一刷全部助手 Tab 标题
     // FR-3：为指定助手日志右上角创建半透明提示词按钮（hover 弹出、移开收起、点击跳转）。
@@ -311,11 +307,11 @@ private:
     CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起）
     QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
     QString                m_sActiveAsst;              // 当前激活助手 id
-    QString                m_sRunningAsst;             // 正在执行一轮的助手 id（空=空闲）
-    QList<SQueuedAdhoc>    m_aAdhocQueue;              // 2026.08.27 跨助手排队指令（FIFO；档切换随 ClearAsstTabs 清空，不持久化）
+    // （m_sRunningAsst 已删：运行态 per-助手存 SAsst::bRunning。）
+    // （m_aAdhocQueue 已删：跨助手排队机制随多助手并发移除。）
     QList<int>             m_aPromptIdx;               // FR-3 激活助手流中「用户提问」块下标（旧→新，供下拉跳转）
     bool                   m_bAdhocEnabled = false;    // 工程是否已打开（输入栏总开关）
-    bool                   m_bAdhocRunning = false;    // 助手是否运行中（运行中禁输入栏）
+    // （m_bAdhocRunning 已删：以 AnyAsstRunning() 按 SAsst::bRunning 聚合。）
     bool                   m_bAsstTabsResetting = false;   // ResetAssistants 拆 Tab 期：忽略程序性 currentChanged（防「+」页自动激活被当新增 → 死循环）
 
     // —— 任务对话流去抖落盘（#6）——

@@ -15,10 +15,20 @@ if /i "%~1"=="/pi" set "PI_ONLY=1"
 :: ---- 参数/codex = 只安装 CodexHarness（设置页「安装 CodexHarness…」按钮调用）----
 set "CODEX_ONLY=0"
 if /i "%~1"=="/codex" set "CODEX_ONLY=1"
+:: ---- 参数/hermes <repoUrl> = 联网安装 Hermes Harness（设置页 Hermes 页
+::      「联网安装（git）」按钮调用；repoUrl=Hermes Harness git 仓库地址，第 2 参传入，
+::      已装时为 fetch+reset 更新）----
+set "HERMES_ONLY=0"
+if /i "%~1"=="/hermes" set "HERMES_ONLY=1"
 :: ---- 参数/update-dsh <tag> = 更新 DeepSeekHarness 到指定 tag（fetch+reset 保留本地；
 ::      版本管理对话框「更新」调用，tag 由 AutoCode 经 ls-remote 解析后传入）----
 set "DSH_UPDATE=0"
 if /i "%~1"=="/update-dsh" set "DSH_UPDATE=1"
+:: ---- 参数/hermes-patch <root> = 给部署根 hermes_cli\oneshot.py 敷设 AutoCode
+::      事件补丁（软编码：补丁源=脚本同级 hermes_oneshot_patch.py，venv python 执行；
+::      幂等已含标记跳过。程序侧选 Hermes 后端保存时与 StartStage 兜底时自动调用）----
+set "HERMES_PATCH=0"
+if /i "%~1"=="/hermes-patch" set "HERMES_PATCH=1"
 
 title AutoCode 环境安装
 cd /d "%~dp0"
@@ -29,11 +39,18 @@ for %%i in ("%~dp0DeepSeekHarness\deepseek-harness") do set "DSH_ROOT=%%~fi"
 :: /update-dsh 模式第 3 参可显式指定 DSH 根（程序侧传配置的 DshRoot，带引号）：
 ::   兼容非脚本同级的安装布局（如多实例共享外部 DSH 根）；%~3 去引号后整串生效。
 if "!DSH_UPDATE!"=="1" if not "%~3"=="" set "DSH_ROOT=%~3"
+:: Hermes 联网安装布局锚点：脚本同级 HermesHarness（程序侧 ResolveHermesCli 探测序
+::   第 2 位；dist\cli.js 为安装完成判据）。仓库地址 = 第 2 参（程序侧传设置页所填值）。
+for %%i in ("%~dp0HermesHarness") do set "HERMES_ROOT=%%~fi"
+set "HERMES_URL=%~2"
+if "!HERMES_URL!"=="" set "HERMES_URL=https://github.com/nousresearch/hermes-agent"
 
 if "!DSH_UPDATE!"=="1" goto :BANNER_DSH_UPDATE
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
 if "!PI_ONLY!"=="1" goto :BANNER_PI
 if "!CODEX_ONLY!"=="1" goto :BANNER_CODEX
+if "!HERMES_ONLY!"=="1" goto :BANNER_HERMES
+if "!HERMES_PATCH!"=="1" goto :HERMES_PATCH
 echo ============================================================
 echo   AutoCode 环境安装
 echo   一键安装：Git、Node.js LTS、Claude Code CLI
@@ -43,6 +60,15 @@ echo   可选接入：GLM 中继工具 - Claude Code 换国产模型
 echo ============================================================
 echo.
 goto :ADMIN
+
+:: ---- /hermes-patch：敷设 oneshot 事件补丁（纯文件操作，无需提权）----
+:HERMES_PATCH
+set "HP_ROOT=%~2"
+if "!HP_ROOT!"=="" set "HP_ROOT=!HERMES_ROOT!"
+set "HP_PY=!HP_ROOT!\hermes-agentenv\Scripts\python.exe"
+if not exist "!HP_PY!" set "HP_PY=python"
+"!HP_PY!" "%~dp0hermes_oneshot_patch.py" "!HP_ROOT!"
+exit /b %ERRORLEVEL%
 
 :BANNER_DSH
 echo ============================================================
@@ -71,6 +97,19 @@ echo   CodexHarness 单独安装
 echo   安装内容：@openai/codex@0.87.0（npm 本地工程安装，--save-exact 锁定版本）
 echo   安装位置：脚本同级 Execute\CodexHarness
 echo   版本说明：v0.88+ 已移除 wire_api="chat"，本后端锁定 0.87.0（chat 网关接入）
+echo ============================================================
+echo.
+goto :ADMIN
+
+:: ---- Hermes 联网安装横幅（/hermes 模式）----
+:BANNER_HERMES
+echo ============================================================
+echo   Hermes Harness 联网安装
+echo   安装内容：git 克隆仓库 + pnpm 依赖 + 构建 dist\cli.js
+echo   安装位置：!HERMES_ROOT!
+echo   仓库地址：!HERMES_URL!
+echo   前置条件：Git 与 Node.js - 缺失时会自动安装
+echo   已装更新：检测到 dist\cli.js 时改为 fetch+reset（保留本地文件）
 echo ============================================================
 echo.
 goto :ADMIN
@@ -105,6 +144,7 @@ echo.
 if "!DSH_UPDATE!"=="1" goto :UPDATE_DSH
 if "!DSH_ONLY!"=="1" goto :DETECT
 if "!PI_ONLY!"=="1" goto :DETECT
+if "!HERMES_ONLY!"=="1" goto :DETECT
 if "!CODEX_ONLY!"=="1" goto :CODEX
 echo ============================================================
 echo   请选择 Claude Code 接入模型：
@@ -135,7 +175,7 @@ if /i "!BACKEND!"=="GLM" ( where chelper >nul 2>&1 && set "HAVE_HELPER=1" )
 echo [检测]
 if "!HAVE_NODE!"=="1"   (echo    node     已安装) else (echo    node     缺失)
 if "!HAVE_GIT!"=="1"    (echo    git      已安装) else (echo    git      缺失)
-if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" (
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="1" (echo    claude   已安装) else (echo    claude   缺失)
     if /i "!BACKEND!"=="GLM" (
         if "!HAVE_HELPER!"=="1" (echo    chelper  已安装) else (echo    chelper  缺失)
@@ -156,7 +196,7 @@ echo.
 set "NEED=0"
 if "!HAVE_NODE!"=="0"   set "NEED=1"
 if "!HAVE_GIT!"=="0"    set "NEED=1"
-if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" (
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="0" set "NEED=1"
     if /i "!BACKEND!"=="GLM" if "!HAVE_HELPER!"=="0" set "NEED=1"
 )
@@ -166,6 +206,7 @@ if "!NEED!"=="0" (
     echo.
     if "!DSH_ONLY!"=="1" goto :DSH
     if "!PI_ONLY!"=="1" goto :PI
+    if "!HERMES_ONLY!"=="1" goto :HERMES
     goto :DSH_ASK
 )
 
@@ -222,6 +263,7 @@ echo.
 :: ---- 6. 需要用 npm 安装的（claude / chelper / pnpm）统一 npm 全局目录 ----
 set "DO_NPMCFG=0"
 if "!DSH_ONLY!"=="1" set "DO_NPMCFG=1"
+if "!HERMES_ONLY!"=="1" set "DO_NPMCFG=1"
 if "!HAVE_CLAUDE!"=="0" set "DO_NPMCFG=1"
 if /i "!BACKEND!"=="GLM" if "!HAVE_HELPER!"=="0" set "DO_NPMCFG=1"
 if "!DO_NPMCFG!"=="1" (
@@ -243,6 +285,8 @@ echo.
 
 :: DSH 单装模式：到此环境就绪，直接进安装段。
 if "!DSH_ONLY!"=="1" goto :DSH
+:: Hermes 联网安装模式：同 DSH（node+git+pnpm 就绪后进安装段）。
+if "!HERMES_ONLY!"=="1" goto :HERMES
 :: PI 单装模式：node 就绪即可（无需 git/npm 全局件），直接进安装段。
 if "!PI_ONLY!"=="1" goto :PI
 
@@ -430,6 +474,108 @@ echo.
 :CODEX_END
 goto :VERIFY
 
+:: ---- Hermes Harness 联网安装段（/hermes <repoUrl>：git 克隆 + pnpm 依赖构建）----
+:HERMES
+echo ============================================================
+echo   联网安装 Hermes Harness
+echo   安装位置：!HERMES_ROOT!
+echo   仓库地址：!HERMES_URL!
+echo ============================================================
+if "!HERMES_URL!"=="" (
+    echo [错误] 缺少仓库地址参数 - 用法：install_env.bat /hermes ^<git仓库URL^>
+    echo         请回 AutoCode 设置页 Hermes 页填写「仓库地址」后重试。
+    goto :HERMES_END
+)
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - 请先运行完整安装（或单独装 Node 22.19+）后重试。
+    goto :HERMES_END
+)
+where git >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Git - 克隆仓库需要 Git，请先安装后重试。
+    goto :HERMES_END
+)
+if exist "!HERMES_ROOT!\dist\cli.js" (
+    echo [更新] 检测到既有安装，改为 git 拉取更新（fetch+reset，保留本地文件）...
+    pushd "!HERMES_ROOT!"
+    git fetch --all --tags
+    if !errorlevel! neq 0 (
+        popd
+        echo [错误] git fetch 失败 - 请检查网络/代理后重跑（fetch 失败不影响既有安装）。
+        goto :HERMES_END
+    )
+    git reset --hard origin/HEAD
+    if !errorlevel! neq 0 (
+        popd
+        echo [错误] git reset 失败 - 请查看上方输出排查。
+        goto :HERMES_END
+    )
+) else (
+    if exist "!HERMES_ROOT!" (
+        echo [提示] 目录已存在但未完成构建，继续依赖安装与构建...
+    ) else (
+        echo [安装] 浅克隆 Hermes Harness 仓库 - 需联网，约几十 MB ...
+        git clone --depth 1 "!HERMES_URL!" "!HERMES_ROOT!"
+        if !errorlevel! neq 0 (
+            echo [错误] 克隆失败 - 请检查仓库地址与网络（GitHub 访问可能需要代理）。
+            goto :HERMES_END
+        )
+    )
+    pushd "!HERMES_ROOT!"
+)
+echo [安装] pnpm 包管理器 pnpm@11.7.0 ...
+call npm install -g pnpm@11.7.0
+call :RefreshPath
+where pnpm >nul 2>&1
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] pnpm 安装失败 - 请关闭窗口重试，或手动执行 npm install -g pnpm@11.7.0
+    goto :HERMES_END
+)
+echo [安装] pnpm 依赖 - 数分钟，请耐心等待...
+call pnpm install
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] pnpm install 失败 - 请检查网络代理后重跑本脚本（可续装）。
+    goto :HERMES_END
+)
+findstr /c:"\"build":" package.json >nul 2>&1
+if !errorlevel! equ 0 (
+    echo [构建] 构建 dist - 仓库声明了 build 脚本，执行构建...
+    call pnpm run build
+    if !errorlevel! neq 0 (
+        if exist "!HERMES_ROOT!\dist\cli.js" (
+            echo [提示] build 脚本失败但 dist\cli.js 已存在，视为完成。
+        ) else (
+            popd
+            echo [错误] 构建失败且缺少 dist\cli.js - 请查看上方输出排查 Node 版本（建议 22.19+）。
+            goto :HERMES_END
+        )
+    )
+) else (
+    echo [提示] 该仓库 package.json 无 build 脚本（NousResearch/hermes-agent 为 Python 主项目，
+    echo        Node 仅为开发工具依赖），跳过构建步骤。
+    ver >nul
+)
+popd
+echo.
+if exist "!HERMES_ROOT!\dist\cli.js" (
+    echo [OK] Hermes 安装完成：!HERMES_ROOT!
+    echo        回到 AutoCode 设置页 Hermes 页点「重新检测」即可生效。
+) else if exist "!HERMES_ROOT!un_agent.py" (
+    echo [OK] Hermes 仓库安装完成（Python 主项目，无 dist\cli.js）：!HERMES_ROOT!
+    echo        此类仓库（如 NousResearch/hermes-agent）还需 Python 环境才能运行：
+    echo        官方安装 iex ^(irm https://hermes-agent.nousresearch.com/install.ps1^)
+    echo        或在本目录 venv 后 uv pip install -e ".[all]"，入口 run_agent.py / cli.py。
+) else (
+    echo [错误] 未找到 dist\cli.js 或 Python 入口 - 安装未完成，请查看上方输出排查。
+)
+echo.
+
+:HERMES_END
+goto :VERIFY
+
 :: ---- PIAgent 单独安装段（2026.08.19 第三后端；robocopy 本机源 → 脚本同级 PIAgent\pi）----
 :PI
 echo ============================================================
@@ -559,6 +705,12 @@ if not exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
     echo [错误] 未找到 bin.js - 更新未完成，请查看上方输出排查。
     goto :UPDATE_DSH_END
 )
+if not exist "!DSH_ROOT!\examples\node_modules\@deepseek-ai\dsh-agent-spine-demo\package.json" (
+    echo [错误] 组合依赖的 dsh-agent-spine-demo 不可达 - 该版本与 AutoCode 不兼容
+    echo        上游 dsh-v0.1.2+ 移除了全部示例包，请回退受支持版本：
+    echo        install_env.bat /update-dsh dsh-v0.1.0-rc.7 "<DSH 根目录>"
+    goto :UPDATE_DSH_END
+)
 if "!OLD_VER!"=="" (
     echo [OK] 已更新到 v!NEW_VER!（旧版本读取失败，跳过对比）。
 ) else if "!NEW_VER!"=="" (
@@ -597,6 +749,11 @@ if exist "%~dp0PIAgent\pi\packages\coding-agent\dist\cli.js" (
 ) else (
     echo [PIAgent] 未安装 - 可选组件，可在 AutoCode 设置页单独安装
 )
+if exist "%~dp0HermesHarness\dist\cli.js" (
+    echo [Hermes] 已安装：%~dp0HermesHarness
+) else (
+    echo [Hermes] 未安装 - 可在 AutoCode 设置页 Hermes 页联网安装（git）或本机源安装
+)
 if "!DSH_ONLY!"=="0" (
     call :ShowVer claude --version
     if /i "!BACKEND!"=="GLM" (
@@ -613,6 +770,7 @@ echo.
 :: ---- 11. 后续操作提示（DSH 单装模式无需 Claude 配置指引）----
 if "!DSH_ONLY!"=="1" goto :END
 if "!PI_ONLY!"=="1" goto :END
+if "!HERMES_ONLY!"=="1" goto :END
 if "!DSH_UPDATE!"=="1" goto :END
 echo ============================================================
 echo   后续配置（需要的话按提示完成）：

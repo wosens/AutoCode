@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QMainWindow>
 #include <QList>
@@ -104,11 +104,11 @@ private slots:
     void OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
 
     // 提示词 agent（面板 ↔ 编排器转发）
-    void OnAdhocSubmit(const QString& a_sText, bool a_bReadOnly);
-    void OnAdhocUndo();
-    void OnAdhocCompact();
+    void OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly);
+    void OnAdhocUndo(const QString& a_sAsstId);
+    void OnAdhocCompact(const QString& a_sAsstId);
     // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
-    void OnAdhocUsage(qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs, int a_iReqs);
+    void OnAdhocUsage(const QString& a_sAsstId, qint64 a_iIn, qint64 a_iOut, double a_dCost, qint64 a_iElapsedMs, int a_iReqs);
 
     // FR-3 任务运行中介入：面板介入栏 → 找任务 → 编排器 InjectTaskMessage。
     void OnTaskInject(const QString& a_sTaskId, const QString& a_sText);
@@ -154,7 +154,7 @@ private:
     void OnAsstSwitched(const QString& a_sOldId, const QString& a_sNewId);
     void OnAsstAdded(const QString& a_sId);
     void OnAsstRemoved(const QString& a_sId, const QString& a_sNewActive);
-    void OnAdhocRunFinished();
+    void OnAdhocRunFinished(const QString& a_sAsstId);
     // 助手档切换原语（跟着任务走）：停跑 → 旧档落盘 → 切 m_pCur → 恢复新档。
     //   所有改变 m_pCur 的路径必须经此函数，禁止裸赋值（防旧档丢失 / 串档）。
     void SwitchAssistantArchive(CTaskInfo* a_pNewTask);

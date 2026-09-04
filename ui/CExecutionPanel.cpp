@@ -1,4 +1,5 @@
-#include "CExecutionPanel.h"
+﻿#include "CExecutionPanel.h"
+#include "../agent/CAgentRunnerFactory.h"   // 2026.09.02 Assistant 块拍摄产出后端（说话人标签）
 
 #include <functional>
 #include <utility>
@@ -53,9 +54,8 @@
 #include "core/StageDef.h"
 
 namespace {
-// 渐进重建每帧创建的块数：单块成本约几毫秒~十几毫秒（Markdown 排版/工具卡构建），
-// 20 块/帧 ≈ 数十毫秒，事件循环可穿插处理用户输入，避免整段同步重建卡死 UI。
-constexpr int k_iRebuildChunk = 20;
+// （2026.09.03 流呈现常量 k_iRebuildChunk/k_iViewInitial/k_iViewPrepend 已随实现
+//   迁入 CStreamPresenter.cpp——任务/助手两路共用，不再散落面板。）
 }
 
 // 费用栏前的执行态指示器（#4）：运行中转圈动画（12 段渐变弧），空闲显示静态状态色点。
@@ -240,6 +240,16 @@ QString FormatElapsed(qint64 a_iMs) {
         .arg(iS, 2, 10, QLatin1Char('0'));
 }
 
+CExecutionPanel::~CExecutionPanel() {
+    // 2026.09.03 释放任务流堆对象（助手流随 SAsst 的 shared_ptr 自清；Unbind 防在途帧回调）。
+    if (m_pCurStream != nullptr) {
+        m_pCurStream->Unbind();
+    }
+    qDeleteAll(m_aStreams);
+    m_aStreams.clear();
+    m_pCurStream = nullptr;
+}
+
 CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     : QWidget(a_pParent) {
     // 统一 11pt 字体辅助（#7）：列表/表头/输入框/按钮显式设点数，不依赖样式继承。
@@ -279,7 +289,9 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     connect(m_pStages, &QTreeWidget::customContextMenuRequested,
             this, &CExecutionPanel::OnStagesContextMenu);
 
-    // 对话流（Claude Code 风格：Markdown 助手块 + 可折叠工具卡 + 事件徽章）
+    // 对话流（Claude Code 风格：Markdown 助手块 + 可折叠工具卡 + 事件徽章）。
+    //   2026.09.03 到顶补建/丢块同步等接线由各流 CStreamPresenter::Bind 负责
+    //   （任务流=EnsureStream 创建时；助手流=CreateAsstTab 建视图时），面板不再直连。
     m_pView = new CMessageView(this);
 
     // 日志 / 阶段产物 / 助手 三页 Tab
@@ -414,18 +426,27 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     //   2026.08.19 运行中输入框有字 → 点击「➤ 追加指令」向正在执行的轮发送追加（claude
     //   轮中注入 / DSH 排队自动续发）；无字 → 维持原「⏹ 停止」。
     connect(m_pBtnSend, &QPushButton::clicked, this, [this]() {
-        if (m_bAdhocRunning) {
+        // 2026.09.03 多助手并发：按钮态按「激活助手」——其在跑：有字=追加指令
+        //   （注入/续发），无字=停止该助手；其空闲（别助手在跑不算）=正常发送立即执行。
+        const SAsst* pAct = ActiveAsst();
+        const QString sActId = pAct != nullptr ? pAct->sId : QString();
+        if (!sActId.isEmpty() && AsstRunning(sActId)) {
             if (m_pAdhocInput != nullptr
                 && !m_pAdhocInput->toPlainText().trimmed().isEmpty()) {
-                DoAdhocSend();   // 运行中追加：走提交流，编排器按后端注入/排队
+                DoAdhocSend();   // 同助手运行中追加：编排器按后端注入/排队续发
                 return;
             }
-            emit sigAdhocStop();   // #4 运行中无输入：按钮即「停止」
+            emit sigAdhocStop(sActId);   // #4 激活助手运行中无输入：按钮即「停止」
             return;
         }
         DoAdhocSend();
     });
-    connect(m_pBtnUndo, &QPushButton::clicked, this, &CExecutionPanel::sigAdhocUndo);
+    // 撤销作用于激活助手（其编排器会话栈）；Qt6 信号带参直连需经 lambda 转发。
+    connect(m_pBtnUndo, &QPushButton::clicked, this, [this]() {
+        if (const SAsst* pAct = ActiveAsst()) {
+            emit sigAdhocUndo(pAct->sId);
+        }
+    });
     // FR-3：提示词下拉浮层（单实例，各助手右上角半透明按钮共用；hover 弹出、点击跳转）。
     m_pPromptFlyout = new CPromptFlyout(this, [this](int a_iIdx) {
         // 浮层存的是提问在 m_aPromptIdx（激活助手）中的序号 → 取真实块下标。
@@ -484,7 +505,8 @@ void CExecutionPanel::UpdateCostLabel() {
     if (m_pCurTask == nullptr) {
         const SAsst* pAsst = ActiveAsst();
         if (pAsst == nullptr || (pAsst->dCost <= 0.0 && pAsst->iInTok == 0 &&
-                                 pAsst->iOutTok == 0 && pAsst->iReqs == 0)) {
+                                 pAsst->iOutTok == 0 && pAsst->iReqs == 0 &&
+                                 !pAsst->bRunning)) {
             m_pLblCost->setText(QStringLiteral("费用: $0.00 | 输入:0 输出:0 | 请求:0"));
             return;
         }
@@ -496,8 +518,13 @@ void CExecutionPanel::UpdateCostLabel() {
             .arg(FormatTokens(pAsst->iInTok))
             .arg(FormatTokens(pAsst->iOutTok))
             .arg(pAsst->iReqs);
-        if (pAsst->iElapsedMs > 0) {
-            sText += QStringLiteral(" | 耗时 %1").arg(FormatElapsed(pAsst->iElapsedMs));
+        // 2026.09 助手运行中：耗时 = 历史累计 + 本轮起始钟实时值（仅展示中的助手即运行
+        //   助手时跳动；切看别的助手仍显示该助手静态累计）。
+        const qint64 iLiveMs = (pAsst->bRunning && m_tAdhocClock.isValid())
+                                ? pAsst->iElapsedMs + m_tAdhocClock.elapsed()
+                                : pAsst->iElapsedMs;
+        if (iLiveMs > 0) {
+            sText += QStringLiteral(" | 耗时 %1").arg(FormatElapsed(iLiveMs));
         }
         m_pLblCost->setText(sText);
         return;
@@ -557,7 +584,7 @@ void CExecutionPanel::AddAsstUsage(const QString& a_sId, qint64 a_iIn, qint64 a_
     p->iReqs      += a_iReqs;
     p->iElapsedMs += a_iMs;
     // 当前费用栏展示的是该助手（无任务时）才即时刷新，避免覆盖任务侧显示。
-    if (m_pCurTask == nullptr && (a_sId == m_sActiveAsst || a_sId == m_sRunningAsst)) {
+    if (m_pCurTask == nullptr && a_sId == m_sActiveAsst) {
         UpdateCostLabel();
     }
 }
@@ -565,6 +592,11 @@ void CExecutionPanel::AddAsstUsage(const QString& a_sId, qint64 a_iIn, qint64 a_
 void CExecutionPanel::OnRunTimer() {
     // 运行中每秒刷新耗时（任务对象仍在即可刷新；非 Running 由 RefreshTask 停表）。
     if (m_pCurTask != nullptr && m_pCurTask->Status() == ETaskStatus::Running) {
+        UpdateCostLabel();
+        return;
+    }
+    // 2026.09 无任务时助手运行中：费用栏「耗时」同样秒级跳动（流量/token 仍收尾归集）。
+    if (m_pCurTask == nullptr && AnyAsstRunning()) {
         UpdateCostLabel();
     }
 }
@@ -583,6 +615,8 @@ void CExecutionPanel::OnAssistantText(CTaskInfo* a_pTask, const QString& a_sText
     const QString sStamp = StampPrefix(a_pTask->Id(), /*a_bFullDate=*/false);
     st.sText = sStamp.isEmpty() ? sBody : QStringLiteral("[%1] %2").arg(sStamp, sBody);
     st.sViewId = a_sViewId;
+    // 2026.09.02 产出后端随块入档（说话人标签用；到达时刻拍摄，切后端不改历史）。
+    st.sBackend = CAgentRunnerFactory::BackendDisplayName();
     AppendData(a_pTask->Id(), st);
 }
 
@@ -604,21 +638,10 @@ void CExecutionPanel::OnToolResult(CTaskInfo* a_pTask, const QString& a_sResult,
         return;
     }
     const QString sId = a_pTask->Id();
-    QList<SBlockData>& aBlocks = m_aBlocks[sId];
-
-    // 回填到最近一个尚无结果的 ToolUse（且视角匹配：并发下按 sViewId 过滤防串配）。
-    // Claude 工具流严格 use→result 交替；单 runner 串行下 sViewId 为空，行为与原启发式一致。
-    for (int i = aBlocks.size() - 1; i >= 0; --i) {
-        if (aBlocks[i].eKind == CMessageBlock::ToolUse && aBlocks[i].sResult.isEmpty()
-            && aBlocks[i].sViewId == a_sViewId) {
-            aBlocks[i].sResult = a_sResult;
-            // 当前任务：同步刷新对应 widget
-            if (sId == m_sCurId && i < m_aCurWidgets.size()) {
-                m_aCurWidgets[i]->SetResult(a_sResult);
-            }
-            MarkTaskDirty(sId);   // #6 回填结果也落盘
-            return;
-        }
+    // 回填到最近一个尚无结果的 ToolUse（且视角匹配：并发评审下按 sViewId 过滤防串配；
+    //   未建件区间由数据层承接，补建时呈现）——与助手日志同一段流呈现代码。
+    if (EnsureStream(sId)->BackfillResult(a_sResult, a_sViewId) >= 0) {
+        return;   // 命中（流内已 fnDirty→MarkTaskDirty 落盘）
     }
     // 没找到未闭合的工具卡：作为系统行兜底（避免丢失）
     AppendLog(sId, a_sResult);
@@ -655,8 +678,11 @@ QString CExecutionPanel::StampPrefix(const QString& a_sKey, bool a_bFullDate) {
         static const QString kAdhoc = QStringLiteral("@@adhoc@@");   // 助手流哨兵键前缀（+助手 id）
         const SAsst* pAsst = a_sKey.startsWith(kAdhoc)
                              ? AsstById(a_sKey.mid(kAdhoc.length())) : nullptr;
-        const QList<SBlockData> aBlocks = (pAsst != nullptr) ? pAsst->aBlocks
-                                                             : m_aBlocks.value(a_sKey);
+        // 2026.09.03 数据在流对象内：助手流取其 pStream（未建=空表）；任务流 EnsureStream。
+        static const QList<SBlockData> k_aEmpty;
+        const QList<SBlockData>& aBlocks = (pAsst != nullptr)
+            ? (pAsst->pStream ? pAsst->pStream->Blocks() : k_aEmpty)
+            : EnsureStream(a_sKey)->Blocks();
         static const QRegularExpression reFull(QStringLiteral("^\\[(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})\\]"));
         static const QRegularExpression reTime(QStringLiteral("^\\[(\\d{2}:\\d{2}:\\d{2})\\]"));
         for (int i = aBlocks.size() - 1; i >= 0; --i) {
@@ -687,7 +713,7 @@ QString CExecutionPanel::StampPrefix(const QString& a_sKey, bool a_bFullDate) {
 QString CExecutionPanel::WithLogTime(const QString& a_sTaskId, const QString& a_sText) {
     if (!m_aDatedLogTasks.contains(a_sTaskId)) {
         // 旧会话重载：首个系统/事件块若已带日期前缀则视为已有日期
-        const QList<SBlockData>& aBlocks = m_aBlocks.value(a_sTaskId);
+        const QList<SBlockData>& aBlocks = EnsureStream(a_sTaskId)->Blocks();
         static const QRegularExpression reDate(QStringLiteral("^\\[\\d{4}-\\d{2}-\\d{2}"));
         bool bHasDate = false;
         for (const SBlockData& st : aBlocks) {
@@ -707,112 +733,32 @@ QString CExecutionPanel::WithLogTime(const QString& a_sTaskId, const QString& a_
     return sStamp.isEmpty() ? a_sText : QStringLiteral("[%1] %2").arg(sStamp, a_sText);
 }
 
+// —— 任务侧流路由（2026.09.03 收拢：原 AppendData/TryMergeWidget/CreateWidget/
+//    RebuildView/RebuildChunk 五个函数的实现全部迁入 CStreamPresenter，面板只保留薄路由）——
+
+CStreamPresenter* CExecutionPanel::EnsureStream(const QString& a_sTaskId) {
+    // 取/建任务流：fnDirty→MarkTaskDirty（数据变化去抖落盘 chat.json 的统一入口）
+    CStreamPresenter* pS = m_aStreams.value(a_sTaskId, nullptr);
+    if (pS == nullptr) {
+        pS = new CStreamPresenter([this, a_sTaskId]() { MarkTaskDirty(a_sTaskId); });
+        m_aStreams.insert(a_sTaskId, pS);
+    }
+    return pS;
+}
+
 void CExecutionPanel::AppendData(const QString& a_sTaskId, const SBlockData& a_stData) {
-    m_aBlocks[a_sTaskId].append(a_stData);
-    MarkTaskDirty(a_sTaskId);   // #6 标脏，去抖落盘 chat.json
-    if (a_sTaskId != m_sCurId) {
-        return;   // 非当前任务：只缓存，不刷视图
-    }
-    if (m_bRebuilding) {
-        return;   // 渐进重建中：分帧循环按实时列表顺序创建本块，此处跳过防重复上屏
-    }
-    // 2026.08.22 连续工具调用合并：并入上一张 ×N 折叠卡，否则新建
-    if (!TryMergeToolWidget(m_aBlocks[a_sTaskId], m_aCurWidgets,
-                            m_aBlocks[a_sTaskId].size() - 1, a_stData)) {
-        CMessageBlock* pW = CreateWidget(a_stData);
-        m_aCurWidgets.append(pW);
-        m_pView->AddBlock(pW);
-    }
-}
-
-// 2026.08.22 连续工具调用合并上屏：command/读写等工具常成串出现（数十条），
-//   逐条渲染既刷屏又拖慢滚动；合并为一张折叠卡，标题显示首条摘要 + ×N，展开看全部。
-bool CExecutionPanel::TryMergeToolWidget(const QList<SBlockData>& aBlocks,
-                                         QList<CMessageBlock*>& aWidgets,
-                                         int a_iNewIdx, const SBlockData& a_stData) {
-    if (a_stData.eKind != CMessageBlock::ToolUse || a_iNewIdx <= 0) {
-        return false;
-    }
-    const SBlockData& stPrev = aBlocks.at(a_iNewIdx - 1);
-    if (stPrev.eKind != CMessageBlock::ToolUse || stPrev.sViewId != a_stData.sViewId) {
-        return false;   // 前一块不是工具调用（或评审视角不同）：不合并
-    }
-    if (a_iNewIdx > aWidgets.size() || aWidgets.isEmpty()) {
-        return false;   // widget 列表未跟上（异常防御）
-    }
-    CMessageBlock* pW = aWidgets.at(a_iNewIdx - 1);
-    if (pW == nullptr || pW->ToolCount() <= 0) {
-        return false;
-    }
-    pW->AddMergedTool(a_stData.sTool, a_stData.sInput);
-    if (!a_stData.sResult.isEmpty()) {
-        pW->SetResult(a_stData.sResult);
-    }
-    aWidgets.append(pW);   // 同一 widget 占多个块位：结果回填/提示词跳转的索引对齐仍成立
-    return true;
-}
-
-CMessageBlock* CExecutionPanel::CreateWidget(const SBlockData& a_stData) {
-    auto* pW = new CMessageBlock(a_stData.eKind, m_pView);
-    switch (a_stData.eKind) {
-        case CMessageBlock::Assistant:
-            pW->SetAssistantText(a_stData.sText);
-            break;
-        case CMessageBlock::ToolUse:
-            pW->SetTool(a_stData.sTool, a_stData.sInput);
-            if (!a_stData.sResult.isEmpty()) {
-                pW->SetResult(a_stData.sResult);   // 重建时已有结果（回填过的）
-            }
-            break;
-        case CMessageBlock::Event:
-            pW->SetEvent(a_stData.sEventKind, a_stData.sText);
-            break;
-        case CMessageBlock::System:
-        case CMessageBlock::Error:
-            pW->SetSystemText(a_stData.sText);
-            break;
-    }
-    return pW;
+    // 入流数据 +（当前任务=已绑定视图）上屏；非当前任务流未绑定，Append 内部自动只入数据。
+    //   旧实现在此内联合并/建件逻辑，现统一走流呈现器（与助手日志同一段代码）。
+    EnsureStream(a_sTaskId)->Append(a_stData);
 }
 
 void CExecutionPanel::RebuildView() {
-    // FR-4：重建等同「跳到最新」，强制跟随到底。
-    // 分帧渐进创建：历史任务对话流可达数百块（Markdown 排版/工具卡构建均不便宜），
-    // 同步一次建完会把 UI 卡住数秒；分帧让事件循环穿插呼吸，点击任务立即上屏、
-    // 其余块随后若干帧补齐，期间逐块滚底也一并关闭（O(N²) 布局是最大卡顿源）。
-    m_pView->ResetFollow();
-    m_pView->Clear();
-    m_aCurWidgets.clear();
-    m_iRebuildIdx = 0;
-    ++m_uRebuildGen;   // 作废仍在排队的旧帧（上次重建尚未跑完就切了任务）
-    m_bRebuilding = true;   // AppendData 新块交分帧循环按序创建，防重复上屏
-    RebuildChunk(m_uRebuildGen);
+    // 重建当前任务流视图（切任务/重载对话流后调用；无当前流空操作）
+    if (m_pCurStream != nullptr) {
+        m_pCurStream->Rebuild();
+    }
 }
 
-void CExecutionPanel::RebuildChunk(quint32 a_uGen) {
-    if (a_uGen != m_uRebuildGen) {
-        return;   // 已被新的重建顶替（切任务/切工程），本帧作废
-    }
-    // 取实时列表引用：重建期间新到的当前任务块（AppendData 已延迟到这里）也能被覆盖到。
-    const QList<SBlockData>& aBlocks = m_aBlocks[m_sCurId];
-    int iCreated = 0;
-    while (m_iRebuildIdx < aBlocks.size() && iCreated < k_iRebuildChunk) {
-        // 2026.08.22 连续工具调用合并：重载/切任务的历史流同样折叠
-        if (!TryMergeToolWidget(aBlocks, m_aCurWidgets, m_iRebuildIdx, aBlocks.at(m_iRebuildIdx))) {
-            CMessageBlock* pW = CreateWidget(aBlocks.at(m_iRebuildIdx));
-            m_aCurWidgets.append(pW);
-            m_pView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
-        }
-        ++m_iRebuildIdx;
-        ++iCreated;
-    }
-    if (m_iRebuildIdx < aBlocks.size()) {
-        QTimer::singleShot(0, this, [this, a_uGen]() { RebuildChunk(a_uGen); });
-        return;
-    }
-    m_bRebuilding = false;
-    m_pView->ScrollToBottomRobust();   // 需求7：重建完成后多帧滚到任务日志最底
-}
 
 void CExecutionPanel::LoadStageOutputs(CTaskInfo* a_pTask) {
     // 「阶段产物」页：按选中任务的流程阶段，列出任务私有目录下已生成的 .md 产物。
@@ -984,18 +930,28 @@ void CExecutionPanel::RefreshTask(CTaskInfo* a_pTask) {
 
 void CExecutionPanel::SetCurrentTask(CTaskInfo* a_pTask) {
     m_pStages->clear();
-    m_pView->Clear();
-    m_aCurWidgets.clear();
+    // 2026.09.03 流呈现器接手：旧流解绑（弃件保数据+作废在途帧，含视图 Clear），
+    //   新流绑共享视图并重建（初始窗口）；未选中任务则无流绑定（视图已清空）。
+    if (m_pCurStream != nullptr) {
+        m_pCurStream->Unbind();
+    }
+    m_pCurStream = nullptr;
     m_sCurId = a_pTask ? a_pTask->Id() : QString();
     m_pCurTask = a_pTask;   // 需求3：供阶段表右键「再次执行」取当前任务
 
     if (a_pTask != nullptr) {
+        m_pCurStream = EnsureStream(a_pTask->Id());
+        m_pCurStream->Bind(m_pView);
         RebuildView();
         RefreshTask(a_pTask);
     } else {
         UpdateCostLabel();             // 2026.08.15 无任务：费用栏归零（不含耗时段）
         m_bTaskRunning = false;        // #4 无任务：指示器归空闲灰点
         m_pRunTimer->stop();           // 2026.08.15 无任务：停耗时刷新
+        // 2026.09 取消选中任务但助手仍在跑：费用栏切到助手视角，耗时需继续秒级跳动。
+        if (AnyAsstRunning()) {
+            m_pRunTimer->start(1000);
+        }
         m_colIdle = QColor(200, 200, 200);
         UpdateBusyIndicator();
         UpdateTaskInjectState();       // FR-3 无任务：禁用介入栏
@@ -1029,8 +985,9 @@ void CExecutionPanel::ShowActiveAssistantPage() {
 
 // ===========================================================================
 // 提示词 agent（按「助手」分 Tab 的独立对话流，#1/#2/#3/#4）
-// 2026.08.22 多助手：块数据/控件/分帧状态全部下沉到各 SAsst；运行中的事件路由到
-//   正在执行的助手（m_sRunningAsst），空闲时路由到激活助手（m_sActiveAsst）。
+// 2026.08.22 多助手：块数据/控件/分帧状态全部下沉到各 SAsst。
+// 2026.09.03 多助手并发：编排器信号带助手 id 直投对应助手流（不再按运行态猜测路由）；
+//   运行态 per-助手（SAsst::bRunning），每个助手是独立 Agent（独立进程/会话链）。
 // ===========================================================================
 
 CExecutionPanel::SAsst* CExecutionPanel::AsstById(const QString& a_sId) {
@@ -1051,19 +1008,65 @@ const CExecutionPanel::SAsst* CExecutionPanel::AsstById(const QString& a_sId) co
     return nullptr;
 }
 
+QStringList CExecutionPanel::BuildAsstTranscript(const QString& a_sAsstId,
+                                                 const QString& a_sCurText) const {
+    // 2026.09.02 跨轮上下文回灌（修复：DSH/Codex/Hermes 每轮全新会话，第 2 轮起
+    //   模型完全失忆——实测用户发「作为默认值」时助手回「消息不完整」）。
+    //   权威源 = 对话流块（含重启后从 assistant.json 恢复的历史），每次提交重建。
+    //   预算：条目cap 40、用户行 1500 字、助手行 4000 字——首轮 guide 全文投喂的
+    //   user 块与长回答截断保尾，防止回灌块无限膨胀挤占上下文。
+    constexpr int k_iMaxEntries = 40;
+    constexpr int k_iMaxUserChars = 1500;
+    constexpr int k_iMaxAsstChars = 4000;
+    const SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr) {
+        return QStringList();
+    }
+    static const QRegularExpression reStamp(
+        QStringLiteral("^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]\\s*"));
+    QStringList aLines;
+    const QList<SBlockData>& aBlocks = pAsst->pStream ? pAsst->pStream->Blocks()
+                                                      : QList<SBlockData>();
+    for (const SBlockData& st : aBlocks) {
+        QString sLine;
+        if (st.eKind == CMessageBlock::Event && st.sEventKind == QStringLiteral("user")) {
+            QString sBody = st.sText;
+            sBody.remove(reStamp);   // 去 "[yyyy-MM-dd HH:mm:ss] " 前缀，省 token
+            if (sBody.size() > k_iMaxUserChars) {
+                sBody = sBody.left(k_iMaxUserChars) + QStringLiteral(" …[截断]");
+            }
+            sLine = QStringLiteral("用户：") + sBody;
+        } else if (st.eKind == CMessageBlock::Assistant && !st.sText.trimmed().isEmpty()) {
+            QString sBody = st.sText;
+            if (sBody.size() > k_iMaxAsstChars) {
+                sBody = sBody.left(k_iMaxAsstChars) + QStringLiteral(" …[截断]");
+            }
+            sLine = QStringLiteral("助手：") + sBody;
+        }
+        if (!sLine.isEmpty()) {
+            aLines.append(sLine);
+        }
+    }
+    // 剔除本次即将提交的提问（调用前 user 块已上屏，prompt 尾部已含原文，防重复）。
+    if (!aLines.isEmpty()) {
+        const QString sCur = aLines.last();
+        if (sCur.startsWith(QStringLiteral("用户："))
+            && sCur.mid(3).trimmed() == a_sCurText.trimmed()) {
+            aLines.removeLast();
+        }
+    }
+    while (aLines.size() > k_iMaxEntries) {
+        aLines.removeFirst();   // 超额丢最旧（保最新对话）
+    }
+    return aLines;
+}
+
 CExecutionPanel::SAsst* CExecutionPanel::ActiveAsst() {
     return AsstById(m_sActiveAsst);
 }
 
-CExecutionPanel::SAsst* CExecutionPanel::RunningTargetAsst() {
-    // 块归属目标：助手在跑 → 该助手（切 Tab 查看其他助手时日志不串流）；空闲 → 激活助手。
-    if (!m_sRunningAsst.isEmpty()) {
-        if (SAsst* p = AsstById(m_sRunningAsst)) {
-            return p;
-        }
-    }
-    return ActiveAsst();
-}
+// （RunningTargetAsst 已删：2026.09.03 起编排器信号带助手 id 直投；本地路径
+//   （DoAdhocSend 等）提交目标=激活助手，不再有「运行中助手优先」的路由猜测。）
 
 QString CExecutionPanel::AsstStampKey(const QString& a_sId) {
     // 助手流时间戳哨兵键：@@adhoc@@ + 助手 id（StampPrefix 依前缀路由到对应助手块列表）。
@@ -1071,38 +1074,38 @@ QString CExecutionPanel::AsstStampKey(const QString& a_sId) {
     return kAdhoc + a_sId;
 }
 
+// —— 助手侧流路由（2026.09.03 收拢：原 AppendAdhocBlock/RebuildAsstView/RebuildAdhocChunk/
+//    BuildOlderChunk/PrependOlderBlocks/PrependAsstOlder/EnsureAsstCoverage 七个函数的实现
+//    全部迁入 CStreamPresenter，面板只保留生命周期与钩子）——
+
+CStreamPresenter* CExecutionPanel::AsstStream(SAsst& a_stAsst) {
+    // 取/建助手流：fnDirty→sigAdhocBlocksChanged（#1 存盘信号，主窗口接手落 assistant.json）。
+    //   懒建；SAsst 值拷贝搬移（ReopenAsst 等）经 shared_ptr 共享同一流，不产生双份。
+    if (!a_stAsst.pStream) {
+        a_stAsst.pStream = std::make_shared<CStreamPresenter>(
+            [this]() { emit sigAdhocBlocksChanged(); });
+    }
+    return a_stAsst.pStream.get();
+}
+
 void CExecutionPanel::AppendAdhocBlock(const SBlockData& a_stData, const QString& a_sTargetId) {
-    SAsst* pAsst = a_sTargetId.isEmpty() ? RunningTargetAsst() : AsstById(a_sTargetId);
+    SAsst* pAsst = a_sTargetId.isEmpty() ? ActiveAsst() : AsstById(a_sTargetId);
     if (pAsst == nullptr) {
         return;   // 无助手（理论不达：始终保底一个助手）
     }
-    pAsst->aBlocks.append(a_stData);
-    // 分帧重建期间只入数据不建控件（镜像 AppendData 让路）：分帧循环读实时列表会按序补上，
-    //   否则会同一块建两份控件。重建结束后的常规路径仍即时建块。
-    if (!pAsst->bRebuilding) {
-        // 2026.08.22 连续工具调用合并：助手流同样折叠为 ×N 卡
-        if (!TryMergeToolWidget(pAsst->aBlocks, pAsst->aWidgets,
-                                pAsst->aBlocks.size() - 1, a_stData)) {
-            // 复用 CreateWidget（其内部以 m_pView 为 parent，AddBlock 会把块 reparent 进助手视图）。
-            CMessageBlock* pW = CreateWidget(a_stData);
-            pAsst->aWidgets.append(pW);
-            pAsst->pView->AddBlock(pW);
-        }
-    }
-    // FR-2：不再无条件 ScrollToBottom；滚动决策交给 CMessageView::AddBlock 内部 m_bFollow
-    //        机制（与任务日志 Tab 行为一致，AC-2.1～2.4）。
+    // 入流数据 +（绑定=Tab 打开且非重建中）合并/建件上屏；流内部处理，与任务日志同码。
+    AsstStream(*pAsst)->Append(a_stData);
     // FR-3：新增用户提问时刷新提示词下拉索引（供半透明按钮下拉跳转；仅归属激活助手时）。
     if (pAsst->sId == m_sActiveAsst &&
         a_stData.eKind == CMessageBlock::Event &&
         a_stData.sEventKind == QStringLiteral("user")) {
         RebuildPromptList();
     }
-    emit sigAdhocBlocksChanged();   // #1 助手流变化 → 触发落盘 assistant.json
+    // （落盘：Append 内 fnDirty 已 emit sigAdhocBlocksChanged，原尾处显式 emit 不再需要）
 }
 
 void CExecutionPanel::RebuildAdhocView() {
-    // 按激活助手数据重建其视图（分帧渐进，与任务视图同款）：单助手历史可达数百块，
-    //   同步一次建完会卡 UI；切助手/切工程时代际号作废在途旧帧。
+    // 按激活助手数据重建其视图（撤销/切档后调用）。
     RebuildAsstView(m_sActiveAsst);
 }
 
@@ -1112,110 +1115,78 @@ void CExecutionPanel::RebuildAsstView(const QString& a_sId) {
     if (pAsst == nullptr || pAsst->bClosed || pAsst->pView == nullptr) {
         return;
     }
-    pAsst->pView->ResetFollow();   // FR-4：重建等同「跳到最新」，强制跟随到底
-    pAsst->pView->Clear();
-    pAsst->aWidgets.clear();
-    pAsst->iRebuildIdx = 0;
-    ++pAsst->uGen;   // 作废仍在排队的旧帧（上次重建尚未跑完就切了助手）
-    pAsst->bRebuilding = true;   // AppendAdhocBlock 新块交分帧循环按序创建，防重复上屏
-    RebuildAdhocChunk(pAsst->sId, pAsst->uGen);
-}
-
-void CExecutionPanel::RebuildAdhocChunk(const QString& a_sId, quint32 a_uGen) {
-    SAsst* pAsst = AsstById(a_sId);
-    if (pAsst == nullptr || a_uGen != pAsst->uGen) {
-        return;   // 助手已删除 / 已被新的重建顶替（切助手/切工程），本帧作废
-    }
-    int iCreated = 0;
-    while (pAsst->iRebuildIdx < pAsst->aBlocks.size() && iCreated < k_iRebuildChunk) {
-        // 2026.08.22 连续工具调用合并：助手流历史重载同样折叠
-        if (!TryMergeToolWidget(pAsst->aBlocks, pAsst->aWidgets,
-                                pAsst->iRebuildIdx, pAsst->aBlocks.at(pAsst->iRebuildIdx))) {
-            CMessageBlock* pW = CreateWidget(pAsst->aBlocks.at(pAsst->iRebuildIdx));
-            pAsst->aWidgets.append(pW);
-            pAsst->pView->AddBlock(pW, /*a_bBatch=*/true);   // 批量：不逐块滚底
+    // 完成回调：激活助手刷新提示词下拉索引（FR-3）；其余助手无钩子。
+    const QString sId = a_sId;
+    AsstStream(*pAsst)->Rebuild([this, sId]() {
+        if (sId == m_sActiveAsst) {
+            RebuildPromptList();
         }
-        ++pAsst->iRebuildIdx;
-        ++iCreated;
-    }
-    if (pAsst->iRebuildIdx < pAsst->aBlocks.size()) {
-        QTimer::singleShot(0, this, [this, a_sId, a_uGen]() { RebuildAdhocChunk(a_sId, a_uGen); });
-        return;
-    }
-    pAsst->bRebuilding = false;
-    pAsst->pView->ScrollToBottomRobust();   // 需求7：恢复完成后多帧滚到助手日志最底
-    if (a_sId == m_sActiveAsst) {
-        RebuildPromptList();   // FR-3 按恢复后的助手流重建提示词下拉索引
-    }
+    });
 }
 
-void CExecutionPanel::OnAdhocAssistantText(const QString& a_sText) {
+void CExecutionPanel::OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText) {
     SBlockData st;
     st.eKind = CMessageBlock::Assistant;
     // 2026.08.22 Agent 输出带时间前缀（用户提示词带日期+时间，见 DoAdhocSend）；
     //   距上个时间戳 <1 分钟不输出时间（StampPrefix）。哨兵键按助手 id 区分（多助手）。
-    const QString sStamp = StampPrefix(AsstStampKey(RunningTargetAsst() ? RunningTargetAsst()->sId : QString()),
-                                        /*a_bFullDate=*/false);
+    const QString sStamp = StampPrefix(AsstStampKey(a_sAsstId), /*a_bFullDate=*/false);
     st.sText = sStamp.isEmpty() ? a_sText : QStringLiteral("[%1] %2").arg(sStamp, a_sText);
-    AppendAdhocBlock(st);
+    // 2026.09.02 产出后端随块入档（说话人标签用；到达时刻拍摄，切后端不改历史）。
+    st.sBackend = CAgentRunnerFactory::BackendDisplayName();
+    AppendAdhocBlock(st, a_sAsstId);   // 2026.09.03 id 直投（多助手并发各归各流）
 }
 
-void CExecutionPanel::OnAdhocToolUse(const QString& a_sTool, const QString& a_sInputJson) {
+void CExecutionPanel::OnAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool,
+                                     const QString& a_sInputJson) {
     SBlockData st;
     st.eKind  = CMessageBlock::ToolUse;
     st.sTool  = a_sTool;
     st.sInput = a_sInputJson;
-    AppendAdhocBlock(st);
+    AppendAdhocBlock(st, a_sAsstId);
 }
 
-void CExecutionPanel::OnAdhocToolResult(const QString& a_sResult) {
-    // 回填到最近一个尚无结果的 ToolUse（与任务流相同的 use→result 交替启发式）。
-    SAsst* pAsst = RunningTargetAsst();
+void CExecutionPanel::OnAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult) {
+    // 回填到该助手最近一个尚无结果的 ToolUse（流呈现代码与任务日志同源；助手块恒空视角）。
+    SAsst* pAsst = AsstById(a_sAsstId);
     if (pAsst == nullptr) {
         return;
     }
-    for (int i = pAsst->aBlocks.size() - 1; i >= 0; --i) {
-        if (pAsst->aBlocks[i].eKind == CMessageBlock::ToolUse &&
-            pAsst->aBlocks[i].sResult.isEmpty()) {
-            pAsst->aBlocks[i].sResult = a_sResult;
-            if (i < pAsst->aWidgets.size()) {
-                pAsst->aWidgets[i]->SetResult(a_sResult);
-            }
-            emit sigAdhocBlocksChanged();   // #1 回填结果也持久化
-            return;
-        }
+    if (AsstStream(*pAsst)->BackfillResult(a_sResult) >= 0) {
+        return;   // 命中（流内已 fnDirty→sigAdhocBlocksChanged 落盘）
     }
-    OnAdhocLog(a_sResult);   // 无未闭合工具卡：作为系统行兜底
+    OnAdhocLog(a_sAsstId, a_sResult);   // 无未闭合工具卡：作为系统行兜底
 }
 
-void CExecutionPanel::OnAdhocLog(const QString& a_sLine) {
+void CExecutionPanel::OnAdhocLog(const QString& a_sAsstId, const QString& a_sLine) {
     SBlockData st;
     st.eKind = a_sLine.startsWith(QStringLiteral("[错误]"))
                ? CMessageBlock::Error
                : CMessageBlock::System;
     st.sText = a_sLine;
-    AppendAdhocBlock(st);
+    AppendAdhocBlock(st, a_sAsstId);
 }
 
-void CExecutionPanel::OnAdhocEvent(const QString& a_sKind, const QString& a_sText) {
+void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sKind,
+                                   const QString& a_sText) {
     SBlockData st;
     st.eKind      = CMessageBlock::Event;
     st.sEventKind = a_sKind;
     st.sText      = a_sText;
-    AppendAdhocBlock(st);
+    AppendAdhocBlock(st, a_sAsstId);
 }
 
-void CExecutionPanel::OnAdhocUndo() {
-    // 2026.08.22 多助手：撤销作用于激活助手的对话流（编排器撤销栈即激活助手会话）。
-    SAsst* pAsst = ActiveAsst();
+void CExecutionPanel::OnAdhocUndo(const QString& a_sAsstId) {
+    // 2026.09.03 多助手并发：撤销作用于指定助手的对话流（其编排器会话栈同源）。
+    SAsst* pAsst = AsstById(a_sAsstId);
     if (pAsst == nullptr) {
         return;
     }
     // 从末尾回溯找最后一个「用户提问」块，连同其后所有回复/工具/事件块一并移除。
+    QList<SBlockData>& aBlocks = AsstStream(*pAsst)->Blocks();
     int iCut = -1;
-    for (int i = pAsst->aBlocks.size() - 1; i >= 0; --i) {
-        if (pAsst->aBlocks[i].eKind == CMessageBlock::Event &&
-            pAsst->aBlocks[i].sEventKind == QStringLiteral("user")) {
+    for (int i = aBlocks.size() - 1; i >= 0; --i) {
+        if (aBlocks[i].eKind == CMessageBlock::Event &&
+            aBlocks[i].sEventKind == QStringLiteral("user")) {
             iCut = i;
             break;
         }
@@ -1223,35 +1194,39 @@ void CExecutionPanel::OnAdhocUndo() {
     if (iCut < 0) {
         return;   // 无提问块可撤销（编排器栈空时已 warn「没有可撤销的提问」，此处兜底）
     }
-    while (pAsst->aBlocks.size() > iCut) {
-        pAsst->aBlocks.removeLast();
+    while (aBlocks.size() > iCut) {
+        aBlocks.removeLast();
     }
-    RebuildAdhocView();
+    if (a_sAsstId == m_sActiveAsst) {
+        RebuildAdhocView();
+    }
     emit sigAdhocBlocksChanged();   // #1 撤销后落盘
 }
 
-void CExecutionPanel::OnAdhocFinished() {
-    SetAdhocRunning(false);   // 一次助手调用结束：恢复输入栏（受工程开关约束）
-    // 2026.08.27 跨助手排队：延迟到本轮收尾链（含编排器对同会话排队追加的自动续发——
-    //   续发会同步重置运行态）全部跑完后再消费队列，避免与同会话续发互踩；
-    //   仍在运行（续发接管）则本次跳过，下一轮结束再触发。
-    QTimer::singleShot(0, this, &CExecutionPanel::ProcessAdhocQueue);
+void CExecutionPanel::OnAdhocFinished(const QString& a_sAsstId) {
+    // 该助手一轮结束：清其运行态（其他并发助手不受影响）。
+    SetAsstRunning(a_sAsstId, false);
 }
 
-void CExecutionPanel::SetAdhocContext(qint64 a_iFill) {
+void CExecutionPanel::SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill) {
     // <0 表示撤销后未知；否则显示 当前占用 / 窗口。记录 fill，交由 UpdateContextButton 统一出文案。
+    // 2026.09.03 多助手并发：快照记到产出助手；进度条显示「激活助手」的快照
+    //   （非激活助手的更新只入档，切到该 Tab 时经 RestoreAsstGauges 还原显示）。
+    SAsst* pOwner = AsstById(a_sAsstId);
+    if (pOwner == nullptr) {
+        return;
+    }
     // 2026.08.15 旧档脏值钳制：历史存档可能带有远超窗口的假占用（result 累计兜底/中转脏 usage
     //   产物，7ce53172 实测 1.9M）。还原或收到此类值时按未知（—）处理，不再显示「1.9M（异常）」
     //   满档——否则每次落盘又把脏值写回 assistant.json，形成还原→显示→再落盘的黏住循环。
     if (a_iFill > 0 && m_iContextLimit > 0 && a_iFill > m_iContextLimit) {
         a_iFill = -1;
     }
-    m_iLastContextFill = a_iFill;
-    // 2026.08.22 多助手：占用快照记到归属助手（运行中→该助手；否则激活助手），切助手时还原。
-    if (SAsst* pAsst = RunningTargetAsst()) {
-        pAsst->iCtxFill = a_iFill;
+    pOwner->iCtxFill = a_iFill;
+    if (a_sAsstId == m_sActiveAsst) {
+        m_iLastContextFill = a_iFill;
+        UpdateContextButton();
     }
-    UpdateContextButton();
 }
 
 void CExecutionPanel::ShowContextMenu(const QPoint& a_stGlobalPos) {
@@ -1277,7 +1252,9 @@ void CExecutionPanel::ShowContextMenu(const QPoint& a_stGlobalPos) {
             emit sigAdhocContextLimitChanged(m_iUserContextLimit);
         }
     } else if (pSel == pActCompact) {
-        emit sigAdhocCompact();
+        if (const SAsst* pAct = ActiveAsst()) {
+            emit sigAdhocCompact(pAct->sId);
+        }
     }
 }
 
@@ -1323,12 +1300,19 @@ void CExecutionPanel::UpdateContextButton() {
     m_pBtnContext->setToolTip(sTip);
 }
 
-void CExecutionPanel::OnAdhocModel(const QString& a_sModel) {
-    // 收到助手本轮所用模型名 → 更新上下文窗口分母（用户设了上限则覆盖探测），刷新进度条。
-    m_sAdhocModel = a_sModel;
-    m_iContextLimit = (m_iUserContextLimit > 0)
-        ? m_iUserContextLimit : ContextLimitForModel(a_sModel);
-    UpdateContextButton();
+void CExecutionPanel::OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel) {
+    // 该助手本轮所用模型名 → 更新其快照 + 上下文窗口分母（用户设了上限则覆盖探测）。
+    SAsst* pOwner = AsstById(a_sAsstId);
+    if (pOwner == nullptr) {
+        return;
+    }
+    pOwner->sModel = a_sModel;
+    if (a_sAsstId == m_sActiveAsst) {
+        m_sAdhocModel  = a_sModel;
+        m_iContextLimit = (m_iUserContextLimit > 0)
+            ? m_iUserContextLimit : ContextLimitForModel(a_sModel);
+        UpdateContextButton();
+    }
 }
 
 void CExecutionPanel::SetUserContextLimit(qint64 a_iLimit) {
@@ -1365,55 +1349,40 @@ qint64 CExecutionPanel::ContextLimitForModel(const QString& a_sModel) {
 }
 
 void CExecutionPanel::UpdateAdhocInputState() {
-    // 2026.08.19 运行中可输入追加指令：输入栏可用只看工程开关（空闲/运行中都能打字——
-    //   运行中输入+发送 = 向正在执行的助手轮追加指令，claude 后端轮中注入、DSH 后端
-    //   排队本轮结束后自动发送）；上下文/撤销按钮仍要求空闲。
-    const bool bOk = m_bAdhocEnabled && !m_bAdhocRunning;
+    // 构造期半初始化守卫：输入栏 textChanged 在控件链建全前即可能触发本函数
+    //   （2026.09.03 改为无条件刷新后暴露），任一关键控件未建直接跳过。
+    if (m_pAdhocInput == nullptr || m_pBtnContext == nullptr
+        || m_pBtnSend == nullptr || m_pBtnUndo == nullptr) {
+        return;
+    }
+    // 2026.09.03 多助手并发：输入/按钮态按「激活助手」判定——其在跑：可输入追加
+    //   （注入/续发）、上下文/撤销禁用、按钮「➤ 追加指令」或「⏹ 停止」；其空闲：
+    //   全部可用、正常「发送」立即执行（其他助手在跑与否不影响本助手）。
+    const SAsst* pAct = ActiveAsst();
+    const bool bActRunning = (pAct != nullptr) && pAct->bRunning;
+    const bool bOk = m_bAdhocEnabled && !bActRunning;
     m_pAdhocInput->setEnabled(m_bAdhocEnabled);
     m_pBtnContext->setEnabled(bOk);
     m_pBtnUndo->setEnabled(bOk);
-    // #4 运行态标识：运行中「发送」变「停止」（红色、可点→sigAdhocStop）；空闲恢复「发送」。
-    //   2026.08.19 运行中且输入框有字 → 「➤ 追加指令」（发送追加，不清空则随时可停）。
     const bool bHasText = m_pAdhocInput != nullptr
                           && !m_pAdhocInput->toPlainText().trimmed().isEmpty();
-    // 2026.08.29 运行态可视化（修「新助手无法发送」误判）：跨助手（激活≠运行）时
-    //   输入框 placeholder 明示可排队发送——旧版空输入时按钮恒「⏹ 停止」且占位符
-    //   与空闲态无异，用户以为无法发送（实际输入文字即变「⏳ 排队发送」）。
-    const bool bCross = !m_sRunningAsst.isEmpty() && m_sActiveAsst != m_sRunningAsst;
-    const SAsst* pRunAsst = AsstById(m_sRunningAsst);
-    const QString sRunName = pRunAsst != nullptr
-        ? pRunAsst->sName : QStringLiteral("另一个助手");
-    if (m_bAdhocRunning && bCross) {
-        m_pAdhocInput->setPlaceholderText(QStringLiteral(
-            "%1 正在运行；此处输入指令将排队，待其结束后自动发送（Ctrl+Enter）")
-            .arg(sRunName));
-    } else if (m_bAdhocRunning) {
+    if (bActRunning) {
         m_pAdhocInput->setPlaceholderText(QStringLiteral(
             "向正在运行的助手追加指令（Ctrl+Enter 立即注入/排队续发；清空可停止）"));
     } else {
         m_pAdhocInput->setPlaceholderText(
             QStringLiteral("向助手输入指令（Ctrl+Enter 发送）"));
     }
-    if (m_bAdhocRunning && bHasText) {
-        // 2026.08.27 运行中发送分两路：激活==运行助手 →「➤ 追加指令」（注入运行轮，
-        //   原语义）；激活是另一助手（切走/新建后再发）→「⏳ 排队发送」（入队，
-        //   运行轮结束后自动发送到该助手，不再误入运行助手的会话）。
-        m_pBtnSend->setText(bCross ? QStringLiteral("⏳ 排队发送")
-                                   : QStringLiteral("➤ 追加指令"));
-        m_pBtnSend->setToolTip(bCross
-            ? QStringLiteral("当前另一个助手正在运行：本条指令将排队，待其结束后自动发送到当前助手")
-            : QStringLiteral("向正在执行的助手轮追加指令（立即注入/排队续发）"));
+    if (bActRunning && bHasText) {
+        m_pBtnSend->setText(QStringLiteral("➤ 追加指令"));
+        m_pBtnSend->setToolTip(
+            QStringLiteral("向正在执行的助手轮追加指令（立即注入/排队续发）"));
         m_pBtnSend->setEnabled(true);
         m_pBtnSend->setStyleSheet(
             QStringLiteral("QPushButton{background:#2563eb;color:white;}"));
-    } else if (m_bAdhocRunning) {
+    } else if (bActRunning) {
         m_pBtnSend->setText(QStringLiteral("⏹ 停止"));
-        // 2026.08.29 跨助手时点停止的是「运行中」那个助手——tooltip 说清归属并提示
-        //   排队通道，防误停/误以为无法发送。
-        m_pBtnSend->setToolTip(bCross
-            ? QStringLiteral("停止 %1 的当前轮；或在输入框输入指令，排队发送到当前助手")
-                  .arg(sRunName)
-            : QStringLiteral("停止当前助手轮"));
+        m_pBtnSend->setToolTip(QStringLiteral("停止当前助手轮"));
         m_pBtnSend->setEnabled(true);
         m_pBtnSend->setStyleSheet(QStringLiteral("QPushButton{background:#dc2626;color:white;}"));
     } else {
@@ -1450,45 +1419,59 @@ void CExecutionPanel::AppendToAdhocInput(const QString& a_sText) {
     m_pAdhocInput->setFocus();
 }
 
-void CExecutionPanel::SetAdhocRunning(bool a_bRunning) {
-    m_bAdhocRunning = a_bRunning;
-    // 2026.08.22 多助手：运行态归属助手。显式置 true 但无运行助手（自动续发排队指令的
-    //   广播路径）→ 归到激活助手；置 false → 清运行助手（下一轮发送时重新归属）。
-    if (a_bRunning && m_sRunningAsst.isEmpty()) {
-        m_sRunningAsst = m_sActiveAsst;
+void CExecutionPanel::SetAsstRunning(const QString& a_sAsstId, bool a_bRunning) {
+    // 2026.09.03 多助手并发：运行态 per-助手（SAsst::bRunning），置/清互不影响其他助手。
+    SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr) {
+        return;
     }
-    if (!a_bRunning) {
-        m_sRunningAsst.clear();
+    const bool bChanged = (pAsst->bRunning != a_bRunning);
+    pAsst->bRunning = a_bRunning;
+    if (!bChanged) {
+        return;
     }
-    // #4 助手 Tab 标签提示运行态（●运行中 / ⏳排队 / 空闲）：统一走 RefreshAsstTabTexts。
+    // 助手耗时实时刷新：起跑记本轮起始钟（跨轮续发不重置钟——已跑时间经 AddAsstUsage
+    //   并入 iElapsedMs，钟停时收尾归集，防双计）；无任务且（任一助手在跑）驱动 1s 定时器。
+    if (a_bRunning) {
+        if (!m_tAdhocClock.isValid()) {
+            m_tAdhocClock.start();
+        }
+        if (m_pCurTask == nullptr) {
+            m_pRunTimer->start(1000);
+        }
+    } else if (!AnyAsstRunning()) {
+        m_tAdhocClock.invalidate();
+        if (m_pCurTask == nullptr) {
+            m_pRunTimer->stop();
+            UpdateCostLabel();   // 冻结为累计值（收尾归集尚未到时会短暂显示上一秒值）
+        }
+    }
+    // #4 助手 Tab 标签提示运行态（●运行中）：统一走 RefreshAsstTabTexts。
     RefreshAsstTabTexts();
     UpdateAdhocInputState();
     UpdateBusyIndicator();   // #4 助手运行态变化 → 刷新执行态指示器
 }
 
-void CExecutionPanel::ClearRunningAsst() {
-    // 2026.08.22 结束态：主窗口在读取运行助手 id（回填会话）之后调用，随后
-    //   OnAdhocFinished → SetAdhocRunning(false) 幂等清空。
-    m_sRunningAsst.clear();
-    RefreshAsstTabTexts();   // 仍有排队助手的保留 ⏳ 标记
+bool CExecutionPanel::AsstRunning(const QString& a_sAsstId) const {
+    const SAsst* p = AsstById(a_sAsstId);
+    return p != nullptr && p->bRunning;
 }
 
-bool CExecutionPanel::AsstQueued(const QString& a_sId) const {
-    for (const SQueuedAdhoc& st : std::as_const(m_aAdhocQueue)) {
-        if (st.sAsstId == a_sId) {
+bool CExecutionPanel::AnyAsstRunning() const {
+    for (const SAsst& st : std::as_const(m_aAssts)) {
+        if (st.bRunning) {
             return true;
         }
     }
     return false;
 }
 
+
+
 QString CExecutionPanel::AsstTabText(const SAsst& a_st) const {
-    // Tab 标题三态：● 运行中（优先）> ⏳ 有排队指令 > 纯名字。
-    if (m_bAdhocRunning && a_st.sId == m_sRunningAsst) {
+    // Tab 标题两态：● 运行中 > 纯名字（2026.09.03 多助手可并发，● 可多个同时亮）。
+    if (a_st.bRunning) {
         return a_st.sName + QStringLiteral(" ●");
-    }
-    if (AsstQueued(a_st.sId)) {
-        return a_st.sName + QStringLiteral(" ⏳");
     }
     return a_st.sName;
 }
@@ -1502,116 +1485,45 @@ void CExecutionPanel::RefreshAsstTabTexts() {
     }
 }
 
-void CExecutionPanel::QueueAdhocPrompt(SAsst* a_pAsst, const QString& a_sText, bool a_bReadOnly) {
-    // 2026.08.27 跨助手排队：提示词归属激活助手但另一助手在跑——入队不发送。
-    //   徽标入目标助手日志（ AppendAdhocBlock 直投 id，绕开运行中路由）；真正的 user 块
-    //   在实际发送时（ProcessAdhocQueue）才上屏，保证与编排器撤销栈一一对应（排队中
-    //   关闭/换档不会留下未发送的悬挂 user 块）。队列不持久化：重启后未发送的排队指令
-    //   以徽标形式留痕，可手动重发。
-    if (a_pAsst == nullptr || a_sText.trimmed().isEmpty()) {
-        return;
-    }
-    m_aAdhocQueue.append({ a_pAsst->sId, a_sText, a_bReadOnly });
-    const int iPos = m_aAdhocQueue.size();
-    SBlockData stBadge;
-    stBadge.eKind      = CMessageBlock::Event;
-    stBadge.sEventKind = QStringLiteral("queued");
-    stBadge.sText = QStringLiteral("已排队第 %1 位（当前助手运行结束后自动发送）：%2")
-                        .arg(iPos)
-                        .arg(a_sText.left(200));
-    AppendAdhocBlock(stBadge, a_pAsst->sId);
-    RefreshAsstTabTexts();   // 目标助手 Tab 标 ⏳
-    UpdateAdhocInputState(); // 按钮文案可能已变（⏳ 排队发送）
-}
 
-void CExecutionPanel::ProcessAdhocQueue() {
-    // 队列消费（OnAdhocFinished 经 singleShot(0) 延迟触发，避开收尾链重入）：
-    //   仍在运行（编排器对同会话排队追加的自动续发已接管）→ 留到下一轮结束；
-    //   队首助手已不存在（档切换随 ClearAsstTabs 清空，防御）→ 丢弃取下一个。
-    if (m_bAdhocRunning || m_aAdhocQueue.isEmpty()) {
-        return;
-    }
-    while (!m_aAdhocQueue.isEmpty()) {
-        const SQueuedAdhoc stQ = m_aAdhocQueue.first();
-        SAsst* pAsst = AsstById(stQ.sAsstId);
-        if (pAsst == nullptr) {
-            m_aAdhocQueue.removeFirst();   // 助手已随档重建消失：丢弃
-            continue;
-        }
-        m_aAdhocQueue.removeFirst();
-        if (pAsst->sId != m_sActiveAsst && pAsst->pView != nullptr) {
-            // 切到目标助手 Tab：→ OnAsstTabCurrentChanged → sigAsstSwitched →
-            //   主窗口 SyncOrchToPanel(旧)/LoadOrchFromPanel(新)，编排器换载该助手会话。
-            m_pTabs->setCurrentWidget(pAsst->pView);
-        }
-        // 与 DoAdhocSend 空闲路径同款：user 块（带时间戳）+ 运行态 + 提交。
-        SBlockData stUser;
-        stUser.eKind      = CMessageBlock::Event;
-        stUser.sEventKind = QStringLiteral("user");
-        const QString sStamp = StampPrefix(AsstStampKey(pAsst->sId), /*a_bFullDate=*/true);
-        stUser.sText = sStamp.isEmpty() ? stQ.sText : QStringLiteral("[%1] %2").arg(sStamp, stQ.sText);
-        AppendAdhocBlock(stUser, pAsst->sId);
-        m_pTabs->setCurrentWidget(pAsst->pView);   // #2 发送后切到该助手 Tab
-        m_sRunningAsst = pAsst->sId;               // 本轮事件（回复/工具）路由到该助手
-        SetAdhocRunning(true);
-        emit sigAdhocSubmit(stQ.sText, stQ.bReadOnly);
-        RefreshAsstTabTexts();   // ⏳ → ●
-        return;   // 一次只发一条；本条结束后 OnAdhocFinished 会再触发消费下一条
-    }
-}
 
 void CExecutionPanel::UpdateBusyIndicator() {
     // #4 综合「当前任务运行中」或「助手运行中」任一为真 → 转圈动画；否则显示状态色点。
     if (m_pBusy == nullptr) {
         return;
     }
-    const bool bBusy = m_bTaskRunning || m_bAdhocRunning;
+    const bool bBusy = m_bTaskRunning || AnyAsstRunning();
     m_pBusy->SetBusy(bBusy);
     m_pBusy->SetIdleColor(m_colIdle);
 }
 
 void CExecutionPanel::DoAdhocSend() {
     // 发送当前输入（Ctrl+Enter 或「发送」按钮调用）。提取自原 fnSend lambda。
+    // 2026.09.03 多助手并发：提交目标锥死「激活助手」——
+    //   激活在跑 → 同助手追加（注入运行轮/排队续发，编排器内按后端分流）；
+    //   激活空闲 → 立即提交该助手自己的会话（其他助手在跑与否无关，不再排队）。
     const QString sText = m_pAdhocInput->toPlainText().trimmed();
-    if (sText.isEmpty()) {
+    SAsst* pAsst = ActiveAsst();
+    if (sText.isEmpty() || pAsst == nullptr) {
         return;
     }
-    // 2026.08.27 跨助手排队：运行中的是另一个助手（用户切到/新建了别的助手再发送）时，
-    //   提示词属于激活助手——不再误注入运行助手的会话与日志，改为排队，运行轮结束后
-    //   自动发送（QueueAdhocPrompt）。空闲但队列未清空（消费延迟窗口内的新发送）同样
-    //   入队保 FIFO 顺序。运行中且激活==运行助手 → 维持原「➤ 追加指令」注入语义。
-    const bool bRunOther = m_bAdhocRunning && !m_sRunningAsst.isEmpty()
-                           && m_sActiveAsst != m_sRunningAsst;
-    const bool bQueueBacklog = !m_bAdhocRunning && !m_aAdhocQueue.isEmpty();
-    if ((bRunOther || bQueueBacklog) && ActiveAsst() != nullptr) {
-        QueueAdhocPrompt(ActiveAsst(), sText, m_pBtnReadOnly->isChecked());
-        m_pAdhocInput->clear();   // 清空 → textChanged → 高度回到单行
-        return;
-    }
-    // 2026.08.22 多助手：本次提交归属「运行中助手」（追加指令场景），空闲时为激活助手。
-    SAsst* pAsst = RunningTargetAsst();
-    if (pAsst == nullptr) {
-        return;
-    }
+    const QString sAsstId = pAsst->sId;
     // 先本地渲染「用户提问」块（❯），与编排器撤销栈一一对应：撤销=移除本块及之后所有块。
-    // 2026.08.22 用户提示词带日期+时间前缀（Agent 输出只带时间，见 OnAssistantText）；
+    // 用户提示词带日期+时间前缀（Agent 输出只带时间，见 OnAssistantText）；
     //   距上个时间戳 <1 分钟不输出时间（StampPrefix，键按助手 id 区分）。
     SBlockData stUser;
     stUser.eKind      = CMessageBlock::Event;
     stUser.sEventKind = QStringLiteral("user");
-    const QString sStamp = StampPrefix(AsstStampKey(pAsst->sId), /*a_bFullDate=*/true);
+    const QString sStamp = StampPrefix(AsstStampKey(sAsstId), /*a_bFullDate=*/true);
     stUser.sText = sStamp.isEmpty() ? sText : QStringLiteral("[%1] %2").arg(sStamp, sText);
-    AppendAdhocBlock(stUser);
+    AppendAdhocBlock(stUser, sAsstId);
     // #2 发送后自动切到该助手 Tab，让用户立即看到日志。
     m_pTabs->setCurrentWidget(pAsst->pView);
-    if (!m_bAdhocRunning) {
-        m_sRunningAsst = pAsst->sId;   // 本轮事件（回复/工具）路由到该助手
-    }
     // #4 先进入运行态（助手 Tab 标 ●、发送变「停止」），再 emit 提交：
-    // 若提交在同步链中即失败（如 claude 启动失败），OnAdhocFinished 的 SetAdhocRunning(false)
-    // 会落在 SetAdhocRunning(true) 之后，最终态正确归零；反之(true 覆盖在 false 之后)会卡在「运行中」假态。
-    SetAdhocRunning(true);
-    emit sigAdhocSubmit(sText, m_pBtnReadOnly->isChecked());
+    // 若提交在同步链中即失败（如 claude 启动失败），OnAdhocFinished 的 SetAsstRunning(id,false)
+    // 会落在 SetAsstRunning(id,true) 之后，最终态正确归零。
+    SetAsstRunning(sAsstId, true);
+    emit sigAdhocSubmit(sAsstId, sText, m_pBtnReadOnly->isChecked());
     m_pAdhocInput->clear();   // 清空 → textChanged → 高度回到单行
 }
 
@@ -1648,16 +1560,19 @@ void CExecutionPanel::OnAdhocTextChanged() {
     constexpr int k_iAdhocMaxLines = 10;
     AdjustInputHeight(m_pAdhocInput, k_iAdhocMaxLines);
     // 2026.08.19 运行中可输入追加指令：有字时按钮从「⏹ 停止」切「➤ 追加指令」，
-    //   清空回落——按钮态跟随输入内容刷新。
-    if (m_bAdhocRunning) {
-        UpdateAdhocInputState();
-    }
+    //   清空回落——按钮态跟随输入内容刷新（2026.09.03 判定按激活助手，轻量直刷）。
+    UpdateAdhocInputState();
 }
 
 // 2026.08.25 判定助手是否“有用”：对话流中存在用户发送的提示词（Event/user 块）。
 //   没有任何用户提示词的助手（只有系统/事件行或完全无内容）视为空助手。
 bool CExecutionPanel::AsstHasUserPrompt(const SAsst& a_st) {
-    return std::any_of(a_st.aBlocks.cbegin(), a_st.aBlocks.cend(),
+    // 2026.09.03 数据在流对象内（未建流=无块=空助手）
+    if (!a_st.pStream) {
+        return false;
+    }
+    const QList<SBlockData>& aBlocks = a_st.pStream->Blocks();
+    return std::any_of(aBlocks.cbegin(), aBlocks.cend(),
                        [](const SBlockData& b) {
                            return b.eKind == CMessageBlock::Event &&
                                   b.sEventKind == QStringLiteral("user");
@@ -1671,9 +1586,11 @@ void CExecutionPanel::RebuildPromptList() {
     if (pAsst == nullptr) {
         return;
     }
-    for (int i = 0; i < pAsst->aBlocks.size(); ++i) {
-        if (pAsst->aBlocks[i].eKind == CMessageBlock::Event &&
-            pAsst->aBlocks[i].sEventKind == QStringLiteral("user")) {
+    const QList<SBlockData>& aBlocks = pAsst->pStream ? pAsst->pStream->Blocks()
+                                                       : QList<SBlockData>();
+    for (int i = 0; i < aBlocks.size(); ++i) {
+        if (aBlocks[i].eKind == CMessageBlock::Event &&
+            aBlocks[i].sEventKind == QStringLiteral("user")) {
             m_aPromptIdx.append(i);
         }
     }
@@ -1681,21 +1598,19 @@ void CExecutionPanel::RebuildPromptList() {
 
 void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
     // FR-3：点击下拉中某条提示词 → 把对应 User 提问块滚到助手日志最顶 + 横纵滚动条归零。
+    // 反向分页：目标块可能早于前沿尚未建件 → 流内 EnsureCoverage 分轮补建后滚动到位。
     SAsst* pAsst = ActiveAsst();
     if (pAsst == nullptr || pAsst->pView == nullptr) {
         return;
     }
-    if (a_iBlockIdx < 0 || a_iBlockIdx >= pAsst->aWidgets.size()) {
-        return;
-    }
-    CMessageBlock* pBlock = pAsst->aWidgets[a_iBlockIdx];
-    if (pBlock == nullptr) {
-        return;
-    }
     // 切到该助手 Tab，确保用户看到滚动结果。
     m_pTabs->setCurrentWidget(pAsst->pView);
-    // 滚动到该块顶部：把内容 widget 内该块的 y（相对内容原点）设为垂直滚动条值。
-    pAsst->pView->ScrollBlockToTop(pBlock);
+    CMessageView* pView = pAsst->pView;   // 流回调时捕获视图（不捕获 SAsst 指针，防搬移悬垂）
+    AsstStream(*pAsst)->EnsureCoverage(a_iBlockIdx, [pView](CMessageBlock* a_pBlock) {
+        if (a_pBlock != nullptr) {
+            pView->ScrollBlockToTop(a_pBlock);
+        }
+    });
 }
 
 void CExecutionPanel::SyncStagesHeight(int a_iTaskListBottomY) {
@@ -1809,8 +1724,10 @@ void CExecutionPanel::OnPromptBtnHovered() {
                        "|^\\[\\d{2}:\\d{2}:\\d{2}\\]\\s*"));
     for (int i = 0; i < m_aPromptIdx.size(); ++i) {
         const int iBlock = m_aPromptIdx.at(i);
-        if (iBlock >= 0 && iBlock < pAsst->aBlocks.size()) {
-            QString sPrompt = pAsst->aBlocks[iBlock].sText;   // 拷贝后去时间戳（pAsst 为 const）
+        const QList<SBlockData>& aBlk = pAsst->pStream ? pAsst->pStream->Blocks()
+                                                       : QList<SBlockData>();
+        if (iBlock >= 0 && iBlock < aBlk.size()) {
+            QString sPrompt = aBlk[iBlock].sText;   // 拷贝后去时间戳（pAsst 为 const）
             m_pPromptFlyout->AddItem(i, sPrompt.remove(k_reStamp));
         }
     }
@@ -1960,65 +1877,6 @@ bool CExecutionPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
 // SBlockData 为本类私有嵌套，序列化逻辑内聚于此，不外露数据结构。
 // ===========================================================================
 
-QJsonObject CExecutionPanel::BlockToJson(const SBlockData& a_stData) {
-    QJsonObject o;
-    if (!a_stData.sViewId.isEmpty()) {
-        o[QStringLiteral("view")] = a_stData.sViewId;   // 评审多视角标识（向后兼容：旧记录无此键）
-    }
-    switch (a_stData.eKind) {
-        case CMessageBlock::Assistant:
-            o[QStringLiteral("kind")] = QStringLiteral("assistant");
-            o[QStringLiteral("text")] = a_stData.sText;
-            break;
-        case CMessageBlock::ToolUse:
-            o[QStringLiteral("kind")]   = QStringLiteral("tool_use");
-            o[QStringLiteral("tool")]   = a_stData.sTool;
-            o[QStringLiteral("input")]  = a_stData.sInput;
-            o[QStringLiteral("result")] = a_stData.sResult;
-            break;
-        case CMessageBlock::Event:
-            o[QStringLiteral("kind")]      = QStringLiteral("event");
-            o[QStringLiteral("eventKind")] = a_stData.sEventKind;
-            o[QStringLiteral("text")]      = a_stData.sText;
-            break;
-        case CMessageBlock::Error:
-            o[QStringLiteral("kind")] = QStringLiteral("error");
-            o[QStringLiteral("text")] = a_stData.sText;
-            break;
-        case CMessageBlock::System:
-        default:
-            o[QStringLiteral("kind")] = QStringLiteral("system");
-            o[QStringLiteral("text")] = a_stData.sText;
-            break;
-    }
-    return o;
-}
-
-CExecutionPanel::SBlockData CExecutionPanel::BlockFromJson(const QJsonObject& a_o) {
-    SBlockData st;
-    st.sViewId = a_o.value(QStringLiteral("view")).toString();
-    const QString sKind = a_o.value(QStringLiteral("kind")).toString();
-    if (sKind == QStringLiteral("assistant")) {
-        st.eKind = CMessageBlock::Assistant;
-        st.sText = a_o.value(QStringLiteral("text")).toString();
-    } else if (sKind == QStringLiteral("tool_use")) {
-        st.eKind   = CMessageBlock::ToolUse;
-        st.sTool   = a_o.value(QStringLiteral("tool")).toString();
-        st.sInput  = a_o.value(QStringLiteral("input")).toString();
-        st.sResult = a_o.value(QStringLiteral("result")).toString();
-    } else if (sKind == QStringLiteral("event")) {
-        st.eKind      = CMessageBlock::Event;
-        st.sEventKind = a_o.value(QStringLiteral("eventKind")).toString();
-        st.sText      = a_o.value(QStringLiteral("text")).toString();
-    } else if (sKind == QStringLiteral("error")) {
-        st.eKind = CMessageBlock::Error;
-        st.sText = a_o.value(QStringLiteral("text")).toString();
-    } else {
-        st.eKind = CMessageBlock::System;
-        st.sText = a_o.value(QStringLiteral("text")).toString();
-    }
-    return st;
-}
 
 // 2026.08.22 多助手持久化：全部助手（含各自会话态快照）→ JSON 数组。
 QJsonArray CExecutionPanel::AssistantsToJson() const {
@@ -2041,8 +1899,10 @@ QJsonArray CExecutionPanel::AssistantsToJson() const {
         oUsage[QStringLiteral("ms")]     = static_cast<double>(st.iElapsedMs);
         o[QStringLiteral("usage")]     = oUsage;
         QJsonArray aBlocks;
-        for (const SBlockData& stB : st.aBlocks) {
-            aBlocks.append(BlockToJson(stB));
+        if (st.pStream) {   // 2026.09.03 数据在流对象内（未建流=无块）
+            for (const SBlockData& stB : st.pStream->Blocks()) {
+                aBlocks.append(BlockToJson(stB));
+            }
         }
         o[QStringLiteral("blocks")] = aBlocks;
         aArr.append(o);
@@ -2085,9 +1945,14 @@ void CExecutionPanel::LoadAssistantsFromJson(const QJsonArray& a_aAssts, const Q
         st.iReqs      = oUsage.value(QStringLiteral("reqs")).toInt();
         st.iElapsedMs = static_cast<qint64>(oUsage.value(QStringLiteral("ms")).toDouble());
         const QJsonArray aBlocks = o.value(QStringLiteral("blocks")).toArray();
-        for (const QJsonValue& vb : aBlocks) {
-            if (vb.isObject()) {
-                st.aBlocks.append(BlockFromJson(vb.toObject()));
+        if (!aBlocks.isEmpty()) {   // 2026.09.03 块数据入流对象（AsstStream 懒建；这里直接建好再填）
+            st.pStream = std::make_shared<CStreamPresenter>(
+                [this]() { emit sigAdhocBlocksChanged(); });
+            QList<SBlockData>& aDst = st.pStream->Blocks();
+            for (const QJsonValue& vb : aBlocks) {
+                if (vb.isObject()) {
+                    aDst.append(BlockFromJson(vb.toObject()));
+                }
             }
         }
         if (sFirstId.isEmpty() && !st.bClosed) {
@@ -2119,7 +1984,8 @@ void CExecutionPanel::LoadAssistantsFromJson(const QJsonArray& a_aAssts, const Q
     // 2026.08.23 各助手独立日志控件：加载后对全部打开助手预建视图（分帧渐进，不卡 UI），
     //   切换 Tab 即时呈现，不再依赖首次切入时的同步重建（此前切换数百块历史会明显卡顿）。
     for (const SAsst& st : m_aAssts) {
-        if (!st.bClosed && !st.aBlocks.isEmpty()) {
+        const bool bHasBlocks = st.pStream && !st.pStream->Blocks().isEmpty();
+        if (!st.bClosed && bHasBlocks) {
             RebuildAsstView(st.sId);
         }
     }
@@ -2190,48 +2056,50 @@ void CExecutionPanel::ClearAsstTabs() {
     }
     m_aAssts.clear();
     m_sActiveAsst.clear();
-    m_sRunningAsst.clear();
     m_aPromptIdx.clear();
-    m_aAdhocQueue.clear();   // 2026.08.27 排队指令随档作废（目标助手 id 已失效；徽标留痕在旧档）
     m_bAsstTabsResetting = false;
     UpdateTabCloseButtons();   // 无助手页 → 顺手摘除「+」占位页
 }
 
 QJsonArray CExecutionPanel::TaskBlocksToJson(const QString& a_sTaskId) const {
     QJsonArray aArr;
-    const QList<SBlockData> aBlocks = m_aBlocks.value(a_sTaskId);
-    for (const SBlockData& st : aBlocks) {
-        aArr.append(BlockToJson(st));
+    // 2026.09.03 数据在流对象内（const 路径不建流；无流=无块）
+    if (const CStreamPresenter* pS = m_aStreams.value(a_sTaskId, nullptr)) {
+        for (const SBlockData& st : pS->Blocks()) {
+            aArr.append(BlockToJson(st));
+        }
     }
     return aArr;
 }
 
 void CExecutionPanel::LoadTaskBlocksFromJson(const QString& a_sTaskId, const QJsonArray& a_aBlocks) {
-    QList<SBlockData>& aBlocks = m_aBlocks[a_sTaskId];
-    aBlocks.clear();
+    QList<SBlockData> aBlocks;
     for (const QJsonValue& v : a_aBlocks) {
         if (v.isObject()) {
             aBlocks.append(BlockFromJson(v.toObject()));
         }
     }
-    if (a_sTaskId == m_sCurId) {
+    EnsureStream(a_sTaskId)->SetBlocks(aBlocks);
+    if (a_sTaskId == m_sCurId && m_pCurStream != nullptr) {
         RebuildView();   // 当前任务：重建视图呈现恢复的对话流
     }
 }
 
 void CExecutionPanel::ClearAllBlocks() {
     // 切工程：彻底清空内存对话流（任务 + 各助手），避免新旧工程数据混淆。
-    m_aBlocks.clear();
-    m_aCurWidgets.clear();
+    //   2026.09.03 任务流整体销毁（Unbind 清件+作废在途帧）；助手侧随 ResetAssistants 一并重建。
+    if (m_pCurStream != nullptr) {
+        m_pCurStream->Unbind();   // 清共享视图上的块 + 断线（析构前先弃件）
+    }
+    qDeleteAll(m_aStreams);
+    m_aStreams.clear();
+    m_pCurStream = nullptr;
     m_sCurId.clear();
     m_aDirtyTaskIds.clear();
-    // 作废任务侧分帧重建的在途帧；助手侧整体复位（各 SAsst 连同视图/分帧状态一并重建）。
-    m_bRebuilding = false;
-    ++m_uRebuildGen;
     if (m_pChatSaveTimer != nullptr) {
         m_pChatSaveTimer->stop();
     }
-    m_pView->Clear();
+    m_pView->Clear();   // 双保险（Unbind 已清；保险无块残留）
     ResetAssistants();
 }
 
@@ -2367,6 +2235,9 @@ CExecutionPanel::SAsst* CExecutionPanel::AsstByView(QWidget* a_pView) {
 CMessageView* CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
     // 建视图 + 右上角提示词按钮 + 插 Tab（默认插在最后一个助手 Tab 右侧）。
     a_stAsst.pView = new CMessageView(this);
+    // 2026.09.03 流呈现器接管接线（到顶补建/丢块同步等在流内，与任务日志同码）：
+    //   建视图即绑流（重开助手复绑同一流，Bind 内先解旧）；字体设置在绑后不影响。
+    AsstStream(a_stAsst)->Bind(a_stAsst.pView);
     QFont fView = a_stAsst.pView->font();
     fView.setPointSize(11);
     a_stAsst.pView->setFont(fView);
@@ -2381,9 +2252,7 @@ CMessageView* CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
             }
         }
     }
-    const bool bRun = (m_bAdhocRunning && a_stAsst.sId == m_sRunningAsst);
-    Q_UNUSED(bRun);
-    m_pTabs->insertTab(iIdx, a_stAsst.pView, AsstTabText(a_stAsst));   // 2026.08.27 ●/⏳ 统一 AsstTabText
+    m_pTabs->insertTab(iIdx, a_stAsst.pView, AsstTabText(a_stAsst));   // ● 运行中标记统一 AsstTabText
     UpdateTabCloseButtons();
     return a_stAsst.pView;
 }
@@ -2408,6 +2277,10 @@ void CExecutionPanel::RemoveAsstTab(SAsst& a_stAsst) {
     if (iIdx >= 0) {
         m_pTabs->removeTab(iIdx);   // 预切后不再是当前页，Qt 不再自动激活「+」页
     }
+    // 2026.09.03 流解绑（断线+弃件保数据+作废在途帧）先于视图销毁，防销毁后回调悬垂。
+    if (a_stAsst.pStream) {
+        a_stAsst.pStream->Unbind();
+    }
     delete a_stAsst.pView;
     a_stAsst.pView = nullptr;
     a_stAsst.pBtnPrompts = nullptr;
@@ -2422,17 +2295,13 @@ void CExecutionPanel::CloseAsst(const QString& a_sId) {
     if (pAsst == nullptr || pAsst->bClosed) {
         return;
     }
-    if (pAsst->sId == m_sRunningAsst && m_bAdhocRunning) {
+    if (pAsst->bRunning) {
         QMessageBox::information(this, QStringLiteral("关闭助手"),
             QStringLiteral("该助手正在执行指令，请先停止再关闭。"));
         return;
     }
-    // 2026.08.27 有排队指令的助手不可关闭：关闭会丢弃未发送的指令（防静默丢失）。
-    if (AsstQueued(pAsst->sId)) {
-        QMessageBox::information(this, QStringLiteral("关闭助手"),
-            QStringLiteral("该助手有排队等待发送的指令，请等它发送完成后再关闭。"));
-        return;
-    }
+    // （2026.08.27 跨助手排队挡已删：排队机制随多助手并发移除；同助手排队注入
+    //   的指令由编排器会话持有，关闭/删除前已要求空闲，无静默丢失。）
     if (std::count_if(m_aAssts.begin(), m_aAssts.end(),
                       [](const SAsst& st) { return !st.bClosed; }) <= 1) {
         QMessageBox::information(this, QStringLiteral("关闭助手"),
@@ -2443,11 +2312,11 @@ void CExecutionPanel::CloseAsst(const QString& a_sId) {
     // 2026.08.25 空助手（无用户发送的提示词）关闭即舍弃，不进「▾」历史：
     //   数据无价值，保留只会占用档位/编号。
     const bool bEmpty = !AsstHasUserPrompt(*pAsst);
-    // 控件已随视图销毁：清对齐列表与分帧重建状态（数据 aBlocks 保留，重开时按需重建）。
-    pAsst->aWidgets.clear();
-    pAsst->iRebuildIdx = 0;
-    ++pAsst->uGen;
-    pAsst->bRebuilding = false;
+    // 控件已随视图销毁：流解绑弃件保数据（RemoveAsstTab 已调，此处幂等兜底），
+    //   数据在流对象内保留，重开时 Rebuild 按需重建。
+    if (pAsst->pStream) {
+        pAsst->pStream->Unbind();
+    }
     pAsst->bClosed = true;
     if (bEmpty) {
         m_aAssts.removeIf([&a_sId](const SAsst& st) { return st.sId == a_sId; });
@@ -2456,9 +2325,6 @@ void CExecutionPanel::CloseAsst(const QString& a_sId) {
     const SAsst stKeep = *pAsst;
     m_aAssts.removeIf([&a_sId](const SAsst& st) { return st.sId == a_sId; });
     m_aAssts.append(stKeep);
-    }
-    if (m_sRunningAsst == a_sId) {
-        m_sRunningAsst.clear();   // 防御（运行中已拦截，正常不达）
     }
     // QTabWidget 摘页时已自动切到相邻页 → OnAsstTabCurrentChanged 已更新 m_sActiveAsst；
     // 兜底：若当前页不是助手页，激活第一个打开的助手。
@@ -2487,7 +2353,8 @@ void CExecutionPanel::OnAsstMenuClicked() {
             continue;   // 2026.08.25 空助手（无用户发送的提示词）不入历史列表
         }
         bAny = true;
-        const QString sLabel = QStringLiteral("%1（%2 条对话）").arg(st.sName).arg(st.aBlocks.size());
+        const int iCount = st.pStream ? st.pStream->Count() : 0;
+        const QString sLabel = QStringLiteral("%1（%2 条对话）").arg(st.sName).arg(iCount);
         QAction* pAct = menu.addAction(sLabel);
         connect(pAct, &QAction::triggered, this, [this, id = st.sId]() { ReopenAsst(id); });
     }
@@ -2612,17 +2479,23 @@ void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
     }
     const QString sOld = m_sActiveAsst;
     m_sActiveAsst = pAsst->sId;
-    // 首次切到该助手（或其控件列表为空）→ 按数据重建其视图（恢复档时惰性补建）。
-    if (pAsst->aWidgets.isEmpty() && !pAsst->aBlocks.isEmpty()) {
+    // 首次切到该助手（或其视图件尚未建）→ 按数据重建其视图（恢复档时惰性补建）。
+    //   2026.09.03 件状态在流内：未建流/无件 且有数据 → 重建（旧：aWidgets 空且 aBlocks 非空）。
+    const bool bNeedsBuild = (pAsst->pView != nullptr)
+        && (!pAsst->pStream || (pAsst->pStream->WidgetCount() == 0 && pAsst->pStream->Count() > 0));
+    if (bNeedsBuild) {
         RebuildAdhocView();
     } else {
         RebuildPromptList();
     }
-    // 上下文占用进度条切换到该助手快照。
+    // 上下文占用进度条/模型窗口切换到该助手快照（2026.09.03 模型名 per-助手）。
     m_iLastContextFill = pAsst->iCtxFill;
+    m_sAdhocModel      = pAsst->sModel;
+    m_iContextLimit    = (m_iUserContextLimit > 0)
+        ? m_iUserContextLimit : ContextLimitForModel(pAsst->sModel);
     UpdateContextButton();
     UpdateCostLabel();   // 2026.08.27 无任务时费用栏随助手切换显示各自动流量记录
-    UpdateAdhocInputState();   // 2026.08.27 运行中切助手：发送按钮 ➤追加/⏳排队 文案随目标切换
+    UpdateAdhocInputState();   // 按激活助手运行态刷新发送按钮（⏹停止/➤追加/发送）
     // FR-3：各助手右上角提示词按钮可见性（仅当前页的按钮显示并贴右上角）。
     for (SAsst& st : m_aAssts) {
         if (st.pBtnPrompts != nullptr && st.pView != nullptr) {

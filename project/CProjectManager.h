@@ -360,6 +360,32 @@ public:
     QList<SDshModelEntry> LoadCodexModels(int* a_pActive = nullptr);
     bool    SaveCodexModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
 
+    // ---- Hermes 第五后端（任务 3213cdbf，[Agent] Hermes* 键）----
+    //   Root=Harness 根（探测序 HermesRoot → exe 同级 HermesHarness → npm 全局）；
+    //   Node=node.exe（空=PATH）；Model/ApiKey/BaseUrl 走网关（OpenAI/Anthropic 兼容）。
+    bool    SaveHermesRoot(const QString& a_sRoot);
+    QString LoadHermesRoot();
+    bool    SaveHermesNodePath(const QString& a_sPath);
+    QString LoadHermesNodePath();
+    bool    SaveHermesModel(const QString& a_sModel);
+    QString LoadHermesModel();
+    bool    SaveHermesApiKey(const QString& a_sKey);
+    QString LoadHermesApiKey();
+    bool    SaveHermesBaseUrl(const QString& a_sUrl);
+    QString LoadHermesBaseUrl();
+    // Hermes 计费单价（$/百万 token，口径同 Pi）。
+    bool    SaveHermesPriceInPerM(double a_d);
+    double  LoadHermesPriceInPerM();
+    bool    SaveHermesPriceCacheReadPerM(double a_d);
+    double  LoadHermesPriceCacheReadPerM();
+    bool    SaveHermesPriceCacheWritePerM(double a_d);
+    double  LoadHermesPriceCacheWritePerM();
+    bool    SaveHermesPriceOutPerM(double a_d);
+    double  LoadHermesPriceOutPerM();
+    // Hermes 自定义大模型表（[HermesModels]；口径同 [PiModels]，条目复用 SDshModelEntry）。
+    QList<SDshModelEntry> LoadHermesModels(int* a_pActive = nullptr);
+    bool    SaveHermesModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+
     // ---- 扫描排除目录（config.ini 的 [Scan] ExcludeDirs，逗号分隔）----
     // 空 = 用内置默认清单（.autodev/build/Execute/.git/.vs/node_modules/doc）。
     bool    SaveScanExcludeDirs(const QString& a_sDirs);

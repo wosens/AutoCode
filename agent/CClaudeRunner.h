@@ -61,6 +61,9 @@ public:
 
     QString BackendName() const override { return QStringLiteral("claude"); }
 
+    // --resume + --fork-session 产生携带完整上下文的新 sid 分支：跨轮上下文原生延续。
+    bool KeepsContextAcrossTurns() const override { return true; }
+
     // 启动一次阶段执行
     //   a_sWorkDir       claude 的工作目录（工程根），相对路径 .autodev/... 落在此处
     //   a_sPrompt        投递给 claude 的完整 prompt（经 stdin 传入）

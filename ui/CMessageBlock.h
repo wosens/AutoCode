@@ -1,7 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QString>
+#include <QList>
+#include <QStringList>
 
 class QLabel;
 class QTextBrowser;
@@ -29,13 +31,25 @@ public:
 
     // —— 按 kind 填充（只调对应那个）——
     void SetAssistantText(const QString& a_sMarkdown);
+    // 2026.09.04 批量路径（切档重建/到顶补建）异步版：Markdown parse+初排版在子线程
+    //   预排版（CMarkdownPreloader），完成回主线程 setDocument 落地——主线程只剩廉价
+    //   落地+宽度微调，批量建块不再持续占用主线程（"加载日志卡"根因治理）。
+    //   a_dEstWidth = 预估排版宽度（视口宽-块边距）；落地前先 setPlainText 占位防空白闪。
+    void SetAssistantTextAsync(const QString& a_sMarkdown, qreal a_dEstWidth);
+    // 2026.09.02 说话人标签改接块内记录的产出后端（旧版取渲染时刻的全局后端，
+    //   切后端后重建视图会把历史回复整体改标，张冠李戴）；空串不生效（保持
+    //   默认"Agent"＝旧数据/未知，不用当前后端冒充）。
+    void SetSpeakerBackend(const QString& a_sName);
     void SetTool(const QString& a_sTool, const QString& a_sInputJson);
     // 2026.08.22 连续工具调用合并：追加一条进本卡（标题显示 ×N，展开看全部）
     void AddMergedTool(const QString& a_sTool, const QString& a_sInputJson);
     void SetResult(const QString& a_sResult);          // 工具结果回填（ToolUse 专用；合并卡按到达顺序填首个空结果）
     int  ToolCount() const;                            // 合并卡内工具条目数（单卡=1）
     void SetEvent(const QString& a_sKind, const QString& a_sText);
-    void SetSystemText(const QString& a_sText);         // System / Error 共用
+    void SetSystemText(const QString& a_sText);         // System / Error 共用（System 首行/复位）
+    // 2026.08.29 反向借鉴 HarnessAgent：连续 System 行合并为一张折叠组卡，
+    //   面板层把后续行并入首卡时逐行追加（组头首行摘要 + 共 N 行，默认折叠）
+    void AppendSystemLine(const QString& a_sText);
 
     void SetExpanded(bool a_bExpanded);
     bool IsExpanded() const;
@@ -52,6 +66,7 @@ private:
     void BuildToolCard();
     void BuildEvent();
     void BuildSystem(bool a_bError);
+    void RefreshSysHeader();                            // System 折叠组头（摘要+行数）
 
     // 工具卡：从入参 JSON 生成标题摘要（取 file_path/command/pattern/path 等）
     static QString ToolSummary(const QString& a_sTool, const QString& a_sInputJson);
@@ -65,6 +80,9 @@ private:
 
     // Assistant
     QTextBrowser*   m_pBrowser = nullptr;
+    QString         m_sPendingMarkdown;   // 2026.09.04 异步预排版在途的原文（失败回退同步渲染用）
+    void ApplyPreloadedDoc(class QTextDocument* a_pDoc, bool a_bFallbackSync);   // 预排版落地
+    QLabel*         m_pSpeaker = nullptr;   // 2026.09.02 说话人标签（产出后端名；SetSpeakerBackend 回填）
 
     // ToolUse
     QToolButton*    m_pHeader   = nullptr;
@@ -77,4 +95,6 @@ private:
 
     // Event / System / Error
     QLabel*         m_pLabel = nullptr;
+    // System 折叠组：已归组的系统行（Error 不折叠，无此列表）
+    QStringList     m_aSysLines;
 };

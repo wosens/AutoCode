@@ -11,6 +11,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QTemporaryDir>
+#include <QEventLoop>
+#include <QProcess>
 #include <QTimer>
 #include <QTextStream>
 
@@ -34,8 +37,75 @@ static void ArmGuard() {
     g_pGuard->start(180000);
 }
 
+// 2026.09.01 --selfheal 模式：端到端验证版本不兼容自愈——先用 git 把 DSH 真实
+// 更新到 dsh-v0.1.2-alpha.3（重演事故：上游移除示例包），再 StartStage 触发自动
+// 修复流水线（回滚基线+清空壳+清残留+pnpm 重建），断言：修复事件流出现、DSH 回到
+// rc.7、最终 sigFinished(ok)。全程真实 git/pnpm，约 5~15 分钟。
+static int RunSelfHealE2E(const QString& a_sRoot) {
+    g_out << "== selfheal e2e: 破坏现场（git reset --hard dsh-v0.1.2-alpha.3）==" << Qt::endl;
+    int iRc = QProcess::execute(QStringLiteral("git"),
+        { QStringLiteral("-C"), a_sRoot, QStringLiteral("reset"),
+          QStringLiteral("--hard"), QStringLiteral("dsh-v0.1.2-alpha.3") });
+    if (iRc != 0) {
+        g_out << "  [FAIL] 破坏现场失败（无该 tag？）rc=" << iRc << Qt::endl;
+        return 1;
+    }
+    const QString sErrBefore = CDeepSeekRunner::DshConfigError();
+    g_out << "  破坏后 DshConfigError: " << (sErrBefore.isEmpty()
+        ? QStringLiteral("(空)") : sErrBefore.left(60)) << Qt::endl;
+    if (!sErrBefore.contains(QStringLiteral("版本与 AutoCode 集成不兼容"))) {
+        g_out << "  [FAIL] 探测未识别为不兼容" << Qt::endl;
+        return 1;
+    }
+    g_sWorkDir = QDir::temp().filePath(QStringLiteral("autocode-selfheal-e2e"));
+    QDir().mkpath(g_sWorkDir);
+    QObject::connect(g_pRunner, &CDeepSeekRunner::sigInfo, [](const QString& s) {
+        g_out << "  [info] " << s << Qt::endl;
+    });
+    int iOk = -1;
+    QString sFinal;
+    QObject::connect(g_pRunner, &CDeepSeekRunner::sigFinished,
+        [&iOk, &sFinal](bool b, const QString& s, qint64, qint64, double,
+                        const QString&) {
+            iOk = b ? 1 : 0;
+            sFinal = s;
+        });
+    QTimer::singleShot(0, []() {
+        g_pRunner->StartStage(g_sWorkDir,
+            QStringLiteral("只回复两个字：成功"), QString(), 30, QString(), false, 0, false);
+    });
+    QTimer stGuard;
+    stGuard.setSingleShot(true);
+    QEventLoop stLoop;
+    QObject::connect(&stGuard, &QTimer::timeout, &stLoop, &QEventLoop::quit);
+    QObject::connect(g_pRunner, &CDeepSeekRunner::sigFinished, &stLoop, &QEventLoop::quit);
+    stGuard.start(25 * 60 * 1000);
+    stLoop.exec();
+    if (iOk != 1) {
+        g_out << "  [FAIL] 自愈后未成功完成一轮: ok=" << iOk
+              << " final=" << sFinal.left(200) << Qt::endl;
+        return 1;
+    }
+    // 终态校验：版本回基线 + 组合包可达
+    const QString sErrAfter = CDeepSeekRunner::DshConfigError();
+    if (!sErrAfter.isEmpty()) {
+        g_out << "  [FAIL] 修复后仍有配置错误: " << sErrAfter.left(120) << Qt::endl;
+        return 1;
+    }
+    g_out << "  == selfheal e2e PASS ==" << Qt::endl;
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     QCoreApplication app(argc, argv);
+    // --selfheal <DSH根>：端到端自愈验证（真实破坏→自动修复→跑通一轮）
+    if (argc > 2 && QByteArray(argv[1]) == "--selfheal") {
+        const QString sRootArg = QString::fromLocal8Bit(argv[2]);
+        CDeepSeekRunner::SetDshRootPath(sRootArg);
+        CDeepSeekRunner::SetDshNodePath(QString());   // 走 PATH
+        g_pRunner = new CDeepSeekRunner();
+        return RunSelfHealE2E(sRootArg);
+    }
     const QString sNode = (argc > 1) ? QString::fromLocal8Bit(argv[1])
         : QStringLiteral(R"(D:\Program Files\nodejs\node.exe)");
     const QString sBin = (argc > 2) ? QString::fromLocal8Bit(argv[2])
@@ -80,7 +150,89 @@ int main(int argc, char* argv[]) {
         g_out << "  step0 " << (g_iFail == 0 ? "PASS" : "FAIL") << Qt::endl;
     }
 
-    CDeepSeekRunner::SetDshProvider((argc > 4) ? QString::fromLocal8Bit(argv[4])
+    // —— 步骤0b（离线单测）：2026.09.01 自愈纯函数 ——
+    //   credentials 坏格式解析/渲染 + 空壳目录计算 + 构建残留清理（临时目录）。
+    {
+        g_out << "step0b: self-heal pure functions" << Qt::endl;
+        const int iFailBefore = g_iFail;
+        QStringList aPairs;
+        // 1) 块式包装（事故现场形态 version:1 + refs: 缩进块）
+        const QString sBad = QStringLiteral("version: 1\nrefs:\n"
+            "  GLM_CUSTOM_API_KEY: e94331c8-aaa\n"
+            "  LUSTER_API_KEY: cr_bb\n");
+        if (!CDeepSeekRunner::ParseWrappedCredentials(sBad, &aPairs)
+            || aPairs.size() != 2
+            || !aPairs[0].startsWith(QStringLiteral("GLM_CUSTOM_API_KEY	e94331c8-aaa"))) {
+            Fail(QStringLiteral("块式包装解析不符: %1").arg(aPairs.join(QStringLiteral(";"))));
+        }
+        // 2) flow map 包装（值带引号）+ 平铺渲染往返
+        const QString sBad2 = QStringLiteral("version: \"1\"\nrefs:\n"
+            "  { GLM_CUSTOM_API_KEY: \"k1\", LUSTER_API_KEY: k2 }\n");
+        QStringList aPairs2;
+        if (!CDeepSeekRunner::ParseWrappedCredentials(sBad2, &aPairs2)
+            || aPairs2.size() != 2
+            || !aPairs2[0].contains(QStringLiteral("k1"))) {
+            Fail(QStringLiteral("flow map 解析不符: %1").arg(aPairs2.join(QStringLiteral(";"))));
+        }
+        const QString sFlat = CDeepSeekRunner::RenderFlatCredentials(aPairs2);
+        if (!sFlat.contains(QStringLiteral("GLM_CUSTOM_API_KEY: k1"))
+            || !sFlat.contains(QStringLiteral("LUSTER_API_KEY: k2"))) {
+            Fail(QStringLiteral("平铺渲染不符: %1").arg(sFlat));
+        }
+        // 3) 平铺 / 仅 version 无 refs → 不动（false）
+        QStringList aP;
+        if (CDeepSeekRunner::ParseWrappedCredentials(
+                QStringLiteral("GLM_CUSTOM_API_KEY: v1\n"), &aP)) {
+            Fail(QStringLiteral("平铺格式不应被识别为坏格式"));
+        }
+        if (CDeepSeekRunner::ParseWrappedCredentials(
+                QStringLiteral("version: 1\n"), &aP)) {
+            Fail(QStringLiteral("仅 version 无 refs 不应产出迁移对"));
+        }
+        // 4) 空壳目录 + 5) 构建残留清理（临时目录）
+        QTemporaryDir stTmp;
+        if (!stTmp.isValid()) {
+            Fail(QStringLiteral("临时目录不可用"));
+        } else {
+            const QString sR = stTmp.path();
+            QDir().mkpath(sR + QStringLiteral("/packages/bundle/sdk-minimal/node_modules/d"));
+            QDir().mkpath(sR + QStringLiteral("/packages/bundle/base/src"));
+            QDir().mkpath(sR + QStringLiteral("/vendor/loader"));
+            QDir().mkpath(sR + QStringLiteral("/vendor/ghost"));
+            QDir().mkpath(sR + QStringLiteral("/apps/cli"));
+            QFile(sR + QStringLiteral("/packages/bundle/base/src/a.ts")).open(QIODevice::WriteOnly);
+            QFile(sR + QStringLiteral("/vendor/loader/README.md")).open(QIODevice::WriteOnly);
+            QFile(sR + QStringLiteral("/apps/cli/package.json")).open(QIODevice::WriteOnly);
+            const QStringList aHollow = CDeepSeekRunner::ComputeHollowDirs(
+                sR, QStringLiteral("packages/bundle/base/src/a.ts\n"
+                    "vendor/loader/README.md\n"
+                    "apps/cli/package.json\n"));
+            const QString sAll = aHollow.join(QStringLiteral(";"));
+            if (!sAll.contains(QStringLiteral("packages/bundle/sdk-minimal"))
+                || !sAll.contains(QStringLiteral("vendor/ghost"))
+                || sAll.contains(QStringLiteral("bundle/base"))
+                || sAll.contains(QStringLiteral("vendor/loader"))
+                || sAll.contains(QStringLiteral("apps/cli"))) {
+                Fail(QStringLiteral("空壳目录计算不符: %1").arg(sAll));
+            }
+            QDir().mkpath(sR + QStringLiteral("/packages/bundle/base/lib"));
+            QDir().mkpath(sR + QStringLiteral("/packages/bundle/base/node_modules/keep/lib"));
+            QFile(sR + QStringLiteral("/packages/bundle/base/lib/a.js")).open(QIODevice::WriteOnly);
+            QFile(sR + QStringLiteral("/packages/bundle/base/x.tsbuildinfo")).open(QIODevice::WriteOnly);
+            QFile(sR + QStringLiteral("/packages/bundle/base/node_modules/keep/lib/b.js")).open(QIODevice::WriteOnly);
+            CDeepSeekRunner::CleanBuildResidue(sR);
+            if (QFile::exists(sR + QStringLiteral("/packages/bundle/base/lib/a.js"))
+                || QFile::exists(sR + QStringLiteral("/packages/bundle/base/x.tsbuildinfo"))) {
+                Fail(QStringLiteral("lib/tsbuildinfo 残留未清"));
+            }
+            if (!QFile::exists(sR + QStringLiteral("/packages/bundle/base/node_modules/keep/lib/b.js"))) {
+                Fail(QStringLiteral("node_modules 内部被误清"));
+            }
+        }
+        g_out << "  step0b " << (g_iFail == iFailBefore ? "PASS" : "FAIL") << Qt::endl;
+    }
+
+CDeepSeekRunner::SetDshProvider((argc > 4) ? QString::fromLocal8Bit(argv[4])
                                                : QStringLiteral("glm-custom"));
     CDeepSeekRunner::SetDshModel((argc > 5) ? QString::fromLocal8Bit(argv[5])
                                             : QStringLiteral("glm-5.2"));
