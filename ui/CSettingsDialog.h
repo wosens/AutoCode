@@ -31,8 +31,11 @@ public:
     // a_pPm 仅用于构造时读当前值（非拥有；空指针时全部用默认值）。
     //   a_fnBackendBusy：后端版本管理对话框的 D6 运行中拦截判据（由 CMainWindow
     //   注入；空=放行，测试场景）。
+    // a_sTaskScope：2026.09.09 v2.1.143 任务级配置覆盖——并空时选中任务名，标题提示
+    //   本次读/写均落在任务档（.autodev/tasks/<id>/config.ini）；空=全局 config.ini。
     explicit CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent = nullptr,
-                             CVersionDialog::FBusyCheck a_fnBackendBusy = {});
+                             CVersionDialog::FBusyCheck a_fnBackendBusy = {},
+                             const QString& a_sTaskScope = QString());
 
     // —— 确定后由主窗口读取并落盘/应用 ——
     int     MaxIter() const;
@@ -103,6 +106,12 @@ private:
     void UpdateDshEnabled();   // 后端下拉联动：DSH 参数子组按选择启用/禁用
     // 2026.09 后端版本管理入口（任务 23183ccb）：Agent 组按钮 → CVersionDialog。
     void OnVersionManage();
+    // 2026.09.10 公共模型配置（四后端共享同一份模型列表与当前项）：
+    //   构造回填后把四张表合并归一到四个成员（两两相等）；任一页的增/改/删/
+    //   设为当前经 ShareModelsFromPage 同步到其余三页。保存时主窗口把同一份
+    //   内容写回四张节（[DshModels]/[PiModels]/[CodexModels]/[HermesModels]）。
+    void UnifySharedModels();
+    void ShareModelsFromPage(int a_iPage);   // 0=DSH 1=Pi 2=Codex 3=Hermes
     // 2026.08.18 自定义大模型列表维护（DSH 页）：列表文本/按钮态刷新 + 增改删/设为当前。
     void RefreshDshModelList();
     // 2026.08.19 列表改 QTreeWidget 后的当前行号（-1=无/占位行）。

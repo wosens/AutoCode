@@ -72,7 +72,10 @@ public:
     static void SetPiModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
     static QString PiActiveProvider();    // 激活条目 provider 键（autocode-<n>）；无激活=空
     static QString PiActiveModelId();     // 激活条目模型 id；无激活=空
-    static QString PiModelsJsonPath();    // ~/.pi/agent/models.json
+    static QString PiModelsJsonPath();
+    // 2026.09.09 v2.1.133 测试隔离：单测/端到端测试把 models.json 指到临时路径，
+    //   杜绝测试写盘污染真实 ~/.pi（该类误踩已三犯：陈旧表被测试还原动作带回）。空=真实路径。
+    static void SetModelsJsonPathOverrideForTest(const QString& a_sPath);    // ~/.pi/agent/models.json
     static bool    WritePiModelsJson();   // 合并写 models.json（true=写成功/无需写）
     static QString PiSettingsJsonPath();  // ~/.pi/agent/settings.json
     // 2026.08.28 429 TPM/RPM 限流自愈：pi 轮级自动重试（settings.retry，默认 3 次、

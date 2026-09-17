@@ -43,6 +43,9 @@ public:
     void UpdateTaskRow(CTaskInfo* a_pTask);
     // 在当前表查找并选中指定任务（启动任务时自动选中，使其日志立即显示）。
     void SelectTask(CTaskInfo* a_pTask);
+    // 2026.09.10 v2.2.153 在历史表查找并选中指定任务：任务终态归档后调用，切「历史任务」
+    //   页并选中刚结束的任务（发选中信号 → 显示其任务日志，与 SelectTask 对称）。
+    void SelectHistoryTask(CTaskInfo* a_pTask);
     CTaskInfo* CurrentTask() const { return m_pCur; }
 
     // FR-3：暴露顶部菜单条容器布局，供 CMainWindow::CreateMenus 注入「工程(&P)」「功能(&F)」菜单。

@@ -547,11 +547,10 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
                     QStringLiteral("远端未找到可识别的版本 tag，未做任何修改。"));
                 return;
             }
-            // 2026.09.01 版本兼容硬约束（同 codex 锁 0.87.0 先例，但 DSH 是“上限锁”）：
-            //   AutoCode 集成（组合 cordis.yml + jsonrpc-demo 入口 + 示例包）绑死
-            //   SupportedDshTag 基线的包结构，上游 dsh-v0.1.2 起移除全部示例包——
-            //   更新过去任务握手必炸（实测：更新到 0.1.2-alpha.3 后任务反复失败）。
-            //   高于基线的 tag 一律阻断，适配新版后再抬常量。
+            // 2026.09.10 版本闸门更新：AutoCode 已双布局适配上游官方 SDK profile
+            //   （Legacy ≤0.1.1 / Profile ≥0.1.2，EDshLayout 判型 + --profile sdk
+            //   --patch 组合层），基线抬升到 dsh-v0.1.5-alpha.1。仍保留上限闸：
+            //   高于基线的 tag 可能再次破坏兼容，一律阻断待适配。
             const QVersionNumber vTarget = QVersionNumber::fromString(
                 TagToVersion(sTag));
             if (!vTarget.isNull()
@@ -559,9 +558,6 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
                 QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
                     QStringLiteral(
                         "目标版本 %1 高于 AutoCode 集成受支持的 %2。\n\n"
-                        "上游 dsh-v0.1.2 起移除了 AutoCode 组合依赖的全部示例包"
-                        "（含 dsh-agent-spine-demo），更新后 DSH 任务将无法启动"
-                        "（ERR_MODULE_NOT_FOUND）。\n\n"
                         "未做任何修改；待 AutoCode 适配新版后开放更新，或使用"
                         "基线版本 %2。")
                         .arg(sTag, CDeepSeekRunner::SupportedDshTag()));

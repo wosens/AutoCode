@@ -17,6 +17,8 @@ public:
 
     // 主窗口最大化/还原时调用，切换最大化按钮二态图标。
     void SetMaximized(bool a_bMaximized);
+    // 2026.09.07 标题文本动态化：主窗口按当前工程刷标题（工程名-AutoCode，未开工程=AutoCode）。
+    void SetTitleText(const QString& a_sText);
     // 需求6：返回按钮当前图标态——m_bMaximized==true 表示当前显示「还原」图标(□，即窗口已最大化)。
     //   最大化按钮据此判翻转方向（图标是还原图标→还原窗口，反之最大化）。命名避开 IsMaximized
     //   （与 <windowsx.h> 的 IsMaximized(hwnd) 宏撞名致 C4003）。

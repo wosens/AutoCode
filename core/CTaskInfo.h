@@ -27,6 +27,14 @@ public:
 
     explicit CTaskInfo(QObject* a_pParent = nullptr);
 
+    // 2026.09.10 v2.2.152 自动命名选行修复（实害：Git 工具任务 11 条编号需求，
+//   「最长行优先」启发式选中 79 字压线的第 7 条细节条款，抠出首子句「资源管理器
+//   右键菜单增加」当任务名，主旨全丢）：从用户原始需求提取任务名——**首个非空行
+//   （总起句）优先**，剥行首编号与「我想/请帮我…开发/创建…一个」引导语后取首子句；
+//   首行泛型/太短时退「最长且 ≤80 字」行（旧策略降为退路）。返回可能为空（无可用
+//   素材，调用方走 guide 标题兜底）。纯字符串逻辑，单测直接覆盖（test_execpanel）。
+static QString ExtractNameFromRequest(const QString& a_sReq);
+
     // —— 基础属性 ——
     QString Id() const { return m_sId; }
     void SetId(const QString& a_sId) { m_sId = a_sId; }

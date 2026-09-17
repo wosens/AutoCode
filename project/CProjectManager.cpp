@@ -1,6 +1,7 @@
 ﻿#include "CProjectManager.h"
 
 #include <QDir>
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
 #include <QTextStream>
@@ -13,6 +14,7 @@
 #include <QThread>   // 2026.08.22 blob 临时名防并发碰撞（线程 id 掺入）
 #include <thread>     // 2026.08.26 指纹同步后台线程（大工程扫描不阻塞 UI）
 #include <QSet>
+#include <vector>    // 2026.09.09 v2.1.143 任务级配置覆盖（MergeFillTaskConfig 节枚举缓冲）
 
 #include <zstd.h>       // 备份压缩（#2）：第三方静态库 libzstd_static，逐文件 zstd 压缩/解压
 #include <Windows.h>
@@ -610,10 +612,14 @@ void CProjectManager::AddRecent(const QString& a_sDir) {
     const QString sCmp = NormalizePath(sStored);
 
     // 去重：已存在则先移除旧条目（按规范化的统一形式比较）。
-    for (int i = 0; i < m_aRecentProjects.size(); ++i) {
+    // 2026.09.09 v2.1.139 改移除【全部】匹配：旧版 removeAt 后 break 只删首个——
+    //   历史上 LoadRecent 叠加 bug（见 LoadRecent 注释）在列表里留下过同名重复项，
+    //   只删首个会残留副本继续被落盘。
+    for (int i = 0; i < m_aRecentProjects.size(); ) {
         if (NormalizePath(m_aRecentProjects.at(i)) == sCmp) {
             m_aRecentProjects.removeAt(i);
-            break;
+        } else {
+            ++i;
         }
     }
     m_aRecentProjects.prepend(sStored);
@@ -627,14 +633,16 @@ QStringList CProjectManager::RecentProjects() const {
 
 void CProjectManager::RemoveRecent(const QString& a_sDir) {
     // 2026.08.20 与 AddRecent 同口径：按规范化路径比较，命中即删；不存在 no-op。
+    //   2026.09.09 v2.1.139 同 AddRecent 改删全部匹配（防叠加 bug 残留重复项）。
     if (a_sDir.isEmpty()) {
         return;
     }
     const QString sCmp = NormalizePath(QDir::cleanPath(a_sDir));
-    for (int i = 0; i < m_aRecentProjects.size(); ++i) {
+    for (int i = 0; i < m_aRecentProjects.size(); ) {
         if (NormalizePath(m_aRecentProjects.at(i)) == sCmp) {
             m_aRecentProjects.removeAt(i);
-            break;
+        } else {
+            ++i;
         }
     }
     SaveRecent();
@@ -642,6 +650,110 @@ void CProjectManager::RemoveRecent(const QString& a_sDir) {
 
 void CProjectManager::ClearRecent() {
     m_aRecentProjects.clear();
+}
+
+// —— 多实例工程锁（2026.09.07 v2.1.123；说明见 CProjectManager.h 同名节）——
+QString CProjectManager::ProjectLockPath(const QString& a_sProjectDir) {
+    if (a_sProjectDir.trimmed().isEmpty()) {
+        return QString();
+    }
+    return QDir::cleanPath(a_sProjectDir) + QStringLiteral("/.autodev/instance.lock");
+}
+
+bool CProjectManager::ReadProjectLock(const QString& a_sProjectDir, SProjectLock* a_pOut) {
+    const QString sLock = ProjectLockPath(a_sProjectDir);
+    if (sLock.isEmpty()) {
+        return false;
+    }
+    QFile fLock(sLock);
+    if (!fLock.open(QIODevice::ReadOnly)) {
+        return false;   // 无锁/不可读（无 .autodev 时同此）
+    }
+    const QJsonObject o = QJsonDocument::fromJson(fLock.readAll()).object();
+    if (a_pOut != nullptr) {
+        a_pOut->iPid     = o.value(QStringLiteral("pid")).toVariant().toLongLong();
+        a_pOut->sExe     = o.value(QStringLiteral("exe")).toString();
+        a_pOut->sStarted = o.value(QStringLiteral("started")).toString();
+    }
+    return o.value(QStringLiteral("pid")).toVariant().toLongLong() > 0;
+}
+
+bool CProjectManager::IsLockHolderAlive(const SProjectLock& a_stLock) {
+    // 自 pid / 无 pid：对「他实例在席」判定而言不算占用。
+    if (a_stLock.iPid <= 0
+            || a_stLock.iPid == static_cast<qint64>(::GetCurrentProcessId())) {
+        return false;
+    }
+    HANDLE hProc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                 static_cast<DWORD>(a_stLock.iPid));
+    if (hProc == nullptr) {
+        // 打开失败：拒绝访问 = 进程存在但无权限（他人/提权）→ 保守当活；
+        // 参数错等 = PID 已不存在 → 陈旧锁。
+        return (::GetLastError() == ERROR_ACCESS_DENIED);
+    }
+    DWORD dwExit = 0;
+    const BOOL bExitOk = ::GetExitCodeProcess(hProc, &dwExit);
+    WCHAR wszImage[MAX_PATH] = {0};
+    DWORD dwImageLen = MAX_PATH;
+    QString sImage;
+    if (::QueryFullProcessImageNameW(hProc, 0, wszImage, &dwImageLen) != FALSE) {
+        sImage = QString::fromWCharArray(wszImage, static_cast<int>(dwImageLen));
+    }
+    ::CloseHandle(hProc);
+    if (!bExitOk || dwExit != STILL_ACTIVE) {
+        return false;   // 已退出（崩溃/强杀残留锁）
+    }
+    // PID 复用复核：锁主必须是 AutoCode 系进程（AutoCode.exe / AutoCode1.exe …），
+    //   否则视为 PID 被无关进程回收的陈旧锁。
+    if (!sImage.isEmpty() && !QFileInfo(sImage).fileName().startsWith(
+            QStringLiteral("AutoCode"), Qt::CaseInsensitive)) {
+        return false;
+    }
+    return true;
+}
+
+void CProjectManager::WriteProjectLock(const QString& a_sProjectDir) {
+    const QString sLock = ProjectLockPath(a_sProjectDir);
+    if (sLock.isEmpty()) {
+        return;
+    }
+    QDir().mkpath(QFileInfo(sLock).absolutePath());   // .autodev 兜底（常规路径已建）
+    QJsonObject o;
+    o[QStringLiteral("pid")]     = static_cast<double>(::GetCurrentProcessId());
+    o[QStringLiteral("exe")]     = QCoreApplication::applicationFilePath();
+    o[QStringLiteral("started")] = QDateTime::currentDateTime().toString(
+        QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    QFile fLock(sLock);
+    if (fLock.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        fLock.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+        fLock.close();
+    }
+}
+
+void CProjectManager::ReleaseProjectLock(const QString& a_sProjectDir) {
+    SProjectLock st;
+    if (!ReadProjectLock(a_sProjectDir, &st)) {
+        return;
+    }
+    if (st.iPid != static_cast<qint64>(::GetCurrentProcessId())) {
+        return;   // 非本进程的锁（他实例在席/陈旧）不动，由后继打开者接管
+    }
+    QFile::remove(ProjectLockPath(a_sProjectDir));
+}
+
+bool CProjectManager::IsProjectHeldByOther(const QString& a_sProjectDir, QString* a_pDesc) {
+    SProjectLock st;
+    if (!ReadProjectLock(a_sProjectDir, &st) || !IsLockHolderAlive(st)) {
+        return false;
+    }
+    if (a_pDesc != nullptr) {
+        *a_pDesc = QStringLiteral("PID %1 · %2 · 启动于 %3")
+                       .arg(st.iPid)
+                       .arg(st.sExe.isEmpty() ? QStringLiteral("AutoCode")
+                                              : QFileInfo(st.sExe).fileName())
+                       .arg(st.sStarted.isEmpty() ? QStringLiteral("?") : st.sStarted);
+    }
+    return true;
 }
 
 QString CProjectManager::LastBrowseDir() const {
@@ -685,6 +797,228 @@ QString CProjectManager::ConfigFilePath() const {
     return QDir::cleanPath(stDir.absolutePath() + QStringLiteral("/config.ini"));
 }
 
+// —— 任务级配置覆盖（2026.09.09 v2.1.143，说明见 CProjectManager.h 同名节）——
+QString CProjectManager::SettingsCfgPath() const {
+    return m_sTaskCfgFile.isEmpty() ? ConfigFilePath() : m_sTaskCfgFile;
+}
+
+void CProjectManager::MergeFillTaskConfig() {
+    // 只补缺、从不覆盖任务已有键：按节枚举全局 config.ini 的键，任务档缺失则回填。
+    //   节清单=设置页管理的运行参数节（[Agent]/[Review]/[Adhoc]/[Scan]/[Backup] 与四张
+    //   模型表）；[Recent]/[UI]/[Window]/[Layout] 等界面态不参与（恒全局）。
+    if (m_sTaskCfgFile.isEmpty() || m_sProjectDir.isEmpty()) {
+        return;
+    }
+    const QString sGlobal = ConfigFilePath();
+    if (sGlobal.isEmpty()) {
+        return;
+    }
+    static const wchar_t* const k_aSections[] = {
+        L"Agent", L"Policy", L"Review", L"Adhoc", L"Scan", L"Backup",
+    };   // 四张模型表不参与键级回填（Count 列表节会被冻结）——读侧走 TableCfgPath
+        // 整表活回退、写侧走 SyncModelTableToGlobal 超集同步（v2.1.144）。
+    const std::wstring wsGlobal = sGlobal.toStdWString();
+    const std::wstring wsTask = m_sTaskCfgFile.toStdWString();
+    std::vector<wchar_t> aBuf(32768);
+    for (const wchar_t* pSect : k_aSections) {
+        const DWORD dwN = GetPrivateProfileSectionW(pSect, aBuf.data(),
+                                                    static_cast<DWORD>(aBuf.size()),
+                                                    wsGlobal.c_str());
+        if (dwN == 0) {
+            continue;
+        }
+        // 缓冲格式 "k=v\0k=v\0...\0\0"；逐键查任务档，缺才回填。
+        const QString sSect = QString::fromWCharArray(pSect);
+        size_t iPos = 0;
+        while (iPos < dwN) {
+            const QString sPair = QString::fromWCharArray(aBuf.data() + iPos);
+            iPos += sPair.size() + 1;
+            const int iEq = sPair.indexOf(QLatin1Char('='));
+            if (iEq <= 0) {
+                continue;
+            }
+            const QString sKey = sPair.left(iEq);
+            const QString sVal = sPair.mid(iEq + 1);
+            wchar_t szProbe[8] = {0};
+            GetPrivateProfileStringW(pSect, sKey.toStdWString().c_str(), L"\x01",
+                                     szProbe, 8, wsTask.c_str());
+            if (szProbe[0] == L'\x01') {   // 任务档缺键 → 回填全局值
+                WritePrivateProfileStringW(pSect, sKey.toStdWString().c_str(),
+                                           sVal.toStdWString().c_str(), wsTask.c_str());
+            }
+        }
+    }
+}
+
+void CProjectManager::SetTaskConfigOverlay(const QString& a_sTaskId) {
+    m_sTaskCfgFile.clear();
+    if (m_sProjectDir.isEmpty() || a_sTaskId.trimmed().isEmpty()) {
+        return;
+    }
+    const QString sId = a_sTaskId.trimmed();
+    QDir().mkpath(TaskDir(sId));
+    m_sTaskCfgFile = QDir::cleanPath(TaskDir(sId) + QStringLiteral("/config.ini"));
+    MergeFillTaskConfig();
+}
+
+QString CProjectManager::TableCfgPath(const wchar_t* a_pSect) const {
+    // 2026.09.09 v2.1.144 模型表列表级读路径：覆盖激活且任务档已有本表（Count 键
+    //   存在）→ 任务表；否则实时回退全局表（任务未显式保存过模型配置 = 跟随缺省
+    //   超集；键级合并回填不适用于 Count/M<i> 列表节——全局后续新增条目无法穿过
+    //   已冻结的 Count，故改为整表活回退）。
+    if (!m_sTaskCfgFile.isEmpty()) {
+        const int iCnt = GetPrivateProfileIntW(a_pSect, L"Count", -1,
+                                               m_sTaskCfgFile.toStdWString().c_str());
+        if (iCnt >= 0) {
+            return m_sTaskCfgFile;
+        }
+    }
+    return ConfigFilePath();
+}
+
+QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
+                                                      const wchar_t* a_pSect,
+                                                      int* a_pActive) const {
+    // 2026.09.09 v2.1.144 从 LoadPiModels 泛化（四张模型表同构，仅节名不同）。
+    QList<SDshModelEntry> aModels;
+    if (a_pActive) {
+        *a_pActive = -1;
+    }
+    if (a_sPath.isEmpty()) {
+        return aModels;
+    }
+    const std::wstring wsPath = a_sPath.toStdWString();
+    const int iCount = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Count", 0, wsPath.c_str()));
+    if (iCount <= 0) {
+        return aModels;
+    }
+    wchar_t szBuf[1024] = { 0 };
+    for (int i = 0; i < iCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            const DWORD dwCopied = GetPrivateProfileStringW(a_pSect, wsKey.c_str(), L"",
+                                                            szBuf, 1024, wsPath.c_str());
+            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        };
+        SDshModelEntry stE;
+        stE.sDisp    = fnReadStr(L"Disp");
+        stE.sBaseURL = fnReadStr(L"URL");
+        stE.sApiKey  = fnReadStr(L"Key");
+        stE.sApi     = fnReadStr(L"Api");
+        stE.sModelId = fnReadStr(L"Model");
+        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        if (stE.iCtx <= 0) {
+            stE.iCtx = 200000;
+        }
+        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        if (stE.iMaxTok <= 0) {
+            stE.iMaxTok = 32768;
+        }
+        if (stE.sApi.isEmpty()) {
+            stE.sApi = QStringLiteral("anthropic-messages");
+        }
+        if (stE.sDisp.isEmpty()) {
+            stE.sDisp = stE.sModelId;
+        }
+        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
+            continue;   // 无模型 id / 请求地址的残缺条目不进表
+        }
+        aModels.append(stE);
+    }
+    if (a_pActive) {
+        const int iActive = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Active", -1, wsPath.c_str()));
+        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
+        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
+            *a_pActive = 0;
+        }
+    }
+    return aModels;
+}
+
+bool CProjectManager::SaveModelsTo(const QString& a_sPath, const wchar_t* a_pSect,
+                                   const QList<SDshModelEntry>& a_aModels, int a_iActive) {
+    // 2026.09.09 v2.1.144 从 SavePiModels 泛化（含缩短后的高位键清理）。
+    if (a_sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = a_sPath.toStdWString();
+    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Count", 0, wsPath.c_str()));
+    const int iNewCount = a_aModels.size();
+    WritePrivateProfileStringW(a_pSect, L"Count",
+                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
+            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
+            WritePrivateProfileStringW(a_pSect, wsKey.c_str(),
+                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
+        };
+        fnWrite(L"Disp",  stE.sDisp);
+        fnWrite(L"URL",   stE.sBaseURL);
+        fnWrite(L"Key",   stE.sApiKey);
+        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
+        fnWrite(L"Model", stE.sModelId);
+        fnWrite(L"Ctx",   QString::number(stE.iCtx));
+        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    }
+    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
+        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
+        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
+            const std::wstring wsKey = wsPrefix + lpszSuffix;
+            WritePrivateProfileStringW(a_pSect, wsKey.c_str(), nullptr, wsPath.c_str());
+        }
+    }
+    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
+    WritePrivateProfileStringW(a_pSect, L"Active",
+                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    return true;
+}
+
+void CProjectManager::SyncModelTableToGlobal(const wchar_t* a_pSect,
+                                             const QList<SDshModelEntry>& a_aModels,
+                                             int a_iActive) {
+    // 2026.09.09 v2.1.144 全局超集同步（用户需求：缺省配置始终保有最多的模型配置）：
+    //   任务态保存的模型表同时并入全局——同身份（URL+Api+ModelId 忽略大小写）以任务
+    //   表内容更新、新身份追加、从不删除全局条目；全局 Active 保持原值（仅全局表
+    //   原本为空时采用任务表 Active，确保缺省配置自身可用）。未激活覆盖=本来就写
+    //   全局，直接返回；空表不反向写（防任务清表误清空全局）。
+    if (m_sTaskCfgFile.isEmpty() || a_aModels.isEmpty()) {
+        return;
+    }
+    const QString sGlobal = ConfigFilePath();
+    if (sGlobal.isEmpty()) {
+        return;
+    }
+    auto fnIdent = [](const SDshModelEntry& a_stE) -> QString {
+        return a_stE.sBaseURL.trimmed().toLower() + QLatin1Char('|')
+             + a_stE.sApi.trimmed().toLower() + QLatin1Char('|')
+             + a_stE.sModelId.trimmed().toLower();
+    };
+    int iGlobalActive = -1;
+    const QList<SDshModelEntry> aGlobal = LoadModelsFrom(sGlobal, a_pSect, &iGlobalActive);
+    QList<SDshModelEntry> aMerged = aGlobal;
+    for (const SDshModelEntry& stE : a_aModels) {
+        const QString sId = fnIdent(stE);
+        bool bReplaced = false;
+        for (int j = 0; j < aMerged.size(); ++j) {
+            if (fnIdent(aMerged.at(j)) == sId) {
+                aMerged[j] = stE;   // 同身份 → 以任务表内容更新
+                bReplaced = true;
+                break;
+            }
+        }
+        if (!bReplaced) {
+            aMerged.append(stE);   // 新身份 → 追加（全局只增不减）
+        }
+    }
+    const int iMergedActive = aGlobal.isEmpty()
+        ? ((a_iActive >= 0 && a_iActive < aMerged.size()) ? a_iActive : -1)
+        : iGlobalActive;
+    SaveModelsTo(sGlobal, a_pSect, aMerged, iMergedActive);
+}
+
 void CProjectManager::SaveRecent() {
     // 落盘失败不抛、不退出（NFR-3.3）；内存列表已更新，本会话仍可用。
     const QString sPath = ConfigFilePath();
@@ -694,24 +1028,30 @@ void CProjectManager::SaveRecent() {
     const std::wstring wsPath = sPath.toStdWString();
     const std::wstring wsSect = std::wstring(L"Recent");
 
-    const int iCount = m_aRecentProjects.size();
-    WritePrivateProfileStringW(wsSect.c_str(), L"Count",
-                               QString::number(iCount).toStdWString().c_str(),
-                               wsPath.c_str());
-
-    for (int i = 0; i < iCount; ++i) {
-        // ini 中 1 = 最近（MRU），索引 0 → key "1"。
-        const QString sKey = QString::number(i + 1);
-        const QString sVal = m_aRecentProjects.at(i);
-        WritePrivateProfileStringW(wsSect.c_str(),
-                                   sKey.toStdWString().c_str(),
-                                   sVal.toStdWString().c_str(),
-                                   wsPath.c_str());
+    // 2026.09.09 v2.1.140 改 WritePrivateProfileSectionW 整节替换：旧版逐键写只增不删，
+    //   列表缩短后高位残留键永留文件（[Recent] 膨胀事故里 1.1MB 残体正是这么留下的，
+    //   profile 每次读都要扫全段）；整节替换会把未出现在新缓冲里的键全部删除（MSDN），
+    //   一次调用收敛文件——旧实例投毒后的高位键在本实例下一次保存时即被清干净。
+    //   缓冲格式："k=v\0k=v\0...\0\0"（wstring 自带尾部终止符补出双 null）。
+    // ini 中 1 = 最近（MRU），索引 0 → key "1"。
+    QString sBody = QStringLiteral("Count=%1").arg(m_aRecentProjects.size());
+    for (int i = 0; i < m_aRecentProjects.size(); ++i) {
+        sBody += QChar(u'\0');
+        sBody += QStringLiteral("%1=%2").arg(i + 1).arg(m_aRecentProjects.at(i));
     }
+    const std::wstring wsBody = sBody.toStdWString();
+    WritePrivateProfileSectionW(wsSect.c_str(), wsBody.c_str(), wsPath.c_str());
 }
 
 void CProjectManager::LoadRecent() {
     // config.ini 不存在 → GetPrivateProfileInt 返回默认值 0 → 列表空（NFR-2.4）。
+    // 2026.09.09 v2.1.139 修「启动极慢 + 最近列表膨胀到两万条」勿回退：
+    //   ① 先 clear()——旧版直接在既有列表上 prepend，而 v2.1.123 起 OnConfigFileChanged
+    //     热同步会多次调本函数，多实例共享 config 时每次热重载都把全量列表再叠一遍
+    //     （内存滚雪球，叠出重复项后被 SaveRecent 全量落盘——副本 config 实测膨胀到
+    //     21744 条/1.1MB，启动仅 LoadRecent 就要两万余次 profile 读）；
+    //   ② 载入即按 NormalizePath 去重（保首个＝MRU 最新），旧档里的历史重复项自此
+    //     自愈，配合 AddRecent/RemoveRecent 的「删全部匹配」双保险。
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return;
@@ -719,27 +1059,52 @@ void CProjectManager::LoadRecent() {
     const std::wstring wsPath = sPath.toStdWString();
     const std::wstring wsSect = std::wstring(L"Recent");
 
-    const int iCount = GetPrivateProfileIntW(wsSect.c_str(), L"Count", 0, wsPath.c_str());
-    if (iCount <= 0) {
-        return;
-    }
+    const int iCountCfg = GetPrivateProfileIntW(wsSect.c_str(), L"Count", 0, wsPath.c_str());
+    m_aRecentProjects.clear();
 
-    // ini 中 1 = 最近（MRU）；逆序 prepend 重建，使 1 落到列表最前。
-    for (int i = iCount; i >= 1; --i) {
+    QStringList aLoaded;
+    QSet<QString> aSeen;
+    auto fnReadKey = [&wsSect, &wsPath](int a_iIdx) -> QString {
         wchar_t szBuf[MAX_PATH] = {0};
         const DWORD dwCopied = GetPrivateProfileStringW(
             wsSect.c_str(),
-            QString::number(i).toStdWString().c_str(),
+            QString::number(a_iIdx).toStdWString().c_str(),
             L"",
             szBuf, MAX_PATH, wsPath.c_str());
-        if (dwCopied == 0) {
-            continue;
+        return dwCopied == 0 ? QString()
+                              : QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
+    };
+    // ini 中 1 = 最近（MRU）；顺序读入保序，重复路径（规范化后相同）只留首个。
+    if (iCountCfg > 0) {
+        for (int i = 1; i <= iCountCfg; ++i) {
+            const QString sVal = fnReadKey(i);
+            if (sVal.isEmpty()) {
+                continue;
+            }
+            const QString sKey = NormalizePath(sVal);
+            if (!aSeen.contains(sKey)) {
+                aSeen.insert(sKey);
+                aLoaded.append(sVal);
+            }
         }
-        const QString sVal = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
-        if (!sVal.isEmpty()) {
-            m_aRecentProjects.prepend(sVal);
+    } else {
+        // 2026.09.09 v2.1.142 Count 键丢失/损坏兑底：如节头同行粘连（换行丢失后
+        //   「[Recent]Count=52」整行被解析器当节头、Count 永远读不到——今日数据修复
+        //   脚本实害，用户表现为「最近打开列表凭空消失」）但编号键仍在时，顺序探测
+        //   重建（首个缺号即止，上限 1000 防坏档拖死启动）；正常空表仅一次探测零开销。
+        for (int i = 1; i <= 1000; ++i) {
+            const QString sVal = fnReadKey(i);
+            if (sVal.isEmpty()) {
+                break;
+            }
+            const QString sKey = NormalizePath(sVal);
+            if (!aSeen.contains(sKey)) {
+                aSeen.insert(sKey);
+                aLoaded.append(sVal);
+            }
         }
     }
+    m_aRecentProjects = aLoaded;
 }
 
 bool CProjectManager::SaveWindowGeometry(const QRect& a_stGeometry, bool a_bMaximized) {
@@ -916,7 +1281,7 @@ QByteArray CProjectManager::LoadVSplitState() {
 
 bool CProjectManager::SaveAutoCompactPct(int a_iPct) {
     // 2026.08.15 比例制：落 [Adhoc] AutoCompactPct（替代已删除的 [Adhoc] AutoCompact 千 token 档位）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -928,7 +1293,7 @@ bool CProjectManager::SaveAutoCompactPct(int a_iPct) {
 
 int CProjectManager::LoadAutoCompactPct() const {
     // 无 config.ini / 缺键 → 默认 75；非法值（<10 或 >95）兜底回 75。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 75;
     }
@@ -954,7 +1319,7 @@ int CProjectManager::AutoCompactKFor(const QString& a_sModel) const {
 
 bool CProjectManager::SaveMaxIter(int a_iN) {
     // 落 [Policy] MaxIter（单阶段最大迭代次数）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -966,7 +1331,7 @@ bool CProjectManager::SaveMaxIter(int a_iN) {
 
 int CProjectManager::LoadMaxIter() {
     // 无 config.ini/缺键 → 默认 3；非法值（<1 或 >9）兜底回 3。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 3;
     }
@@ -977,7 +1342,7 @@ int CProjectManager::LoadMaxIter() {
 
 bool CProjectManager::SaveMaxResume(int a_iN) {
     // 落 [Policy] MaxResume（驳回后单阶段最大续跑次数）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -989,7 +1354,7 @@ bool CProjectManager::SaveMaxResume(int a_iN) {
 
 int CProjectManager::LoadMaxResume() {
     // 无 config.ini/缺键 → 默认 3；非法值（<1 或 >9）兜底回 3。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 3;
     }
@@ -1000,7 +1365,7 @@ int CProjectManager::LoadMaxResume() {
 
 bool CProjectManager::SaveReviewResume(int a_iN) {
     // 落 [Policy] ReviewResume（评审阶段驳回后最大续跑次数）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1012,7 +1377,7 @@ bool CProjectManager::SaveReviewResume(int a_iN) {
 
 int CProjectManager::LoadReviewResume() {
     // 无 config.ini/缺键 → 默认 1；非法值（<1 或 >9）兜底回 1。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 1;
     }
@@ -1025,7 +1390,7 @@ bool CProjectManager::SaveAgentBackend(int a_iBackend) {
     // 2026.08.18 落 [Agent] Backend（1=claude，2=dsh，3=pi）；
     // 2026.08.21 修：扩展 4=codex——旧实现 1..3 钳位把 Codex 兜底改写回 1，
     //   表现为「设置页选 CodexHarness 确认后无效」（其余键正常落盘）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1040,7 +1405,7 @@ bool CProjectManager::SaveAgentBackend(int a_iBackend) {
 int CProjectManager::LoadAgentBackend() {
     // 2026.08.18 无 config.ini/缺键 → 默认 1（claude）；仅认合法值，其余兜底 1。
     // 2026.08.21 修：同 SaveAgentBackend 扩展 4=codex（旧 1..3 钳位读不回 4）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 1;
     }
@@ -1080,51 +1445,51 @@ static QString LoadDshStrKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey
 }
 
 bool CProjectManager::SaveDshRoot(const QString& a_sRoot) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshRoot", a_sRoot);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshRoot", a_sRoot);
 }
 
 QString CProjectManager::LoadDshRoot() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshRoot", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"DshRoot", QString());
 }
 
 bool CProjectManager::SaveDshNodePath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshNodePath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshNodePath", a_sPath);
 }
 
 QString CProjectManager::LoadDshNodePath() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshNodePath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"DshNodePath", QString());
 }
 
 bool CProjectManager::SaveDshBinJsPath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshBinJsPath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshBinJsPath", a_sPath);
 }
 
 QString CProjectManager::LoadDshBinJsPath() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshBinJsPath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"DshBinJsPath", QString());
 }
 
 bool CProjectManager::SaveDshCordisPath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshCordisPath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshCordisPath", a_sPath);
 }
 
 QString CProjectManager::LoadDshCordisPath() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshCordisPath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"DshCordisPath", QString());
 }
 
 bool CProjectManager::SaveDshProvider(const QString& a_sProvider) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshProvider", a_sProvider);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshProvider", a_sProvider);
 }
 
 QString CProjectManager::LoadDshProvider() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshProvider", QStringLiteral("glm-custom"));
+    return LoadDshStrKey(SettingsCfgPath(), L"DshProvider", QStringLiteral("glm-custom"));
 }
 
 bool CProjectManager::SaveDshModel(const QString& a_sModel) {
-    return SaveDshStrKey(ConfigFilePath(), L"DshModel", a_sModel);
+    return SaveDshStrKey(SettingsCfgPath(), L"DshModel", a_sModel);
 }
 
 QString CProjectManager::LoadDshModel() {
-    return LoadDshStrKey(ConfigFilePath(), L"DshModel", QStringLiteral("glm-5.2"));
+    return LoadDshStrKey(SettingsCfgPath(), L"DshModel", QStringLiteral("glm-5.2"));
 }
 
 // 2026.08.18 DSH 计费单价（$/百万 token，[Agent] DshPrice*）：DSH 协议只报 token
@@ -1144,62 +1509,62 @@ static double LoadDshDblKey(const QString& a_sPathCfg, const wchar_t* a_lpszKey,
 }
 
 bool CProjectManager::SaveDshPriceInPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"DshPriceInPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"DshPriceInPerM", a_d);
 }
 
 double CProjectManager::LoadDshPriceInPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"DshPriceInPerM", 3.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"DshPriceInPerM", 3.0);
 }
 
 bool CProjectManager::SaveDshPriceCacheReadPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"DshPriceCacheReadPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"DshPriceCacheReadPerM", a_d);
 }
 
 double CProjectManager::LoadDshPriceCacheReadPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"DshPriceCacheReadPerM", 0.3);
+    return LoadDshDblKey(SettingsCfgPath(), L"DshPriceCacheReadPerM", 0.3);
 }
 
 bool CProjectManager::SaveDshPriceCacheWritePerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"DshPriceCacheWritePerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"DshPriceCacheWritePerM", a_d);
 }
 
 double CProjectManager::LoadDshPriceCacheWritePerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"DshPriceCacheWritePerM", 3.75);
+    return LoadDshDblKey(SettingsCfgPath(), L"DshPriceCacheWritePerM", 3.75);
 }
 
 bool CProjectManager::SaveDshPriceOutPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"DshPriceOutPerM", a_d);
 }
 
 // 2026.08.20 PIAgent 计费单价（$/百万 token，[Agent] PiPrice*PerM）：pi 协议只报
 //   token 分量不报金额，客户端按单价折算；默认对齐 DSH/claude 同档价目。
 bool CProjectManager::SavePiPriceInPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"PiPriceInPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"PiPriceInPerM", a_d);
 }
 double CProjectManager::LoadPiPriceInPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"PiPriceInPerM", 3.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"PiPriceInPerM", 3.0);
 }
 bool CProjectManager::SavePiPriceCacheReadPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"PiPriceCacheReadPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"PiPriceCacheReadPerM", a_d);
 }
 double CProjectManager::LoadPiPriceCacheReadPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"PiPriceCacheReadPerM", 0.3);
+    return LoadDshDblKey(SettingsCfgPath(), L"PiPriceCacheReadPerM", 0.3);
 }
 bool CProjectManager::SavePiPriceCacheWritePerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"PiPriceCacheWritePerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"PiPriceCacheWritePerM", a_d);
 }
 double CProjectManager::LoadPiPriceCacheWritePerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"PiPriceCacheWritePerM", 3.75);
+    return LoadDshDblKey(SettingsCfgPath(), L"PiPriceCacheWritePerM", 3.75);
 }
 bool CProjectManager::SavePiPriceOutPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"PiPriceOutPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"PiPriceOutPerM", a_d);
 }
 double CProjectManager::LoadPiPriceOutPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"PiPriceOutPerM", 15.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"PiPriceOutPerM", 15.0);
 }
 
 double CProjectManager::LoadDshPriceOutPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"DshPriceOutPerM", 15.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"DshPriceOutPerM", 15.0);
 }
 
 // 2026.08.18 自定义大模型表（[DshModels] Count/Active/M<i>*）：DSH 后端跨机器
@@ -1207,408 +1572,169 @@ double CProjectManager::LoadDshPriceOutPerM() {
 //   密钥经 INI 明文存储（设置页 tooltip 已告知）；读缓冲放宽到 1024 防长密钥截断。
 //   节与 [Agent] 不同，不复用 SaveDshStrKey/LoadDshStrKey（二者硬编码 L"Agent"）。
 QList<SDshModelEntry> CProjectManager::LoadDshModels(int* a_pActive) {
-    QList<SDshModelEntry> aModels;
-    if (a_pActive) {
-        *a_pActive = -1;
-    }
-    const QString sPath = ConfigFilePath();
-    if (sPath.isEmpty()) {
-        return aModels;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Count", 0, wsPath.c_str()));
-    if (iCount <= 0) {
-        return aModels;
-    }
-    wchar_t szBuf[1024] = { 0 };
-    for (int i = 0; i < iCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            const DWORD dwCopied = GetPrivateProfileStringW(L"DshModels", wsKey.c_str(), L"",
-                                                            szBuf, 1024, wsPath.c_str());
-            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
-        };
-        SDshModelEntry stE;
-        stE.sDisp    = fnReadStr(L"Disp");
-        stE.sBaseURL = fnReadStr(L"URL");
-        stE.sApiKey  = fnReadStr(L"Key");
-        stE.sApi     = fnReadStr(L"Api");
-        stE.sModelId = fnReadStr(L"Model");
-        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
-        if (stE.iCtx <= 0) {
-            stE.iCtx = 200000;
-        }
-        stE.iMaxTok = fnReadStr(L"Max").toInt();
-        if (stE.iMaxTok <= 0) {
-            stE.iMaxTok = 32768;
-        }
-        if (stE.sApi.isEmpty()) {
-            stE.sApi = QStringLiteral("anthropic-messages");
-        }
-        if (stE.sDisp.isEmpty()) {
-            stE.sDisp = stE.sModelId;
-        }
-        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
-            continue;   // 无模型 id / 接入点的残缺条目不进表
-        }
-        aModels.append(stE);
-    }
-    if (a_pActive) {
-        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Active", -1, wsPath.c_str()));
-        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
-        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
-            *a_pActive = 0;
-        }
-    }
-    return aModels;
+    // 2026.09.09 v2.1.144 改经 LoadModelsFrom（任务级覆盖：任务档无本表时整表实时回退全局）。
+    return LoadModelsFrom(TableCfgPath(L"DshModels"), L"DshModels", a_pActive);
 }
 
 bool CProjectManager::SaveDshModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
-    const QString sPath = ConfigFilePath();
+    // 2026.09.09 v2.1.144 改经 SaveModelsTo + 任务态全局超集同步（缺省恒保有最多模型配置）。
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    // 先读旧条目数再写新 Count（写后就读不到旧值了），缩短时用于清除残留键
-    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"DshModels", L"Count", 0, wsPath.c_str()));
-    const int iNewCount = a_aModels.size();
-    WritePrivateProfileStringW(L"DshModels", L"Count",
-                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
-    for (int i = 0; i < iNewCount; ++i) {
-        const SDshModelEntry& stE = a_aModels.at(i);
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            WritePrivateProfileStringW(L"DshModels", wsKey.c_str(),
-                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
-        };
-        fnWrite(L"Disp",  stE.sDisp);
-        fnWrite(L"URL",   stE.sBaseURL);
-        fnWrite(L"Key",   stE.sApiKey);
-        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
-        fnWrite(L"Model", stE.sModelId);
-        fnWrite(L"Ctx",   QString::number(stE.iCtx));
-        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    if (!SaveModelsTo(sPath, L"DshModels", a_aModels, a_iActive)) {
+        return false;
     }
-    // 表缩短时清掉残留旧条目键（防幽灵行被下次 Load 读回）
-    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
-            const std::wstring wsKey = wsPrefix + lpszSuffix;
-            WritePrivateProfileStringW(L"DshModels", wsKey.c_str(), nullptr, wsPath.c_str());
-        }
-    }
-    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
-    WritePrivateProfileStringW(L"DshModels", L"Active",
-                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    SyncModelTableToGlobal(L"DshModels", a_aModels, a_iActive);
     return true;
 }
 
 // 2026.08.19 PIAgent 第三后端键（[Agent] Pi*）：root/node/provider/model/apiKey/thinking
 //   六项，存取口径同 Dsh*（SaveDshStrKey/LoadDshStrKey 走 [Agent] 节，直接复用）。
 bool CProjectManager::SavePiRoot(const QString& a_sRoot) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiRoot", a_sRoot);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiRoot", a_sRoot);
 }
 
 QString CProjectManager::LoadPiRoot() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiRoot", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"PiRoot", QString());
 }
 
 bool CProjectManager::SavePiNodePath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiNodePath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiNodePath", a_sPath);
 }
 
 QString CProjectManager::LoadPiNodePath() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiNodePath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"PiNodePath", QString());
 }
 
 bool CProjectManager::SavePiProvider(const QString& a_sProvider) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiProvider", a_sProvider);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiProvider", a_sProvider);
 }
 
 QString CProjectManager::LoadPiProvider() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiProvider", QStringLiteral("anthropic"));
+    return LoadDshStrKey(SettingsCfgPath(), L"PiProvider", QStringLiteral("anthropic"));
 }
 
 bool CProjectManager::SavePiModel(const QString& a_sModel) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiModel", a_sModel);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiModel", a_sModel);
 }
 
 QString CProjectManager::LoadPiModel() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiModel", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"PiModel", QString());
 }
 
 bool CProjectManager::SavePiApiKey(const QString& a_sKey) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiApiKey", a_sKey);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiApiKey", a_sKey);
 }
 
 QString CProjectManager::LoadPiApiKey() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiApiKey", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"PiApiKey", QString());
 }
 
 bool CProjectManager::SavePiThinking(const QString& a_sLevel) {
-    return SaveDshStrKey(ConfigFilePath(), L"PiThinking", a_sLevel);
+    return SaveDshStrKey(SettingsCfgPath(), L"PiThinking", a_sLevel);
 }
 
 QString CProjectManager::LoadPiThinking() {
-    return LoadDshStrKey(ConfigFilePath(), L"PiThinking", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"PiThinking", QString());
 }
 
 // 2026.08.20 PiAgent 自定义大模型表（[PiModels]；实现口径与 [DshModels] 完全一致，
 //   仅节名不同——条目本体由 CPiAgentRunner 合成写 ~/.pi/agent/models.json 生效）。
 QList<SDshModelEntry> CProjectManager::LoadPiModels(int* a_pActive) {
-    QList<SDshModelEntry> aModels;
-    if (a_pActive) {
-        *a_pActive = -1;
-    }
-    const QString sPath = ConfigFilePath();
-    if (sPath.isEmpty()) {
-        return aModels;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Count", 0, wsPath.c_str()));
-    if (iCount <= 0) {
-        return aModels;
-    }
-    wchar_t szBuf[1024] = { 0 };
-    for (int i = 0; i < iCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            const DWORD dwCopied = GetPrivateProfileStringW(L"PiModels", wsKey.c_str(), L"",
-                                                            szBuf, 1024, wsPath.c_str());
-            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
-        };
-        SDshModelEntry stE;
-        stE.sDisp    = fnReadStr(L"Disp");
-        stE.sBaseURL = fnReadStr(L"URL");
-        stE.sApiKey  = fnReadStr(L"Key");
-        stE.sApi     = fnReadStr(L"Api");
-        stE.sModelId = fnReadStr(L"Model");
-        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
-        if (stE.iCtx <= 0) {
-            stE.iCtx = 200000;
-        }
-        stE.iMaxTok = fnReadStr(L"Max").toInt();
-        if (stE.iMaxTok <= 0) {
-            stE.iMaxTok = 32768;
-        }
-        if (stE.sApi.isEmpty()) {
-            stE.sApi = QStringLiteral("anthropic-messages");
-        }
-        if (stE.sDisp.isEmpty()) {
-            stE.sDisp = stE.sModelId;
-        }
-        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
-            continue;   // 无模型 id / 请求地址的残缺条目不进表
-        }
-        aModels.append(stE);
-    }
-    if (a_pActive) {
-        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Active", -1, wsPath.c_str()));
-        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
-        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
-            *a_pActive = 0;
-        }
-    }
-    return aModels;
+    // 2026.09.09 v2.1.144 改经 LoadModelsFrom（任务级覆盖：任务档无本表时整表实时回退全局）。
+    return LoadModelsFrom(TableCfgPath(L"PiModels"), L"PiModels", a_pActive);
 }
 
 bool CProjectManager::SavePiModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
-    const QString sPath = ConfigFilePath();
+    // 2026.09.09 v2.1.144 改经 SaveModelsTo + 任务态全局超集同步（缺省恒保有最多模型配置）。
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"PiModels", L"Count", 0, wsPath.c_str()));
-    const int iNewCount = a_aModels.size();
-    WritePrivateProfileStringW(L"PiModels", L"Count",
-                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
-    for (int i = 0; i < iNewCount; ++i) {
-        const SDshModelEntry& stE = a_aModels.at(i);
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            WritePrivateProfileStringW(L"PiModels", wsKey.c_str(),
-                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
-        };
-        fnWrite(L"Disp",  stE.sDisp);
-        fnWrite(L"URL",   stE.sBaseURL);
-        fnWrite(L"Key",   stE.sApiKey);
-        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
-        fnWrite(L"Model", stE.sModelId);
-        fnWrite(L"Ctx",   QString::number(stE.iCtx));
-        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    if (!SaveModelsTo(sPath, L"PiModels", a_aModels, a_iActive)) {
+        return false;
     }
-    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
-            const std::wstring wsKey = wsPrefix + lpszSuffix;
-            WritePrivateProfileStringW(L"PiModels", wsKey.c_str(), nullptr, wsPath.c_str());
-        }
-    }
-    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
-    WritePrivateProfileStringW(L"PiModels", L"Active",
-                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    SyncModelTableToGlobal(L"PiModels", a_aModels, a_iActive);
     return true;
 }
 
 // 2026.08.21 Codex 自定义大模型表（[CodexModels]；口径同 [PiModels]，差异仅一点：
 //   默认 API 格式 = chat（Codex wire_api，v0.88+ 仅 responses））。
 QList<SDshModelEntry> CProjectManager::LoadCodexModels(int* a_pActive) {
-    QList<SDshModelEntry> aModels;
-    if (a_pActive) {
-        *a_pActive = -1;
-    }
-    const QString sPath = ConfigFilePath();
-    if (sPath.isEmpty()) {
-        return aModels;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Count", 0, wsPath.c_str()));
-    if (iCount <= 0) {
-        return aModels;
-    }
-    wchar_t szBuf[1024] = { 0 };
-    for (int i = 0; i < iCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            const DWORD dwCopied = GetPrivateProfileStringW(L"CodexModels", wsKey.c_str(), L"",
-                                                            szBuf, 1024, wsPath.c_str());
-            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
-        };
-        SDshModelEntry stE;
-        stE.sDisp    = fnReadStr(L"Disp");
-        stE.sBaseURL = fnReadStr(L"URL");
-        stE.sApiKey  = fnReadStr(L"Key");
-        stE.sApi     = fnReadStr(L"Api");
-        stE.sModelId = fnReadStr(L"Model");
-        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
-        if (stE.iCtx <= 0) {
-            stE.iCtx = 200000;
-        }
-        stE.iMaxTok = fnReadStr(L"Max").toInt();
-        if (stE.iMaxTok <= 0) {
-            stE.iMaxTok = 32768;
-        }
-        if (stE.sApi.isEmpty()) {
-            stE.sApi = QStringLiteral("chat");   // Codex wire_api 默认 chat
-        }
-        if (stE.sDisp.isEmpty()) {
-            stE.sDisp = stE.sModelId;
-        }
-        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
-            continue;   // 无模型 id / 请求地址的残缺条目不进表
-        }
-        aModels.append(stE);
-    }
-    if (a_pActive) {
-        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Active", -1, wsPath.c_str()));
-        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
-        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
-            *a_pActive = 0;
-        }
-    }
-    return aModels;
+    // 2026.09.09 v2.1.144 改经 LoadModelsFrom（任务级覆盖：任务档无本表时整表实时回退全局）。
+    return LoadModelsFrom(TableCfgPath(L"CodexModels"), L"CodexModels", a_pActive);
 }
 
 bool CProjectManager::SaveCodexModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
-    const QString sPath = ConfigFilePath();
+    // 2026.09.09 v2.1.144 改经 SaveModelsTo + 任务态全局超集同步（缺省恒保有最多模型配置）。
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"CodexModels", L"Count", 0, wsPath.c_str()));
-    const int iNewCount = a_aModels.size();
-    WritePrivateProfileStringW(L"CodexModels", L"Count",
-                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
-    for (int i = 0; i < iNewCount; ++i) {
-        const SDshModelEntry& stE = a_aModels.at(i);
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            WritePrivateProfileStringW(L"CodexModels", wsKey.c_str(),
-                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
-        };
-        fnWrite(L"Disp",  stE.sDisp);
-        fnWrite(L"URL",   stE.sBaseURL);
-        fnWrite(L"Key",   stE.sApiKey);
-        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("chat") : stE.sApi);
-        fnWrite(L"Model", stE.sModelId);
-        fnWrite(L"Ctx",   QString::number(stE.iCtx));
-        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    if (!SaveModelsTo(sPath, L"CodexModels", a_aModels, a_iActive)) {
+        return false;
     }
-    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
-            const std::wstring wsKey = wsPrefix + lpszSuffix;
-            WritePrivateProfileStringW(L"CodexModels", wsKey.c_str(), nullptr, wsPath.c_str());
-        }
-    }
-    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
-    WritePrivateProfileStringW(L"CodexModels", L"Active",
-                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    SyncModelTableToGlobal(L"CodexModels", a_aModels, a_iActive);
     return true;
 }
 
 // CodexHarness 第四后端（OpenAI Codex CLI 0.87.0，[Agent] Codex* 键；口径同 Pi*）。
 bool CProjectManager::SaveCodexRoot(const QString& a_sRoot) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexRoot", a_sRoot);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexRoot", a_sRoot);
 }
 
 QString CProjectManager::LoadCodexRoot() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexRoot", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexRoot", QString());
 }
 
 bool CProjectManager::SaveCodexNodePath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexNodePath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexNodePath", a_sPath);
 }
 
 QString CProjectManager::LoadCodexNodePath() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexNodePath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexNodePath", QString());
 }
 
 bool CProjectManager::SaveCodexProvider(const QString& a_sProvider) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexProvider", a_sProvider);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexProvider", a_sProvider);
 }
 
 QString CProjectManager::LoadCodexProvider() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexProvider", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexProvider", QString());
 }
 
 bool CProjectManager::SaveCodexModel(const QString& a_sModel) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexModel", a_sModel);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexModel", a_sModel);
 }
 
 QString CProjectManager::LoadCodexModel() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexModel", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexModel", QString());
 }
 
 bool CProjectManager::SaveCodexApiKey(const QString& a_sKey) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexApiKey", a_sKey);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexApiKey", a_sKey);
 }
 
 QString CProjectManager::LoadCodexApiKey() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexApiKey", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexApiKey", QString());
 }
 
 bool CProjectManager::SaveCodexBaseUrl(const QString& a_sUrl) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexBaseUrl", a_sUrl);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexBaseUrl", a_sUrl);
 }
 
 QString CProjectManager::LoadCodexBaseUrl() {
-    return LoadDshStrKey(ConfigFilePath(), L"CodexBaseUrl", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"CodexBaseUrl", QString());
 }
 
 bool CProjectManager::SaveCodexWireApi(const QString& a_sApi) {
-    return SaveDshStrKey(ConfigFilePath(), L"CodexWireApi", a_sApi);
+    return SaveDshStrKey(SettingsCfgPath(), L"CodexWireApi", a_sApi);
 }
 
 QString CProjectManager::LoadCodexWireApi() {
     // 默认 chat（v0.88+ 移除 wire_api="chat"，本后端锁定 0.87.0 按 chat 网关接入）。
-    const QString sApi = LoadDshStrKey(ConfigFilePath(), L"CodexWireApi",
+    const QString sApi = LoadDshStrKey(SettingsCfgPath(), L"CodexWireApi",
                                        QStringLiteral("chat"));
     return sApi.isEmpty() ? QStringLiteral("chat") : sApi;
 }
@@ -1619,182 +1745,103 @@ QString CProjectManager::LoadCodexWireApi() {
 //   [Agent] 节 + Win32 profile API，GBK 安全）；模型表口径同 [PiModels]。
 // ---------------------------------------------------------------------------
 bool CProjectManager::SaveHermesRoot(const QString& a_sRoot) {
-    return SaveDshStrKey(ConfigFilePath(), L"HermesRoot", a_sRoot);
+    return SaveDshStrKey(SettingsCfgPath(), L"HermesRoot", a_sRoot);
 }
 
 QString CProjectManager::LoadHermesRoot() {
-    return LoadDshStrKey(ConfigFilePath(), L"HermesRoot", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"HermesRoot", QString());
 }
 
 bool CProjectManager::SaveHermesNodePath(const QString& a_sPath) {
-    return SaveDshStrKey(ConfigFilePath(), L"HermesNodePath", a_sPath);
+    return SaveDshStrKey(SettingsCfgPath(), L"HermesNodePath", a_sPath);
 }
 
 QString CProjectManager::LoadHermesNodePath() {
-    return LoadDshStrKey(ConfigFilePath(), L"HermesNodePath", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"HermesNodePath", QString());
 }
 
 bool CProjectManager::SaveHermesModel(const QString& a_sModel) {
-    return SaveDshStrKey(ConfigFilePath(), L"HermesModel", a_sModel);
+    return SaveDshStrKey(SettingsCfgPath(), L"HermesModel", a_sModel);
 }
 
 QString CProjectManager::LoadHermesModel() {
-    return LoadDshStrKey(ConfigFilePath(), L"HermesModel", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"HermesModel", QString());
 }
 
 bool CProjectManager::SaveHermesApiKey(const QString& a_sKey) {
-    return SaveDshStrKey(ConfigFilePath(), L"HermesApiKey", a_sKey);
+    return SaveDshStrKey(SettingsCfgPath(), L"HermesApiKey", a_sKey);
 }
 
 QString CProjectManager::LoadHermesApiKey() {
-    return LoadDshStrKey(ConfigFilePath(), L"HermesApiKey", QString());
+    return LoadDshStrKey(SettingsCfgPath(), L"HermesApiKey", QString());
 }
 
 bool CProjectManager::SaveHermesBaseUrl(const QString& a_sUrl) {
-    return SaveDshStrKey(ConfigFilePath(), L"HermesBaseUrl", a_sUrl);
+    return SaveDshStrKey(SettingsCfgPath(), L"HermesBaseUrl", a_sUrl);
 }
 
 QString CProjectManager::LoadHermesBaseUrl() {
     // 空回退内网网关基址（与既有四后端网关口径一致；设置页可改）。
-    return LoadDshStrKey(ConfigFilePath(), L"HermesBaseUrl",
+    return LoadDshStrKey(SettingsCfgPath(), L"HermesBaseUrl",
                          QStringLiteral("http://192.168.118.128:9000"));
 }
 
 bool CProjectManager::SaveHermesPriceInPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceInPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"HermesPriceInPerM", a_d);
 }
 
 double CProjectManager::LoadHermesPriceInPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceInPerM", 3.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"HermesPriceInPerM", 3.0);
 }
 
 bool CProjectManager::SaveHermesPriceCacheReadPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceCacheReadPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"HermesPriceCacheReadPerM", a_d);
 }
 
 double CProjectManager::LoadHermesPriceCacheReadPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceCacheReadPerM", 0.3);
+    return LoadDshDblKey(SettingsCfgPath(), L"HermesPriceCacheReadPerM", 0.3);
 }
 
 bool CProjectManager::SaveHermesPriceCacheWritePerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceCacheWritePerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"HermesPriceCacheWritePerM", a_d);
 }
 
 double CProjectManager::LoadHermesPriceCacheWritePerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceCacheWritePerM", 3.75);
+    return LoadDshDblKey(SettingsCfgPath(), L"HermesPriceCacheWritePerM", 3.75);
 }
 
 bool CProjectManager::SaveHermesPriceOutPerM(double a_d) {
-    return SaveDshDblKey(ConfigFilePath(), L"HermesPriceOutPerM", a_d);
+    return SaveDshDblKey(SettingsCfgPath(), L"HermesPriceOutPerM", a_d);
 }
 
 double CProjectManager::LoadHermesPriceOutPerM() {
-    return LoadDshDblKey(ConfigFilePath(), L"HermesPriceOutPerM", 15.0);
+    return LoadDshDblKey(SettingsCfgPath(), L"HermesPriceOutPerM", 15.0);
 }
 
 // Hermes 自定义大模型表（[HermesModels]；口径同 [PiModels]，默认 API 格式
 //   anthropic-messages；maxTokens 保存侧不在此钳位——设置页与 CHermesRunner
 //   EnsureRuntimeConfig 双侧 qMin(131072) 收口，本层保持透传）。
 QList<SDshModelEntry> CProjectManager::LoadHermesModels(int* a_pActive) {
-    QList<SDshModelEntry> aModels;
-    if (a_pActive) {
-        *a_pActive = -1;
-    }
-    const QString sPath = ConfigFilePath();
-    if (sPath.isEmpty()) {
-        return aModels;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iCount = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Count", 0, wsPath.c_str()));
-    if (iCount <= 0) {
-        return aModels;
-    }
-    wchar_t szBuf[1024] = { 0 };
-    for (int i = 0; i < iCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            const DWORD dwCopied = GetPrivateProfileStringW(L"HermesModels", wsKey.c_str(), L"",
-                                                            szBuf, 1024, wsPath.c_str());
-            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
-        };
-        SDshModelEntry stE;
-        stE.sDisp    = fnReadStr(L"Disp");
-        stE.sBaseURL = fnReadStr(L"URL");
-        stE.sApiKey  = fnReadStr(L"Key");
-        stE.sApi     = fnReadStr(L"Api");
-        stE.sModelId = fnReadStr(L"Model");
-        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
-        if (stE.iCtx <= 0) {
-            stE.iCtx = 200000;
-        }
-        stE.iMaxTok = fnReadStr(L"Max").toInt();
-        if (stE.iMaxTok <= 0) {
-            stE.iMaxTok = 32768;
-        }
-        if (stE.sApi.isEmpty()) {
-            stE.sApi = QStringLiteral("anthropic-messages");
-        }
-        if (stE.sDisp.isEmpty()) {
-            stE.sDisp = stE.sModelId;
-        }
-        if (stE.sModelId.isEmpty() || stE.sBaseURL.isEmpty()) {
-            continue;   // 无模型 id / 请求地址的残缺条目不进表
-        }
-        aModels.append(stE);
-    }
-    if (a_pActive) {
-        const int iActive = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Active", -1, wsPath.c_str()));
-        *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
-        if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
-            *a_pActive = 0;
-        }
-    }
-    return aModels;
+    // 2026.09.09 v2.1.144 改经 LoadModelsFrom（任务级覆盖：任务档无本表时整表实时回退全局）。
+    return LoadModelsFrom(TableCfgPath(L"HermesModels"), L"HermesModels", a_pActive);
 }
 
 bool CProjectManager::SaveHermesModels(const QList<SDshModelEntry>& a_aModels, int a_iActive) {
-    const QString sPath = ConfigFilePath();
+    // 2026.09.09 v2.1.144 改经 SaveModelsTo + 任务态全局超集同步（缺省恒保有最多模型配置）。
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(L"HermesModels", L"Count", 0, wsPath.c_str()));
-    const int iNewCount = a_aModels.size();
-    WritePrivateProfileStringW(L"HermesModels", L"Count",
-                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
-    for (int i = 0; i < iNewCount; ++i) {
-        const SDshModelEntry& stE = a_aModels.at(i);
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            WritePrivateProfileStringW(L"HermesModels", wsKey.c_str(),
-                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
-        };
-        fnWrite(L"Disp",  stE.sDisp);
-        fnWrite(L"URL",   stE.sBaseURL);
-        fnWrite(L"Key",   stE.sApiKey);
-        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
-        fnWrite(L"Model", stE.sModelId);
-        fnWrite(L"Ctx",   QString::number(stE.iCtx));
-        fnWrite(L"Max",   QString::number(stE.iMaxTok));
+    if (!SaveModelsTo(sPath, L"HermesModels", a_aModels, a_iActive)) {
+        return false;
     }
-    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
-            const std::wstring wsKey = wsPrefix + lpszSuffix;
-            WritePrivateProfileStringW(L"HermesModels", wsKey.c_str(), nullptr, wsPath.c_str());
-        }
-    }
-    const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
-    WritePrivateProfileStringW(L"HermesModels", L"Active",
-                               std::to_wstring(iActive).c_str(), wsPath.c_str());
+    SyncModelTableToGlobal(L"HermesModels", a_aModels, a_iActive);
     return true;
 }
 
 bool CProjectManager::SaveClaudeCmd(const QString& a_sCmd) {
     // 落 [Agent] ClaudeCmd（claude 命令，可含路径）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1806,7 +1853,7 @@ bool CProjectManager::SaveClaudeCmd(const QString& a_sCmd) {
 
 QString CProjectManager::LoadClaudeCmd() {
     // 无 config.ini / 缺键 / 空 → 默认 "claude"（PATH 上找）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return QStringLiteral("claude");
     }
@@ -1820,7 +1867,7 @@ QString CProjectManager::LoadClaudeCmd() {
 
 bool CProjectManager::SaveAskTimeoutSec(int a_iSec) {
     // 落 [Agent] AskTimeoutSec（ask_user 提问等待超时秒数）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1832,7 +1879,7 @@ bool CProjectManager::SaveAskTimeoutSec(int a_iSec) {
 
 int CProjectManager::LoadAskTimeoutSec() {
     // 无 config.ini/缺键 → 默认 600（10 分钟）；非法值（<30）兜底回 600。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 600;
     }
@@ -1844,7 +1891,7 @@ int CProjectManager::LoadAskTimeoutSec() {
 int CProjectManager::LoadStallMinutes() {
     // 2026.08.17 [Agent] StallMinutes：无 config.ini/缺键 → 默认 10 分钟；非法值（<1 或 >120）
     //   兜底回 10。阈值下限保护长工具执行（如分钟级构建）不误杀；上限防配置手误致任务假死半天。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 10;
     }
@@ -1855,7 +1902,7 @@ int CProjectManager::LoadStallMinutes() {
 
 bool CProjectManager::SaveScanExcludeDirs(const QString& a_sDirs) {
     // 落 [Scan] ExcludeDirs（逗号分隔目录名清单）；空串=写空（回退内置默认）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1867,7 +1914,7 @@ bool CProjectManager::SaveScanExcludeDirs(const QString& a_sDirs) {
 
 QString CProjectManager::LoadScanExcludeDirs() {
     // 无 config.ini/缺键/空 → 返回空串（调用方用内置默认清单）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return QString();
     }
@@ -1880,7 +1927,7 @@ QString CProjectManager::LoadScanExcludeDirs() {
 
 bool CProjectManager::SaveReviewParallel(int a_iN) {
     // 落 [Review] Parallel（评审多视角并行视角数）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1892,7 +1939,7 @@ bool CProjectManager::SaveReviewParallel(int a_iN) {
 
 int CProjectManager::LoadReviewParallel() {
     // 无 config.ini/缺键 → 默认 3（全部评审默认并行）；非法值（<1 或 >8）兜底回 3。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 3;
     }
@@ -1903,7 +1950,7 @@ int CProjectManager::LoadReviewParallel() {
 
 bool CProjectManager::SaveWebSearch(bool a_bOn) {
     // 2026.08.15 落 [Agent] WebSearch（阶段联网检索开关）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1915,7 +1962,7 @@ bool CProjectManager::SaveWebSearch(bool a_bOn) {
 
 bool CProjectManager::LoadWebSearch() {
     // 2026.08.15 无 config.ini/缺键 → 默认开（1）；0=全阶段禁用联网检索。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return true;
     }
@@ -1925,7 +1972,7 @@ bool CProjectManager::LoadWebSearch() {
 
 bool CProjectManager::SaveExpertAssistant(bool a_bOn) {
     // 落 [Adhoc] ExpertAssistant（1=启用专家助手闭环验证，0=禁用）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1937,7 +1984,7 @@ bool CProjectManager::SaveExpertAssistant(bool a_bOn) {
 
 bool CProjectManager::LoadExpertAssistant() const {
     // 无 config.ini/缺键 → 默认启用（1）；0=手工禁用。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return true;
     }
@@ -1947,7 +1994,7 @@ bool CProjectManager::LoadExpertAssistant() const {
 
 bool CProjectManager::SaveAdhocContextLimit(qint64 a_iLimit) {
     // 落 [Adhoc] ContextLimit（0 表示未设/回退自动探测）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }
@@ -1959,7 +2006,7 @@ bool CProjectManager::SaveAdhocContextLimit(qint64 a_iLimit) {
 
 qint64 CProjectManager::LoadAdhocContextLimit() const {
     // 无 config.ini / 缺键 / 非法 → 返回 0（回退按模型自动探测）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return 0;
     }
@@ -2181,7 +2228,7 @@ bool RestoreTreeLegacy(const QString& a_sSrc, const QString& a_sDst) {
 
 QString CProjectManager::LoadBackupExcludeDirs() const {
     // 读 [Backup] ExcludeDirs 原文（逗号分隔）；无 config.ini/缺键 → 空串（回退内置默认）。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return QString();
     }
@@ -2194,7 +2241,7 @@ QString CProjectManager::LoadBackupExcludeDirs() const {
 
 bool CProjectManager::SaveBackupExcludeDirs(const QString& a_sDirs) {
     // 落 [Backup] ExcludeDirs（空串=清空回退内置默认）；失败不抛。
-    const QString sPath = ConfigFilePath();
+    const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return false;
     }

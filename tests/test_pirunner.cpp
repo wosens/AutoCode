@@ -134,7 +134,11 @@ int main(int argc, char* argv[]) {
     //   备份 ~/.pi/agent/models.json（存在时），测试后还原——只动 autocode-* 槽位也
     //   保平安（用户手写 provider 必须原样保留）。
     {
-        const QString sJsonPath = CPiAgentRunner::PiModelsJsonPath();
+        // 2026.09.09 v2.1.133 测试隔离：models.json 指临时文件（v2.1.132 及此前直接写真实
+        //   ~/.pi/agent/models.json——备份还原在并发/中断下三度把陈旧表带回现场）。
+        const QString sRealJson = CPiAgentRunner::PiModelsJsonPath();
+        const QString sJsonPath = QDir::temp().filePath(QStringLiteral("autocode-pi-models-test.json"));
+        CPiAgentRunner::SetModelsJsonPathOverrideForTest(sJsonPath);
         QByteArray baBackup;
         const bool bHadFile = QFile::exists(sJsonPath);
         if (bHadFile) {
@@ -240,8 +244,33 @@ int main(int argc, char* argv[]) {
                   && oProv2.contains(QStringLiteral("my-ollama")),
               QStringLiteral("清空表应清 autocode-* 槽位且保留外部 provider"));
 
-        // 还原现场（机器上有真实 models.json 时）。
-        if (bHadFile) {
+        // 2026.09.09 v2.1.140 比对跳过：内容一致时 WritePiModelsJson 零写盘——
+        //   只读属性拦截：未跳过则写路径必失败（truncate 打不开/原子替换 remove 不动
+        //   只读目标）返回 false；跳过则不碰文件返回 true。
+        CPiAgentRunner::SetPiModels(aModels, 0);
+        QFile fBefore(sJsonPath);
+        fBefore.open(QIODevice::ReadOnly);
+        const QByteArray aBefore = fBefore.readAll();
+        fBefore.close();
+        QFile::setPermissions(sJsonPath,
+            QFileDevice::Permissions(QFileDevice::ReadOwner | QFileDevice::ReadUser
+                                     | QFileDevice::ReadGroup | QFileDevice::ReadOther));
+        Check(CPiAgentRunner::WritePiModelsJson(),
+              QStringLiteral("内容一致时应跳过写盘（只读属性下仍返回 true）"));
+        QFile::setPermissions(sJsonPath,
+            QFileDevice::Permissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                     | QFileDevice::ReadUser | QFileDevice::WriteUser
+                                     | QFileDevice::ReadGroup | QFileDevice::ReadOther));
+        QFile::remove(sJsonPath + QStringLiteral(".tmp"));   // 若未跳过可能残留 tmp
+        QFile fAfter(sJsonPath);
+        fAfter.open(QIODevice::ReadOnly);
+        const QByteArray aAfter = fAfter.readAll();
+        fAfter.close();
+        Check(aAfter == aBefore, QStringLiteral("跳过写盘时文件字节应不变"));
+
+        CPiAgentRunner::SetModelsJsonPathOverrideForTest(QString());   // 结束隔离
+        // 真实 models.json 全程未触碰，无需还原（保留原块以防其他用例依赖）。
+        if (false && bHadFile) {
             QFile fRest(sJsonPath);
             fRest.open(QIODevice::WriteOnly | QIODevice::Truncate);
             fRest.write(baBackup);

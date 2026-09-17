@@ -19,6 +19,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/utf-8 /W3)
     add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    # 2026.09.10 Release 崩溃定位基础设施：Release 也产完整 PDB（/Zi + /DEBUG:FULL），
+    #   并用 /OPT:NOICF 关掉 identical COMDAT folding——v2.2.147 前后两次崩溃同一 RVA
+    #   但行为已变，ICF 把不同函数折叠同体是定位黑盒的主因；REF 保留（去未引用）。
+    add_compile_options($<$<CONFIG:Release>:/Zi>)
+    add_link_options("$<$<CONFIG:Release>:/DEBUG:FULL;/OPT:REF;/OPT:NOICF;/INCREMENTAL:NO>")
 endif()
 
 set(CMAKE_AUTOMOC ON)
@@ -80,6 +85,8 @@ qt_add_executable(AutoCode WIN32
     ui/CMessageView.cpp
     ui/CMarkdownPreloader.h
     ui/CMarkdownPreloader.cpp
+    ui/CStageBar.h
+    ui/CStageBar.cpp
     ui/CStreamPresenter.h
     ui/CStreamPresenter.cpp
     ui/CMessageBlock.h
@@ -104,6 +111,8 @@ qt_add_executable(AutoCode WIN32
     ui/CFilePreviewWidget.cpp
     ui/CAboutDialog.h
     ui/CAboutDialog.cpp
+    ui/CTipStyle.h
+    ui/CTipStyle.cpp
     # SQLite 历史库层（纯 C API，直接编 sqlite3.c）
     db/CTaskHistoryDB.h
     db/CTaskHistoryDB.cpp
@@ -174,6 +183,14 @@ add_custom_command(TARGET AutoCode POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/hermes_oneshot_patch.py"
         "$<TARGET_FILE_DIR:AutoCode>/hermes_oneshot_patch.py"
+    # 2026.09.13 助手护栏：exe 同级 CLAUDE.md（CAgentRunnerBase::
+    #   SharedGlobalContextContent 前置注入给 pi 助手）——防助手直接
+    #   edit GBK 的 config.ini 损坏中文、防代跑长安装任务被停滞检测杀。
+    #   不覆盖用户手放的 exe 同级 CLAUDE.md：部署目录已有同名文件时跳过。
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/agent_env_guard.md"
+        "$<TARGET_FILE_DIR:AutoCode>/agent_env_guard.md"
+    COMMAND cmd /c "if not exist \"$<TARGET_FILE_DIR:AutoCode>\\CLAUDE.md\" copy /y \"$<TARGET_FILE_DIR:AutoCode>\\agent_env_guard.md\" \"$<TARGET_FILE_DIR:AutoCode>\\CLAUDE.md\" >nul"
     COMMENT "Copy install_env.bat to output dir"
 )
 
@@ -205,7 +222,10 @@ add_custom_command(TARGET AutoCode POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/cordis.autocode.yml"
         "$<TARGET_FILE_DIR:AutoCode>/dsh/cordis.autocode.yml"
-    COMMENT "Sync DSH cordis.autocode.yml to output dir"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/sdk.autocode.patch.yml"
+        "$<TARGET_FILE_DIR:AutoCode>/dsh/sdk.autocode.patch.yml"
+    COMMENT "Sync DSH cordis.autocode.yml + sdk.autocode.patch.yml to output dir"
 )
 
 # ---- 单元测试（CProjectManager 最近打开历史 MRU 逻辑）----
@@ -235,6 +255,10 @@ qt_add_executable(test_projectmanager
     core/StageDef.cpp
     core/CTaskInfo.h
     core/CTaskInfo.cpp
+    ui/CSettingsDialog.h
+    ui/CSettingsDialog.cpp
+    ui/CVersionDialog.h
+    ui/CVersionDialog.cpp
 )
 target_include_directories(test_projectmanager PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -258,10 +282,14 @@ qt_add_executable(test_execpanel
     tests/test_execpanel.cpp
     ui/CExecutionPanel.h
     ui/CExecutionPanel.cpp
+    ui/CAskUserDialog.h
+    ui/CAskUserDialog.cpp
     ui/CMessageView.h
     ui/CMessageView.cpp
     ui/CMarkdownPreloader.h
     ui/CMarkdownPreloader.cpp
+    ui/CStageBar.h
+    ui/CStageBar.cpp
     ui/CStreamPresenter.h
     ui/CStreamPresenter.cpp
     ui/CMessageBlock.h
@@ -270,6 +298,8 @@ qt_add_executable(test_execpanel
     ui/CArtifactView.cpp
     ui/CFilePreviewWidget.h
     ui/CFilePreviewWidget.cpp
+    ui/CTipStyle.h
+    ui/CTipStyle.cpp
     agent/CAgentRunnerFactory.h
     agent/CAgentRunnerBase.h
     agent/CAgentRunnerBase.cpp
@@ -289,6 +319,33 @@ set_target_properties(test_execpanel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_execpanel COMMAND test_execpanel)
+
+# ---- 单元测试（CTaskListPanel 左栏两表切换口径：再次执行切当前任务/终态切历史任务）----
+# 2026.09.10 v2.2.153 回归：SelectTask 切「当前任务」页+发选中信号（主窗口链终点
+# SetCurrentTask 自动落「日志」页，见 test_execpanel）；SelectHistoryTask 切「历史
+# 任务」页选中刚结束任务（OnTaskFinished 终态链）。GUI 测试（QWidget，offscreen）。
+qt_add_executable(test_tasklistpanel
+    tests/test_tasklistpanel.cpp
+    ui/CTaskListPanel.h
+    ui/CTaskListPanel.cpp
+    ui/CProjectExplorerPanel.h
+    ui/CProjectExplorerPanel.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/TaskTypes.h
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(test_tasklistpanel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(test_tasklistpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test)
+set_target_properties(test_tasklistpanel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_tasklistpanel COMMAND test_tasklistpanel)
 
 # ---- 单元测试（CTaskHistoryDB：SQLite 历史库 Upsert/LoadAll/Delete 往返）----
 qt_add_executable(test_historydb
@@ -440,6 +497,71 @@ set_target_properties(import_tasks PROPERTIES
 
 # ---- 集成测试（CDeepSeekRunner：联网真实调用 DSH 组合 + glm 中继，不挂 ctest）----
 # 手动跑: Execute/Release/test_dshrunner.exe（覆盖握手/三信号流/多轮续会话/注入轮）。
+# 2026.09.09 v2.1.133 编排器+pi+本地 spark 真机端到端（超限自动压缩自愈链验证；
+# 不挂 ctest——依赖本地 llama.cpp 8080 与真实网关往返）。
+qt_add_executable(test_orchpi
+    tests/test_orchpi.cpp
+    core/TaskTypes.h
+    core/CModelEntry.h
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CMcpAskServer.h
+    agent/CMcpAskServer.cpp
+    orch/CTaskOrchestrator.h
+    orch/CTaskOrchestrator.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    db/CTaskHistoryDB.h
+    db/CTaskHistoryDB.cpp
+    sqlite3.h
+    sqlite3.c
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
+)
+target_include_directories(test_orchpi PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/db
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${ZSTD_INCLUDE_DIR}
+)
+target_link_libraries(test_orchpi PRIVATE Qt6::Core Qt6::Network Qt6::Widgets ${ZSTD_LIB})
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES LANGUAGE C COMPILE_FLAGS "/W0")
+endif()
+set_target_properties(test_orchpi PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
 qt_add_executable(test_dshrunner
     tests/test_dshrunner.cpp
     agent/CClaudeRunner.h
@@ -456,6 +578,19 @@ target_include_directories(test_dshrunner PRIVATE
 target_link_libraries(test_dshrunner PRIVATE Qt6::Core Qt6::Network)
 set_target_properties(test_dshrunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+# 2026.09.10 同步 DSH 组合层到测试 exe 同级（Profile 布局的 --patch 引用 exe 目录
+#   dsh\sdk.autocode.patch.yml；与 AutoCode 主程序的 POST_BUILD 同口径）。
+add_custom_command(TARGET test_dshrunner POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:test_dshrunner>/dsh"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/sdk.autocode.patch.yml"
+        "$<TARGET_FILE_DIR:test_dshrunner>/dsh/sdk.autocode.patch.yml"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/cordis.autocode.yml"
+        "$<TARGET_FILE_DIR:test_dshrunner>/dsh/cordis.autocode.yml"
+    COMMENT "Sync DSH overlays to test_dshrunner dir"
 )
 
 # ---- Pi 后端离线单元测试（不联网，挂 ctest）----
@@ -584,7 +719,7 @@ add_test(NAME test_hermesrunner COMMAND test_hermesrunner)
 # ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
 # 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
 set_tests_properties(
-    test_projectmanager test_execpanel test_historydb test_verify_flow
+    test_projectmanager test_execpanel test_tasklistpanel test_historydb test_verify_flow
     test_record_verify test_rollback test_pirunner test_versiondlg test_codexrunner
     test_hermesrunner
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

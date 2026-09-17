@@ -118,8 +118,14 @@ QString CPiAgentRunner::PiActiveModelId() {
         ? s_aPiModels.at(s_iPiActiveModel).sModelId : QString();
 }
 
+static QString s_sModelsJsonPathOverride;   // 2026.09.09 v2.1.133 测试隔离（空=真实路径）
+void CPiAgentRunner::SetModelsJsonPathOverrideForTest(const QString& a_sPath) {
+    s_sModelsJsonPathOverride = a_sPath;
+}
 QString CPiAgentRunner::PiModelsJsonPath() {
-    return QDir::homePath() + QStringLiteral("/.pi/agent/models.json");
+    return s_sModelsJsonPathOverride.isEmpty()
+        ? QDir::homePath() + QStringLiteral("/.pi/agent/models.json")
+        : s_sModelsJsonPathOverride;
 }
 
 bool CPiAgentRunner::WritePiModelsJson() {
@@ -165,11 +171,45 @@ bool CPiAgentRunner::WritePiModelsJson() {
         oProv.insert(QStringLiteral("autocode-%1").arg(i + 1), oEntry);
     }
     oRoot.insert(QStringLiteral("providers"), oProv);
-    QFile stOut(sPath);
-    if (!stOut.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    // 2026.09.09 v2.1.140 多实例加固（勿回退）：①内容比对——磁盘正本与目标字节一致
+    //   时跳过写盘（同配置多实例的热重载/StartStage 自愈常态零写盘，减少共享文件抖动）；
+    //   ②原子替换——旧版 truncate+写非原子，并发实例的 pi 进程启动可能读到半截
+    //   JSON 解析失败 → 全槽丢失（历史「Unknown provider autocode-n」竞态的深层根源），
+    //   改 Hermes EnsureHermesHomeConfig 同款 .tmp→remove→rename 口径。
+    const QByteArray aNew = QJsonDocument(oRoot).toJson(QJsonDocument::Indented);
+    {
+        QFile stCur(sPath);
+        if (stCur.open(QIODevice::ReadOnly)) {
+            const QByteArray aCur = stCur.readAll();
+            stCur.close();
+            if (aCur == aNew) {
+                return true;   // 已一致，零写盘
+            }
+        }
+    }
+    const QString sTmp = sPath + QStringLiteral(".tmp");
+    {
+        QFile stTmp(sTmp);
+        if (!stTmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return false;
+        }
+        if (stTmp.write(aNew) != aNew.size()) {
+            stTmp.close();
+            QFile::remove(sTmp);
+            return false;
+        }
+        stTmp.close();
+    }
+    // rename 原子替换；目标已被并发实例抢先替换时 remove/rename 失败——兑底删临时
+    //   文件（对方写入与本方目标来自同一内存表，最终状态仍正确）。
+    if (!QFile::remove(sPath) && QFile::exists(sPath)) {
+        QFile::remove(sTmp);
         return false;
     }
-    stOut.write(QJsonDocument(oRoot).toJson(QJsonDocument::Indented));
+    if (!QFile::rename(sTmp, sPath)) {
+        QFile::remove(sTmp);
+        return false;
+    }
     return true;
 }
 
@@ -521,6 +561,8 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     // 环境：继承 + 按 provider 注入 API key（NFR-4：不进命令行、不打日志）。
     //   2026.08.20 激活自定义条目时旁路 env 注入（密钥在 models.json 的 provider 配置里）。
     QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
+    InjectAskEnv(oEnv);
     // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
     oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));

@@ -527,15 +527,59 @@ void CMessageBlock::BuildSystem(bool a_bError) {
     m_pLabel->setVisible(false);   // 默认折叠
 }
 
+// 2026.09.04 v2.0.113 旧轮次裸 JSON 事件行的渲染清洗：v2.0.108 时代的 Hermes
+//   事件补丁（tooldone/think/progress/tool）在旧版 exe 下不认识这些事件类型，
+//   原样透传成 System 灰字持久化在档（实测助手档 3 行 2 万+字符的裸 JSON）。
+//   载档重建时在此转为人读摘要：tooldone→✔/✘ 工具耗时、think→💭 思考、
+//   tool→⚙ 工具预览、progress→丢弃（返回空串，调用方跳过）；非裸 JSON
+//   行原样返回（零副作用）。
+QString CMessageBlock::PrettyLegacyJsonLine(const QString& a_sText) {
+    if (!a_sText.startsWith(QLatin1String("{\"type\": "))) {
+        return a_sText;
+    }
+    const QJsonObject o = QJsonDocument::fromJson(a_sText.toUtf8()).object();
+    const QString sType = o.value(QStringLiteral("type")).toString();
+    if (sType == QLatin1String("tooldone")) {
+        const qint64 iMs = o.value(QStringLiteral("ms")).toInteger();
+        QString s = o.value(QStringLiteral("err")).toBool() ? QStringLiteral("✘ ")
+                                                            : QStringLiteral("✔ ");
+        s += o.value(QStringLiteral("tool")).toString();
+        if (iMs > 0) {
+            s += QStringLiteral("（%1s）").arg(iMs / 1000.0, 0, 'f', 1);
+        }
+        return s;
+    }
+    if (sType == QLatin1String("think")) {
+        QString s = o.value(QStringLiteral("text")).toString();
+        s.replace(QLatin1Char('\n'), QLatin1Char(' '));
+        return s.isEmpty() ? QString() : QStringLiteral("💭 ") + s.left(80);
+    }
+    if (sType == QLatin1String("tool")) {
+        return QStringLiteral("⚙ ") + o.value(QStringLiteral("tool")).toString()
+             + (o.value(QStringLiteral("preview")).toString().isEmpty()
+                    ? QString()
+                    : QStringLiteral(" ") + o.value(QStringLiteral("preview")).toString());
+    }
+    if (sType == QLatin1String("progress")) {
+        return QString();   // 历史进度心跳无回看价值，丢弃
+    }
+    return a_sText;
+}
+
 void CMessageBlock::SetSystemText(const QString& a_sText) {
     if (m_pLabel == nullptr) {
         return;
     }
     if (m_eKind == System) {
-        // System 折叠组：首行入组（后续行由面板层 AppendSystemLine 并入）
+        // System 折叠组：首行入组（后续行由面板层 AppendSystemLine 并入；
+        //   v2.0.113 首行经裸 JSON 清洗，清洗为空则不建组）
+        const QString sPretty = PrettyLegacyJsonLine(a_sText);
+        if (sPretty.isEmpty()) {
+            return;
+        }
         m_aSysLines.clear();
-        m_aSysLines.append(a_sText);
-        m_pLabel->setText(a_sText);
+        m_aSysLines.append(sPretty);
+        m_pLabel->setText(sPretty);
         RefreshSysHeader();
     } else {
         m_pLabel->setText(a_sText);   // Error：单条红字不折叠
@@ -547,7 +591,11 @@ void CMessageBlock::AppendSystemLine(const QString& a_sText) {
     if (m_eKind != System) {
         return;
     }
-    m_aSysLines.append(a_sText);
+    const QString sPretty = PrettyLegacyJsonLine(a_sText);   // v2.0.113 裸 JSON 清洗
+    if (sPretty.isEmpty()) {
+        return;
+    }
+    m_aSysLines.append(sPretty);
     if (m_pLabel != nullptr) {
         m_pLabel->setText(m_aSysLines.join(QLatin1Char('\n')));
     }

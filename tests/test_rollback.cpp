@@ -8,6 +8,9 @@
 
 #include "project/CProjectManager.h"
 #include "ui/CRollbackDialog.h"
+#include "ui/CDiffViewDialog.h"
+#include <QPlainTextEdit>
+#include <QTextBlock>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSplitter>
@@ -138,6 +141,63 @@ private:
     }
 
 private slots:
+    // ============ 2026.09.04 查看变更：LCS 行级对齐（对齐 HarnessAgent 效果）============
+    // 旧实现「公共前后缀夹逼」把中间整块标色——改 1 行带红绿几十行上下文，看不出
+    // 实质修改。新实现 LCS 逐行对齐：只有真正增/删/改的行着色，公共行不着色，
+    // 缺失侧插占位（灰）。经对话框双栏文本 + ExtraSelection 着色行数断言。
+    void testDiffLcsAlign() {
+        // 旧/新各 10 行，仅第 4 行内容不同。LCS 逐行对齐后两侧等长 11 行：
+        //   旧侧 [l0..l3, "l4 old", 占位, l5..l9]，新侧 [l0..l3, 占位, "l4 new", l5..l9]，
+        //   着色各 2 条（变更行 + 灰占位），公共 9 行不着色。
+        const QByteArray aOld = QByteArrayLiteral("l0\nl1\nl2\nl3\nl4 old\nl5\nl6\nl7\nl8\nl9");
+        const QByteArray aNew = QByteArrayLiteral("l0\nl1\nl2\nl3\nl4 new\nl5\nl6\nl7\nl8\nl9");
+        CDiffViewDialog stDlg(QStringLiteral("a.txt"), aOld, aNew, false, false,
+                              QStringLiteral("old"), QStringLiteral("new"));
+        // findChildren 栏序不保证（splitter children 顺序与创建序可异）——按内容锚定。
+        const QList<QPlainTextEdit*> aEdits = stDlg.findChildren<QPlainTextEdit*>();
+        QCOMPARE(aEdits.size(), 2);
+        QPlainTextEdit* pEdOld = aEdits.at(0)->toPlainText().contains(QLatin1String("l4 old"))
+                                     ? aEdits.at(0) : aEdits.at(1);
+        QPlainTextEdit* pEdNew = (pEdOld == aEdits.at(0)) ? aEdits.at(1) : aEdits.at(0);
+        // 两侧等长 11 行（LCS 对齐 + 1 占位）。
+        QCOMPARE(pEdOld->document()->blockCount(), 11);
+        QCOMPARE(pEdNew->document()->blockCount(), 11);
+        // 着色各 2 条：旧 = "l4 old"(红@4) + 占位(灰@5)；新 = 占位(灰@4) + "l4 new"(绿@5)。
+        QCOMPARE(pEdOld->extraSelections().size(), 2);
+        QCOMPARE(pEdNew->extraSelections().size(), 2);
+        QCOMPARE(pEdOld->extraSelections().at(0).cursor.blockNumber(), 4);
+        QCOMPARE(pEdOld->extraSelections().at(0).cursor.block().text(), QStringLiteral("l4 old"));
+        QCOMPARE(pEdNew->extraSelections().at(1).cursor.blockNumber(), 5);
+        QCOMPARE(pEdNew->extraSelections().at(1).cursor.block().text(), QStringLiteral("l4 new"));
+        // 占位块可见文本为空（哨兵不外显）。
+        QCOMPARE(pEdOld->extraSelections().at(1).cursor.block().text(), QString());
+        QCOMPARE(pEdNew->extraSelections().at(0).cursor.block().text(), QString());
+    }
+
+    void testDiffLcsInsertDelete() {
+        // 旧 3 行 → 新 5 行（中间插入 2 行）：对齐后两侧等长 5 行——
+        //   旧侧 [a, 占位, 占位, b, c]（2 灰），新侧 [a, x, y, b, c]（2 绿）。
+        const QByteArray aOld = QByteArrayLiteral("a\nb\nc");
+        const QByteArray aNew = QByteArrayLiteral("a\nx\ny\nb\nc");
+        CDiffViewDialog stDlg(QStringLiteral("b.txt"), aOld, aNew, false, false,
+                              QStringLiteral("old"), QStringLiteral("new"));
+        const QList<QPlainTextEdit*> aEdits = stDlg.findChildren<QPlainTextEdit*>();
+        QPlainTextEdit* pEdOld = aEdits.at(0)->toPlainText().contains(QLatin1String("x"))
+                                     ? aEdits.at(1) : aEdits.at(0);   // 含 x 的是新侧
+        QPlainTextEdit* pEdNew = (pEdOld == aEdits.at(0)) ? aEdits.at(1) : aEdits.at(0);
+        QCOMPARE(pEdOld->document()->blockCount(), 5);
+        QCOMPARE(pEdNew->document()->blockCount(), 5);
+        QCOMPARE(pEdOld->extraSelections().size(), 2);
+        QCOMPARE(pEdNew->extraSelections().size(), 2);
+        // 旧侧 2 条占位（灰，块 1/2，文本空）。
+        QCOMPARE(pEdOld->extraSelections().at(0).cursor.blockNumber(), 1);
+        QCOMPARE(pEdOld->extraSelections().at(1).cursor.blockNumber(), 2);
+        QCOMPARE(pEdOld->extraSelections().at(0).cursor.block().text(), QString());
+        // 新侧 2 条新增（绿）：x@1、y@2。
+        QCOMPARE(pEdNew->extraSelections().at(0).cursor.block().text(), QStringLiteral("x"));
+        QCOMPARE(pEdNew->extraSelections().at(1).cursor.block().text(), QStringLiteral("y"));
+    }
+
     // ============ v1.4.85：无差异 turn 快照建「同源引用版」（回退列表不再缺条目）============
 
     void testNoChangeAliasVersion() {

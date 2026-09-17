@@ -53,6 +53,78 @@ static bool IsGeoOnScreen(const QRect& a_stGeo) {
     return false;
 }
 
+// —— 模型表列宽持久化（2026.09.11，口径同 CRollbackDialog::SaveLayoutState）——
+// 显式整型串存 [Layout] SettingsModelCols{Dsh,Pi,Codex,Hermes}（ConfigFilePath 恒
+// 全局 config.ini，界面态不参与任务级覆盖）；恢复严格校验个数 + 限幅 [24,2000]，
+// 坏档整表自弃回缺省值。不用 QSettings（UTF-8 整文件重写会打乱 profile API 写下的
+// ANSI 中文值，见 CRollbackDialog 同名注释）；写后冲刷 profile 缓存保证即时落盘。
+static QString ReadProfileString(const QString& a_sFile, const wchar_t* a_pwsSect,
+                                 const wchar_t* a_pwsKey) {
+    wchar_t szBuf[2048] = {0};   // 列宽整型串最长数十字符，2K 富余
+    const DWORD dw = GetPrivateProfileStringW(a_pwsSect, a_pwsKey, L"", szBuf, 2048,
+                                              a_sFile.toStdWString().c_str());
+    return QString::fromWCharArray(szBuf, static_cast<int>(dw));
+}
+
+static QList<int> SplitInts(const QString& a_s, int a_iExpect) {
+    // 恰好 a_iExpect 个整数才通过；空串/个数不符/含非数字字符返回空表（坏档自弃）。
+    if (a_s.isEmpty()) {
+        return {};
+    }
+    const QStringList aParts = a_s.split(QLatin1Char(','));
+    if (aParts.size() != a_iExpect) {
+        return {};
+    }
+    QList<int> aV;
+    for (const QString& sP : aParts) {
+        bool bOk = false;
+        const int i = sP.toInt(&bOk);
+        if (!bOk) {
+            return {};
+        }
+        aV.append(i);
+    }
+    return aV;
+}
+
+static void SaveModelColWidths(CProjectManager* a_pPm, QTreeWidget* a_pTree,
+                               const wchar_t* a_pwsKey) {
+    if (a_pPm == nullptr || a_pTree == nullptr) {
+        return;
+    }
+    const QString sCfg = a_pPm->ConfigFilePath();
+    if (sCfg.isEmpty()) {
+        return;
+    }
+    QString sVals;   // 前六列宽逗号串；末列「当前」stretchLastSection 恒填满不存
+    for (int i = 0; i < a_pTree->columnCount() - 1; ++i) {
+        if (!sVals.isEmpty()) {
+            sVals += QLatin1Char(',');
+        }
+        sVals += QString::number(a_pTree->columnWidth(i));
+    }
+    WritePrivateProfileStringW(L"Layout", a_pwsKey, sVals.toStdWString().c_str(),
+                               (LPCWSTR)sCfg.utf16());
+    // 冲刷 profile 写缓存（WritePrivateProfileStringW 延迟落盘，见 CRollbackDialog 注释）。
+    ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, (LPCWSTR)sCfg.utf16());
+}
+
+static void RestoreModelColWidths(CProjectManager* a_pPm, QTreeWidget* a_pTree,
+                                  const wchar_t* a_pwsKey) {
+    if (a_pPm == nullptr || a_pTree == nullptr) {
+        return;
+    }
+    const QString sCfg = a_pPm->ConfigFilePath();
+    if (sCfg.isEmpty()) {
+        return;
+    }
+    const QList<int> aCols = SplitInts(
+        ReadProfileString(sCfg, L"Layout", a_pwsKey), a_pTree->columnCount() - 1);
+    for (int i = 0; i < aCols.size(); ++i) {
+        a_pTree->setColumnWidth(i, qBound(24, aCols.at(i), 2000));   // 同回退表限幅
+    }
+}
+
 // 2026.08.18 自定义大模型条目编辑对话框（无 Q_OBJECT：纯表单 + exec/lambda 连接，
 //   不进 moc/构建系统）。校验：模型 ID / 接入点必填（空则拦截 accept 并提示）；
 //   其余空值在 Entry() 回默认（API 类型→anthropic-messages，显示名→模型 ID）。
@@ -155,6 +227,22 @@ public:
                                      QStringLiteral("模型 ID 与接入点为必填项。"));
                 return;
             }
+            // 2026.09.09 v2.1.129 上下文超配提醒（第 4 次复发的 1M 类坑：条目配模型原生
+            //   窗口而服务端真实窗口更小——pi 以为有 1M 永不自动压缩，对话涨满即 400
+            //   exceed_context_size_error；实害：本地 llama.cpp n_ctx=65536 配 1000000）。
+            //   非阻断（大窗口真实存在如 SenseNova 528K），仅提示核对服务端真实窗口。
+            if (m_pSpinCtx->value() > 262144) {
+                const QMessageBox::StandardButton eRet = QMessageBox::question(this,
+                    QStringLiteral("自定义模型"),
+                    QStringLiteral("上下文窗口填了 %1 token（>256K）。请确认这是"
+                                   "【服务端真实可用的窗口】而非模型原生上限——配超真实窗口时"
+                                   "pi 不会自动压缩，对话涨满后端即报 400 exceed_context_size_error。"
+                                   "仍按此值保存吗？").arg(m_pSpinCtx->value()),
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (eRet != QMessageBox::Yes) {
+                    return;
+                }
+            }
             accept();
         });
         connect(pBtns, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -211,10 +299,29 @@ private:
 };
 
 CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
-                                 CVersionDialog::FBusyCheck a_fnBackendBusy)
+                                 CVersionDialog::FBusyCheck a_fnBackendBusy,
+                                 const QString& a_sTaskScope)
     : QDialog(a_pParent), m_fnBackendBusy(std::move(a_fnBackendBusy)) {
     m_pPm = a_pPm;   // 2026.08.27 几何持久化用（done() 落盘）；非拥有。
     SetupUi();
+    // 2026.09.09 v2.2.145 任务级配置覆盖提示（改对话框内提示条，勿用标题后缀——
+    //   标题后缀曾被用户误认成「多出来的 tab」）：选中任务时顶部黄色提示条注明
+    //   本次读/写均落在任务档（.autodev/tasks/<id>/config.ini，缺键继承全局）。
+    if (!a_sTaskScope.isEmpty()) {
+        if (auto* pLay = qobject_cast<QVBoxLayout*>(layout()); pLay != nullptr) {
+            auto* pLblScope = new QLabel(
+                QStringLiteral("◆ 任务模式：本次设置保存到任务目录（任务：%1）；"
+                               "未选任务时保存到程序目录。模型条目会同时并入全局缺省配置。")
+                    .arg(a_sTaskScope), this);
+            pLblScope->setWordWrap(true);
+            pLblScope->setStyleSheet(
+                QStringLiteral("background:#fff7d6;border:1px solid #e0c36a;"
+                               "border-radius:4px;padding:6px 8px;color:#6b5900;"));
+            pLay->insertWidget(0, pLblScope);   // 提示条插到最前（QTabWidget 之上）
+        }
+    }
+    // ⚠ v2.1.143~v2.2.145 曾在此处多出一次 SetupUi()（构造双套 UI——顶部多一条空表
+    //   Tab 条＝用户报的「多出来的 tab/模型全部清空」真因，v2.2.146 删除），勿面加。
 
     // 构造时回填当前值（a_pPm 为空 → 全默认，仅调试/极端场景）。
     const int iDefMaxIter = (a_pPm != nullptr) ? a_pPm->LoadMaxIter() : 3;
@@ -340,6 +447,9 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_aDshModels = (a_pPm != nullptr) ? a_pPm->LoadDshModels(&m_iDshActiveModel)
                                       : QList<SDshModelEntry>();
     RefreshDshModelList();
+    // 2026.09.10 公共模型配置：四张表合并归一为一份共享表（列表 + 当前项）——
+    //   四页展示同一份数据，切换后端无需重配模型（保存时同一份内容写回四张节）。
+    UnifySharedModels();
 
     // 2026.08.27 窗口几何：优先恢复上次保存的（[SettingsWindow]）；无记录/已出屏则用
     //   默认尺寸。默认取 sizeHint（含最高页签的完整内容）夹在父窗口所在屏工作区 95% 内——
@@ -361,13 +471,25 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
         }
         resize(szDef.expandedTo(QSize(620, 460)));
     }
+
+    // 2026.09.11 模型表列宽恢复（[Layout] SettingsModelCols*；缺档/坏档用上方缺省值，
+    //   四页各存各的——同一份共享数据、各视图宽度独立，口径同回退对话框两表）。
+    RestoreModelColWidths(m_pPm, m_pTreeDshModels, L"SettingsModelColsDsh");
+    RestoreModelColWidths(m_pPm, m_pTreePiModels, L"SettingsModelColsPi");
+    RestoreModelColWidths(m_pPm, m_pTreeCodexModels, L"SettingsModelColsCodex");
+    RestoreModelColWidths(m_pPm, m_pTreeHermesModels, L"SettingsModelColsHermes");
 }
 
 void CSettingsDialog::done(int a_r) {
     // 2026.08.27 几何落盘：accept / reject / 标题栏 X 关闭（触发 reject）都经 done()，
     //   在此统一保存；失败静默（下次用默认几何，不影响功能）。
+    // 2026.09.11 模型表列宽同点落盘（用户拖表头调宽后，确定/取消/X 关闭都记忆）。
     if (m_pPm != nullptr) {
         m_pPm->SaveSettingsDialogGeometry(geometry());
+        SaveModelColWidths(m_pPm, m_pTreeDshModels, L"SettingsModelColsDsh");
+        SaveModelColWidths(m_pPm, m_pTreePiModels, L"SettingsModelColsPi");
+        SaveModelColWidths(m_pPm, m_pTreeCodexModels, L"SettingsModelColsCodex");
+        SaveModelColWidths(m_pPm, m_pTreeHermesModels, L"SettingsModelColsHermes");
     }
     QDialog::done(a_r);
 }
@@ -610,7 +732,7 @@ void CSettingsDialog::SetupUi() {
     // —— 自定义大模型（2026.08.18 多条目管理：跨机器自配 LLM）——
     //   条目经组合 cordis.yml 的 autocode-active env 槽位注入（DSH_LLM_* + 密钥值），
     //   激活条目覆盖上方 Provider/模型固定路由；表空则回退固定路由。
-    auto* pGroupModels = new QGroupBox(QStringLiteral("自定义大模型"), pTabDsh);
+    auto* pGroupModels = new QGroupBox(QStringLiteral("自定义大模型（四后端共享）"), pTabDsh);
     auto* pLayModels = new QVBoxLayout(pGroupModels);
     // 2026.08.19 列表改多列 QTreeWidget（显示名/接入点/API/模型ID/上下文/最大输出/当前），
     //   选中条目的信息一目了然；字体 11 号与全局统一（#7）。
@@ -627,10 +749,14 @@ void CSettingsDialog::SetupUi() {
     m_pTreeDshModels->setRootIsDecorated(false);
     m_pTreeDshModels->setAlternatingRowColors(true);
     QHeaderView* pHdrModels = m_pTreeDshModels->header();
+    // 2026.09.11 全列可拖分隔线调宽（原第 1 列 Stretch 不可拖，用户要求每列都能调）：
+    //   改全部 Interactive + 末列「当前」stretchLastSection 填满剩余空间（同任务历史
+    //   列表口径）；列宽经 [Layout] SettingsModelColsDsh 持久化（构造恢复/done() 落盘）。
     pHdrModels->setSectionsMovable(false);                        // 禁拖动换列序
     pHdrModels->setSectionResizeMode(QHeaderView::Interactive);   // 全列可拖分隔线调宽
-    pHdrModels->setSectionResizeMode(1, QHeaderView::Stretch);    // 接入点列伸缩填满
+    pHdrModels->setStretchLastSection(true);                      // 末列拉伸填满剩余空间
     pHdrModels->resizeSection(0, 130);
+    pHdrModels->resizeSection(1, 190);   // 接入点（URL 较长，原 Stretch 列改固定缺省宽）
     pHdrModels->resizeSection(2, 125);
     pHdrModels->resizeSection(3, 100);
     pHdrModels->resizeSection(4, 75);
@@ -644,9 +770,12 @@ void CSettingsDialog::SetupUi() {
     pHdrModels->setFont(fntModelsHdr);
     m_pTreeDshModels->setMinimumHeight(120);
     m_pTreeDshModels->setToolTip(QStringLiteral(
-        "自定义模型条目（配置随程序走，存 exe 同级 config.ini 的 [DshModels] 节）。\n"
+        "自定义模型条目（2026.09.10 起四个后端页共享同一份列表与「当前」模型：在任一页\n"
+        "新增/编辑/删除/设为当前，其余后端页同步生效，切换后端无需重配；正本存 exe 同级\n"
+        "config.ini 的 [DshModels]/[PiModels]/[CodexModels]/[HermesModels] 四节同内容）。\n"
         "「当前」列打 ● 的条目生效，忽略上方 Provider/模型（组合改走 autocode-active\n"
-        "槽位：接入点 / API Key / 窗口等全部取自该条目）。双击条目可直接编辑"));
+        "槽位：接入点 / API Key / 窗口等全部取自该条目）。双击条目可直接编辑；\n"
+        "列宽拖表头分隔线可调，自动记忆（双击分隔线自适应内容）"));
     connect(m_pTreeDshModels, &QTreeWidget::itemDoubleClicked,
             this, [this](QTreeWidgetItem*, int) { OnDshModelEdit(); });
     // 选中行变化只刷新按钮态（RefreshDshModelList 内部 blockSignals 重建，无重入）
@@ -811,7 +940,7 @@ void CSettingsDialog::SetupUi() {
     // —— PiAgent 自定义大模型（2026.08.20，口径仿 DSH 页）——
     //   条目合成写 ~/.pi/agent/models.json 的 autocode-<n> provider 槽位（密钥随
     //   provider 配置走，不进命令行/日志）；激活条目覆盖上方 Provider/模型固定路由。
-    auto* pGroupPiModels = new QGroupBox(QStringLiteral("自定义大模型"), pTabPi);
+    auto* pGroupPiModels = new QGroupBox(QStringLiteral("自定义大模型（四后端共享）"), pTabPi);
     auto* pLayPiModels = new QVBoxLayout(pGroupPiModels);
     m_pTreePiModels = new QTreeWidget(pGroupPiModels);
     m_pTreePiModels->setColumnCount(7);
@@ -826,10 +955,13 @@ void CSettingsDialog::SetupUi() {
     m_pTreePiModels->setRootIsDecorated(false);
     m_pTreePiModels->setAlternatingRowColors(true);
     QHeaderView* pHdrPiModels = m_pTreePiModels->header();
+    // 2026.09.11 同 DSH 页：全列可拖调宽（原第 1 列 Stretch 改 Interactive），
+    //   末列填满；列宽经 [Layout] SettingsModelColsPi 持久化。
     pHdrPiModels->setSectionsMovable(false);
     pHdrPiModels->setSectionResizeMode(QHeaderView::Interactive);
-    pHdrPiModels->setSectionResizeMode(1, QHeaderView::Stretch);
+    pHdrPiModels->setStretchLastSection(true);
     pHdrPiModels->resizeSection(0, 130);
+    pHdrPiModels->resizeSection(1, 190);   // 请求地址（原 Stretch 列改固定缺省宽）
     pHdrPiModels->resizeSection(2, 125);
     pHdrPiModels->resizeSection(3, 100);
     pHdrPiModels->resizeSection(4, 75);
@@ -843,9 +975,12 @@ void CSettingsDialog::SetupUi() {
     pHdrPiModels->setFont(fntPiModelsHdr);
     m_pTreePiModels->setMinimumHeight(120);
     m_pTreePiModels->setToolTip(QStringLiteral(
-        "自定义模型条目（正本存 exe 同级 config.ini 的 [PiModels] 节，确定保存时合成写\n"
-        "~/.pi/agent/models.json 的 autocode-<n> provider 槽位）。\n"
-        "「当前」列打 ● 的条目生效，忽略上方 Provider/模型/API Key 固定路由。双击编辑"));
+        "自定义模型条目（2026.09.10 起四个后端页共享同一份列表与「当前」模型：在任一页\n"
+        "新增/编辑/删除/设为当前，其余后端页同步生效，切换后端无需重配；正本存 exe 同级\n"
+        "config.ini 的 [DshModels]/[PiModels]/[CodexModels]/[HermesModels] 四节同内容，\n"
+        "确定保存时本节合成写 ~/.pi/agent/models.json 的 autocode-<n> provider 槽位）。\n"
+        "「当前」列打 ● 的条目生效，忽略上方 Provider/模型/API Key 固定路由。双击编辑；\n"
+        "列宽拖表头分隔线可调，自动记忆"));
     connect(m_pTreePiModels, &QTreeWidget::itemDoubleClicked,
             this, [this](QTreeWidgetItem*, int) { OnPiModelEdit(); });
     connect(m_pTreePiModels, &QTreeWidget::currentItemChanged,
@@ -986,7 +1121,7 @@ void CSettingsDialog::SetupUi() {
     // —— CodexHarness 自定义大模型（2026.08.21，口径仿 DSH/Pi 页）——
     //   条目经 ~/.codex/config.toml 的 autocode-<n> provider 槽位 + auth.json 生效；
     //   激活条目覆盖上方 Provider/模型/BaseUrl/WireApi/APIKey 固定路由。
-    auto* pGroupCodexModels = new QGroupBox(QStringLiteral("自定义大模型"), pTabCodex);
+    auto* pGroupCodexModels = new QGroupBox(QStringLiteral("自定义大模型（四后端共享）"), pTabCodex);
     auto* pLayCodexModels = new QVBoxLayout(pGroupCodexModels);
     m_pTreeCodexModels = new QTreeWidget(pGroupCodexModels);
     m_pTreeCodexModels->setColumnCount(7);
@@ -1001,10 +1136,13 @@ void CSettingsDialog::SetupUi() {
     m_pTreeCodexModels->setRootIsDecorated(false);
     m_pTreeCodexModels->setAlternatingRowColors(true);
     QHeaderView* pHdrCodexModels = m_pTreeCodexModels->header();
+    // 2026.09.11 同 DSH 页：全列可拖调宽（原第 1 列 Stretch 改 Interactive），
+    //   末列填满；列宽经 [Layout] SettingsModelColsCodex 持久化。
     pHdrCodexModels->setSectionsMovable(false);
     pHdrCodexModels->setSectionResizeMode(QHeaderView::Interactive);
-    pHdrCodexModels->setSectionResizeMode(1, QHeaderView::Stretch);
+    pHdrCodexModels->setStretchLastSection(true);
     pHdrCodexModels->resizeSection(0, 130);
+    pHdrCodexModels->resizeSection(1, 190);   // 请求地址（原 Stretch 列改固定缺省宽）
     pHdrCodexModels->resizeSection(2, 90);
     pHdrCodexModels->resizeSection(3, 100);
     pHdrCodexModels->resizeSection(4, 75);
@@ -1018,10 +1156,14 @@ void CSettingsDialog::SetupUi() {
     pHdrCodexModels->setFont(fntCodexModelsHdr);
     m_pTreeCodexModels->setMinimumHeight(120);
     m_pTreeCodexModels->setToolTip(QStringLiteral(
-        "自定义模型条目（正本存 exe 同级 config.ini 的 [CodexModels] 节，确定保存时合成写\n"
-        "~/.codex 的 config.toml autocode-<n> provider 槽位与 auth.json）。\n"
-        "「当前」列打 ● 的条目生效，忽略上方 Provider/模型/API Key/BaseUrl/WireApi 固定路由。"
-        "双击编辑"));
+        "自定义模型条目（2026.09.10 起四个后端页共享同一份列表与「当前」模型：在任一页\n"
+        "新增/编辑/删除/设为当前，其余后端页同步生效，切换后端无需重配；正本存 exe 同级\n"
+        "config.ini 的 [DshModels]/[PiModels]/[CodexModels]/[HermesModels] 四节同内容，\n"
+        "确定保存时本节合成写 ~/.codex 的 config.toml autocode-<n> provider 槽位与 auth.json）。\n"
+        "「当前」列打 ● 的条目生效，忽略上方 Provider/模型/API Key/BaseUrl/WireApi 固定路由。\n"
+        "双击编辑。注意：Codex 只能连 chat completions 兼容端点（openai-completions 等同\n"
+        "chat；anthropic-messages 端点不可用于 Codex，设为当前前请确认端点类型）；\n"
+        "列宽拖表头分隔线可调，自动记忆"));
     connect(m_pTreeCodexModels, &QTreeWidget::itemDoubleClicked,
             this, [this](QTreeWidgetItem*, int) { OnCodexModelEdit(); });
     connect(m_pTreeCodexModels, &QTreeWidget::currentItemChanged,
@@ -1178,7 +1320,7 @@ void CSettingsDialog::SetupUi() {
     pFormHermes->addRow(QStringLiteral("计费单价($/M)："), pRowHermesPrice);
     pLayHermes->addWidget(pGroupHermes);
     // 自定义大模型（[HermesModels]，7 列口径同 Pi/Codex 树）。
-    auto* pGroupHermesModels = new QGroupBox(QStringLiteral("自定义大模型"), pTabHermes);
+    auto* pGroupHermesModels = new QGroupBox(QStringLiteral("自定义大模型（四后端共享）"), pTabHermes);
     auto* pLayHermesModels = new QVBoxLayout(pGroupHermesModels);
     m_pTreeHermesModels = new QTreeWidget(pGroupHermesModels);
     m_pTreeHermesModels->setColumnCount(7);
@@ -1193,10 +1335,13 @@ void CSettingsDialog::SetupUi() {
     m_pTreeHermesModels->setRootIsDecorated(false);
     m_pTreeHermesModels->setAlternatingRowColors(true);
     QHeaderView* pHdrHermesModels = m_pTreeHermesModels->header();
+    // 2026.09.11 同 DSH 页：全列可拖调宽（原第 1 列 Stretch 改 Interactive），
+    //   末列填满；列宽经 [Layout] SettingsModelColsHermes 持久化。
     pHdrHermesModels->setSectionsMovable(false);
     pHdrHermesModels->setSectionResizeMode(QHeaderView::Interactive);
-    pHdrHermesModels->setSectionResizeMode(1, QHeaderView::Stretch);
+    pHdrHermesModels->setStretchLastSection(true);
     pHdrHermesModels->resizeSection(0, 130);
+    pHdrHermesModels->resizeSection(1, 190);   // 请求地址（原 Stretch 列改固定缺省宽）
     pHdrHermesModels->resizeSection(2, 125);
     pHdrHermesModels->resizeSection(3, 100);
     pHdrHermesModels->resizeSection(4, 75);
@@ -1210,9 +1355,11 @@ void CSettingsDialog::SetupUi() {
     pHdrHermesModels->setFont(fntHermesHdr);
     m_pTreeHermesModels->setMinimumHeight(120);
     m_pTreeHermesModels->setToolTip(QStringLiteral(
-        "自定义模型条目（正本存 config.ini 的 [HermesModels] 节）。\n"
+        "自定义模型条目（2026.09.10 起四个后端页共享同一份列表与「当前」模型：在任一页\n"
+        "新增/编辑/删除/设为当前，其余后端页同步生效，切换后端无需重配；正本存 config.ini\n"
+        "的 [DshModels]/[PiModels]/[CodexModels]/[HermesModels] 四节同内容）。\n"
         "「当前」列打 ● 的条目生效，忽略上方模型/API Key 固定路由。双击编辑。\n"
-        "最大输出上限 131072（网关 2^17 上限，保存时钳位）"));
+        "最大输出上限 131072（网关 2^17 上限，保存时钳位）；列宽拖表头分隔线可调，自动记忆"));
     connect(m_pTreeHermesModels, &QTreeWidget::itemDoubleClicked,
             this, [this](QTreeWidgetItem*, int) { OnHermesModelEdit(); });
     connect(m_pTreeHermesModels, &QTreeWidget::currentItemChanged,
@@ -1276,7 +1423,11 @@ void CSettingsDialog::UpdateDshEnabled() {
     if (m_pSpinDshPriceCacheRead != nullptr) { m_pSpinDshPriceCacheRead->setEnabled(bDsh); }
     if (m_pSpinDshPriceCacheWrite != nullptr) { m_pSpinDshPriceCacheWrite->setEnabled(bDsh); }
     if (m_pSpinDshPriceOut != nullptr)       { m_pSpinDshPriceOut->setEnabled(bDsh); }
-    if (m_pTreeDshModels != nullptr)   { m_pTreeDshModels->setEnabled(bDsh); }
+    // 2026.09.09 v2.1.138 自定义大模型列表不再要求选中本后端（用户需求：未选为当前
+    //   后端也要能编辑条目）：模型表是纯 config 数据（[DshModels]），不依赖后端选中/
+    //   安装状态，可提前预配；单价/Provider 等运行参数仍随选中联动不变。按钮组由
+    //   UpdateDshModelButtons 经树 isEnabled() 派生，树恒启用后随选中行联动。
+    if (m_pTreeDshModels != nullptr)   { m_pTreeDshModels->setEnabled(true); }
     // 2026.08.18 后端专属项反向联动：DSH/PIgent 后端下这四项对运行无效果——claude 命令/
     //   提问等待超时只进 CClaudeRunner（DSH/Pi 用 node 启动、无 ask_user MCP 工具），
     //   联网检索开关与自动压缩比只折算进 claude 专属启动参数（两后端侧忽略并降级提示）。
@@ -1320,6 +1471,73 @@ void CSettingsDialog::UpdateDshEnabled() {
 // 2026.08.18 自定义大模型列表刷新：重建多列条目行（当前列 ● 标记），空表给占位行；
 //   末尾按选中行与组级开关更新按钮态（选中态变化 / 增删改 / 设为当前后都走这里）。
 //   重建全程 blockSignals——currentItemChanged 也接到本函数，靠屏蔽防环。
+// 2026.09.10 公共模型配置：四张模型表合并归一——四个成员变同一份共享表
+//   （列表 + 当前项两两相等），四页展示/编辑的是同一份数据。合并规则见
+//   CModelEntry.h MergeSharedModelTables（基底 = 最多条目的表，其余表新身份追加；
+//   传参优先级 Pi > DSH > Hermes > Codex——并列时 Pi 表定基底序）。
+void CSettingsDialog::UnifySharedModels() {
+    const QList<QList<SDshModelEntry>> aTables = {
+        m_aPiModels, m_aDshModels, m_aHermesModels, m_aCodexModels };
+    const QList<int> aActives = {
+        m_iPiActiveModel, m_iDshActiveModel, m_iHermesActiveModel, m_iCodexActiveModel };
+    // 共享当前项优先取当前选中后端自己表的激活条目（磁盘四表收敛后各表 Active
+    //   本就相同，该优先级只在未收敛期起作用——保留用户在当前后端已选的模型）。
+    int iPrefTable = -1;
+    const int iCurBackend = (m_pComboBackend != nullptr)
+        ? m_pComboBackend->currentData().toInt() : 1;
+    if (iCurBackend == 3) {
+        iPrefTable = 0;         // Pi
+    } else if (iCurBackend == 2) {
+        iPrefTable = 1;         // DSH
+    } else if (iCurBackend == 5) {
+        iPrefTable = 2;         // Hermes
+    } else if (iCurBackend == 4) {
+        iPrefTable = 3;         // Codex
+    }
+    const SSharedModels stM = MergeSharedModelTables(aTables, aActives, iPrefTable);
+    m_aPiModels = stM.aModels;
+    m_aDshModels = stM.aModels;
+    m_aHermesModels = stM.aModels;
+    m_aCodexModels = stM.aModels;
+    m_iPiActiveModel = stM.iActive;
+    m_iDshActiveModel = stM.iActive;
+    m_iHermesActiveModel = stM.iActive;
+    m_iCodexActiveModel = stM.iActive;
+    RefreshPiModelList();
+    RefreshDshModelList();
+    RefreshHermesModelList();
+    RefreshCodexModelList();
+}
+
+// 2026.09.10 公共模型配置：任一页的模型改动（增/改/删/复制/设为当前）落地后，
+//   把该页的列表与当前项同步到其余三页并刷新——四页始终是同一份数据，
+//   保存时主窗口把同一份内容写回四张节，切换后端即用同一份列表/当前项。
+//   （不能反向调 UnifySharedModels：其余三页还是改动前的旧副本，合并会把
+//   刚删掉的条目从旧副本里补回来。）
+void CSettingsDialog::ShareModelsFromPage(int a_iPage) {
+    QList<SDshModelEntry>* apLists[4] = {
+        &m_aDshModels, &m_aPiModels, &m_aCodexModels, &m_aHermesModels };
+    int* apiActives[4] = {
+        &m_iDshActiveModel, &m_iPiActiveModel, &m_iCodexActiveModel, &m_iHermesActiveModel };
+    if (a_iPage < 0 || a_iPage >= 4) {
+        return;
+    }
+    const QList<SDshModelEntry> aSrc = *apLists[a_iPage];
+    const int iSrcActive = *apiActives[a_iPage];
+    for (int i = 0; i < 4; ++i) {
+        if (i == a_iPage) {
+            continue;
+        }
+        *apLists[i] = aSrc;
+        *apiActives[i] = iSrcActive;
+    }
+    // 只刷新其余三页（本页刷新由各自 handler 的 UpdateXxxEnabled 收尾）。
+    if (a_iPage != 0) { RefreshDshModelList(); }
+    if (a_iPage != 1) { RefreshPiModelList(); }
+    if (a_iPage != 2) { RefreshCodexModelList(); }
+    if (a_iPage != 3) { RefreshHermesModelList(); }
+}
+
 void CSettingsDialog::RefreshDshModelList() {
     if (m_pTreeDshModels == nullptr) {
         return;
@@ -1387,6 +1605,7 @@ void CSettingsDialog::OnDshModelAdd() {
     if (m_aDshModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iDshActiveModel = 0;
     }
+    ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshDshModelList();   // 先重建（新行落位），再选中末行
     if (m_pTreeDshModels->topLevelItemCount() > 0) {
         m_pTreeDshModels->setCurrentItem(
@@ -1411,6 +1630,7 @@ void CSettingsDialog::OnDshModelCopy() {
     if (m_aDshModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iDshActiveModel = 0;
     }
+    ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshDshModelList();
     if (m_pTreeDshModels->topLevelItemCount() > 0) {
         m_pTreeDshModels->setCurrentItem(
@@ -1429,6 +1649,7 @@ void CSettingsDialog::OnDshModelEdit() {
         return;
     }
     m_aDshModels[iRow] = dlg.Entry();
+    ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateDshEnabled();
 }
 
@@ -1451,6 +1672,7 @@ void CSettingsDialog::OnDshModelDel() {
     if (m_aDshModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
         m_iDshActiveModel = 0;
     }
+    ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateDshEnabled();
 }
 
@@ -1460,6 +1682,7 @@ void CSettingsDialog::OnDshModelSetActive() {
         return;
     }
     m_iDshActiveModel = (m_iDshActiveModel == iRow) ? -1 : iRow;   // 再点一次取消
+    ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateDshEnabled();
 }
 
@@ -1569,7 +1792,9 @@ void CSettingsDialog::UpdatePiEnabled() {
     if (m_pSpinPiPriceCacheRead != nullptr) { m_pSpinPiPriceCacheRead->setEnabled(bPi); }
     if (m_pSpinPiPriceCacheWrite != nullptr){ m_pSpinPiPriceCacheWrite->setEnabled(bPi); }
     if (m_pSpinPiPriceOut != nullptr)       { m_pSpinPiPriceOut->setEnabled(bPi); }
-    if (m_pTreePiModels != nullptr)  { m_pTreePiModels->setEnabled(bPi); }
+    // 2026.09.09 v2.1.138 自定义大模型列表不再要求选中/安装本后端（同 DSH 口径）：
+    //   [PiModels] 为纯 config 数据，未选 pi 时也可增改删/设为当前（提前预配）。
+    if (m_pTreePiModels != nullptr)  { m_pTreePiModels->setEnabled(true); }
     auto* pStdModel = qobject_cast<QStandardItemModel*>(m_pComboBackend->model());
     const Qt::ItemFlags eFlags = m_bPiInstalled
         ? (Qt::ItemIsSelectable | Qt::ItemIsEnabled) : Qt::NoItemFlags;
@@ -1655,6 +1880,7 @@ void CSettingsDialog::OnPiModelAdd() {
     if (m_aPiModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iPiActiveModel = 0;
     }
+    ShareModelsFromPage(1);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshPiModelList();
     if (m_pTreePiModels->topLevelItemCount() > 0) {
         m_pTreePiModels->setCurrentItem(
@@ -1679,6 +1905,7 @@ void CSettingsDialog::OnPiModelCopy() {
     if (m_aPiModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iPiActiveModel = 0;
     }
+    ShareModelsFromPage(1);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshPiModelList();
     if (m_pTreePiModels->topLevelItemCount() > 0) {
         m_pTreePiModels->setCurrentItem(
@@ -1697,6 +1924,7 @@ void CSettingsDialog::OnPiModelEdit() {
         return;
     }
     m_aPiModels[iRow] = dlg.Entry();
+    ShareModelsFromPage(1);   // 2026.09.10 公共模型配置：同步其余三页
     UpdatePiEnabled();
 }
 
@@ -1719,6 +1947,7 @@ void CSettingsDialog::OnPiModelDel() {
     if (m_aPiModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
         m_iPiActiveModel = 0;
     }
+    ShareModelsFromPage(1);   // 2026.09.10 公共模型配置：同步其余三页
     UpdatePiEnabled();
 }
 
@@ -1728,6 +1957,7 @@ void CSettingsDialog::OnPiModelSetActive() {
         return;
     }
     m_iPiActiveModel = (m_iPiActiveModel == iRow) ? -1 : iRow;
+    ShareModelsFromPage(1);   // 2026.09.10 公共模型配置：同步其余三页
     UpdatePiEnabled();
 }
 
@@ -2044,7 +2274,9 @@ void CSettingsDialog::UpdateCodexEnabled() {
     if (m_pEditCodexRoot != nullptr)     { m_pEditCodexRoot->setEnabled(true); }
     if (m_pEditCodexProvider != nullptr) { m_pEditCodexProvider->setEnabled(bCodex && !bCodexCustomActive); }
     if (m_pComboCodexWireApi != nullptr) { m_pComboCodexWireApi->setEnabled(bCodex && !bCodexCustomActive); }
-    if (m_pTreeCodexModels != nullptr)   { m_pTreeCodexModels->setEnabled(bCodexSel); }
+    // 2026.09.09 v2.1.138 自定义大模型列表不再要求选中本后端（v14:45 曾放宽到
+    //   「选中 Codex 即可用」，现彻底放开）：[CodexModels] 为纯 config 数据。
+    if (m_pTreeCodexModels != nullptr)   { m_pTreeCodexModels->setEnabled(true); }
     auto* pStdModel = qobject_cast<QStandardItemModel*>(m_pComboBackend->model());
     const Qt::ItemFlags eFlags = m_bCodexInstalled
         ? (Qt::ItemIsSelectable | Qt::ItemIsEnabled) : Qt::NoItemFlags;
@@ -2226,6 +2458,7 @@ void CSettingsDialog::OnCodexModelAdd() {
     if (m_aCodexModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iCodexActiveModel = 0;
     }
+    ShareModelsFromPage(2);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshCodexModelList();
     if (m_pTreeCodexModels->topLevelItemCount() > 0) {
         m_pTreeCodexModels->setCurrentItem(
@@ -2250,6 +2483,7 @@ void CSettingsDialog::OnCodexModelCopy() {
     if (m_aCodexModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iCodexActiveModel = 0;
     }
+    ShareModelsFromPage(2);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshCodexModelList();
     if (m_pTreeCodexModels->topLevelItemCount() > 0) {
         m_pTreeCodexModels->setCurrentItem(
@@ -2268,6 +2502,7 @@ void CSettingsDialog::OnCodexModelEdit() {
         return;
     }
     m_aCodexModels[iRow] = dlg.Entry();
+    ShareModelsFromPage(2);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateCodexEnabled();
 }
 
@@ -2290,6 +2525,7 @@ void CSettingsDialog::OnCodexModelDel() {
     if (m_aCodexModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
         m_iCodexActiveModel = 0;
     }
+    ShareModelsFromPage(2);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshCodexModelList();
     UpdateCodexEnabled();
 }
@@ -2300,6 +2536,7 @@ void CSettingsDialog::OnCodexModelSetActive() {
         return;
     }
     m_iCodexActiveModel = (m_iCodexActiveModel == iRow) ? -1 : iRow;
+    ShareModelsFromPage(2);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshCodexModelList();
     UpdateCodexEnabled();
 }
@@ -2389,7 +2626,9 @@ void CSettingsDialog::UpdateHermesEnabled() {
     if (m_pSpinHermesPriceCacheRead != nullptr) { m_pSpinHermesPriceCacheRead->setEnabled(bHermes); }
     if (m_pSpinHermesPriceCacheWrite != nullptr){ m_pSpinHermesPriceCacheWrite->setEnabled(bHermes); }
     if (m_pSpinHermesPriceOut != nullptr)       { m_pSpinHermesPriceOut->setEnabled(bHermes); }
-    if (m_pTreeHermesModels != nullptr) { m_pTreeHermesModels->setEnabled(bHermes); }
+    // 2026.09.09 v2.1.138 自定义大模型列表不再要求选中本后端（同 DSH/Pi/Codex 口径）：
+    //   [HermesModels] 为纯 config 数据，未选 Hermes 时也可增改删/设为当前。
+    if (m_pTreeHermesModels != nullptr) { m_pTreeHermesModels->setEnabled(true); }
     RefreshHermesModelList();
 }
 
@@ -2554,6 +2793,14 @@ void CSettingsDialog::OnInstallHermesNet() {
     }
     // 提权启动 exe 同级 install_env.bat 的 /hermes 单装模式（地址作第 2 参传入）。
     //   cmd /k 保持窗口：git/pnpm/失败输出可查。
+    // 2026.09.07 v2.1.121 修引号剥离（用户实报：「'E:\...\AutoCode\Execute' 不是
+    //   内部或外部命令」）：cmd 对 /k 后串的引号规则（cmd /? 规则 2）——引号数 >2 时
+    //   剥掉首个引号并去掉末尾最后一个引号。旧式 `/k "bat" /hermes "url"`（4 引号）
+    //   被剥后路径失去包裹，exe 目录带空格（Execute - 副本）即在首个空格处断开，把
+    //   `E:\...\AutoCode\Execute` 当命令执行。修法＝整条命令外层再包一对引号
+    //   （`/k ""bat" /hermes "url""`）——cmd 剥掉外层后剩下平衡的
+    //   `"bat" /hermes "url"`；实测带空格路径正确执行、%~2 剥引号取 URL 不受影响。
+    //   （DSH/Pi/Codex 的 `/k "bat" /mode` 恰 2 引号走 cmd 规则 1 保留引号，无需改。）
     const QString sScript = QCoreApplication::applicationDirPath()
         + QStringLiteral("/install_env.bat");
     if (!QFile::exists(sScript)) {
@@ -2562,9 +2809,9 @@ void CSettingsDialog::OnInstallHermesNet() {
                            "构建同步到 exe 同级）。").arg(QDir::toNativeSeparators(sScript)));
         return;
     }
-    const QString sArgs = QStringLiteral("/k \"")
+    const QString sArgs = QStringLiteral("/k \"\"")
         + QDir::toNativeSeparators(sScript) + QStringLiteral("\" /hermes \"")
-        + sRepo + QStringLiteral("\"");
+        + sRepo + QStringLiteral("\"\"");
     const HINSTANCE hInst = ShellExecuteW(nullptr, L"runas", L"cmd.exe",
                                            sArgs.toStdWString().c_str(),
                                            nullptr, SW_SHOWNORMAL);
@@ -2645,6 +2892,7 @@ void CSettingsDialog::OnHermesModelAdd() {
     if (m_aHermesModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iHermesActiveModel = 0;
     }
+    ShareModelsFromPage(3);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshHermesModelList();
     if (m_pTreeHermesModels->topLevelItemCount() > 0) {
         m_pTreeHermesModels->setCurrentItem(
@@ -2668,6 +2916,7 @@ void CSettingsDialog::OnHermesModelCopy() {
     if (m_aHermesModels.size() == 1) {   // 仅此一条 → 自动设为缺省
         m_iHermesActiveModel = 0;
     }
+    ShareModelsFromPage(3);   // 2026.09.10 公共模型配置：同步其余三页
     RefreshHermesModelList();
     if (m_pTreeHermesModels->topLevelItemCount() > 0) {
         m_pTreeHermesModels->setCurrentItem(
@@ -2686,6 +2935,7 @@ void CSettingsDialog::OnHermesModelEdit() {
         return;
     }
     m_aHermesModels[iRow] = dlg.Entry();
+    ShareModelsFromPage(3);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateHermesEnabled();
 }
 
@@ -2708,6 +2958,7 @@ void CSettingsDialog::OnHermesModelDel() {
     if (m_aHermesModels.size() == 1) {      // 仅剩一条 → 自动设为缺省
         m_iHermesActiveModel = 0;
     }
+    ShareModelsFromPage(3);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateHermesEnabled();
 }
 
@@ -2717,6 +2968,7 @@ void CSettingsDialog::OnHermesModelSetActive() {
         return;
     }
     m_iHermesActiveModel = (m_iHermesActiveModel == iRow) ? -1 : iRow;
+    ShareModelsFromPage(3);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateHermesEnabled();
 }
 

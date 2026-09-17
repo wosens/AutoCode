@@ -646,6 +646,8 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     //   CLI 工具的输出编码。PowerShell 的输出编码由启动时的环境与 profile 决定，
     //   见 README「彻底解决中文编码」一节（profile + 系统 UTF-8 代码页）。
     QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
+    InjectAskEnv(oEnv);
     oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
@@ -655,6 +657,14 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     //   AGENTS.md（二进制实测无 CLAUDE.md 候选），为免向用户主目录复制文件，改为把
     //   共享全局规则（<exe>\CLAUDE.md 或 ~/.claude/CLAUDE.md）直接前置进本阶段 prompt。
     QString sPrompt = a_sPrompt;
+    // 2026.09.14 技能清单前置（codex 无原生技能机制，语义同全局规则注入）：
+    //   列名称/描述/SKILL.md 路径，命中时模型自行读取——与 claude/pi/dsh 的技能发现对齐。
+    const QString sSkillCatalog = CAgentRunnerBase::SharedSkillsCatalog();
+    if (!sSkillCatalog.isEmpty()) {
+        sPrompt.prepend(sSkillCatalog + QStringLiteral("\n\n---\n\n"));
+        emit sigInfo(QStringLiteral("[system/codex] 已注入技能清单（%1 字符）")
+                         .arg(QString::number(sSkillCatalog.size())));
+    }
     const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
     if (!sGlobalCtx.isEmpty()) {
         sPrompt.prepend(QStringLiteral(

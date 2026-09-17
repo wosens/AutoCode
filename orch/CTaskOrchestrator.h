@@ -53,11 +53,20 @@ public:
     // 2026.09.03 多助手并发：每个助手一个独立 SAdhocSession（runner 进程/会话链/撤销栈/
     //   回灌缓存/模式状态机），按助手 id 索引、常驻编排器（切助手不再换载）。跨助手提交
     //   各起各的进程立即运行，互不排队；同助手运行中追加仍为注入/续发语义。
-    // 向指定助手投递一条指令；a_bReadOnly=true 时仅 Read/Grep/Glob（无 Edit/Write/Bash）。
-    //   a_sTaskId 非空 = 当前选中任务：注入该任务 memory.md 经验 + 非只读轮附追加规则（记忆跟着任务走）。
+    // 2026-09-11 权限三态化（原 bReadOnly 布尔升级为下拉选择）：
+    //   PermAuto（缺省）＝自动审批：工具全开、不询问（与旧版非只读行为一致）；
+    //   PermManual＝手工审批：允许改动，但提示词强制要求任何改动工程/有影响的操作
+    //   先征得用户同意（claude 后端调 ask_user 弹窗确认，其余后端先列明待执行操作、
+    //   停在回复里等下一轮确认）；PermReadOnly＝只读：禁 Bash/Edit/Write（claude/pi
+    //   硬禁，dsh/codex/hermes 由提示词约束）+ 各处只读口径（不备份/不沉淀/不纠偏）。
+    //   三态的备份快照/record.md/记忆沉淀/guide 同步均按「非只读」口径区分。
+    enum EAdhocPerm { PermAuto = 0, PermManual = 1, PermReadOnly = 2 };
+    // 向指定助手投递一条指令；a_iPerm 为权限三态（见 EAdhocPerm）。
+    //   a_sTaskId 非空 = 当前选中任务：仅一行可选指引（memory.md 由助手自行 Read 取用，
+    //   非只读轮附一句条件性沉淀规则）——不注入任务信息全文，防稀释用户请求权重（v2.1.134）。
     //   2026.09.02 a_pTranscript 非空 = 外部提交（面板传入权威对话记录，整体重建回灌缓存；
     //   空 = 编排器内部续发——排队指令/max-turns 续跑，沿用缓存并轮内追加）。
-    void SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly,
+    void SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText, int a_iPerm = PermAuto,
                      const QString& a_sTaskId = QString(), const QStringList* a_pTranscript = nullptr);
     // 撤销指定助手最后一条提问（fork-session sid 链 O(1) 回退，#4）。
     void UndoAdhoc(const QString& a_sAsstId);
@@ -133,6 +142,9 @@ signals:
     // 2026.08.27 运行中实时计量（任务阶段/助手轮次通用）：本轮累计 输入/输出 token，
     //   每完成一次 API 请求发一次（Claude Code 式“当前指令消耗”直观反馈）；-1/-1=本轮结束清零。
     void sigLiveUsage(qint64 a_iIn, qint64 a_iOut);
+    // 2026.09.05 助手本轮实时计量（per-助手路由）：会话内累计/重置均带助手 id 上抛，
+    //   面板刷该助手页内自己的「本轮 ↑↓」标签（多助手并发各自独立）。
+    void sigAdhocLiveUsage(const QString& a_sAsstId, qint64 a_iIn, qint64 a_iOut);
     void sigAdhocUndo(const QString& a_sAsstId);                       // 撤销该助手最后一条提问（面板清尾块）
     void sigAdhocFinished(const QString& a_sAsstId);                   // 该助手一次调用结束（启用输入栏）
     void sigAdhocRunning(const QString& a_sAsstId);                    // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
@@ -266,7 +278,7 @@ private:
         QString               sGuideHash;      // 上次投喂 guide.md 的 SHA256（变更重投判定）
         QList<QPair<QString, QString>> aStack; // (prompt, sid) 撤销链；撤销=弹栈回基点
         QStringList           aTranscript;     // 跨轮上下文回灌缓存（DSH/Codex/Hermes 用）
-        bool                  bReadOnly = false;    // 本轮只读开关
+        int                   iPerm = PermAuto; // 本轮权限三态（EAdhocPerm；原 bReadOnly 布尔三态化）
         EAdhocMode            eMode = Idle;    // 异步流程状态机（多助手各一份，互不干扰）
         CTaskInfo*            pAutoNameTask = nullptr;   // AutoNaming 模式待命名任务
         QString               sPendingPrompt;  // Submitting 模式当前 prompt（压栈用）
@@ -275,11 +287,25 @@ private:
         QDateTime             dtStart;         // 本轮起点（耗时归集）
         int                   iResume = 0;     // max-turns 自动续跑计数（上限 2，新提问清零）
         QStringList           aPendingInjects; // 同助手运行中排队指令（本轮结束自动续发）
+        qint64                iLiveIn  = 0;    // 2026.09.05 本轮实时计量（per-会话：并发助手各自累计，
+        qint64                iLiveOut = 0;    //   收尾 0/0 回退归集 + 页内「本轮 ↑↓」显示）
+        // 2026.09.09 v2.1.131 确认语应付自动纠偏（实害：本地小模型对规则重的 prompt 只回
+        //   「收到」「我来」零工具零结果，v2.1.130 请求定界后仍复发）：本轮成功但终答超短且
+        //   全程零工具 → 同会话自动追发执行指令重试一轮（每用户提问限一次）。
+        bool                  bTurnSawTool = false;   // 本轮是否出现过工具调用（StartAdhocStage 清零）
+        QString               sLastAsstText;          // 本轮最后一条助手文本（StartAdhocStage 清零）
+        bool                  bNudgeUsed = false;     // 本条提问已纠偏过（SubmitAdhoc 用户提交清零）
+        // 2026.09.09 v2.1.132 上下文超限自愈：pi 报 exceeds the available context size
+        //   （实测 pi 不自动压缩——会话跨 110% 窗口仍原样发请求）→ 自动走压缩两步
+        //   （摘要→重播种）后重发原提问；每条提问限一次防压缩后仍超限死循环。
+        bool                  bAutoCompactActive = false;   // 压缩完成后待自动重发
+        bool                  bAutoCompactDone = false;     // 本条提问已自愈过（SubmitAdhoc 清零）
+        QString              sCompactBaseSid;         // 超限自愈：压缩期间暂存的原会话 sid（摘要失败回退用）
     };
     SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
     void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
     void StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
-                         bool a_bDropLastUser = false);   // 按会话 sSid/bReadOnly 组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）
+                         bool a_bDropLastUser = false);   // 按会话 sSid/权限三态组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）
 
     CProjectManager* m_pPm;
     CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选

@@ -11,9 +11,8 @@
 
 #include "ui/CMessageBlock.h"   // 块控件（SBlockData 现居 CStreamPresenter.h）
 #include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 亦在此）
+#include "ui/CStageBar.h"          // 2026.09.04 阶段横向图标条
 
-class QTreeWidget;
-class QTreeWidgetItem;
 class QLabel;
 class QTabWidget;
 class QSplitter;
@@ -23,6 +22,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QProgressBar;
 class QToolButton;
+class QComboBox;   // 2026-09-11 权限下拉（自动/手工/只读）
 class QTimer;
 class CBusyIndicator;
 class CArtifactView;
@@ -53,9 +53,18 @@ public:
                      const QString& a_sText);                                      // 阶段生命周期事件
 
     void SetCurrentTask(CTaskInfo* a_pTask);   // 切换显示任务（重建对话流 + 刷新阶段表）
+    // 2026.09.09 有效选中观察口：面板 m_pCurTask 始终跟随用户可见选中（含取消选中
+    //   当轮即时置空）。与 CMainWindow::m_pCur（助手档 key，取消选中时若助手在跑会
+    //   保留旧任务到本轮结束，见 SwitchAssistantArchive 早退）不同源——助手提示词的
+    //   任务信息注入（memory.md/经验规则）须以本值为准：没选任务就绝不带任务信息。
+    CTaskInfo* CurrentTask() const { return m_pCurTask; }
+    // 2026.09.09 彻底删除助手核心层（无弹窗；观察口：DeleteAsst UI 确认后调它，
+    //   测试直调本层验证删除效果）。与 CloseAsst（软关闭可恢复）对应。
+    void DeleteAsstCore(const QString& a_sId);
     void ShowTaskLogPage();
     // 2026.08.29 上下文进度条菜单（右键/左键共用）：立即压缩 + 设置上下文大小。
-    void ShowContextMenu(const QPoint& a_stGlobalPos);                    // 2026.08.24 切到任务侧「日志」页（开始任务后不落在助手 Tab）
+    //   2026.09.05 per-助手控件：目标助手 id 显式传入（该助手自己的进度条/会话）。
+    void ShowContextMenu(const QString& a_sAsstId, const QPoint& a_stGlobalPos);
     // 2026.08.29 阶段产物页分割条持久化（[Layout] ArtifactsSplit，base64 saveState）。
     QByteArray ArtifactsSplitState() const;
     void RestoreArtifactsSplit(const QByteArray& a_stState);
@@ -93,7 +102,7 @@ public:
     //   标题不切页（用户停留当前 Tab）；默认 true 保持双击切页原行为。
     void ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab = true);
     // FR-9：按左栏任务列表（Tab）底部 y 同步阶段表高度，使两者底部对齐（任务列表不含按钮行）。
-    void SyncStagesHeight(int a_iTaskListBottomY);
+
 
     // —— 对话流持久化（#1 助手 / #6 任务）：CMainWindow 在存盘/恢复时调用 ——
     // 2026.08.22 多助手：助手对话流改为按「助手」分条存取，Tab 标题即助手名。
@@ -114,16 +123,31 @@ public:
     //   阶段/轮次开始清零、每完成一次 API 请求刷新；(0,0) 隐藏。
     void SetLiveUsage(qint64 a_iIn, qint64 a_iOut);
     void ApplyLiveUsage(qint64 a_iIn, qint64 a_iOut);   // 限频到点实际上屏
+    // 2026.09.05 助手「本轮 ↑↓」per-助手路由（原全局单值在多助手并发下互相覆盖）：
+    //   编排器按会话累计后带助手 id 上抛，面板刷该助手页内自己的实时标签。
+    void OnAdhocLiveUsage(const QString& a_sAsstId, qint64 a_iIn, qint64 a_iOut);
+    void FlushAsstLiveUsage();      // 限频到点：逐助手冲刷 m_aPendingAsstLive 到各自标签
+    // 2026.09.05 v2.0.120 执行态指示器观察口（测试/诊断）：per-助手页内指示器（统计栏
+    //   费用前，转圈=该助手运行中）与任务侧底部指示器；BusyIndicatorSpinning 判转圈态
+    //   （CBusyIndicator 定义在 .cpp、无 Q_OBJECT，经 QWidget* 透出避免头文件依赖）。
+    QWidget* AsstBusyIndicator(const QString& a_sId) const;
+    QWidget* TaskBusyIndicator() const;
+    static bool BusyIndicatorSpinning(const QWidget* a_pW);
     QString ActiveAsstId() const { return m_sActiveAsst; }  // 当前激活（显示中）的助手 id
     // 2026.09.02 跨轮上下文回灌：提取指定助手最近对话记录（"用户：…"/"助手：…"
     //   交替，时间升序，已去时间戳前缀并按预算截断），供不支持会话续接的后端
     //   （DSH/Codex/Hermes）每轮把历史回灌进 prompt。a_sCurText = 本次即将提交的
     //   提问（末尾周着它的 user 块已上屏，剔除防重复）；助手不存在/无历史返回空。
     QStringList BuildAsstTranscript(const QString& a_sAsstId, const QString& a_sCurText) const;
+    //   2026.09.07 v2.1.124 连发助手段只留末条（终答）：一轮内 Hermes v2.0.116 中间段
+    //   叙述块会以独立 Assistant 块落流，逐条回灌会让历史像"未完成的现行任务"——
+    //   实测「你现在用的是什么模型？」被回灌历史带偏成继续执行 record.md 追加
+    //   （用户报障：回答与需求毫无关系）；段内叙述丢弃只留终答（回归 asstTranscript）。
     // 2026.08.27 升 public 供测试驱动（test_execpanel 用例）：发送当前输入。
     // 2026.09.03 多助手并发：激活助手在跑 → 注入/续发（同助手追加）；空闲 → 立即提交
     // 该助手自己的会话（其他助手在跑与否无关）。
-    void DoAdhocSend();
+    // 2026.09.05 per-助手输入栏：目标助手 id 显式传入（空 = 激活助手，测试兼容）。
+    void DoAdhocSend(const QString& a_sAsstId = QString());
     void ResetAssistants();                                 // 复位为单个默认助手（清空会话/对话流）
     void ClearAsstTabs();                                   // 拆除全部助手 Tab + 清模型（不建默认助手；载档/复位共用，含「+」页再入防护）
     int AsstCount() const { return m_aAssts.size(); }
@@ -134,7 +158,9 @@ public:
 
 signals:
     // 2026.09.03 多助手并发：提交/撤销/压缩/停止均带目标助手 id（编排器按 id 路由会话）。
-    void sigAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly);
+    // 2026-09-11 权限三态化：a_iPerm＝0 自动审批（缺省）/1 手工审批/2 只读
+    //   （CTaskOrchestrator::EAdhocPerm，原 a_bReadOnly 布尔三态化）。
+    void sigAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, int a_iPerm);
     void sigAdhocUndo(const QString& a_sAsstId);
     void sigAdhocCompact(const QString& a_sAsstId);
     void sigAdhocStop(const QString& a_sAsstId);
@@ -181,22 +207,31 @@ private:
     void RebuildAdhocView();   // 按激活助手数据重建其对话流（撤销/切档后调用）
     void RebuildAsstView(const QString& a_sId);   // 2026.08.23 按指定助手重建（多助手各自独立控件，加载后预建防切换卡顿）
     CStreamPresenter* AsstStream(SAsst& a_stAsst);   // 取/建助手流（fnDirty→sigAdhocBlocksChanged；懒建，SAsst 值拷贝后共享同一流）
-    void UpdateAdhocInputState();   // 按 m_bAdhocEnabled/激活助手运行态刷新输入栏可用性
-    void OnAdhocTextChanged();      // 多行输入框高度自适应（按内容行数，上限 10 行）
+    void UpdateAdhocInputState(const QString& a_sAsstId = QString());   // 按 m_bAdhocEnabled/各助手运行态刷新其输入栏可用性（2026.09.05 per-助手；空 id=全量刷新）
     // 输入框高度自适应通用版：按字体度量算单行高、按 blockCount 线性增长、封顶 a_iMaxLines 行。
     // 介入栏与助手栏共用，保证两框初始高度与增长行为完全一致（#3）。
     static void AdjustInputHeight(QPlainTextEdit* a_pEdit, int a_iMaxLines);
     // FR-3：助手日志右上角半透明提示词按钮 hover/leave → 显示/隐藏提示词下拉浮层。
     void OnPromptBtnHovered();
     void OnPromptBtnLeaved();
+    // 2026.09.13 浮层收起判定：全局鼠标位是否仍在「浮层 ∪ 触发按钮 ∪ 条目全文 tip 窗」
+    //   区域内（含 8px 容差）。鼠标常会移到条目 tip（贴光标在浮层外沿展开）上读全文，
+    //   旧规则 Leave 即收会把浮层连同 tip 一起带走；新规则 500ms 后按位置判定，
+    //   在 tip 窗上则续命重查。
+    bool IsCursorInsideFlyoutRegion();
     // FR-3：点击下拉中某条提示词 → 把对应 User 提问块滚到助手日志最顶 + 横纵滚动条归零。
     void OnPromptPicked(int a_iBlockIdx);
     // FR-3：按历次 User 提问重建下拉浮层列表（块变化 / 弹出前刷新）。
     void RebuildPromptList();
     void UpdateBusyIndicator();     // 刷新执行态指示器（任务/助手运行→转圈，否则状态色点）
-    void UpdateContextButton();     // 按 fill/limit/model 刷新上下文进度条占比/颜色/tooltip
+    // 2026.09.05 per-助手控件组：上下文进度条/统计标签随助手走，入参 = 目标助手。
+    void UpdateContextButton(const SAsst& a_stAsst);   // 该助手上下文进度条占比/颜色/tooltip
+    void UpdateAsstCostLabel(const SAsst& a_stAsst);   // 该助手统计栏（费用/token/请求/耗时）
+    qint64 AsstContextLimit(const SAsst& a_stAsst) const;   // 该助手窗口分母（用户上限>模型探测）
+    void CreateAsstWidgets(SAsst& a_stAsst);   // 建助手页容器（日志视图+输入栏+统计栏）并接信号
+    void SyncRunTimer();            // 2026.09.05 耗时定时器统一开关（任务或任一助手在跑即跑）
     void UpdateTaskInjectState();   // FR-3 按当前任务 Running 态刷新介入输入栏可用性
-    void UpdateCostLabel();         // 2026.08.15 刷新底部费用/状态栏（含运行耗时）
+    void UpdateCostLabel();         // 2026.08.15 刷新底部费用/状态栏（2026.09.05 起仅任务侧；助手统计在各自页内）
     void OnRunTimer();              // 2026.08.15 运行中每秒刷新耗时显示
     static qint64 ContextLimitForModel(const QString& a_sModel);  // 模型名 → 上下文窗口 token 上限
     void MarkTaskDirty(const QString& a_sTaskId);   // 标脏 + 启动去抖 timer（#6）
@@ -205,8 +240,8 @@ private:
     void OnOutputSelected(int a_iRow);          // 选中某阶段产物 → 读取文件内容显示
     void OnStagesContextMenu(const QPoint& a_stPos);   // 需求3：阶段表右键「再次执行」
 
-    QTreeWidget*    m_pStages  = nullptr;
-    QSplitter*      m_pStageSplit = nullptr;   // 阶段表/日志Tab 的垂直分隔条（FR-9 对齐经 setSizes 设比例）
+    CStageBar*      m_pStageBar = nullptr;   // 2026.09.04 阶段横向图标条（替代 QTreeWidget 阶段表）
+    // （m_pStageSplit 已删：阶段条固定高移出 splitter，FR-9 高度对齐随图标条化移除。）
     QTabWidget*     m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 /「+」页 / 文件预览
     QWidget*        m_pAddTabPage = nullptr;  // 「+」新增助手占位页（选中即新增并弹回，参考 DSHAgentManage）
     QWidget*        m_pArtifactsPage = nullptr;  // 「阶段产物」页本体（Tab 布局管制时识别非助手页用）
@@ -223,14 +258,13 @@ private:
     qint64          m_iPendingLiveIn = 0;   // 暂存的最新流式值
     qint64          m_iPendingLiveOut = 0;
     CBusyIndicator* m_pBusy    = nullptr;   // 执行态动画指示器（费用文本前，#4）
-    QTimer*         m_pRunTimer = nullptr;  // 2026.08.15 运行耗时 1s 刷新定时器（任务 Running 或助手运行中跑）
-    QElapsedTimer   m_tAdhocClock;         // 2026.09 助手本轮起始钟（无任务时费用栏「耗时」实时跳动）
+    QTimer*         m_pRunTimer = nullptr;  // 2026.08.15 运行耗时 1s 刷新定时器（任务 Running 或任一助手运行中跑；2026.09.05 统一 SyncRunTimer 开关）
     bool            m_bTaskRunning = false; // 当前选中任务是否运行中（#4 指示器用）
     QColor          m_colIdle;             // 指示器空闲态颜色（随任务状态）
-    QString         m_sAdhocModel;                 // 助手当前所用模型名（按钮 tooltip 显示）
-    qint64          m_iContextLimit   = 200000;    // 上下文窗口上限（按模型名查表，默认 200K）
-    qint64          m_iUserContextLimit = 0;       // 用户设的窗口上限（>0 覆盖按模型探测；0=自动）
-    qint64          m_iLastContextFill = 0;        // 最近一次上下文占用（重算分母时复用）
+    // （2026.09.05 per-助手化已删：m_tAdhocClock/m_iContextLimit/m_iLastContextFill/
+    //   m_sAdhocModel/m_pAdhocInput/m_pComboPerm/m_pBtnContext/m_pBtnSend/m_pBtnUndo——
+    //   耗时钟/窗口分母/进度条/输入栏全部随助手存在 SAsst 内，切换页即切实例。）
+    qint64          m_iUserContextLimit = 0;       // 用户设的窗口上限（>0 覆盖按模型探测；0=自动；全局配置对各助手一致）
 
     QString                          m_sCurId;
     CTaskInfo*                       m_pCurTask = nullptr;  // 需求3：当前显示任务（供阶段表右键取）
@@ -258,7 +292,21 @@ private:
         // 2026.09.03 对话流收拢：数据/件/前沿/重建状态全在流对象内（shared：SAsst 值拷贝
         //   搬移场景（ReopenAsst 等）共享同一流，不产生双份）。懒建（AsstStream），未建时为空。
         CStreamPresenterPtr   pStream;
-        CMessageView*         pView = nullptr;    // 该助手的对话流视图（Tab 页本体；关闭后为 null，重开重建）
+        // 2026.09.05 per-助手控件组（用户需求：提示词/发送按钮/统计信息全部随助手 Tab 页切换，
+        //   独立实例）：Tab 页本体 = pPage 容器（日志视图 + 输入栏 + 统计栏）；关闭后全部置空，
+        //   重开重建（统计数值随 SAsst 持久化字段还原，不随控件丢）。
+        QWidget*              pPage = nullptr;        // Tab 页容器（日志+输入栏+统计栏）
+        CMessageView*         pView = nullptr;    // 该助手的对话流视图（pPage 内；关闭后为 null，重开重建）
+        QPlainTextEdit*       pInput = nullptr;   // 该助手指令输入框（Ctrl+Enter 发送）
+        QComboBox*            pComboPerm = nullptr;   // 2026-09-11 权限下拉：0 自动审批（缺省）/1 手工审批/2 只读（原 pBtnReadOnly 勾选钮）
+        int                   iPerm = 0;              // 权限三态持久化字段（assistant.json "perm"；闭页后控件重建回显）
+        QProgressBar*         pBtnContext  = nullptr;   // 上下文占比进度条（点击/右键菜单）
+        QPushButton*          pBtnUndo     = nullptr;   // ↶ 撤销
+        QPushButton*          pBtnSend     = nullptr;   // 发送/追加/停止
+        QLabel*               pLblCost = nullptr;      // 该助手统计栏（费用/token/请求/耗时）
+        QLabel*               pLblLive = nullptr;      // 该助手本轮实时 ↑↓
+        CBusyIndicator*       pBusy = nullptr;   // 2026.09.05 v2.0.120 该助手执行态指示器（统计栏费用前：运行转圈/空闲灰点）
+        QElapsedTimer         tClock;                  // 本轮起始钟（耗时实时跳动，per-助手：并发助手各自计时）
         QToolButton*          pBtnPrompts = nullptr;  // FR-3 右上角提示词按钮（parent=pView）
         QToolButton*          pBtnBottom  = nullptr;  // 提示词按钮正下方「↓」按钮（点击滚动到日志最底）
         bool                  bClosed = false;   // 2026.08.23 已关闭（Tab 摘除但数据保留，可从「▾」菜单恢复）
@@ -267,7 +315,7 @@ private:
     const SAsst* AsstById(const QString& a_sId) const;
     SAsst* ActiveAsst();              // 当前激活助手（无助手时 nullptr）
     // （RunningTargetAsst 已删：编排器信号带助手 id，直投对应助手流。）
-    SAsst* AsstByView(QWidget* a_pView);   // 按视图反查助手（Tab 事件定位）
+    SAsst* AsstByPage(QWidget* a_pPage);   // 按助手页容器反查助手（Tab 事件定位；2026.09.05 Tab 页本体=pPage）
     // 2026.09.03 反向分页（助手流版，依赖 SAsst 故在此声明）：滚动到顶补建更早一段；
     //   BuildOlderChunk 为两流共用实现——补 [frontier-100, frontier) 入临时列表（块内
     //   合并仍生效），再前插对齐外层并行列表并推进前沿；EnsureAsstCoverage 供提示词
@@ -288,31 +336,34 @@ private:
     CMessageView* CreateAsstTab(SAsst& a_stAsst, int a_iPos = -1);   // 建视图 + 提示词按钮 + 插 Tab
     void RemoveAsstTab(SAsst& a_stAsst);                            // 摘 Tab（视图交 parent 回收）
     void CloseAsst(const QString& a_sId);       // 点「x」：关闭该助手（Tab 摘除、数据保留，可经「▾」恢复）
+    // 2026.09.09 右键彻底删除 UI 层：守卫（运行中/最后一个打开助手）+ 二次确认弹窗，
+    //   确认后交 public DeleteAsstCore 执行；编排器会话经 sigAsstRemoved 由主窗口清理。
+    void DeleteAsst(const QString& a_sId);
     void OnAsstMenuClicked();                  // 点「▾」：弹出已关闭助手菜单（选择恢复）
     void ReopenAsst(const QString& a_sId);     // 从菜单恢复已关闭助手（重建 Tab 并激活）
     void OnAsstAddClicked();                 // 点「+」：新增助手并激活（名字自动编号）
     void OnAsstTabRenamed(int a_iIdx);       // 双击助手 Tab → 改名
     void OnAsstTabMoved(int a_iFrom, int a_iTo);   // 拖动 → 模型顺序同步 Tab 相对顺序
     void OnAsstTabCurrentChanged(int a_iIdx);      // 切 Tab：激活助手切换 + 状态栏同步
+    void OnAsstTabContextMenu(const QPoint& a_stPos);   // 右键助手 Tab：彻底删除入口
     void SyncAsstsOrderToTabs();             // 拖动后按 Tab 顺序重排 m_aAssts
     // 2026.08.25 助手是否有用：对话流中存在用户发送的提示词（Event/user 块）；
     //   无任何用户提示词 = 空助手（不入「▾」历史，关闭时直接舍弃）。
     static bool AsstHasUserPrompt(const SAsst& a_st);
     static QString AsstStampKey(const QString& a_sId);   // 时间戳哨兵键（@@adhoc@@+id，兼容旧流）
-    QPlainTextEdit*        m_pAdhocInput  = nullptr;   // 指令输入框（多行，Ctrl+Enter 发送）
-    QToolButton*           m_pBtnReadOnly = nullptr;   // 只读/完整 切换（checkable）
-    QProgressBar*          m_pBtnContext  = nullptr;   // 上下文占比进度条（绿≤70%/红>70%，右键压缩）
-    QPushButton*           m_pBtnUndo     = nullptr;   // ↶ 回退（点击→撤销）
-    QPushButton*           m_pBtnSend     = nullptr;   // 发送
-    CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起）
+    CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起；仅当前助手页可见，锚定其按钮）
+    QTimer*                m_pFlyoutHideTimer = nullptr;   // 2026.09.13 浮层收起定时器：鼠标离开区域 500ms 后才收（位置判定，见 IsCursorInsideFlyoutRegion）
     QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
     QString                m_sActiveAsst;              // 当前激活助手 id
     // （m_sRunningAsst 已删：运行态 per-助手存 SAsst::bRunning。）
     // （m_aAdhocQueue 已删：跨助手排队机制随多助手并发移除。）
     QList<int>             m_aPromptIdx;               // FR-3 激活助手流中「用户提问」块下标（旧→新，供下拉跳转）
-    bool                   m_bAdhocEnabled = false;    // 工程是否已打开（输入栏总开关）
+    bool                   m_bAdhocEnabled = false;    // 工程是否已打开（各助手输入栏总开关）
     // （m_bAdhocRunning 已删：以 AnyAsstRunning() 按 SAsst::bRunning 聚合。）
     bool                   m_bAsstTabsResetting = false;   // ResetAssistants 拆 Tab 期：忽略程序性 currentChanged（防「+」页自动激活被当新增 → 死循环）
+    // 2026.09.05 per-助手「本轮 ↑↓」限频暂存：id → 最新流式值（含 (0,0) 隐藏指令），
+    //   共享 200ms 单次定时器到点统一上屏（与任务侧 m_iPendingLive* 同一限频口径）。
+    QHash<QString, QPair<qint64, qint64>> m_aPendingAsstLive;
 
     // —— 任务对话流去抖落盘（#6）——
     QTimer*                m_pChatSaveTimer = nullptr; // 去抖写定时器（500ms 合并高频输出）

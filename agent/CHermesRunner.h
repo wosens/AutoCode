@@ -160,6 +160,9 @@ private:
     //   阈值 3 倍窗口兑底。
     QString     m_sExeHome;               // exe 形态部署根（wal 心跳探测用）
     QDateTime   m_tLastWalMod;            // 上次巡检看到的 wal/-shm 最后修改时间
+    // 2026.09.04 v2.0.117 长 prompt 临时文件（@file 投递，见 StartStage）：
+    //   StartStage 写入、进程退出（slotOnFinished）/Stop/Reset 后删除。
+    QString     m_sPromptTmpFile;
     // 2026.09.03 v2.0.108 progress 事件提示节流（60s）：生成过程可见性（对齐
     //   pi 流式心跳提示口径），StartStage/Reset 清零。
     qint64      m_iLastProgHintMs = 0;

@@ -108,28 +108,34 @@ int main(int argc, char* argv[]) {
     }
     const QString sNode = (argc > 1) ? QString::fromLocal8Bit(argv[1])
         : QStringLiteral(R"(D:\Program Files\nodejs\node.exe)");
-    const QString sBin = (argc > 2) ? QString::fromLocal8Bit(argv[2])
-        : QStringLiteral(R"(E:\wosens\Programs\VisualC++\QT\DeepSeekHarness\deepseek-harness\packages\examples\jsonrpc-demo\lib\bin.js)");
-    const QString sCordis = (argc > 3) ? QString::fromLocal8Bit(argv[3])
-        : QStringLiteral(R"(E:\wosens\Programs\VisualC++\QT\DeepSeekHarness\deepseek-harness\examples\autocode-agent\cordis.yml)");
+    // 2026.09.10 默认改 root 推导模式（旧默认显式 bin/cordis 路径随上游 0.1.2+
+    //   删 examples 树已失效；DSH 已更新到官方 SDK profile 布局，布局由
+    //   DshLayoutOf 自动判型，联网步骤走 ResolveStartArgs）。
+    const QString sDshRoot = (argc > 2) ? QString::fromLocal8Bit(argv[2])
+        : QStringLiteral(R"(E:\wosens\Programs\VisualC++\QT\DeepSeekHarness\deepseek-harness)");
+    const QString sProvider = (argc > 3) ? QString::fromLocal8Bit(argv[3])
+        : QStringLiteral("shangtang-deepseek");
+    const QString sModel = (argc > 4) ? QString::fromLocal8Bit(argv[4])
+        : QStringLiteral("deepseek-v4-flash");
     CDeepSeekRunner::SetDshNodePath(sNode);
-    CDeepSeekRunner::SetDshBinJsPath(sBin);
-    CDeepSeekRunner::SetDshCordisPath(sCordis);
+    CDeepSeekRunner::SetDshProvider(sProvider);
+    CDeepSeekRunner::SetDshModel(sModel);
 
     // —— 步骤0（离线单测）：轻量自动配置的根目录推导 + node PATH 兜底 ——
     //   优先级：显式键 > root 推导；node 留空 → "node"。
     {
         g_out << "step0: root-derive + PATH fallback" << Qt::endl;
-        const QString sRoot = QDir(sBin).absolutePath().section(
-            QStringLiteral("/packages/"), 0, 0);   // 从已知 bin.js 反推仓库根
+        const QString sRoot = QDir(sDshRoot).absolutePath();
         CDeepSeekRunner::SetDshBinJsPath(QString());
         CDeepSeekRunner::SetDshCordisPath(QString());
         CDeepSeekRunner::SetDshRootPath(sRoot);
-        if (CDeepSeekRunner::ResolveBinJsPath() != QDir::fromNativeSeparators(sBin)) {
+        // 布局自适应预期（0.1.10 双布局：本机 root 现为 Profile 布局）。
+        const QString sExpectBin = (CDeepSeekRunner::DshLayoutOf(sRoot)
+                                        == CDeepSeekRunner::EDshLayout::Profile)
+            ? sRoot + QStringLiteral("/apps/cli/lib/bin.js")
+            : sRoot + QStringLiteral("/packages/examples/jsonrpc-demo/lib/bin.js");
+        if (CDeepSeekRunner::ResolveBinJsPath() != sExpectBin) {
             Fail(QStringLiteral("root 推导 bin.js 不符: %1").arg(CDeepSeekRunner::ResolveBinJsPath()));
-        }
-        if (CDeepSeekRunner::ResolveCordisPath() != QDir::fromNativeSeparators(sCordis)) {
-            Fail(QStringLiteral("root 推导 cordis 不符: %1").arg(CDeepSeekRunner::ResolveCordisPath()));
         }
         if (!CDeepSeekRunner::LooksLikeDshRoot(sRoot) || CDeepSeekRunner::LooksLikeDshRoot(QStringLiteral("Z:/no-such"))) {
             Fail(QStringLiteral("LooksLikeDshRoot 判定错误"));
@@ -139,15 +145,71 @@ int main(int argc, char* argv[]) {
             Fail(QStringLiteral("node 留空未回退 PATH"));
         }
         CDeepSeekRunner::SetDshNodePath(sNode);
-        // 恢复显式键（后续联网步骤与旧行为一致）
-        CDeepSeekRunner::SetDshRootPath(QString());
-        CDeepSeekRunner::SetDshBinJsPath(sBin);
-        CDeepSeekRunner::SetDshCordisPath(sCordis);
+        // 保持 root 推导模式（后续联网步骤按布局自动取入口/参数）
+        CDeepSeekRunner::SetDshRootPath(sRoot);
         if (!CDeepSeekRunner::DshConfigError().isEmpty()) {
             Fail(QStringLiteral("三路径齐备时 DshConfigError 应为空: %1")
                      .arg(CDeepSeekRunner::DshConfigError()));
         }
         g_out << "  step0 " << (g_iFail == 0 ? "PASS" : "FAIL") << Qt::endl;
+    }
+
+    // —— 步骤0b（离线单测，2026.09.10）：双布局判型 + 启动参数 + 根推导 ——
+    //   Profile（≥0.1.2 官方 SDK）＝ apps/cli 构建产物；Legacy（≤0.1.1）＝
+    //   examples/jsonrpc-demo 两件套；启动参数按布局分支（--profile sdk --patch
+    //   vs {bin, cordis}）。
+    {
+        g_out << "step0b: dual-layout detect + start args" << Qt::endl;
+        QTemporaryDir oTmp;
+        if (oTmp.isValid()) {
+            // 造 Profile 布局根：仅 apps/cli/lib/bin.js
+            const QString sP = oTmp.path() + QStringLiteral("/p");
+            QDir().mkpath(sP + QStringLiteral("/apps/cli/lib"));
+            QFile(sP + QStringLiteral("/apps/cli/lib/bin.js")).open(QIODevice::WriteOnly);
+            if (CDeepSeekRunner::DshLayoutOf(sP) != CDeepSeekRunner::EDshLayout::Profile
+                || !CDeepSeekRunner::LooksLikeDshRoot(sP)) {
+                Fail(QStringLiteral("Profile 布局判型错误"));
+            }
+            CDeepSeekRunner::SetDshBinJsPath(QString());
+            CDeepSeekRunner::SetDshCordisPath(QString());
+            CDeepSeekRunner::SetDshRootPath(sP);
+            if (CDeepSeekRunner::ResolveBinJsPath() != sP + QStringLiteral("/apps/cli/lib/bin.js")) {
+                Fail(QStringLiteral("Profile 布局 bin.js 推导错误: %1")
+                        .arg(CDeepSeekRunner::ResolveBinJsPath()));
+            }
+            const QStringList aP = CDeepSeekRunner::ResolveStartArgs();
+            if (aP.size() != 5 || aP.at(1) != QStringLiteral("--profile")
+                || aP.at(2) != QStringLiteral("sdk") || aP.at(3) != QStringLiteral("--patch")
+                || !aP.at(4).endsWith(QStringLiteral("/dsh/sdk.autocode.patch.yml"))) {
+                Fail(QStringLiteral("Profile 布局启动参数错误: %1").arg(aP.join(QLatin1Char(' '))));
+            }
+            // 造 Legacy 布局根：仅旧两件套（apps/cli 无 → 判 Legacy）
+            const QString sL = oTmp.path() + QStringLiteral("/l");
+            QDir().mkpath(sL + QStringLiteral("/packages/examples/jsonrpc-demo/lib"));
+            QDir().mkpath(sL + QStringLiteral("/examples/autocode-agent"));
+            QFile(sL + QStringLiteral("/packages/examples/jsonrpc-demo/lib/bin.js")).open(QIODevice::WriteOnly);
+            QFile(sL + QStringLiteral("/examples/autocode-agent/cordis.yml")).open(QIODevice::WriteOnly);
+            if (CDeepSeekRunner::DshLayoutOf(sL) != CDeepSeekRunner::EDshLayout::Legacy) {
+                Fail(QStringLiteral("Legacy 布局判型错误"));
+            }
+            CDeepSeekRunner::SetDshRootPath(sL);
+            const QStringList aL = CDeepSeekRunner::ResolveStartArgs();
+            if (aL.size() != 2 || aL.at(1) != sL + QStringLiteral("/examples/autocode-agent/cordis.yml")) {
+                Fail(QStringLiteral("Legacy 布局启动参数错误: %1").arg(aL.join(QLatin1Char(' '))));
+            }
+            // 空根判 None
+            const QString sN = oTmp.path() + QStringLiteral("/n");
+            QDir().mkpath(sN);
+            if (CDeepSeekRunner::DshLayoutOf(sN) != CDeepSeekRunner::EDshLayout::None
+                || CDeepSeekRunner::LooksLikeDshRoot(sN)) {
+                Fail(QStringLiteral("空根应判 None"));
+            }
+            // 恢复联网步骤的 root 模式（step0b 里临时改过显式键）
+            CDeepSeekRunner::SetDshBinJsPath(QString());
+            CDeepSeekRunner::SetDshCordisPath(QString());
+            CDeepSeekRunner::SetDshRootPath(QDir(sDshRoot).absolutePath());
+        }
+        g_out << "  step0b " << (g_iFail == 0 ? "PASS" : "FAIL") << Qt::endl;
     }
 
     // —— 步骤0b（离线单测）：2026.09.01 自愈纯函数 ——

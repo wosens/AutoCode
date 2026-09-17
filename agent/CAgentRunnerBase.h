@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QProcessEnvironment>
 
 // Agent 后端 runner 抽象基类（2026.08.18 多后端支持：Claude Code / DeepSeekHarness）。
 //
@@ -82,11 +83,25 @@ public:
     //   2) <用户主目录>\.claude\skills   —— 机器上已有 Claude Code 技能库时自动复用。
     // 各后端经原生机制挂载（pi: --skill；DSH: DSH_SKILLS_DIRS env → cordis customSkillDirs）。
     static QStringList SharedSkillDirs();
-    // 全局规则内容（Claude Code 的 CLAUDE.md 语义）：优先 <exe 目录>\CLAUDE.md（便携），
-    // 回退 <用户主目录>\.claude\CLAUDE.md；两者都无返回空串。运行时注入 prompt/persona，
-    // 不复制进 ~/.pi、~/.dsh、~/.codex 等各 harness 的主目录（之前复制桥接方案废弃）。
-    // 上限保护：超过 64KB 视为异常不注入（防巨型文件挤占上下文）。
+    // 全局规则内容（Claude Code 的 CLAUDE.md 语义）：<exe 目录>\CLAUDE.md（部署环境
+    //   约定）与 <用户主目录>\.claude\CLAUDE.md（用户全局规则，含 UI 测试铁律）两份
+    //   **按序拼接**（2026.09.13 勿回退：旧版取第一个命中会让便携层遮蔽全局层，
+    //   UI 测试铁律从未到达 pi/dsh/codex/hermes）；两者都无返回空串。运行时注入
+    //   prompt/persona，不复制进 ~/.pi、~/.dsh、~/.codex 等 harness 主目录。
+    //   上限保护：每份超 64KB 视为异常不注入该份（防巨型文件挤占上下文）。
     static QString SharedGlobalContextContent();
+    // 共享技能目录清单（2026.09.14）：扫描 SharedSkillDirs() 递归收集 SKILL.md，
+    //   解析 frontmatter 的 name/description 生成紧凑目录文本（一条一行：名称—描述—路径），
+    //   供「CLI 无原生技能机制」的后端（codex/hermes）经 prompt 前置注入——模型命中
+    //   时用文件读取工具自行读 SKILL.md（同 Claude Code 的技能加载语义，但不写任何主目录）。
+    //   2026.09.13 增强勿回退：①钉选技能（ui-sandbox，AutoCode GUI 测试主技能，全局
+    //   CLAUDE.md 铁律引用）置顶永不被截断；②命中钉选时清单头部追加「GUI 测试铁律」
+    //   一行（实测光有可选清单弱模型仍不联想，须点名指向）；③详情区 12KB 截断后剩余
+    //   技能压成名字串兑底（名字即目录名，可推导 SKILL.md 路径），不再无声丢弃。
+    //   无任何技能返回空串。
+    static QString SharedSkillsCatalog();
+    // 指定目录集的清单生成（测试入口）：语义同 SharedSkillsCatalog，目录由调用方给。
+    static QString SharedSkillsCatalogFromDirs(const QStringList& aDirs);
 
 signals:
     void sigInfo(const QString& a_sLine);                              // 系统/原始信息
@@ -111,4 +126,12 @@ protected:
     qint64      m_iLastContextFill = 0; // 当前上下文占用（最后一条 assistant 的三项 input token 之和）
     int         m_iLastReqCount = 0;    // 本次运行 API 请求数（assistant 消息条数）
     QString     m_sLastModel;           // 最近 result 的 model 字段（供上层查上下文窗口）
+
+    // 2026-09-12 手工审批弹窗通道（全后端）：向子进程环境注入 AUTOCODE_ASK_EXE
+    //   （AutoCode.exe 全路径）与 AUTOCODE_ASK_PIPE（本实例 AskServer 管道名）。
+    //   助手在手工审批轮经 Bash 运行 "%AUTOCODE_ASK_EXE%" --ask <超时秒> "问题"
+    //   → --ask 模式连本实例管道 → 主窗口弹 CAskUserDialog → stdout 回用户答复
+    //   （退出码 0=已答复 / 2=取消 / 3=超时 / 4=服务不可用）。claude 后端另有
+    //   ask_user MCP 工具不走此通道，但环境注入无害。
+    static void InjectAskEnv(QProcessEnvironment& a_oEnv);
 };

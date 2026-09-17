@@ -7,6 +7,7 @@
 #include <QMap>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <QRegularExpression>
 #include <QCoreApplication>
 
@@ -280,6 +281,36 @@ QString BuildHermesYamlText(const QStringList& a_aLines,
     }
     return aOut.join(QLatin1Char('\n'));
 }
+
+// 2026.09.05 Hermes 轮次上限兜底文本本地化：hermes-agent 跑满 max_iterations
+//   （默认 90；AutoCode 的 maxTurns 对 Hermes 无效）后自动再发一次「总结进度」
+//   请求，该请求再失败（典型 Connection error——模型网关不可达）时把英文兜底串
+//   当最终回复返回（chat_completion_helpers.py handle_max_iterations 的 except
+//   分支）。用户看到裸英文无从排查 → 命中即替换为中文提示（保留轮数与原始
+//   错误细节，并说明已完成工作已落盘、可重发继续）；未命中原样返回。
+//   调用点三处：assistant 事件 / result 事件 / exe 形态（-z 纯文本）收尾。
+QString LocalizeHermesCapText(const QString& a_sText) {
+    const QString sTrim = a_sText.trimmed();
+    static const QRegularExpression reCapSum(
+        QStringLiteral("^I reached the maximum iterations \\((\\d+)\\) "
+                       "but couldn't summarize\\. Error: (.+)"),
+        QRegularExpression::DotMatchesEverythingOption);
+    const QRegularExpressionMatch oM = reCapSum.match(sTrim);
+    if (oM.hasMatch()) {
+        return QStringLiteral(
+                   "⚠ Hermes 已达轮次上限（%1 轮），收尾总结请求失败：%2。\n"
+                   "此前已完成的工作均已保存；检查网络/模型网关后重发指令即可继续。")
+            .arg(oM.captured(1), oM.captured(2).trimmed());
+    }
+    // 同链路姊妹分支：总结请求成功但模型返回空（connection 正常、内容为空）。
+    if (sTrim.startsWith(QStringLiteral(
+            "I reached the iteration limit and couldn't generate a summary."))) {
+        return QStringLiteral(
+            "⚠ Hermes 已达轮次上限，未能生成收尾总结（模型返回空）。\n"
+            "此前已完成的工作均已保存；重发指令即可继续。");
+    }
+    return a_sText;
+}
 }   // namespace
 
 bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath) {
@@ -343,11 +374,12 @@ bool OneshotHasEventPatch(const QString& a_sPyPath) {
     if (!fPy.open(QIODevice::ReadOnly)) {
         return false;
     }
-    // 2026.09.03 v2.0.108 检 v2 标记；v2.0.109 升 v3 标记（v3 增工具参数
-    //   preview/tooldone 结果/think 思考流）。只含旧版标记视为未敷设——
+    // 2026.09.03 v2.0.108 检 v2 标记；v2.0.109 升 v3；v2.0.114 升 v4（v4 增
+    //   中间段文本按 assistant 消息上抛）；v2.0.117 升 v5（-z @<file> 提示词
+    //   展开——Windows 命令行 32767 上限）。只含旧版标记视为未敷设——
     //   EnsureHermesOneshotPatch 重调 bat，敷设器自动原地升级。
     const bool bHit = QString::fromUtf8(fPy.readAll())
-                          .contains(QStringLiteral("AutoCode events patch v3"));
+                          .contains(QStringLiteral("AutoCode events patch v5"));
     fPy.close();
     return bHit;
 }
@@ -435,11 +467,19 @@ QString CHermesRunner::ResolveHermesCli() {
             return sExe;
         }
     }
-    // 2) exe 同级 HermesHarness\dist\cli.js（便携部署，install 布局同 Pi/Codex）。
+    // 2) exe 同级 HermesHarness（便携部署，install 布局同 Pi/Codex）：
+    //    形态 A <dir>\dist\cli.js；形态 B <dir>\hermes-agent\venv\Scripts\hermes.exe
+    //    或旧平铺 <dir>\venv\Scripts\hermes.exe（install_env.bat 2026.09.13 起
+    //    Python 形态自动安装到同级并 setx HERMES_HOME，此处兜底使其无需配置即命中）。
     const QString sExeDir = QCoreApplication::applicationDirPath();
-    const QString sSibling = sExeDir + QStringLiteral("/HermesHarness/dist/cli.js");
+    const QString sSiblingRoot = sExeDir + QStringLiteral("/HermesHarness");
+    const QString sSibling = sSiblingRoot + QStringLiteral("/dist/cli.js");
     if (QFile::exists(sSibling)) {
         return QFileInfo(sSibling).absoluteFilePath();
+    }
+    const QString sSiblingExe = FindHermesExeUnderRoot(sSiblingRoot);
+    if (!sSiblingExe.isEmpty()) {
+        return sSiblingExe;
     }
     // 3) PATH 上的 hermes.cmd（npm 全局安装形态）：.cmd 是 npm 生成的 shell 垫片，
     //    不能直接交给 node 拉起（node 直跑 .cmd 必败）——解析垫片内容提取真实
@@ -576,6 +616,10 @@ void CHermesRunner::Reset() {
     m_sExeHome.clear();      // 2026.09.03 wal 心跳旁路状态（v2.0.105 方案 A）
     m_tLastWalMod = QDateTime();
     m_iLastProgHintMs = 0;   // 2026.09.03 v2.0.108 progress 提示节流重置
+    if (!m_sPromptTmpFile.isEmpty()) {   // 2026.09.04 v2.0.117 长 prompt 临时文件清理
+        QFile::remove(m_sPromptTmpFile);
+        m_sPromptTmpFile.clear();
+    }
 }
 
 void CHermesRunner::StartStage(const QString& a_sWorkDir,
@@ -586,10 +630,31 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
                                bool a_bFork,
                                int a_iAutocompactK,
                                bool a_bEnableAskUser) {
-    Q_UNUSED(a_sWorkDir);
-    Reset();
+    Reset();   // a_sWorkDir：工程根（exe 形态注入 TERMINAL_CWD 锚定工具路径，见下）
     emit sigInfo(QStringLiteral("[hermes] 启动阶段（prompt %1 字符）")
                      .arg(a_sPrompt.size()));
+    // 2026.09.14 技能清单前置（hermes 技能只发现 HERMES_HOME/skills，不认 ~/.claude/skills；
+    //   CLI 无按路径挂载参数）：语义同 codex——列名称/描述/SKILL.md 路径，命中时模型自行读取。
+    //   在 Reset() 之后改局部副本，不影响基线 prompt。
+    QString sPrompt = a_sPrompt;
+    const QString sSkillCatalog = CAgentRunnerBase::SharedSkillsCatalog();
+    if (!sSkillCatalog.isEmpty()) {
+        sPrompt.prepend(sSkillCatalog + QStringLiteral("\n\n---\n\n"));
+        emit sigInfo(QStringLiteral("[system/hermes] 已注入技能清单（%1 字符）")
+                         .arg(QString::number(sSkillCatalog.size())));
+    }
+    // 2026.09.13 全局规则注入补齐（勿回退）：hermes 与 codex 同无 CLAUDE.md 自动加载，
+    //   v2.3.163 只给 codex 做了全局规则前置，hermes 漏做——用户实测「助手不自动使用
+    //   ui-sandbox 技能」根因之二：hermes 助手连「UI 测试→ui-sandbox，禁物理鼠标键盘」
+    //   的铁律文本都拿不到。口径同 codex：共享全局规则前置进本阶段 prompt。
+    const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
+    if (!sGlobalCtx.isEmpty()) {
+        sPrompt.prepend(QStringLiteral(
+            "以下是全局工程约定（CLAUDE.md），在整个任务中始终遵守：\n\n%1\n\n---\n\n")
+            .arg(sGlobalCtx));
+        emit sigInfo(QStringLiteral("[system/hermes] 已注入全局规则（%1 字符）")
+                         .arg(QString::number(sGlobalCtx.size())));
+    }
     // claude 专属参数降级提示（非默认值时提示一次，口径同 Codex）。
     if (a_iMaxTurns != 30 || a_iAutocompactK > 0 || a_bEnableAskUser
         || a_bFork || !a_sResumeSid.isEmpty() || !a_sDisallowedTools.isEmpty()) {
@@ -646,6 +711,8 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
     //   GBK 控制台环境，继承会把子进程 Python IO 拽回 ANSI 导致输出乱码）；
     //   HERMES_* 与 ~/.hermes 双保险（密钥绝不进命令行/日志）。
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
+    InjectAskEnv(env);
     env.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     env.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     env.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
@@ -683,21 +750,61 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
             //   时 CMainWindow 已触发，此处兜底 hermes 更新后的重敷）；失败仅提示
             //   不阻断：回退上游静默形态，回复照常、用量缺省 0。
             if (!EnsureHermesOneshotPatch(sHome)) {
+                // 2026.09.08 v2.1.126 失败原因自含：敷设后复检仍非 v5 多为 exe 侧
+                //   hermes_oneshot_patch.py 旧版（01.更新程序.bat v2.1.126 起同步该文件，
+                //   旧副本不同步 → 部署标记永远到不了 v5，每轮重敷设且缺 @file 投递
+                //   展开——长 prompt>12000 字符会以 "@<路径>" 原文喂给模型）。
                 emit sigInfo(QStringLiteral(
-                    "[hermes] oneshot 事件补丁未敷设（install_env.bat /hermes-patch"
-                    "未成功），本轮可能无工具/用量事件。"));
+                    "[hermes] oneshot 事件补丁未敷设到 v5（install_env.bat /hermes-patch"
+                    "未成功，或 exe 同级 hermes_oneshot_patch.py 为旧版），本轮可能无工具/用量事件；"
+                    "长提示词投递也可能异常——请从完整程序目录更新该 py 后重试。"));
             }
             env.insert(QStringLiteral("HERMES_ONESHOT_EVENTS"), QStringLiteral("1"));
             // v2.0.105 方案 A：部署根记入 wal 心跳旁路（CheckStall 巡检用）。
             m_sExeHome = sHome;
             m_tLastWalMod = HermesWalMtime(sHome);
         }
+        // 2026.09.05 v2.0.119 修 Hermes exe 形态工作目录漂移（用户报障：「任务一直
+        //   无法生成 intake.md」）：hermes-agent -z 一次性模式的 terminal/read_file/
+        //   patch 等工具**不认进程 cwd**，统一锚定 HOME——实测最小复现：任意 cwd 下
+        //   `hermes.exe -z "跑 pwd"` 恒返回 /c/Users/Administrator，相对路径
+        //   `.autodev/tasks/<id>/intake.md` 全部写到 C:\Users\Administrator\.autodev\下，
+        //   AutoCode 在工程目录校验失败 → 阶段反复回退 → 「多次回退仍未生成
+        //   intake.md」升级暂停（实害任务：拳皇 aea501f7，5 轮全部写错位）。注入
+        //   TERMINAL_CWD（hermes 官方工作区锚点，file_tools/_get_env_config/
+        //   LocalEnvironment 全链路读取，要求绝对路径、非 "."/"auto" 等 sentinel）
+        //   钉到工程根；实测注入后 pwd 与相对路径读写均正确落工程目录。形态 A
+        //   （Node Harness）尊重进程 cwd（2026.09.01 买证），不注入避免改变其行为。
+        if (!a_sWorkDir.isEmpty() && QDir::isAbsolutePath(a_sWorkDir)) {
+            env.insert(QStringLiteral("TERMINAL_CWD"),
+                       QDir::toNativeSeparators(a_sWorkDir));
+        }
     }
     m_pProc->setProcessEnvironment(env);
     m_pProc->setWorkingDirectory(a_sWorkDir.isEmpty() ? QDir::currentPath() : a_sWorkDir);
     if (bExeForm) {
+        // 2026.09.04 v2.0.117：Windows CreateProcess 命令行 32767 字符上限——
+        //   长 prompt（回灌缓存，实测大工程会话轻易超限报「文件名或扩展名
+        //   太长」）改写 UTF-8 临时文件传 "@<path>"（补丁 v5 在 run_oneshot 入口
+        //   展开）；短 prompt 仍走命令行。临时文件收尾/停止后删除。
+        QString sPromptArg = sPrompt;
+        if (!m_sPromptTmpFile.isEmpty()) {
+            QFile::remove(m_sPromptTmpFile);
+            m_sPromptTmpFile.clear();
+        }
+        if (sPrompt.size() > 12000) {
+            QTemporaryFile fTmp(QDir::temp().absoluteFilePath(
+                QStringLiteral("autocode-hermes-prompt-XXXXXX.txt")));
+            fTmp.setAutoRemove(false);
+            if (fTmp.open()) {   // QTemporaryFile 无参 open（默认读写截断）
+                fTmp.write(sPrompt.toUtf8());
+                fTmp.close();
+                m_sPromptTmpFile = fTmp.fileName();
+                sPromptArg = QStringLiteral("@") + QDir::toNativeSeparators(m_sPromptTmpFile);
+            }   // 写失败回退原文（超限时启动报错自带真因）
+        }
         m_pProc->start(sCli, QStringList()
-                       << QStringLiteral("-z") << a_sPrompt);
+                       << QStringLiteral("-z") << sPromptArg);
     } else {
         m_pProc->start(sNode, QStringList()
                        << QDir::toNativeSeparators(sCli)
@@ -714,7 +821,7 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
     if (!bExeForm) {
         // prompt 经 stdin 投递（同 pi/codex：不进命令行防长度/转义/日志泄露）。
         //   exe 形态 prompt 已随 -z 参数投递（-z 不支持 stdin 读入）。
-        m_pProc->write(a_sPrompt.toUtf8());
+        m_pProc->write(sPrompt.toUtf8());
         m_pProc->closeWriteChannel();
     }
     m_actClock.start();
@@ -798,7 +905,8 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
         ++m_iLastReqCount;   // assistant 消息条数 = API 请求数（基类口径）
         if (!sText.isEmpty()) {
             m_bSawAssistant = true;
-            emit sigAssistantText(sText);
+            // 2026.09.05 轮次上限兜底英文 → 中文提示（见 LocalizeHermesCapText）。
+            emit sigAssistantText(LocalizeHermesCapText(sText));
         }
         return;
     }
@@ -810,9 +918,10 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
         //   清零重计），tail=尾部窗口预览（清洗换行、截 48 字）。
         m_actClock.start();
         const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
-        // v2.0.109：chars>=30 才出提示行——工具密集流中 glm 每段仅产几个字
-        //   （实测 chars=2/3，"已输出 2 字"无信息量），只刷心跳不出行。
-        if (o.value(QStringLiteral("chars")).toInt() >= 30 && iNow - m_iLastProgHintMs >= 60000) {
+        // v2.0.113：节流 60s→15s+首条即显（用户实测纯生成轮长时间零反馈：
+        //   glm 短段 2~3 字被 chars>=30 阈值吞、60s 节流下长生成轮一分钟才
+        //   一行；现每段开始即见行，chars>=30 才带字数+预览，否则简版）。
+        if (iNow - m_iLastProgHintMs >= 15000) {
             m_iLastProgHintMs = iNow;
             QString sTail = o.value(QStringLiteral("tail")).toString();
             sTail.replace(QLatin1Char('\n'), QLatin1Char(' '))
@@ -820,31 +929,23 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
             if (sTail.size() > 48) {
                 sTail = sTail.left(48) + QStringLiteral("…");
             }
-            emit sigInfo(QStringLiteral("⏳ 模型生成中… 本段已输出 %1 字")
-                             .arg(o.value(QStringLiteral("chars")).toInt())
-                         + (sTail.isEmpty()
-                                ? QString()
-                                : QStringLiteral("（…") + sTail + QStringLiteral("…）")));
+            emit sigInfo(QStringLiteral("⏳ 模型生成中…")
+                         + (o.value(QStringLiteral("chars")).toInt() >= 30
+                                ? QStringLiteral(" 本段已输出 %1 字")
+                                      .arg(o.value(QStringLiteral("chars")).toInt())
+                                      + (sTail.isEmpty()
+                                             ? QString()
+                                             : QStringLiteral("（…") + sTail + QStringLiteral("…）"))
+                                : QString()));
         }
         return;
     }
     if (sType == QStringLiteral("think")) {
-        // 2026.09.04 v2.0.109 思考流（补丁 v3 接 tool_progress 的
-        //   "_thinking"/"reasoning.available"）：刷新心跳 + 与 progress 共用
-        //   60s 节流提示行（思考文本截 60 字）。
+        // 2026.09.04 v2.0.114 思考流（补丁 v3 "_thinking"/"reasoning.available"）：
+        //   v4 中间段文本已按正式 assistant 块上抛且与思考内容重叠（实测成对
+        //   同文），💭 行取消显示只刷停滞心跳（旧 v3 补丁无中间文本，此分支
+        //   保留提示逻辑已无必要——补丁版本与 exe 同步升级，不留双轨）。
         m_actClock.start();
-        const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
-        if (iNow - m_iLastProgHintMs >= 60000) {
-            m_iLastProgHintMs = iNow;
-            QString sThink = o.value(QStringLiteral("text")).toString();
-            sThink.replace(QLatin1Char('\n'), QLatin1Char(' '));
-            if (sThink.size() > 60) {
-                sThink = sThink.left(60) + QStringLiteral("…");
-            }
-            if (!sThink.trimmed().isEmpty()) {
-                emit sigInfo(QStringLiteral("💭 ") + sThink);
-            }
-        }
         return;
     }
     if (sType == QStringLiteral("tooldone")) {
@@ -906,7 +1007,10 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
         if (iApiCalls > 0) {
             m_iLastReqCount = iApiCalls;
         }
-        m_sLastEventText = o.value(QStringLiteral("text")).toString();
+        // 2026.09.05 轮次上限兜底英文 → 中文提示（见 LocalizeHermesCapText；
+        //   影响 sigFinished 结果文本与自动命名/压缩摘要取值）。
+        m_sLastEventText = LocalizeHermesCapText(
+            o.value(QStringLiteral("text")).toString());
         return;   // 终态在进程退出时统一上抛（slotOnFinished）
     }
     // 未知事件：原始透传 sigInfo（前向兼容，真实格式落定后在此扩展分支）。
@@ -957,6 +1061,10 @@ void CHermesRunner::slotOnStdErr() {
 void CHermesRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus) {
     Q_UNUSED(a_eStatus);
     m_pStallTimer->stop();
+    if (!m_sPromptTmpFile.isEmpty()) {   // 2026.09.04 v2.0.117 长 prompt 临时文件：进程已退出可删
+        QFile::remove(m_sPromptTmpFile);
+        m_sPromptTmpFile.clear();
+    }
     if (m_bFinished) {
         return;   // Stop() 静默收尾 / 已报 finish
     }
@@ -974,7 +1082,8 @@ void CHermesRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStat
     //   任务名（实测任务被命名成「完成」）；压缩摘要（CompactSummarize）同理。
     if (m_bExeForm && !m_aPlainOut.isEmpty()) {
         m_bSawAssistant = true;
-        m_sLastEventText = m_aPlainOut.join(QLatin1Char('\n'));
+        // 2026.09.05 轮次上限兜底英文 → 中文提示（见 LocalizeHermesCapText）。
+        m_sLastEventText = LocalizeHermesCapText(m_aPlainOut.join(QLatin1Char('\n')));
         emit sigAssistantText(m_sLastEventText);
         m_aPlainOut.clear();
     }

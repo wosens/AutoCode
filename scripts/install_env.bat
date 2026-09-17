@@ -65,7 +65,8 @@ goto :ADMIN
 :HERMES_PATCH
 set "HP_ROOT=%~2"
 if "!HP_ROOT!"=="" set "HP_ROOT=!HERMES_ROOT!"
-set "HP_PY=!HP_ROOT!\hermes-agentenv\Scripts\python.exe"
+set "HP_PY=!HP_ROOT!\hermes-agent\venv\Scripts\python.exe"
+if not exist "!HP_PY!" set "HP_PY=!HP_ROOT!\venv\Scripts\python.exe"
 if not exist "!HP_PY!" set "HP_PY=python"
 "!HP_PY!" "%~dp0hermes_oneshot_patch.py" "!HP_ROOT!"
 exit /b %ERRORLEVEL%
@@ -338,6 +339,12 @@ echo.
 
 :: ---- DeepSeekHarness 安装段（克隆 + pnpm 依赖构建 + 部署 AutoCode 组合文件）----
 :DSH
+:: 2026.09.13 代理支持：set AC_GIT_PROXY=http://127.0.0.1:7897 后 git 走单次代用。
+set "GIT_PROXY_ARGS="
+if defined AC_GIT_PROXY (
+    set "GIT_PROXY_ARGS=-c http.proxy=!AC_GIT_PROXY! -c https.proxy=!AC_GIT_PROXY!"
+    echo [代理] git 走 !AC_GIT_PROXY!（环境变量 AC_GIT_PROXY）
+)
 echo ============================================================
 echo   安装 DeepSeekHarness
 echo ============================================================
@@ -352,6 +359,12 @@ if !errorlevel! neq 0 (
     echo [错误] 缺少 Git - 克隆仓库需要 Git，请先装好再重试。
     goto :DSH_END
 )
+if exist "!DSH_ROOT!\apps\cli\lib\bin.js" (
+    echo [OK] 检测到已安装（官方 SDK profile 布局）：!DSH_ROOT!
+    echo        仅检查 AutoCode 组合层文件后结束。
+    echo.
+    goto :DSH_CORDIS
+)
 if exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
     echo [OK] 检测到已安装：!DSH_ROOT!
     echo        仅更新 AutoCode 组合文件后结束。
@@ -362,9 +375,11 @@ if exist "!DSH_ROOT!" (
     echo [提示] 目录已存在但未完成构建，继续依赖安装与构建...
 ) else (
     echo [安装] 克隆 deepseek-harness 仓库 - 浅克隆，约几十 MB ...
-    git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git "!DSH_ROOT!"
+    git !GIT_PROXY_ARGS! clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git "!DSH_ROOT!"
     if !errorlevel! neq 0 (
-        echo [错误] 克隆失败 - 请检查网络，GitHub 访问可能需要代理。
+        if exist "!DSH_ROOT!" rd /s /q "!DSH_ROOT!"
+        echo [错误] 克隆失败 - 残留目录已清理，可安全重跑。
+        echo        GitHub 访问不通时先设代理再重跑：set AC_GIT_PROXY=http://127.0.0.1:7897
         goto :DSH_END
     )
 )
@@ -376,26 +391,46 @@ if !errorlevel! neq 0 (
     echo [错误] pnpm 安装失败 - 请关闭窗口重试，或手动执行 npm install -g pnpm@11.7.0
     goto :DSH_END
 )
-echo [安装] pnpm 依赖 - 数分钟，请耐心等待...
 pushd "!DSH_ROOT!"
+call :JunctionPrecheck
+if !errorlevel! neq 0 (
+    popd
+    goto :DSH_END
+)
+echo [安装] pnpm 依赖 - 数分钟，请耐心等待...
 call pnpm install
 if !errorlevel! neq 0 (
     popd
     echo [错误] pnpm install 失败 - 请检查网络代理后重跑本脚本。
     goto :DSH_END
 )
-echo [构建] 编译 lib - 仓库不含 lib 构建产物，必须执行...
-call pnpm run build:lib
+echo [构建] 完整构建（0.1.5 起 build:lib 依赖 native 先行，须整体跑；约 5~15 分钟）...
+call pnpm run build
 if !errorlevel! neq 0 (
     popd
-    echo [错误] build:lib 失败 - 请查看上方输出排查 Node 版本（建议 22.19 以上或 24 以上）。
+    echo [错误] build 失败 - 请查看上方输出排查 Node 版本（建议 22.19 以上或 24 以上）。
     goto :DSH_END
 )
 popd
 echo.
 
 :DSH_CORDIS
-:: 部署 AutoCode 组合文件（正本在 AutoCode 仓库 agent/dsh，构建时同步到脚本同级 dsh\）。
+:: 部署 AutoCode 组合层（正本在 AutoCode 仓库 agent/dsh，构建时同步到脚本同级 dsh\）。
+:: 2026.09.10 双布局：新版（>=0.1.2，apps\cli 入口）组合层 = dsh\sdk.autocode.patch.yml
+::   （启动时 --profile sdk --patch 绝对路径直接引用，无需部署进 DSH 仓库）；
+::   旧版（<=0.1.1）仍部署 cordis.yml 到 examples 树（相对 node_modules 解析要求）。
+if exist "!DSH_ROOT!\apps\cli\lib\bin.js" (
+    if exist "%~dp0dsh\sdk.autocode.patch.yml" (
+        echo [OK] 官方 SDK profile 布局：组合层 sdk.autocode.patch.yml 就位（--patch 直接引用）。
+    ) else (
+        echo [警告] 未找到 %~dp0dsh\sdk.autocode.patch.yml - 请确认 AutoCode 程序目录完整。
+    )
+    echo [OK] DeepSeekHarness 安装完成：!DSH_ROOT!
+    echo        AutoCode 启动时会自动探测本目录并回填配置；
+    echo        设置页也可点「重新检测」立即生效。
+    echo.
+    goto :DSH_END
+)
 if not exist "!DSH_ROOT!\examples\autocode-agent" mkdir "!DSH_ROOT!\examples\autocode-agent"
 if exist "%~dp0dsh\cordis.autocode.yml" (
     copy /y "%~dp0dsh\cordis.autocode.yml" "!DSH_ROOT!\examples\autocode-agent\cordis.yml" >nul
@@ -486,20 +521,83 @@ if "!HERMES_URL!"=="" (
     echo         请回 AutoCode 设置页 Hermes 页填写「仓库地址」后重试。
     goto :HERMES_END
 )
-where node >nul 2>&1
-if !errorlevel! neq 0 (
-    echo [错误] 缺少 Node.js - 请先运行完整安装（或单独装 Node 22.19+）后重试。
-    goto :HERMES_END
-)
 where git >nul 2>&1
 if !errorlevel! neq 0 (
     echo [错误] 缺少 Git - 克隆仓库需要 Git，请先安装后重试。
     goto :HERMES_END
 )
+:: 2026.09.13 代理支持：GitHub 直连不通时，先 set AC_GIT_PROXY=http://127.0.0.1:7897
+::   再重跑本脚本 - git 以 -c http/https.proxy 单次代用，不污染全局 .gitconfig。
+set "GIT_PROXY_ARGS="
+if defined AC_GIT_PROXY (
+    set "GIT_PROXY_ARGS=-c http.proxy=!AC_GIT_PROXY! -c https.proxy=!AC_GIT_PROXY!"
+    echo [代理] git 走 !AC_GIT_PROXY!（环境变量 AC_GIT_PROXY）
+)
+set "PIP_PROXY_ARGS="
+if defined AC_PIP_PROXY (
+    set "PIP_PROXY_ARGS=--proxy !AC_PIP_PROXY!"
+    echo [代理] pip 走 !AC_PIP_PROXY!（环境变量 AC_PIP_PROXY）
+)
+
+:: ---- 布局判定（双形态，探测序同 CHermesRunner::ResolveHermesCli）----
+::   形态 A（Node Harness）    ：!HERMES_ROOT!\dist\cli.js
+::   形态 B（Python hermes-agent，官方 install.ps1 布局）：
+::     !HERMES_ROOT!\hermes-agent\{仓库+venv\Scripts\hermes.exe}
+::   形态 B 平铺（2026.09 旧装）：!HERMES_ROOT!\{仓库+venv\Scripts\hermes.exe}
+set "HFORM="
+set "HREPO="
 if exist "!HERMES_ROOT!\dist\cli.js" (
+    set "HFORM=A"
+    set "HREPO=!HERMES_ROOT!"
+) else if exist "!HERMES_ROOT!\hermes-agent\run_agent.py" (
+    set "HFORM=B"
+    set "HREPO=!HERMES_ROOT!\hermes-agent"
+) else if exist "!HERMES_ROOT!\run_agent.py" (
+    set "HFORM=BFLAT"
+    set "HREPO=!HERMES_ROOT!"
+) else if exist "!HERMES_ROOT!\package.json" (
+    set "HFORM=AHALF"
+    set "HREPO=!HERMES_ROOT!"
+) else (
+    set "HFORM=NEW"
+)
+
+if "!HFORM!"=="NEW" (
+    echo [安装] 浅克隆 Hermes 仓库 - 需联网，约几十 MB ...
+    git !GIT_PROXY_ARGS! clone --depth 1 "!HERMES_URL!" "!HERMES_ROOT!\hermes-agent"
+    if !errorlevel! neq 0 (
+        if exist "!HERMES_ROOT!\hermes-agent" rd /s /q "!HERMES_ROOT!\hermes-agent"
+        echo [错误] 克隆失败 - 残留目录已清理，可安全重跑。
+        echo        GitHub 访问不通时先设代理再重跑：set AC_GIT_PROXY=http://127.0.0.1:7897
+        goto :HERMES_END
+    )
+    if exist "!HERMES_ROOT!\hermes-agent\pyproject.toml" (
+        set "HFORM=B"
+        set "HREPO=!HERMES_ROOT!\hermes-agent"
+    ) else (
+        rem Node 仓库：上移到根，保持形态 A 布局（!HERMES_ROOT!\dist\cli.js）
+        echo [布局] Node 形态仓库 - 内容上移到安装根 ...
+        robocopy "!HERMES_ROOT!\hermes-agent" "!HERMES_ROOT!" /E /MOVE /NFL /NDL /NJH /NJS /NP /R:2 /W:2 >nul
+        rd /s /q "!HERMES_ROOT!\hermes-agent" 2>nul
+        set "HFORM=AHALF"
+        set "HREPO=!HERMES_ROOT!"
+    )
+)
+
+:: ---- Python 形态（B / BFLAT）：venv + 依赖 + 补丁 + 环境变量 ----
+if "!HFORM!"=="B" goto :HERMES_PY
+if "!HFORM!"=="BFLAT" goto :HERMES_PY
+
+:: ---- Node 形态（A=更新 / AHALF=续装）：pnpm 依赖与构建 ----
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - 请先运行完整安装（或单独装 Node 22.19+）后重试。
+    goto :HERMES_END
+)
+if "!HFORM!"=="A" (
     echo [更新] 检测到既有安装，改为 git 拉取更新（fetch+reset，保留本地文件）...
-    pushd "!HERMES_ROOT!"
-    git fetch --all --tags
+    pushd "!HREPO!"
+    git !GIT_PROXY_ARGS! fetch --all --tags
     if !errorlevel! neq 0 (
         popd
         echo [错误] git fetch 失败 - 请检查网络/代理后重跑（fetch 失败不影响既有安装）。
@@ -512,17 +610,13 @@ if exist "!HERMES_ROOT!\dist\cli.js" (
         goto :HERMES_END
     )
 ) else (
-    if exist "!HERMES_ROOT!" (
-        echo [提示] 目录已存在但未完成构建，继续依赖安装与构建...
-    ) else (
-        echo [安装] 浅克隆 Hermes Harness 仓库 - 需联网，约几十 MB ...
-        git clone --depth 1 "!HERMES_URL!" "!HERMES_ROOT!"
-        if !errorlevel! neq 0 (
-            echo [错误] 克隆失败 - 请检查仓库地址与网络（GitHub 访问可能需要代理）。
-            goto :HERMES_END
-        )
-    )
-    pushd "!HERMES_ROOT!"
+    echo [提示] 目录已存在但未完成构建，继续依赖安装与构建...
+    pushd "!HREPO!"
+)
+call :JunctionPrecheck
+if !errorlevel! neq 0 (
+    popd
+    goto :HERMES_END
 )
 echo [安装] pnpm 包管理器 pnpm@11.7.0 ...
 call npm install -g pnpm@11.7.0
@@ -554,8 +648,7 @@ if !errorlevel! equ 0 (
         )
     )
 ) else (
-    echo [提示] 该仓库 package.json 无 build 脚本（NousResearch/hermes-agent 为 Python 主项目，
-    echo        Node 仅为开发工具依赖），跳过构建步骤。
+    echo [提示] 该仓库 package.json 无 build 脚本，跳过构建步骤。
     ver >nul
 )
 popd
@@ -563,17 +656,77 @@ echo.
 if exist "!HERMES_ROOT!\dist\cli.js" (
     echo [OK] Hermes 安装完成：!HERMES_ROOT!
     echo        回到 AutoCode 设置页 Hermes 页点「重新检测」即可生效。
-) else if exist "!HERMES_ROOT!un_agent.py" (
-    echo [OK] Hermes 仓库安装完成（Python 主项目，无 dist\cli.js）：!HERMES_ROOT!
-    echo        此类仓库（如 NousResearch/hermes-agent）还需 Python 环境才能运行：
-    echo        官方安装 iex ^(irm https://hermes-agent.nousresearch.com/install.ps1^)
-    echo        或在本目录 venv 后 uv pip install -e ".[all]"，入口 run_agent.py / cli.py。
 ) else (
-    echo [错误] 未找到 dist\cli.js 或 Python 入口 - 安装未完成，请查看上方输出排查。
+    echo [错误] 未找到 dist\cli.js - 安装未完成，请查看上方输出排查。
 )
-echo.
+goto :HERMES_END
+
+:HERMES_PY
+:: Python 主项目（NousResearch/hermes-agent 等）：官方布局 = 仓库内 venv。
+echo [信息] Python 形态 Hermes（仓库：!HREPO!）
+if exist "!HREPO!\venv\Scripts\hermes.exe" (
+    echo [更新] 检测到既有 venv 安装，git 拉取更新（fetch+reset）...
+    pushd "!HREPO!"
+    git !GIT_PROXY_ARGS! fetch --all --tags
+    if !errorlevel! neq 0 (
+        popd
+        echo [错误] git fetch 失败 - 请检查网络/代理后重跑（不影响既有安装）。
+        goto :HERMES_END
+    )
+    git reset --hard origin/HEAD
+    popd
+    goto :HERMES_PY_FINISH
+)
+:: 新装：定位 Python 3.11 ~ 3.13（py 启动器优先，回退 python；商店假 python 被版本检查拦下）
+set "HPY="
+py -3 -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2]<(3,14) else 1)" >nul 2>&1
+if !errorlevel! equ 0 (
+    set "HPY=py -3"
+) else (
+    python -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2]<(3,14) else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "HPY=python"
+)
+if "!HPY!"=="" (
+    echo [错误] 未找到 Python 3.11~3.13 - hermes-agent 官方要求，请安装后重跑：
+    echo        https://www.python.org/downloads/ （安装时勾选 Add python.exe to PATH 与 py launcher）
+    goto :HERMES_END
+)
+echo [安装] 创建 venv ...
+pushd "!HREPO!"
+!HPY! -m venv venv
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] venv 创建失败 - 请查看上方输出。
+    goto :HERMES_END
+)
+echo [安装] pip install -e ".[all]" - 数分钟，请耐心等待...
+venv\Scripts\python.exe -m pip install !PIP_PROXY_ARGS! -e ".[all]"
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] 依赖安装失败 - 可重跑本脚本续装；代理环境先 set AC_PIP_PROXY=http://127.0.0.1:7897
+    goto :HERMES_END
+)
+popd
+
+:HERMES_PY_FINISH
+if not exist "!HREPO!\venv\Scripts\hermes.exe" (
+    echo [错误] venv 内缺少 hermes.exe - 安装未完成，请查看上方输出。
+    goto :HERMES_END
+)
+echo [验证] hermes --version ...
+"!HREPO!\venv\Scripts\hermes.exe" --version
+echo [补丁] 敷设 AutoCode 事件补丁（hermes_oneshot_patch.py，幂等）...
+"!HREPO!\venv\Scripts\python.exe" "%~dp0hermes_oneshot_patch.py" "!HERMES_ROOT!"
+if !errorlevel! neq 0 (
+    echo [警告] 补丁敷设失败（多为上游改版锚点失配，见上方原因行）- 后端仍可运行，
+    echo        仅影响中间过程/用量事件输出；升级 AutoCode 后可重跑 /hermes-patch 重试。
+)
+setx HERMES_HOME "!HERMES_ROOT!" >nul 2>&1
+echo [OK] Hermes 安装完成（Python 形态）：!HREPO!
+echo        已写入用户环境变量 HERMES_HOME；回 AutoCode 设置页点「重新检测」即可生效。
 
 :HERMES_END
+goto :VERIFY
 goto :VERIFY
 
 :: ---- PIAgent 单独安装段（2026.08.19 第三后端；robocopy 本机源 → 脚本同级 PIAgent\pi）----
@@ -668,6 +821,9 @@ if !errorlevel! neq 0 (
 )
 for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Content -Raw package.json|ConvertFrom-Json).version"`) do set "NEW_VER=%%v"
 echo [更新] 源码已切换到：!NEW_VER!
+echo [更新] 清理旧构建残留与半态（官方 clean 脚本；跨大版本更新必做——
+echo        手工删 lib 会留 tsbuildinfo/中间态不一致，tsc -b 会跳过 emit 导致构建失败）...
+call pnpm run clean
 echo [安装] pnpm 包管理器 pnpm@11.7.0 ...
 call npm install -g pnpm@11.7.0
 call :RefreshPath
@@ -685,31 +841,39 @@ if !errorlevel! neq 0 (
     echo        重跑本更新修复；期间旧版本仍可运行。
     goto :UPDATE_DSH_END
 )
-echo [构建] 编译 lib ...
-call pnpm run build:lib
+echo [构建] 完整构建（0.1.5 起 build:lib 依赖 native 先行，须整体跑；约 5~15 分钟）...
+call pnpm run build
 if !errorlevel! neq 0 (
     popd
-    echo [错误] build:lib 失败 - 处于半更新态（旧 bin.js 未删仍可运行），重跑本更新修复。
+    echo [错误] build 失败 - 处于半更新态，重跑本更新修复（clean 已清残留会全量重建）。
     goto :UPDATE_DSH_END
 )
 popd
-:: 部署 AutoCode 组合文件（语句同 :DSH_CORDIS 段，此处重写不动原段）。
-if not exist "!DSH_ROOT!\examples\autocode-agent" mkdir "!DSH_ROOT!\examples\autocode-agent"
-if exist "%~dp0dsh\cordis.autocode.yml" (
-    copy /y "%~dp0dsh\cordis.autocode.yml" "!DSH_ROOT!\examples\autocode-agent\cordis.yml" >nul
-    echo [OK] 已部署 AutoCode 组合文件 cordis.yml。
+:: 部署/校验 AutoCode 组合层（2026.09.10 双布局，同 :DSH_CORDIS 段口径）。
+if exist "!DSH_ROOT!\apps\cli\lib\bin.js" (
+    if exist "%~dp0dsh\sdk.autocode.patch.yml" (
+        echo [OK] 官方 SDK profile 布局验收通过：apps\cli 入口 + 组合层 sdk.autocode.patch.yml 就位。
+    ) else (
+        echo [警告] 未找到 %~dp0dsh\sdk.autocode.patch.yml - 请确认 AutoCode 程序目录完整。
+    )
 ) else (
-    echo [警告] 未找到 %~dp0dsh\cordis.autocode.yml - 请确认 AutoCode 程序目录完整。
-)
-if not exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
-    echo [错误] 未找到 bin.js - 更新未完成，请查看上方输出排查。
-    goto :UPDATE_DSH_END
-)
-if not exist "!DSH_ROOT!\examples\node_modules\@deepseek-ai\dsh-agent-spine-demo\package.json" (
-    echo [错误] 组合依赖的 dsh-agent-spine-demo 不可达 - 该版本与 AutoCode 不兼容
-    echo        上游 dsh-v0.1.2+ 移除了全部示例包，请回退受支持版本：
-    echo        install_env.bat /update-dsh dsh-v0.1.0-rc.7 "<DSH 根目录>"
-    goto :UPDATE_DSH_END
+    if not exist "!DSH_ROOT!\examples\autocode-agent" mkdir "!DSH_ROOT!\examples\autocode-agent"
+    if exist "%~dp0dsh\cordis.autocode.yml" (
+        copy /y "%~dp0dsh\cordis.autocode.yml" "!DSH_ROOT!\examples\autocode-agent\cordis.yml" >nul
+        echo [OK] 已部署 AutoCode 组合文件 cordis.yml。
+    ) else (
+        echo [警告] 未找到 %~dp0dsh\cordis.autocode.yml - 请确认 AutoCode 程序目录完整。
+    )
+    if not exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
+        echo [错误] 未找到 bin.js - 更新未完成，请查看上方输出排查。
+        goto :UPDATE_DSH_END
+    )
+    if not exist "!DSH_ROOT!\examples\node_modules\@deepseek-ai\dsh-agent-spine-demo\package.json" (
+        echo [错误] 组合依赖的 dsh-agent-spine-demo 不可达 - 该版本与 AutoCode 不兼容
+        echo        请改用官方 SDK profile 版本（dsh-v0.1.2+，AutoCode 已适配）或回退：
+        echo        install_env.bat /update-dsh dsh-v0.1.0-rc.7 "<DSH 根目录>"
+        goto :UPDATE_DSH_END
+    )
 )
 if "!OLD_VER!"=="" (
     echo [OK] 已更新到 v!NEW_VER!（旧版本读取失败，跳过对比）。
@@ -798,6 +962,24 @@ pause
 exit /b
 
 :: ==================== 子函数 ====================
+
+:JunctionPrecheck
+:: 2026.09.13 pnpm 前置能力预检：pnpm 依赖目录联接（reparse point）。
+:: 受限令牌（沙箱/助手会话/组策略禁 reparse）下会 EPERM，提前给出明确指引，
+:: 而不是让 pnpm 在深处报 symlink 错误。返回 1=环境不可用。
+set "_JT_TEST=%TEMP%\ac_jt_%RANDOM%"
+mklink /J "!_JT_TEST!" "%TEMP%" >nul 2>&1
+if exist "!_JT_TEST!" (
+    rd "!_JT_TEST!" >nul 2>&1
+    set "_JT_TEST="
+    exit /b 0
+)
+set "_JT_TEST="
+echo [错误] 当前环境禁止创建目录联接（junction）- pnpm 无法安装依赖。
+echo        常见原因：在助手/沙箱会话或受限令牌中运行了本脚本。
+echo        解决：回到 AutoCode 设置页点「安装」按钮（独立管理员窗口运行），
+echo        或自行开一个 cmd 窗口直接运行本脚本（正常用户令牌不受限）。
+exit /b 1
 
 :RefreshPath
 :: 把注册表两处 Machine + User PATH 前置合并，再追加初始进程 PATH（_ORIG_PATH）防丢失。

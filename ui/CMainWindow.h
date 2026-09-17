@@ -104,7 +104,7 @@ private slots:
     void OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
 
     // 提示词 agent（面板 ↔ 编排器转发）
-    void OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, bool a_bReadOnly);
+    void OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, int a_iPerm);
     void OnAdhocUndo(const QString& a_sAsstId);
     void OnAdhocCompact(const QString& a_sAsstId);
     // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
@@ -133,15 +133,28 @@ private:
     // 当前助手档 owner（选中任务=任务 id；否则 "global"）。
     QString CurrentAdhocOwner() const;
     void StartAskServer();
+    void ActivateAskClient(QLocalSocket* a_pSock);   // 2026-09-12 接管一条提问连接（当前位空时）
     // 2026.08.20 多实例配置同步：config.ini（exe 同级全局）回填运行期静态配置。
     //   a_bStartup=true 仅启动调用（含 DSH/Pi 不可用警告弹窗）；热重载 false 静默。
     void ApplyAgentConfigToRuntime(bool a_bStartup);
+    // 2026.09.10 公共模型配置：四张模型表（当前设置参数源范围）合并为一份共享表
+    //   （列表+当前项，规则见 CModelEntry.h MergeSharedModelTables）后统一应用到
+    //   四个 runner——切换后端即用同一份列表/当前项，无需重配。
+    void ApplySharedModelsToRunners();
+    // 2026.09.09 v2.1.143 任务级配置覆盖：随有效选中任务切换设置参数源（任务档优先/
+    //   未选回全局），重应用运行期配置。选中变化、删除/移除任务、切工程时调用。
+    void ApplyTaskConfigOverlay(CTaskInfo* a_pTask);
     void OnConfigFileChanged();            // QFileSystemWatcher 触发（外部实例保存）
     void CreateMenus();
     void SetStatus(const QString& a_sText);
     // 迭代熔断（escalation）弹模态对话框：阻塞详情 + 打开任务目录 / 重置迭代并继续 / 忽略。
     void OnEscalation(CTaskInfo* a_pTask, const QString& a_sEventText);
+    // 2026.09.07 v2.1.123 多实例工程锁：他实例持锁时弹阻断式确认（默认 No）；
+    //   2026.09.09 v2.1.137 a_bAutoRestore 参数已随「启动自动恢复上次工程」移除而删除。
     void OpenProjectDir(const QString& a_sDir);
+    // 2026.09.07 标题=工程名-AutoCode 版本（未开工程=AutoCode 版本）：窗口标题供任务
+    //   管理器/Alt-Tab 辨认多实例各开的工程；自绘标题栏同步刷左上角标题文本。
+    void UpdateWindowTitle();
     void SaveTask(CTaskInfo* a_pTask);   // 持久化任务到 .autodev/tasks/<id>/task.json
     void ClearTasks();                   // 清理内存任务对象（切工程时调用）
     void ReloadHistory();                // 从全局 SQLite 库重载历史任务并刷新历史页
@@ -204,7 +217,8 @@ private:
 
     // ask_user 提问服务：孙进程 MCP server 经此管道发来提问，弹窗作答后回包。
     QLocalServer*      m_pAskServer = nullptr;
-    QLocalSocket*      m_pAskClient = nullptr;   // 当前提问连接（串行，一次一个）
+    QLocalSocket*      m_pAskClient = nullptr;   // 当前提问连接（一次只弹一个对话框）
+    QList<QLocalSocket*> m_aAskQueue;            // 2026-09-12 排队提问连接（多助手并发手工审批；对端断连自动离队）
     QByteArray         m_bufAsk;                 // 提问连接行缓冲
     // 2026.08.20 多实例配置同步：盯 config.ini（其他实例保存 → 热重载）。
     QFileSystemWatcher* m_pCfgWatcher  = nullptr;

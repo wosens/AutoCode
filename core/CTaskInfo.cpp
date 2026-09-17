@@ -5,6 +5,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QJsonParseError>
+#include <QRegularExpression>   // 2026.09.10 v2.2.152 ExtractNameFromRequest
+#include <algorithm>            // std::any_of（泛型词表命中判定）
 
 CTaskInfo::CTaskInfo(QObject* a_pParent)
     : QObject(a_pParent) {
@@ -192,4 +194,97 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
         m_aHistory.append(r);
     }
     return true;
+}
+
+// —— 2026.09.10 v2.2.152 自动命名选行修复：从用户原始需求提取任务名 ——
+// 策略：① 首个非空行（总起句）优先——需求文档首行几乎总是主旨陈述（「我想开发一个
+//   ……的工具」）；② 首行泛型/太短则退「最长且 ≤80 字」行（2026.08.20 修订语义降为
+//   退路：最长行往往是编号细节条款而非主旨，79 字压线入选第 7 条抠出「资源管理器
+//   右键菜单增加」的实害勿回退）。行内清洗：剥行首编号/条目号 → 剥引导语（剥后 <4
+//   字回退剥前）→ 取首子句边界（首子句不足 10 字顺延，同编排器旧口径）→ 截 24 字。
+QString CTaskInfo::ExtractNameFromRequest(const QString& a_sReq) {
+    QStringList aLines;
+    for (const QString& sLine : a_sReq.split(QLatin1Char('\n'))) {
+        const QString s = sLine.trimmed();
+        if (!s.isEmpty()) {
+            aLines.append(s);
+        }
+    }
+    if (aLines.isEmpty()) {
+        return QString();
+    }
+    static const QRegularExpression reNum(
+        QStringLiteral("^\\s*(?:(?:FR|NFR|AC|Q)\\d+\\.?|\\d+[.、])\\s*"),
+        QRegularExpression::CaseInsensitiveOption);
+    // 引导语（一层，不循环剥）：「请帮我开发一个X」→「X」。剥后 <4 字回退剥前原文
+    //   （防短句被剥到太短/意外全剥）。
+    static const QRegularExpression reLeadIn(
+        QStringLiteral("^(?:我想|我想要|想要|请帮我|帮我|请你|请|我需要|需要)?\\s*"
+                       "(?:开发|创建|实现|做一个|写一个|搭一个|搭建|制作|设计)?\\s*"
+                       "(?:一个|一款|个)?\\s*"));
+    // 首子句截断（同编排器 MaybeAutoNameTask 旧口径）：边界为全/半角逗号句号分号冒号；
+    //   首子句不足 10 字顺延到下一边界；截 24 字。
+    static const QRegularExpression reSep(QStringLiteral("[，,。;；：:]"));
+    auto fnClean = [](const QString& a_sLine) -> QString {
+        QString s = a_sLine;
+        s.remove(reNum);
+        QString sStripped = s;
+        sStripped.remove(reLeadIn);
+        sStripped = sStripped.trimmed();
+        return (sStripped.size() >= 4) ? sStripped : s.trimmed();
+    };
+    auto fnClause = [](QString s) -> QString {
+        s = s.simplified();
+        int iFrom = 0;
+        for (;;) {
+            const QRegularExpressionMatch mSep = reSep.match(s, iFrom);
+            if (!mSep.hasMatch() || mSep.capturedStart() >= s.size() - 1) {
+                break;   // 无更多子句边界（边界在末尾也视为无）
+            }
+            const int iLen = mSep.capturedStart();
+            if (iLen >= 10) {
+                s = s.left(iLen).trimmed();
+                break;
+            }
+            iFrom = mSep.capturedStart() + 1;   // 首子句太短：顺延到下一边界
+        }
+        if (s.size() > 24) {
+            s = s.left(24).trimmed();
+        }
+        return s;
+    };
+    // 泛型判定（精简版，完整表在编排器 MaybeAutoNameTask）：完全等于常见模板词。
+    static const QStringList aGeneric = {
+        QStringLiteral("需求收集"), QStringLiteral("需求概述"), QStringLiteral("需求分析"),
+        QStringLiteral("需求规格"), QStringLiteral("需求描述"), QStringLiteral("功能需求"),
+        QStringLiteral("非功能需求"), QStringLiteral("验收标准"), QStringLiteral("待澄清"),
+        QStringLiteral("概述"), QStringLiteral("概要"), QStringLiteral("总结"),
+        QStringLiteral("背景"), QStringLiteral("目标"), QStringLiteral("设计"),
+        QStringLiteral("方案"), QStringLiteral("需求"), QStringLiteral("任务"),
+        QStringLiteral("项目"), QStringLiteral("如题"), QStringLiteral("同上"),
+    };
+    auto fnIsGeneric = [](const QString& a_s) -> bool {
+        if (a_s.size() < 4) { return true; }
+        const QString sLow = a_s.toLower();
+        return std::any_of(aGeneric.cbegin(), aGeneric.cend(),
+            [&sLow](const QString& g) { return sLow == g.toLower(); });
+    };
+    // ① 首个非空行（总起句）优先。
+    QString sCandidate = fnClause(fnClean(aLines.first()));
+    // ② 首行泛型/太短：退「最长且 ≤80 字」行（旧策略降为退路）。
+    if (sCandidate.isEmpty() || fnIsGeneric(sCandidate)) {
+        QString sLongest;
+        for (const QString& sLine : aLines) {
+            if (sLine.size() <= 80 && sLine.size() > sLongest.size()) {
+                sLongest = sLine;
+            }
+        }
+        if (!sLongest.isEmpty()) {
+            const QString sAlt = fnClause(fnClean(sLongest));
+            if (!sAlt.isEmpty() && !fnIsGeneric(sAlt)) {
+                sCandidate = sAlt;
+            }
+        }
+    }
+    return sCandidate;
 }

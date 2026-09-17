@@ -1,4 +1,4 @@
-#include "CDiffViewDialog.h"
+﻿#include "CDiffViewDialog.h"
 
 #include <QGuiApplication>
 #include <QScreen>
@@ -19,15 +19,86 @@
 #include <QFontDatabase>
 #include <QScrollBar>
 
+#include <algorithm>
+#include <vector>
+
 namespace {
 void SetPt11(QWidget* a_pW) {
     QFont f = a_pW->font();
     f.setPointSize(11);
     a_pW->setFont(f);
 }
-// 变化区域底色（Beyond Compare 风格：旧=红、新=绿；浅色适配白底黑字）。
-const QColor kClrOld(QStringLiteral("#ffd6d6"));
-const QColor kClrNew(QStringLiteral("#d6ffd6"));
+// 变化区域底色（Beyond Compare 风格；浅色适配白底黑字）。
+const QColor kClrOld(QStringLiteral("#ffd6d6"));   // 删除行（旧侧有、新侧无）
+const QColor kClrNew(QStringLiteral("#d6ffd6"));   // 新增行（新侧有、旧侧无）
+const QColor kClrPad(QStringLiteral("#f2f2f2"));   // 对齐占位行（该侧缺失）
+// 行对齐占位哨兵（区别于真实空行：真实空行是公共行不着色，占位行灰底）。
+const QChar kPad = QChar(0x01);
+// LCS 行对齐上限：O(n·m) 内存/耗时保护，超限退化前后缀整块对齐（保可用性）。
+constexpr int k_iLcsMaxLines = 6000;
+
+// 按通用换行拆行（吞 \r，保留空行结构——空行参与对齐）。
+QList<QString> SplitLines(const QByteArray& a_buf) {
+    const QString s = QString::fromUtf8(a_buf);
+    QList<QString> aLines;
+    int iStart = 0;
+    for (int i = 0; i < s.size(); ++i) {
+        if (s.at(i) == QLatin1Char('\n')) {
+            int iEnd = i;
+            if (iEnd > iStart && s.at(iEnd - 1) == QLatin1Char('\r')) {
+                --iEnd;
+            }
+            aLines.append(s.mid(iStart, iEnd - iStart));
+            iStart = i + 1;
+        }
+    }
+    aLines.append(s.mid(iStart));
+    return aLines;
+}
+
+// LCS 按行对齐（2026.09.04 对齐 HarnessAgent HistoryDiffDialog 口径）：逐行求最长
+//   公共子序列，缺失侧插入占位行——只有真正增/删/改的行着色，公共行不着色。
+//   旧实现用「公共前缀+公共后缀」把中间整块标色：改动一行会带红/绿几十行上下文，
+//   看不出实质改了什么（用户反馈不如 HarnessAgent 的根源）。
+void AlignLinesLcs(const QList<QString>& a_a, const QList<QString>& a_b,
+                   QList<QString>& a_aOut, QList<QString>& a_bOut) {
+    a_aOut.clear();
+    a_bOut.clear();
+    const int iN = a_a.size(), iM = a_b.size();
+    if (iN > k_iLcsMaxLines || iM > k_iLcsMaxLines) {
+        // 超限退化：直接整块并排（不插占位，着色按整块区间）。
+        a_aOut = a_a;
+        a_bOut = a_b;
+        return;
+    }
+    std::vector<std::vector<int>> vvDp(static_cast<size_t>(iN) + 1,
+                                       std::vector<int>(static_cast<size_t>(iM) + 1, 0));
+    for (int i = iN - 1; i >= 0; --i) {
+        for (int j = iM - 1; j >= 0; --j) {
+            vvDp[i][j] = (a_a.at(i) == a_b.at(j))
+                ? vvDp[i + 1][j + 1] + 1
+                : std::max(vvDp[i + 1][j], vvDp[i][j + 1]);
+        }
+    }
+    int i = 0, j = 0;
+    while (i < iN && j < iM) {
+        if (a_a.at(i) == a_b.at(j)) {
+            a_aOut.append(a_a.at(i));   // 公共行
+            a_bOut.append(a_b.at(j));
+            ++i; ++j;
+        } else if (vvDp[i + 1][j] >= vvDp[i][j + 1]) {
+            a_aOut.append(a_a.at(i));   // 旧侧删除行
+            a_bOut.append(QString(kPad));
+            ++i;
+        } else {
+            a_aOut.append(QString(kPad));   // 新侧新增行
+            a_bOut.append(a_b.at(j));
+            ++j;
+        }
+    }
+    while (i < iN) { a_aOut.append(a_a.at(i)); a_bOut.append(QString(kPad)); ++i; }
+    while (j < iM) { a_aOut.append(QString(kPad)); a_bOut.append(a_b.at(j)); ++j; }
+}
 }   // namespace
 
 CDiffViewDialog::CDiffViewDialog(const QString& a_sPath,
@@ -45,6 +116,7 @@ CDiffViewDialog::CDiffViewDialog(const QString& a_sPath,
 void CDiffViewDialog::BuildUi() {
     setWindowTitle(QStringLiteral("查看变更 — %1").arg(m_sPath));
     resize(1100, 680);
+    setMinimumSize(640, 420);
     // 2026.08.29 恢复上次窗口几何（[Layout] DiffWin="x,y,w,h"；限幅屏幕可用区，
     //   坏档/无记录用默认 1100x680）。profile API 读写（与 CRollbackDialog 同口径）。
     if (!m_sCfgPath.isEmpty()) {
@@ -134,47 +206,11 @@ void CDiffViewDialog::BuildUi() {
     fnBind(m_pTxtNew, m_pTxtOld);
 }
 
-void CDiffViewDialog::AlignSides(const QList<QString>& a_aOld, const QList<QString>& a_aNew,
-                                 QList<QString>& a_aOldOut, QList<QString>& a_aNewOut,
-                                 int& a_iOldFrom, int& a_iOldTo,
-                                 int& a_iNewFrom, int& a_iNewTo) {
-    // 公共前缀。
-    int iPre = 0;
-    while (iPre < a_aOld.size() && iPre < a_aNew.size()
-           && a_aOld[iPre] == a_aNew[iPre]) {
-        ++iPre;
-    }
-    // 公共后缀（不与前缀重叠）。
-    int iSuf = 0;
-    while (iSuf < a_aOld.size() - iPre && iSuf < a_aNew.size() - iPre
-           && a_aOld[a_aOld.size() - 1 - iSuf] == a_aNew[a_aNew.size() - 1 - iSuf]) {
-        ++iSuf;
-    }
-    const int iMidOld = a_aOld.size() - iPre - iSuf;
-    const int iMidNew = a_aNew.size() - iPre - iSuf;
-    const int iPadOld = qMax(0, iMidNew - iMidOld);   // 旧侧缺的行数 → 旧侧补空行
-    const int iPadNew = qMax(0, iMidOld - iMidNew);
-
-    a_aOldOut = a_aOld;
-    a_aNewOut = a_aNew;
-    for (int i = 0; i < iPadOld; ++i) {
-        a_aOldOut.insert(iPre + iMidOld, QString());
-    }
-    for (int i = 0; i < iPadNew; ++i) {
-        a_aNewOut.insert(iPre + iMidNew, QString());
-    }
-    // 变化区间（补位后的行号，含端点；区间为空表示两侧内容完全一致）。
-    a_iOldFrom = iPre;
-    a_iOldTo   = iPre + iMidOld - 1;
-    a_iNewFrom = iPre;
-    a_iNewTo   = iPre + iMidNew - 1;
-}
-
 void CDiffViewDialog::Fill() {
     m_pLblOld->setText(m_sLabelOld);
     m_pLblNew->setText(m_sLabelNew);
 
-    // 单侧缺失（新增/删除）：缺失侧占位说明，另一侧全文高亮。
+    // 单侧缺失（新增/删除文件）：缺失侧占位说明，另一侧全文高亮。
     if (m_bOldMissing || m_bNewMissing) {
         if (m_bOldMissing) {
             m_pTxtOld->setPlainText(QStringLiteral("（该记录点中不存在此文件）"));
@@ -206,49 +242,98 @@ void CDiffViewDialog::Fill() {
         return;
     }
 
-    const QList<QString> aOld = QString::fromUtf8(m_bufOld).split('\n');
-    const QList<QString> aNew = QString::fromUtf8(m_bufNew).split('\n');
+    // 2026.09.04 LCS 行级对齐（对齐 HarnessAgent HistoryDiffDialog）：逐行最长公共
+    //   子序列，缺失侧插占位行；只有真正变更的行着色（删除=旧侧红 / 新增=新侧绿 /
+    //   占位=灰），公共行不着色——替代旧「前后缀夹逼整块标色」（改一行红绿几十行，
+    //   看不出实质修改）。
+    const QList<QString> aOld = SplitLines(m_bufOld);
+    const QList<QString> aNew = SplitLines(m_bufNew);
     QList<QString> aOldAl, aNewAl;
-    int iOldFrom = 0, iOldTo = -1, iNewFrom = 0, iNewTo = -1;
-    AlignSides(aOld, aNew, aOldAl, aNewAl, iOldFrom, iOldTo, iNewFrom, iNewTo);
+    AlignLinesLcs(aOld, aNew, aOldAl, aNewAl);
 
-    m_pTxtOld->setPlainText(aOldAl.join(QLatin1Char('\n')));
-    m_pTxtNew->setPlainText(aNewAl.join(QLatin1Char('\n')));
+    // 占位行显示为空行（哨兵不出现在可见文本里）。
+    QList<QString> aOldShow, aNewShow;
+    for (const QString& s : aOldAl) { aOldShow.append(s.contains(kPad) ? QString() : s); }
+    for (const QString& s : aNewAl) { aNewShow.append(s.contains(kPad) ? QString() : s); }
+    m_pTxtOld->setPlainText(aOldShow.join(QLatin1Char('\n')));
+    m_pTxtNew->setPlainText(aNewShow.join(QLatin1Char('\n')));
 
-    // 变化区域底色（行号 → 文本块整行选区；区间为空=无变化不上色）。
-    auto fnHighlight = [](QPlainTextEdit* a_pTxt, int a_iFrom, int a_iTo, const QColor& a_clr) {
-        if (a_iFrom > a_iTo) {
-            return;
-        }
+    // 行级着色：本侧占位=灰；本侧行与对侧同位不同（或对侧占位）=变更色；完全相同=不着色。
+    auto fnMark = [this](QPlainTextEdit* a_pEdit, const QList<QString>& aSelf,
+                         const QList<QString>& aOther, const QColor& a_clrChange) {
         QList<QTextEdit::ExtraSelection> aSel;
-        for (int i = a_iFrom; i <= a_iTo && i < a_pTxt->document()->blockCount(); ++i) {
-            QTextBlock stBlk = a_pTxt->document()->findBlockByNumber(i);
-            if (!stBlk.isValid()) {
-                continue;
+        QTextBlock stBlk = a_pEdit->document()->firstBlock();
+        for (int k = 0; k < aSelf.size() && stBlk.isValid(); ++k, stBlk = stBlk.next()) {
+            const bool bPadSelf  = aSelf.at(k).contains(kPad);
+            const bool bPadOther = (k < aOther.size()) && aOther.at(k).contains(kPad);
+            const bool bSame     = !bPadSelf && !bPadOther
+                                   && (k < aOther.size()) && aSelf.at(k) == aOther.at(k);
+            if (bSame) {
+                continue;   // 公共行不着色（正是 LCS 对齐的价值所在）
             }
-            QTextCursor stCur(stBlk);
-            stCur.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
-            QTextEdit::ExtraSelection st;
-            st.cursor = stCur;
-            st.format.setBackground(a_clr);
-            aSel.append(st);
+            QTextEdit::ExtraSelection stEs;
+            stEs.cursor = QTextCursor(stBlk);
+            stEs.cursor.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+            stEs.format.setBackground(bPadSelf ? kClrPad : a_clrChange);
+            aSel.append(stEs);
         }
-        a_pTxt->setExtraSelections(aSel);
+        a_pEdit->setExtraSelections(aSel);
     };
-    fnHighlight(m_pTxtOld, iOldFrom, iOldTo, kClrOld);
-    fnHighlight(m_pTxtNew, iNewFrom, iNewTo, kClrNew);
+    fnMark(m_pTxtOld, aOldAl, aNewAl, kClrOld);
+    fnMark(m_pTxtNew, aNewAl, aOldAl, kClrNew);
 
-    // 定位到第一处变化。
-    const int iFirst = qMax(0, qMin(iOldFrom, iNewFrom) - 2);
-    for (QPlainTextEdit* pTxt : {m_pTxtOld, m_pTxtNew}) {
-        QTextCursor stCur(pTxt->document()->findBlockByNumber(iFirst));
-        pTxt->setTextCursor(stCur);
+    // 定位到第一处变更（行号 = 首个非公共位；两侧同步置光标并居中视口）。
+    int iFirst = -1;
+    const int iRows = qMin(aOldAl.size(), aNewAl.size());
+    for (int k = 0; k < iRows; ++k) {
+        const bool bPadSelf  = aOldAl.at(k).contains(kPad);
+        const bool bPadOther = aNewAl.at(k).contains(kPad);
+        if (bPadSelf || bPadOther || aOldAl.at(k) != aNewAl.at(k)) {
+            iFirst = k;
+            break;
+        }
+    }
+    if (iFirst < 0 && aOldAl.size() != aNewAl.size()) {
+        iFirst = iRows;   // 尾部纯增删
+    }
+    if (iFirst > 0) {
+        for (QPlainTextEdit* pTxt : {m_pTxtOld, m_pTxtNew}) {
+            QTextCursor stCur(pTxt->document()->findBlockByNumber(iFirst));
+            pTxt->setTextCursor(stCur);
+            pTxt->centerCursor();
+        }
+    }
+}
+
+void CDiffViewDialog::showEvent(QShowEvent* a_pEvent) {
+    QDialog::showEvent(a_pEvent);
+    // 2026.09.04 标题栏防超屏兜底（用户实测标题栏被顶出屏幕外不可见——恢复几何来自
+    //   坏档/异 DPI/异屏数会话时，构建期 qBound 钳制仍可能被窗口管理器布局覆盖）：
+    //   显示后按「标题栏中点所在屏」校正——不在任何屏内则整体钳回该屏可用区。
+    const QRect rcFrame = frameGeometry();
+    const QPoint ptTitle(rcFrame.center().x(), rcFrame.top() + 8);   // 标题栏中点
+    QScreen* pScr = QGuiApplication::screenAt(ptTitle);
+    if (pScr == nullptr) {
+        pScr = QGuiApplication::primaryScreen();
+    }
+    if (pScr != nullptr) {
+        const QRect rcAvail = pScr->availableGeometry();
+        const int iW = rcFrame.width(), iH = rcFrame.height();
+        const int iX = qBound(rcAvail.left(), rcFrame.left(),
+                              rcAvail.right() - iW + 1);
+        const int iY = qBound(rcAvail.top(), rcFrame.top(),
+                              rcAvail.bottom() - iH + 1);
+        if (iX != rcFrame.left() || iY != rcFrame.top()) {
+            move(iX, iY);
+        }
     }
 }
 
 void CDiffViewDialog::hideEvent(QHideEvent* a_pEvent) {
     // 2026.08.29 关闭时保存窗口几何（exec 结束 hide 必经；析构不重复写）。
-    if (!m_sCfgPath.isEmpty()) {
+    // 2026.09.04 最大化/最小化状态不存（存的是还原几何，且部分 WM 下含阴影 frame
+    //   负偏移——恢复后正好把标题栏顶出屏幕，即用户反馈的超屏来源之一）。
+    if (!m_sCfgPath.isEmpty() && !isMaximized() && !isMinimized()) {
         const QString sVal = QStringLiteral("%1,%2,%3,%4")
                                  .arg(QString::number(x()), QString::number(y()),
                                       QString::number(width()), QString::number(height()));

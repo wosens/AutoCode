@@ -70,6 +70,8 @@ private:
 
     // 工具卡：从入参 JSON 生成标题摘要（取 file_path/command/pattern/path 等）
     static QString ToolSummary(const QString& a_sTool, const QString& a_sInputJson);
+    // 2026.09.04 v2.0.113 旧轮次裸 JSON 事件行的渲染清洗（tooldone/think/tool→人读摘要，progress→空串丢弃）
+    static QString PrettyLegacyJsonLine(const QString& a_sText);
     // 工具卡标题（含 ▶/▼ 箭头、首条摘要与合并 ×N 计数）
     QString HeaderText(bool a_bArrowDown) const;
     // 工具卡：构造 diff/入参内容

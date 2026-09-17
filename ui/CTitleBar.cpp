@@ -88,6 +88,14 @@ CTitleBar::CTitleBar(QWidget* a_pParent)
     SetMaximized(false);
 }
 
+void CTitleBar::SetTitleText(const QString& a_sText) {
+    // 2026.09.07 工程名入标题：同文本早退（防切档抖动），未建标签安全空判。
+    if (m_pLblTitle == nullptr || m_pLblTitle->text() == a_sText) {
+        return;
+    }
+    m_pLblTitle->setText(a_sText);
+}
+
 void CTitleBar::SetMaximized(bool a_bMaximized) {
     // R6 性能保护：窗口态未变直接早退，避免 resizeEvent 兜底高频调用时反复 setText 抖动。
     if (m_bMaximized == a_bMaximized) {

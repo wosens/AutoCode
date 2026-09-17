@@ -39,6 +39,9 @@ static QString s_sCustomBootSig;
 // 根目录内固定相对布局（bin.js 与 cordis.yml 的推导位置）。
 static constexpr const char* kSzDshBinJsRel  = "/packages/examples/jsonrpc-demo/lib/bin.js";
 static constexpr const char* kSzDshCordisRel = "/examples/autocode-agent/cordis.yml";
+// 2026.09.10 Profile 布局：上游 dsh-v0.1.2 起官方 SDK 入口（dsh CLI 构建产物；
+//   git 里只有 src，pnpm build 后生成——存在即「构建完成的新版根」）。
+static constexpr const char* kSzDshCliBinRel = "/apps/cli/lib/bin.js";
 
 void CDeepSeekRunner::SetDshRootPath(const QString& a_sRoot) {
     s_sDshRootPath = QDir::fromNativeSeparators(a_sRoot.trimmed());
@@ -56,12 +59,55 @@ QString CDeepSeekRunner::ResolveNodePath() {
     return s_sDshNodePath.isEmpty() ? QStringLiteral("node") : s_sDshNodePath;
 }
 
+CDeepSeekRunner::EDshLayout CDeepSeekRunner::DshLayoutOf(const QString& a_sRoot) {
+    // 2026.09.10 布局判型（优先 Legacy：新旧同存的过渡根按旧口径跑，行为已验证）：
+    //   Legacy = examples/jsonrpc-demo/bin.js 存在（≤0.1.1 示例包布局）；
+    //   Profile = apps/cli/lib/bin.js 存在（≥0.1.2 官方 SDK profile，需已构建）；
+    //   None = 两者皆无（未安装/未构建/未知布局）。
+    const QString sRoot = QDir::fromNativeSeparators(
+        (a_sRoot.isEmpty() ? s_sDshRootPath : a_sRoot).trimmed());
+    if (sRoot.isEmpty()) {
+        return EDshLayout::None;
+    }
+    if (QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshBinJsRel))) {
+        return EDshLayout::Legacy;
+    }
+    if (QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshCliBinRel))) {
+        return EDshLayout::Profile;
+    }
+    return EDshLayout::None;
+}
+
 QString CDeepSeekRunner::ResolveBinJsPath() {
     if (!s_sDshBinJsPath.isEmpty()) {
         return s_sDshBinJsPath;
     }
-    return s_sDshRootPath.isEmpty() ? QString()
-                                    : s_sDshRootPath + QString::fromLatin1(kSzDshBinJsRel);
+    if (s_sDshRootPath.isEmpty()) {
+        return QString();
+    }
+    // 2026.09.10 双布局：Profile 根（apps/cli 构建产物）返回 dsh CLI 入口。
+    if (DshLayoutOf() == EDshLayout::Profile) {
+        return s_sDshRootPath + QString::fromLatin1(kSzDshCliBinRel);
+    }
+    return s_sDshRootPath + QString::fromLatin1(kSzDshBinJsRel);
+}
+
+QString CDeepSeekRunner::ResolvePatchPath() {
+    // 2026.09.10 Profile 布局组合层：exe 同级 dsh\sdk.autocode.patch.yml（CMake
+    //   POST_BUILD 从仓库 agent/dsh 同步）；绝对路径引用，无需部署到 DSH root。
+    return QCoreApplication::applicationDirPath()
+           + QStringLiteral("/dsh/sdk.autocode.patch.yml");
+}
+
+QStringList CDeepSeekRunner::ResolveStartArgs() {
+    // 2026.09.10 双布局启动参数：Profile = dsh CLI 官方 SDK profile（--patch 叠加
+    //   AutoCode 组合层：autocode-active 槽位/maxTokensAsSuccess=false/技能目录/
+    //   persona/session root/压缩阈值）；Legacy = 旧两件套 {bin, cordis} 不变。
+    if (DshLayoutOf() == EDshLayout::Profile) {
+        return { ResolveBinJsPath(), QStringLiteral("--profile"), QStringLiteral("sdk"),
+                 QStringLiteral("--patch"), ResolvePatchPath() };
+    }
+    return { ResolveBinJsPath(), ResolveCordisPath() };
 }
 
 QString CDeepSeekRunner::ResolveCordisPath() {
@@ -73,10 +119,10 @@ QString CDeepSeekRunner::ResolveCordisPath() {
 }
 
 bool CDeepSeekRunner::LooksLikeDshRoot(const QString& a_sRoot) {
+    // 2026.09.10 双布局：Legacy 两件套或 Profile 构建产物，任一即认。
     const QString sRoot = QDir::fromNativeSeparators(a_sRoot.trimmed());
     return !sRoot.isEmpty()
-        && QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshBinJsRel))
-        && QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshCordisRel));
+        && DshLayoutOf(sRoot) != EDshLayout::None;
 }
 
 QString CDeepSeekRunner::DshConfigError() {
@@ -106,6 +152,44 @@ QString CDeepSeekRunner::DshConfigError() {
             "deepseek-harness 仓库根（bin.js 按固定布局自动推导）。").arg(
                 sBin.isEmpty() ? QStringLiteral("(空)") : sBin);
     }
+    // 2026.09.10 Profile 布局分支（≥0.1.2 官方 SDK）：不查 cordis 两件套/spine 包
+    //   （examples 树已删），改查 --patch 组合层存在性 + 同构模板自检（!!js 语法/
+    //   autocode-active 槽位——与 Legacy 的 cordis 守卫同一套检查目标）。
+    if (DshLayoutOf() == EDshLayout::Profile) {
+        const QString sPatch = ResolvePatchPath();
+        if (!QFile::exists(sPatch)) {
+            return QStringLiteral(
+                "DSH 为官方 SDK profile 布局，但程序目录缺组合层文件：%1。\n"
+                "处理：从完整程序目录拷贝 dsh\\ 子目录（含 sdk.autocode.patch.yml），"
+                "或重跑「安装 DeepSeekHarness…」后重试。").arg(
+                    QDir::toNativeSeparators(sPatch));
+        }
+        QFile oPatch(sPatch);
+        if (oPatch.open(QIODevice::ReadOnly)) {
+            const QString sPatchText = QString::fromUtf8(oPatch.readAll());
+            oPatch.close();
+            for (const QString& sLine : sPatchText.split(QChar::LineFeed)) {
+                const QString sTrimmed = sLine.trimmed();
+                if (sTrimmed.startsWith(QLatin1Char('#'))) {
+                    continue;
+                }
+                if (sTrimmed.contains("!!js [") || sTrimmed.contains("!!js {")) {
+                    return QStringLiteral(
+                        "组合层 sdk.autocode.patch.yml 含不支持的 !!js 序列/映射表达式"
+                        "（!!js 仅支持标量）。\n文件：%1\n处理：更新程序目录 dsh\\"
+                        "sdk.autocode.patch.yml 后重开 AutoCode。").arg(
+                            QDir::toNativeSeparators(sPatch));
+                }
+            }
+            if (CustomActiveValid() && !sPatchText.contains("autocode-active")) {
+                return QStringLiteral(
+                    "程序目录的 dsh\\sdk.autocode.patch.yml 是旧版（缺 autocode-active "
+                    "槽位），自定义大模型无法路由。\n处理：从完整程序目录拷贝新的 "
+                    "dsh\\sdk.autocode.patch.yml，或重跑「01.更新程序.bat」同步后重启。");
+            }
+        }
+        return QString();   // Profile 布局校验完备
+    }
     const QString sCordis = ResolveCordisPath();
     if (sCordis.isEmpty() || !QFile::exists(sCordis)) {
         return QStringLiteral(
@@ -115,6 +199,59 @@ QString CDeepSeekRunner::DshConfigError() {
             "AutoCode 仓库 agent/dsh/cordis.autocode.yml 复制为 "
             "<DSH根>/examples/autocode-agent/cordis.yml。").arg(
                 sCordis.isEmpty() ? QStringLiteral("(空)") : sCordis);
+    }
+    // 2026.09.08 v2.1.127 模板语法自检：DSH loader 的 !!js schema 只注册 scalar kind，
+    //   `!!js [数组].filter(...)`（flow 序列节点）必炸 unknown tag（08-24 persona 行潜伏雷，
+    //   旧部署位未同步该版才未暴露；v2.1.125 修同步后引爆为「握手反复退出」）。主模板与部署位
+    //   双侧扫描——只查部署位会漏「首次同步投毒」（SyncCordisFromMaster 在本函数之后的
+    //   EnsureProcess 才跑）。
+    for (const QString& sYml : QStringList{ sCordis, QCoreApplication::applicationDirPath()
+                                                + QStringLiteral("/dsh/cordis.autocode.yml") }) {
+        QFile oYml(sYml);
+        if (!oYml.exists() || !oYml.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        const QString sYmlText = QString::fromUtf8(oYml.readAll());
+        oYml.close();
+        // 逐行扫描且跳过 # 注释行（v2.1.128 自摆乌龙教训：修复版模板的注释里写了
+        //   示例文本「!!js [数组]」被自家守卫命中——守卫只该看有效配置行）。
+        bool bBadJs = false;
+        for (const QString& sLine : sYmlText.split(QChar::LineFeed)) {
+            const QString sTrimmed = sLine.trimmed();
+            if (sTrimmed.startsWith(QLatin1Char('#'))) {
+                continue;
+            }
+            if (sTrimmed.contains("!!js [") || sTrimmed.contains("!!js {")) {
+                bBadJs = true;
+                break;
+            }
+        }
+        if (bBadJs) {
+            return QStringLiteral(
+                "组合 cordis.yml 含 DSH 不支持的 !!js 序列/映射表达式（!!js 仅支持标量，"
+                "解析必炸 unknown tag）。\n"
+                "文件：%1\n处理：更新程序目录 dsh\\cordis.autocode.yml（v2.1.127 已修复"
+                "persona 行）后重开 AutoCode。").arg(QDir::toNativeSeparators(sYml));
+        }
+    }
+    // 2026.09.08 v2.1.125 模板陈旧自检（实害：副本 08-18 旧模板缺 autocode-active 槽位 →
+    //   initialize 报 -32603 no adapter registered for provider "autocode-active"）：激活自定义
+    //   模型而 exe 侧 dsh\cordis.autocode.yml 不带槽位 = 部署目录未随主程序更新，前置拦截并给
+    //   更新指引（不再等任务握手才炸）。
+    if (CustomActiveValid()) {
+        QFile oMasterYml(QCoreApplication::applicationDirPath()
+                          + QStringLiteral("/dsh/cordis.autocode.yml"));
+        if (oMasterYml.exists() && oMasterYml.open(QIODevice::ReadOnly)) {
+            const bool bHasSlot = oMasterYml.readAll().contains("autocode-active");
+            oMasterYml.close();
+            if (!bHasSlot) {
+                return QStringLiteral(
+                    "程序目录的 dsh\\cordis.autocode.yml 是旧版（缺 autocode-active 槽位），"
+                    "自定义大模型无法路由。\n"
+                    "处理：从完整程序目录拷贝新的 dsh\\cordis.autocode.yml，或重跑"
+                    "「01.更新程序.bat」同步后重启。");
+            }
+        }
     }
     // 2026.09.01 组合依赖包可达性（版本兼容探测，任务握手前拦截）：cordis.yml 引用的
     //   dsh-agent-spine-demo 是上游 dsh-v0.1.2 起移除的示例包（官方删包无别名）——
@@ -178,17 +315,25 @@ QString CDeepSeekRunner::DshInstallDiagnosis() {
                 continue;
             }
             const QString sRoot = QDir(sBase + sName).canonicalPath();
-            const bool bBin = QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshBinJsRel));
-            const bool bCordis = QFileInfo::exists(sRoot + QString::fromLatin1(kSzDshCordisRel));
-            if (bBin && bCordis) {
+            // 2026.09.10 双布局缺项诊断：Legacy 看 bin.js/cordis.yml 两件套；Profile
+            //   看 apps/cli 构建产物（git 只有 src，pnpm build 后才有 lib）。
+            const bool bCliBin = QFileInfo::exists(
+                sRoot + QString::fromLatin1(kSzDshCliBinRel));
+            const bool bBin = bCliBin || QFileInfo::exists(
+                sRoot + QString::fromLatin1(kSzDshBinJsRel));
+            const bool bCordis = QFileInfo::exists(
+                sRoot + QString::fromLatin1(kSzDshCordisRel));
+            if (bBin && (bCordis || bCliBin)) {
                 continue;   // 完整根（探测应已命中），继续看其他候选
             }
             QString sMissing;
             if (!bBin) {
-                sMissing = QStringLiteral("bin.js（packages\\examples\\jsonrpc-demo\\lib\\ 下）——"
-                                          "克隆或 pnpm 构建未完成，重跑「安装 DeepSeekHarness…」续装");
+                sMissing = QStringLiteral(
+                    "bin.js（packages\\examples\\jsonrpc-demo\\lib\\ 或新版本 "
+                    "apps\\cli\\lib\\ 下）——克隆或 pnpm 构建未完成，重跑「安装 "
+                    "DeepSeekHarness…」续装");
             }
-            if (!bCordis) {
+            if (!bCordis && !bCliBin) {
                 if (!sMissing.isEmpty()) {
                     sMissing += QStringLiteral("；");
                 }
@@ -235,11 +380,13 @@ QString CDeepSeekRunner::DshRepoUrl() {
 
 QString CDeepSeekRunner::SupportedDshTag() {
     // 2026.09.01 见头文件注释：AutoCode 集成绑定的基线 tag（回退/安装命令用）。
+    // 2026.09.09 v2.1.134 回退越权改动：工作区曾被某 Agent 任务未记档抬至 0.1.5-alpha.1
+    //   （"双布局支持"半成品，与本机 rc.7 部署矛盾且破坏上限锁测试）。
     return QStringLiteral("dsh-v0.1.0-rc.7");
 }
 
 QVersionNumber CDeepSeekRunner::SupportedDshVersion() {
-    // 数值比较基线（0.1.2-alpha.3 的 fromString=0.1.2 > 0.1.0 判“超基线”；
+    // 数值比较基线（0.1.2-alpha.3 的 fromString=0.1.2 > 0.1.0 判"超基线"；
     //   rc.7 == 0.1.0 不高于自身）。适配新版后同步抬升两常量。
     return QVersionNumber::fromString(QStringLiteral("0.1.0"));
 }
@@ -509,6 +656,17 @@ int CDeepSeekRunner::CleanBuildResidue(const QString& a_sRoot) {
         }
     };
     fnVisit(QDir(a_sRoot).filePath(QStringLiteral("packages")));
+    // 2026.09.10 补根目录 solution 级 tsbuildinfo（实测坑：根 tsconfig.host/client
+    //   .tsbuildinfo 残留时 tsc -b 认为 host/client 面已构建、跳过包内 emit，
+    //   tsdown 报 Cannot find entry 卡死 build；手工删包内 lib 不够，根残留必清）。
+    QDir stRootDir(a_sRoot);
+    const QFileInfoList aRootInfos = stRootDir.entryInfoList(
+        {QStringLiteral("tsconfig*.tsbuildinfo")}, QDir::Files);
+    for (const QFileInfo& stI : aRootInfos) {
+        if (QFile::remove(stI.absoluteFilePath())) {
+            ++iRemoved;
+        }
+    }
     return iRemoved;
 }
 
@@ -656,6 +814,7 @@ void CDeepSeekRunner::ResetTurnState() {
     m_iFastRetry = 0;
     m_sTurnText.clear();
     m_sTurnReasonKind.clear();
+    m_sTurnErrInfo.clear();   // 2026.09.10 上轮错误详情不复用
     m_iSumInTok = 0;
     m_iSumOutTok = 0;
     m_iLiveEmitIn = 0;    // 2026.08.27 实时计量已发累计复位
@@ -862,6 +1021,8 @@ void CDeepSeekRunner::HealRunStep(int a_iStep) {
     const int kiStepTimeoutMs[] = {0, 60 * 1000, 60 * 1000,
                                    15 * 60 * 1000, 30 * 60 * 1000, 30 * 1000};
     QProcessEnvironment stEnv = QProcessEnvironment::systemEnvironment();
+    // 2026-09-12 手工审批弹窗通道（自愈重建后重入 StartStage，环境同口径）
+    InjectAskEnv(stEnv);
     stEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     stEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     stEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
@@ -888,9 +1049,11 @@ void CDeepSeekRunner::HealRunStep(int a_iStep) {
                 { QStringLiteral("/c"), QStringLiteral("pnpm install") });
             break;
         case 4:
-            emit sigInfo(QStringLiteral("🔧 [4/5] pnpm run build:lib（全量重建，约 3~10 分钟）…"));
+            // 2026.09.10 build:lib → build：0.1.5 起 lib 依赖 native-system 先行，
+            //   单跑 build:lib 必挂（Cannot find entry）；官方完整流程含 native+lib+web。
+            emit sigInfo(QStringLiteral("🔧 [4/5] pnpm run build（完整重建，约 5~15 分钟）…"));
             m_pHealProc->start(QStringLiteral("cmd"),
-                { QStringLiteral("/c"), QStringLiteral("pnpm run build:lib") });
+                { QStringLiteral("/c"), QStringLiteral("pnpm run build") });
             break;
         default:
             FinishHeal(false, QStringLiteral("内部错误：未知修复步骤 %1").arg(a_iStep));
@@ -1006,11 +1169,12 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
         m_eProcState = ProcDead;
         // 落到下方冷启动路径：以新工程 cwd 重新拉进程 + 握手。
     }
-    // 部署位组合文件对账：模板（exe 同级 dsh\cordis.autocode.yml）有更新而部署副本
-    //   还是旧的（老安装/手工拷贝），冷启动前覆盖——旧副本缺 autocode-active 槽位时
-    //   自定义模型会静默失效。进程未运行（本函数前置条件），覆盖安全；失败不阻断
-    //   （部署目录可能只读，旧副本仍可用默认路由）。
-    SyncCordisFromMaster();
+    // 部署位组合文件对账（2026.09.10 仅 Legacy 布局：Profile 布局的组合层是
+    //   --patch 绝对路径直接引用 exe 目录正本，无部署副本概念）：模板（exe 同级
+    //   dsh\cordis.autocode.yml）有更新而部署副本还是旧的，冷启动前覆盖。
+    if (DshLayoutOf() == EDshLayout::Legacy) {
+        SyncCordisFromMaster();
+    }
     // 收尾旧进程（Dead 残留状态清理；正常路径进程已退出）。
     if (m_pProc->state() != QProcess::NotRunning) {
         if (!m_pProc->waitForFinished(3000)) {
@@ -1021,6 +1185,8 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     // 环境注入：DSH_CWD（bash/fs-local 工作目录）+ DSH_SESSION_ROOT（会话 jsonl 落盘，
     //   放工程 .autodev 下与任务产物同域，不污染工程根）。
     QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
+    InjectAskEnv(oEnv);
     // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
     oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
@@ -1043,9 +1209,17 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
         oEnv.insert(QStringLiteral("DSH_LLM_CTX"), QString::number(stM.iCtx));
         oEnv.insert(QStringLiteral("DSH_LLM_MAXTOK"), QString::number(stM.iMaxTok));
         oEnv.insert(QStringLiteral("AUTOCODE_DSH_API_KEY"), stM.sApiKey);
+        // 2026.09.10 连接类失败定位（用户实测：本地 ollama 停服 → "Connection error" 裸文本
+        //   无目标地址，远端/本地不分排查一圈）：记录本进程实际 LLM 目标，失败提示时呈现。
+        m_sLlmBaseUrl = stM.sBaseURL;
+        m_sLlmLabel   = stM.sDisp.isEmpty() ? stM.sModelId : stM.sDisp;
         if (stM.iCtx > 0) {
             m_iCtxWindow = stM.iCtx;   // 窗口种子（request/context 上报后覆盖）
         }
+    } else {
+        // 固定路由（settings.yaml 的 provider 定义）：URL 在 dsh 侧，AutoCode 只知名字。
+        m_sLlmBaseUrl.clear();
+        m_sLlmLabel = DshModel();
     }
     // 2026.08.24 便携资产注入（三后端统一口径，见 CAgentRunnerBase 注释）：
     //   技能目录 = <exe>\skills（便携）+ ~/.claude/skills（存在者），';' 连接经
@@ -1071,11 +1245,17 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     m_actClock.restart();
     // node 直起（不经 cmd.exe：参数化传参，无 shim 引号重解析问题；Windows 路径含
     //   空格安全）。stdin 全程不关（铁律：bin.js 对 stdin end 敏感）。
-    m_pProc->start(ResolveNodePath(), QStringList{ResolveBinJsPath(), ResolveCordisPath()});
+    // 2026.09.10 双布局参数：Profile = dsh CLI --profile sdk --patch <exe组合层>；
+    //   Legacy = {bin, cordis} 两件套（见 ResolveStartArgs）。
+    m_pProc->start(ResolveNodePath(), ResolveStartArgs());
     if (!m_pProc->waitForStarted(10000)) {
         m_eProcState = ProcDead;
-        EmitFailed(QStringLiteral("无法启动 DSH 进程：%1 %2 %3").arg(
-            DshNodePath(), DshBinJsPath(), DshCordisPath()));
+        const QStringList aArgs = ResolveStartArgs();
+        EmitFailed(QStringLiteral("无法启动 DSH 进程（%1 布局）：node %2")
+                       .arg(DshLayoutOf() == EDshLayout::Profile
+                                ? QStringLiteral("官方 SDK profile")
+                                : QStringLiteral("示例包"),
+                            aArgs.join(QLatin1Char(' '))));
         return false;
     }
     // initialize 握手：cwd/provider/model（maxTokens 不传——组合 maxTokensAsSuccess=false，
@@ -1140,6 +1320,17 @@ void CDeepSeekRunner::SyncCordisFromMaster() {
         oDeployed.close();
         if (aOld == aMaster) {
             return;   // 已同步
+        }
+        // 2026.09.08 v2.1.125 防降级守卫（实害：副本 dsh\cordis.autocode.yml 停在
+        //   08-18 无槽位版——01.更新程序.bat 只同步 exe/bat/help 不同步 dsh\，冷启动
+        //   把部署位覆盖回旧版 → DSH initialize 报 -32603 no adapter registered for
+        //   provider "autocode-active"，任务阶段直接失败）：exe 侧模板缺 autocode-active
+        //   槽位而部署副本已带 → 跳过覆盖（宁用部署位新模板，不拿旧模板降级）。
+        if (!aMaster.contains("autocode-active") && aOld.contains("autocode-active")) {
+            emit sigInfo(QStringLiteral("[system/dsh] 程序目录模板缺 autocode-active 槽位"
+                                        "（疑似旧部署未同步），保留部署位现有模板：%1")
+                             .arg(QDir::toNativeSeparators(sMaster)));
+            return;
         }
     }
     if (oDeployed.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -1472,8 +1663,20 @@ void CDeepSeekRunner::HandleSessionEvent(const QJsonObject& oParams) {
     }
     if (sType == QStringLiteral("turn/end")) {
         m_bTurnEnded = true;
-        m_sTurnReasonKind = oData.value(QStringLiteral("reason")).toObject()
-                                .value(QStringLiteral("kind")).toString();
+        const QJsonObject oReason = oData.value(QStringLiteral("reason")).toObject();
+        m_sTurnReasonKind = oReason.value(QStringLiteral("kind")).toString();
+        // 2026.09.10 失败可诊断性：error 类 reason 携带 reason.error{message,code}（如
+        //   "Connection error."/TRANSPORT）——此前丢弃致 FinishTurn 只能报「无错误文本」。
+        if (m_sTurnReasonKind != QStringLiteral("completed")
+                && m_sTurnReasonKind != QStringLiteral("max-tokens")) {
+            const QJsonObject oErr = oReason.value(QStringLiteral("error")).toObject();
+            const QString sErrCode = oErr.value(QStringLiteral("code")).toString();
+            const QString sErrMsg  = oErr.value(QStringLiteral("message")).toString();
+            if (!sErrMsg.isEmpty()) {
+                m_sTurnErrInfo = sErrCode.isEmpty()
+                    ? sErrMsg : QStringLiteral("%1（code=%2）").arg(sErrMsg, sErrCode);
+            }
+        }
         // 完成判定严格门控 idle：turn/end 只说明轮次逻辑结束，server 内部收尾可能
         //   未完，此刻投递下一轮有竞态风险。idle 正常在 turn/end 后数秒内到达；
         //   5s 未到仅提示（idle 永不到的异常形态交 stall 巡检兜底 kill，不在此收尾）。
@@ -1537,7 +1740,27 @@ void CDeepSeekRunner::FinishTurn() {
     } else {
         sSub = sKind.isEmpty() ? QStringLiteral("error") : sKind;
         if (sMsg.trimmed().isEmpty()) {
-            sMsg = QStringLiteral("无错误文本（turn/end reason=%1）").arg(sSub);
+            // 2026.09.10 turn/end 的 error 详情（Connection error/TRANSPORT 等）优先于占位文案。
+            sMsg = m_sTurnErrInfo.trimmed().isEmpty()
+                 ? QStringLiteral("无错误文本（turn/end reason=%1）").arg(sSub)
+                 : m_sTurnErrInfo;
+        }
+        // 2026.09.10 连接类失败定位：追加实际 LLM 目标——本地端口未监听（重试秒败特征）
+        //   时给出显式指引，不再让「本地服务没开」伪装成「网络故障」。
+        if (sMsg.contains(QStringLiteral("Connection error"), Qt::CaseInsensitive)
+                || sMsg.contains(QStringLiteral("TRANSPORT"))
+                || sMsg.contains(QStringLiteral("ECONNREFUSED"))) {
+            const QString sTarget = m_sLlmBaseUrl.isEmpty()
+                ? QStringLiteral("固定路由 %1（定义见 ~/.dsh/settings.yaml）").arg(DshProvider())
+                : m_sLlmBaseUrl;
+            const bool bLocal = m_sLlmBaseUrl.startsWith(QStringLiteral("http://127.0.0.1"))
+                             || m_sLlmBaseUrl.startsWith(QStringLiteral("http://localhost"));
+            sMsg = QStringLiteral("%1；LLM 目标：%2（模型：%3）%4")
+                       .arg(sMsg, sTarget,
+                            m_sLlmLabel.isEmpty() ? DshModel() : m_sLlmLabel,
+                            bLocal ? QStringLiteral("——本地地址连不上，请确认模型服务已启动"
+                                     "（如 ollama/spark），或在设置中切换 DSH 模型条目")
+                                   : QString());
         }
     }
     m_sLastSubtype = sSub;

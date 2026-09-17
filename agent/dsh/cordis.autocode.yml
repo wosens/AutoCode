@@ -72,7 +72,11 @@
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
-    persona: !!js [process.env.DSH_SYSTEM_PROMPT ?? 'You are a meticulous coding agent executing staged automation tasks. Follow the task instructions exactly and write the required output files before finishing.', process.env.DSH_GLOBAL_CONTEXT].filter(Boolean).join('\n\n')
+    # 2026.09.08 v2.1.127 修 YAML 解析失败（unknown tag !<tag:yaml.org,2002:js>）：
+    #   DSH loader 的 "!!js" 只支持 scalar kind——后接数组/映射字面量的写法是 flow 序列/映射节点，解析必炸
+    #   （08-24 起潜伏，旧部署位未同步该版才未暴露）。改单个双引号标量表达式（同文件
+    #   compression: 行先例）；yml 中的 \n 经 YAML 转义后为 JS 字符串换行。
+    persona: !!js "(process.env.DSH_SYSTEM_PROMPT ?? 'You are a meticulous coding agent executing staged automation tasks. Follow the task instructions exactly and write the required output files before finishing.') + (process.env.DSH_GLOBAL_CONTEXT ? '\\n\\n' + process.env.DSH_GLOBAL_CONTEXT : '')"
     # 2026.08.24 enable workspace context (align with claude/pi/codex backends):
     # auto-discovers and injects project AGENTS.md / CLAUDE.md (plus .local
     # overlays). maxBytes caps the injected payload. Previously `false`, which

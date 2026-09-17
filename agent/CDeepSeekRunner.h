@@ -65,12 +65,26 @@ public:
     //   node 留空时走 PATH 的 "node"（本机装了 node 即零配置）。
     static void SetDshRootPath(const QString& a_sRoot);
     static QString DshRootPath();
+    // 2026.09.10 双布局：上游 dsh-v0.1.2 起移除 packages/examples（jsonrpc-demo/
+    //   spine-demo），JSON-RPC SDK 转正为官方 profile（dsh CLI + --profile sdk）。
+    //   DshLayoutOf 按 root 内入口文件判型：Legacy=examples/jsonrpc-demo/bin.js，
+    //   Profile=apps/cli/lib/bin.js（构建后存在）。启动参数/校验路径按布局分支，
+    //   两布局的 wire 协议完全一致（initialize/session/prompt/事件流未变）。
+    enum class EDshLayout { None, Legacy, Profile };
+    static EDshLayout DshLayoutOf(const QString& a_sRoot = QString());
     // 三个生效路径（显式键 → root 推导 → node 回退 "node"）。
     static QString ResolveNodePath();
     static QString ResolveBinJsPath();
     static QString ResolveCordisPath();
-    // 候选根目录判定：推导出的 bin.js 与 cordis.yml 都存在才认（=「完整可用」；
-    //   启动/设置页探测同级 DSH 仓库、设置页后端下拉可用性都用它）。
+    // 2026.09.10 Profile 布局启动参数（node apps/cli/lib/bin.js --profile sdk
+    //   --patch <exe>/dsh/sdk.autocode.patch.yml）；Legacy 布局维持 {bin, cordis}。
+    static QStringList ResolveStartArgs();
+    // 2026.09.10 Profile 布局 patch 正本路径（exe 同级 dsh\sdk.autocode.patch.yml；
+    //   直接以绝对路径引用，无需部署到 DSH root——无相对 node_modules 解析需求）。
+    static QString ResolvePatchPath();
+    // 候选根目录判定：任一布局入口可用即认（Legacy=bin.js+cordis.yml 两件套；
+    //   Profile=apps/cli 构建产物；启动/设置页探测同级 DSH 仓库、设置页后端下拉
+    //   可用性都用它）。
     static bool LooksLikeDshRoot(const QString& a_sRoot);
     // 2026.08.18 可用性统一校验（启动警告/设置保存兜底/StartStage 前置三处同一口径）：
     //   返回空串 = 可用；非空 = 第一处问题的完整处理指引（含一键安装路径）。
@@ -94,14 +108,12 @@ public:
     //   git ls-remote 与更新段共用，单一锚点防双实现漂移）。
     static QString DshRepoUrl();
 
-    // 2026.09.01 DSH 版本兼容硬约束（防复发）：AutoCode 的 DSH 集成（组合 cordis.yml +
-    //   jsonrpc-demo 入口 + dsh-agent-spine-demo 等示例包）绑死 dsh-v0.1.0-rc.7 的包
-    //   结构；上游 dsh-v0.1.2 起移除了 packages/examples 全组（官方 note：remove-
-    //   agent-spine-demo，无别名替代）——更新到该版本后任务握手必炸（ERR_MODULE_NOT_
-    //   FOUND）。版本管理对话框更新分派与 Verdict 用 SupportedDshVersion() 判定上限、
-    //   DshConfigError 用组合包可达性兜底探测，三处同源本常量。
-    static QString SupportedDshTag();       // "dsh-v0.1.0-rc.7"（回退/安装命令用）
-    static QVersionNumber SupportedDshVersion();   // 0.1.0（数值比较用，rc.7 == 基线）
+    // 2026.09.10 DSH 版本兼容基线抬升到官方 SDK profile：AutoCode 双布局支持后
+    //   （Legacy ≤0.1.1 / Profile ≥0.1.2，见 EDshLayout），受支持上限 = 本常量。
+    //   版本管理对话框更新分派与 Verdict 用 SupportedDshVersion() 判定上限；未来
+    //   上游再破坏兼容时重新抬升/适配并同步本常量。
+    static QString SupportedDshTag();       // "dsh-v0.1.5-alpha.1"（回退/安装命令用）
+    static QVersionNumber SupportedDshVersion();   // 0.1.5（数值比较用）
 
     // ===== 2026.09.01 DSH 环境自愈（版本不兼容自动回滚重建 + credentials 坏格式修复）=====
     // credentials.yaml 坏格式解析/渲染（纯函数，单测靶点）：旧/第三方工具写的
@@ -281,6 +293,9 @@ private:
     QString     m_sPromptWorkDir;         // 本轮工作目录（冷启动/重试路径用）
     QString     m_sPendingPrompt;         // 握手中暂存的 prompt（Ready 后投递）
     QString     m_sTurnText;              // 本轮最后一条 assistant 文本（sigFinished result 用）
+    QString     m_sTurnErrInfo;           // 2026.09.10 turn/end reason.error{message,code}（此前丢弃致「无错误文本」）
+    QString     m_sLlmBaseUrl;            // 2026.09.10 本进程 LLM 目标（autocode-active 激活条目 URL；空=固定路由）
+    QString     m_sLlmLabel;              // 2026.09.10 LLM 目标显示名（激活条目 Disp 或模型 id）
     QString     m_sTurnReasonKind;        // turn/end 的 reason.kind
     qint64      m_iSumInTok  = 0;         // 轮内 Σ input（含 cache 读/写，账单口径）
     qint64      m_iSumOutTok = 0;         // 轮内 Σ output

@@ -125,6 +125,18 @@ public:
     // 确保 .autodev 与 .autodev/tasks 存在
     bool EnsureAutoDev();
 
+    // —— 任务级配置覆盖（2026.09.09 v2.1.143）——
+    // 设置参数（功能→设置 所管理的运行参数键）支持按任务覆盖：任务选中时，设置页
+    //   读=任务档键优先（激活时自动合并回填全局缺键，全局后续新改动也在再次选中时
+    //   流入）、写=落任务档 <工程>/.autodev/tasks/<id>/config.ini；未选任务/空 id 时
+    //   读写全局 config.ini（原行为）。界面态键（[Recent]/[UI]/[Window]/[Layout]/
+    //   [SettingsWindow]）不参与覆盖恒走全局。任务档随任务目录走（在席锁保护面内）。
+    void SetTaskConfigOverlay(const QString& a_sTaskId);   // 空 id=清除覆盖
+    bool TaskConfigOverlayActive() const { return !m_sTaskCfgFile.isEmpty(); }
+    QString TaskConfigFile() const { return m_sTaskCfgFile; }
+    // 设置类 Load*/Save* 实际生效的 config 路径（覆盖激活=任务档，否则全局）。
+    QString SettingsCfgPath() const;
+
     // .autodev/guide.md 是否存在
     bool HasGuide() const;
 
@@ -208,6 +220,29 @@ public:
     bool SaveWindowGeometry(const QRect& a_stGeometry, bool a_bMaximized);
     // 载入窗口几何；无 config.ini / 缺键时返回 false（调用方用默认几何）。
     bool LoadWindowGeometry(QRect& a_stGeometry, bool& a_bMaximized);
+
+    // ---- 多实例工程锁（2026.09.07 v2.1.123）----
+    // <工程>/.autodev/instance.lock：在席实例标记。工程态（assistant.json/task.json/
+    //   guide/record）为整文件后写覆盖先写，双实例同开一工程会互踩——OpenProjectDir
+    //   打开前查锁（他实例持有：弹阻断确认，默认 No；原启动自动恢复静默跳过分支已随
+    //   v2.1.137 移除自动恢复删除），打开成功写自己的锁、切走/退出时摘除；崩溃残留锁
+    //   按 PID 存活判定自动接管（PID 被无关进程复用时按进程名 AutoCode* 复核排除）。
+    //   history.db 本身并发安全不在保护面。
+    struct SProjectLock {
+        qint64  iPid = 0;
+        QString sExe;
+        QString sStarted;
+    };
+    static QString ProjectLockPath(const QString& a_sProjectDir);
+    // 读锁（存在且带 pid 才 true）；a_pOut 可空。
+    static bool ReadProjectLock(const QString& a_sProjectDir, SProjectLock* a_pOut = nullptr);
+    // 锁主进程存活且非本进程（含进程名复核；OpenProcess 拒绝访问时保守当活）。
+    static bool IsLockHolderAlive(const SProjectLock& a_stLock);
+    static void WriteProjectLock(const QString& a_sProjectDir);
+    // 仅摘 pid==本进程 的锁（他实例/陈旧锁不动）。
+    static void ReleaseProjectLock(const QString& a_sProjectDir);
+    // 便捷判定：锁存在、锁主活、且非本进程 → true（a_pDesc 带展示描述）。
+    static bool IsProjectHeldByOther(const QString& a_sProjectDir, QString* a_pDesc = nullptr);
 
     // ---- 设置对话框几何持久化（[SettingsWindow] 段 X/Y/W/H）----
     // 2026.08.27：设置窗口大小/位置跨会话记忆（与主窗口 [Window] 同口径，无最大化态）。
@@ -473,6 +508,25 @@ public:
 private:
     // FR-6：取任务备份根目录 .autodev/tasks/<id>/backups。
     QString BackupsDir(const QString& a_sTaskId) const;
+    // 2026.09.09 v2.1.143 任务级配置覆盖：激活时把全局 config.ini 中覆盖节内、任务档
+    //   缺失的键合并回填进任务档（只补缺、从不覆盖任务已有键）——设置类读序恒为
+    //   「任务档键 → 全局键」且现有 Load* 单文件读法无需改动。
+    void MergeFillTaskConfig();
+    QString m_sTaskCfgFile;   // 任务级覆盖档路径（空=未激活）
+    // 2026.09.09 v2.1.144 模型表列表级覆盖（用户需求：缺省配置恒保有最多模型）：
+    //   ①读侧——任务档无本表（无 Count 键）时实时回退全局表（未显式保存过模型配置
+    //   的任务跟随缺省超集；一旦任务态保存过即冻结为任务自己的表）；②写侧——任务
+    //   态保存后 SyncModelTableToGlobal 把条目并入全局：同身份（URL+Api+ModelId，
+    //   忽略大小写）更新内容、新身份追加、从不删除；全局 Active 保持，全局表空时
+    //   采用任务表 Active（确保缺省配置自身可用）。
+    QList<SDshModelEntry> LoadModelsFrom(const QString& a_sPath, const wchar_t* a_pSect,
+                                         int* a_pActive) const;
+    bool SaveModelsTo(const QString& a_sPath, const wchar_t* a_pSect,
+                      const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    void SyncModelTableToGlobal(const wchar_t* a_pSect,
+                                const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    // 模型表读路径：覆盖激活且任务档已有本表 → 任务档；否则全局（活回退，非键级）。
+    QString TableCfgPath(const wchar_t* a_pSect) const;
     // 统一库 CBackupStore 惰性构造（m_sProjectDir 就绪后；线程安全，后台备份线程共用）。
     // 注入排除清单谓词（BackupExcludeDirs 顶层一级，含 .autodev 自身防递归）。
     CBackupStore* BackupStore() const;

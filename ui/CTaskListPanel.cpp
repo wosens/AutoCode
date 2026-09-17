@@ -383,6 +383,22 @@ void CTaskListPanel::SelectTask(CTaskInfo* a_pTask) {
     }
 }
 
+void CTaskListPanel::SelectHistoryTask(CTaskInfo* a_pTask) {
+    if (a_pTask == nullptr) {
+        return;
+    }
+    // 2026.09.10 v2.2.153 切到「历史任务」页并选中该行（正常发信号 → 触发 OnTaskSelected
+    //   显示其日志）。与 SelectTask 对称：任务终态归档/历史副本整批重建后调用，使刚结束
+    //   任务的日志无需手动点选即可保持显示。
+    m_pTab->setCurrentWidget(m_pTreeHis);
+    for (int i = 0; i < m_pTreeHis->topLevelItemCount(); ++i) {
+        if (TaskOf(m_pTreeHis->topLevelItem(i)) == a_pTask) {
+            m_pTreeHis->setCurrentItem(m_pTreeHis->topLevelItem(i));   // 不屏蔽信号：需要触发选中→显示日志
+            return;
+        }
+    }
+}
+
 void CTaskListPanel::SetProjectRoot(const QString& a_sDir) {
     // FR-3：转发给资源管理器刷新文件树根（空串=清空树）。
     if (m_pExplorer != nullptr) {

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QDialog>
 #include <QList>
@@ -25,6 +25,7 @@ public:
 
 protected:
     // 2026.08.29 窗口几何持久化（[Layout] DiffWin，profile API；a_sCfgPath 空=不持久化）。
+    void showEvent(QShowEvent* a_pEvent) override;   // 2026.09.04 标题栏防超屏兜底校正
     void hideEvent(QHideEvent* a_pEvent) override;
 
 private:

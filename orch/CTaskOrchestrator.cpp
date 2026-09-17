@@ -1667,20 +1667,17 @@ bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
     };
 
     QString sCandidate;
-    // ① 任务内容（用户原始需求）：多行取「信息量最大」的一行（最长且 ≤80 字），单行或
-    //   都超长则取首个非空行——首行常是宽泛总起句（如「创建一个网页版小游戏」），其后
-    //   的具体描述行更能代表任务内容。
-    {
-        QString sFirst;
+    // ① 任务内容（用户原始需求）：2026.09.10 v2.2.152 选行修复——首个非空行（总起句）
+    //    优先（CTaskInfo::ExtractNameFromRequest 内含编号/引导语剥离+首子句截断，首行泛型/太短时内退「最长且 ≤80 字」行）。
+    //    旧「最长行优先」策略把 79 字压线的编号细节条款（第 7 条）当主旨、抠出「资源管理器右键菜单增加」
+    //    丢掉任务主旨的实害勿回退——需求文档首行几乎总是主旨陈述，细节行再长也是子项。
+    sCandidate = CTaskInfo::ExtractNameFromRequest(a_pTask->UserRequest());
+    // 首行/最长行均不可用（全泛型）：退首个非空行原文（后续 isGeneric 复核会走 guide 兜底）。
+    if (sCandidate.isEmpty()) {
         for (const QString& sLine : a_pTask->UserRequest().split(QLatin1Char('\n'))) {
             const QString s = sLine.trimmed();
-            if (s.isEmpty()) { continue; }
-            if (sFirst.isEmpty()) { sFirst = s; }
-            if (s.size() <= 80 && s.size() > sCandidate.size()) {
-                sCandidate = s;
-            }
+            if (!s.isEmpty()) { sCandidate = s; break; }
         }
-        if (sCandidate.isEmpty()) { sCandidate = sFirst; }
     }
     // ② 工程 guide.md 兜底（任务内容为空时）：首个非泛型标题；标题尾注括号常承载标题
     //   本体（「需求规格 — 任务 xxx（网页版飞机大战）」→「网页版飞机大战」），尾注含
@@ -1746,10 +1743,14 @@ bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
         return false;   // 无可用素材：保留临时名，标记不清（下次 Intake 重跑再试）
     }
 
-    a_pTask->SetAutoNamed(false);
+    a_pTask->SetAutoNamed(true);   // 2026.09.10 v2.2.152：本地启发式名只是临时名——保留
+    //   autoNamed 标记，Intake 成功后的钩子（Advance）会用 Agent 重新定稿覆盖（实害：旧版
+    //   此处清标记，创建时 guide 生成占用 runner → 本地兜底 → 标记被清 → Intake 后 Agent
+    //   重命名钩子条件 AutoNamed()==true 不满足 → 「资源管理器右键菜单增加」坏名永固）。
+    //   手动改名/Agent 定稿/历史复活各自清标记，不冲突。
     a_pTask->SetName(sCandidate);   // 发 sigChanged → task.json 回写 + UI 刷新
     StageEvent(a_pTask, QStringLiteral("auto_named"),
-        QStringLiteral("⚙ 任务已自动命名：「%1」").arg(sCandidate));
+        QStringLiteral("⚙ 任务临时命名（本地启发式，待 Agent 定稿）：「%1」").arg(sCandidate));
     return true;
 }
 
@@ -1788,16 +1789,19 @@ bool CTaskOrchestrator::AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId
         ? QStringLiteral("（项目指南为空）")
         : QStringLiteral("以下是当前工程的项目指南（guide.md）：\\n---\\n%1\\n---").arg(sGuide);
     const QString sPrompt = QStringLiteral(
-        "【任务命名】请为下面的任务起一个简短的中文任务名称。\\n\\n"
-        "%1\\n\\n用户的任务需求（任务内容）：\\n---\\n%2\\n---\\n\\n"
-        "命名要求：\\n"
-        "1. 一句话描述任务要做什么（如「创建一个竖版的飞机大战游戏」），不超过 20 个字；\\n"
-        "2. 结合项目指南理解任务在工程中的定位，名称要具体、能区分于其他任务；\\n"
-        "3. 不要包含「任务」「需求」这类泛型词，不要带任务 id；\\n"
-        "4. 只输出名称本身：不要任何解释、引号、标点结尾或多余文字。")
+        "【任务命名】请为下面的任务起一个简短的中文任务名称。\n\n"
+        "%1\n\n用户的任务需求（任务内容）：\n---\n%2\n---\n\n"
+        "命名要求：\n"
+        "1. 一句话描述任务要做什么（如「创建一个竖版的飞机大战游戏」），不超过 20 个字；\n"
+        "2. 需求常为多行编号文档——名称必须概括任务的整体目标（通常就是首句主旨句，\n"
+        "   如「自动拉取/提交/推送代码的工具」），绝不要抓取某一条编号细节、界面元素或子功能片段\n"
+        "   当名称（如「资源管理器右键菜单」）；\n"
+        "3. 结合项目指南理解任务在工程中的定位，名称要具体、能区分于其他任务；\n"
+        "4. 不要包含「任务」「需求」这类泛型词，不要带任务 id；\n"
+        "5. 只输出名称本身：不要任何解释、引号、标点结尾或多余文字。")
         .arg(sGuideSec, sReq);
     pS->pAutoNameTask = a_pTask;
-    pS->bReadOnly = true;    // 纯命名：禁 Bash/Edit/Write
+    pS->iPerm = PermReadOnly;    // 纯命名：禁 Bash/Edit/Write
     pS->sPendingPrompt.clear();
     pS->eMode = AutoNaming;
     StageEvent(a_pTask, QStringLiteral("auto_naming"),
@@ -2190,17 +2194,24 @@ void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
     // 运行中上下文占用（每条 assistant 消息的 usage）→ 直通助手面板进度条实时刷新。
     connect(pR, &CAgentRunnerBase::sigContextFill, pR,
             [this, sId](qint64 a_iFill) { emit sigAdhocContext(sId, a_iFill); });
-    // 2026.08.27 助手轮次实时计量：本轮累计 token 直通面板（Claude Code 式直观反馈）。
-    //   全局单值（多助手并发时显示最后活动轮，瞬时反馈语义可接受）。
+    // 2026.08.27 助手轮次实时计量：本轮累计 token 直通该助手页内的实时标签
+    //   （2026.09.05 per-助手：会话内累计 + 带 id 上抛，多助手并发各自独立不互踩，
+    //   同时修复旧全局单值在并发下互相覆盖/清零的混计）。
     connect(pR, &CAgentRunnerBase::sigUsageDelta, pR,
-            [this](qint64 a_iIn, qint64 a_iOut) {
-                m_iLiveIn += a_iIn;
-                m_iLiveOut += a_iOut;
-                emit sigLiveUsage(m_iLiveIn, m_iLiveOut);
+            [this, sId](qint64 a_iIn, qint64 a_iOut) {
+                SAdhocSession* pS = m_aAdhoc.value(sId, nullptr);
+                if (pS == nullptr) {
+                    return;
+                }
+                pS->iLiveIn  += a_iIn;
+                pS->iLiveOut += a_iOut;
+                emit sigAdhocLiveUsage(sId, pS->iLiveIn, pS->iLiveOut);
             });
-    // 流式实时刷新（绝对值直通显示，不入账）：与上一连接共展 sigLiveUsage。
-    connect(pR, &CAgentRunnerBase::sigLivePartial, this,
-            &CTaskOrchestrator::sigLiveUsage);
+    // 流式实时刷新（绝对值直通显示，不入账）：同样按助手 id 路由。
+    connect(pR, &CAgentRunnerBase::sigLivePartial, pR,
+            [this, sId](qint64 a_iIn, qint64 a_iOut) {
+                emit sigAdhocLiveUsage(sId, a_iIn, a_iOut);
+            });
     connect(pR,
             qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
                 &CAgentRunnerBase::sigFinished),
@@ -2214,11 +2225,18 @@ void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
 void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
                                         bool a_bDropLastUser) {
     EnsureAdhocRunner(a_S);
-    ResetLiveUsage();   // 新轮次开始：实时计量清零
+    // 新轮次开始：该会话本轮实时计量清零（2026.09.05 per-助手，带 id 收起其页内标签；
+    //   不再碰全局 m_iLive*——那是任务阶段专用）。
+    a_S.iLiveIn  = 0;
+    a_S.iLiveOut = 0;
+    a_S.bTurnSawTool = false;   // 2026.09.09 v2.1.131 纠偏判据轮首清零
+    a_S.sLastAsstText.clear();
+    emit sigAdhocLiveUsage(a_S.sId, 0, 0);
     const QString sWorkDir = m_pPm ? m_pPm->ProjectDir() : QString();
-    // deny 黑名单（bypass 下 allow 失效、deny 生效）：readOnly=只读分析禁 Bash/Edit/Write；
-    //   非 readOnly=ToolsDev() 现返回空串=全开。
-    const QString sTools = a_S.bReadOnly
+    // deny 黑名单（bypass 下 allow 失效、deny 生效）：只读轮=禁 Bash/Edit/Write；
+    //   自动/手工审批轮=ToolsDev() 现返回空串=全开（手工审批的约束在提示词层，见
+    //   SubmitAdhoc 的【手工审批模式】指令）。
+    const QString sTools = (a_S.iPerm == PermReadOnly)
         ? QStringLiteral("Bash,Edit,Write")
         : ToolsDev();
     // fork 链：有当前 sid 则 --resume + --fork-session 产生新 sid 分支，旧 sid 保持不污染
@@ -2288,7 +2306,7 @@ void CTaskOrchestrator::InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_s
 }
 
 void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText,
-                                    bool a_bReadOnly, const QString& a_sTaskId,
+                                    int a_iPerm, const QString& a_sTaskId,
                                    const QStringList* a_pTranscript) {
     // 2026.09.03 多助手并发：本函数只操作 a_sAsstId 的会话——该助手在跑 → 注入/排队
     //   （同助手追加语义）；空闲 → 起该助手自己的 runner 进程立即执行。其他助手是否
@@ -2296,7 +2314,7 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     SAdhocSession* pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
     if (pS->pRunner != nullptr && pS->pRunner->IsRunning()) {
         // 轮中介入（方案 §2.3）：非只读文本注入前同口径拍 turn 快照（失败不阻断）。
-        if (!a_bReadOnly && !a_sText.trimmed().isEmpty() && m_pPm != nullptr
+        if (a_iPerm != PermReadOnly && !a_sText.trimmed().isEmpty() && m_pPm != nullptr
             && !m_pPm->ProjectDir().isEmpty()) {
             const QString sOwner = a_sTaskId.isEmpty()
                 ? QStringLiteral("global") : a_sTaskId;
@@ -2331,9 +2349,11 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             QStringLiteral("请先打开一个工程再使用助手"));
         return;
     }
-    pS->bReadOnly = a_bReadOnly;
+    pS->iPerm = a_iPerm;
     pS->sLastTaskId = a_sTaskId;   // 自动续发排队指令时沿用同任务档（记忆注入）
     pS->iResume = 0;   // 新提问：max-turns 自动续跑计数清零
+    pS->bNudgeUsed = false;   // 2026.09.09 v2.1.131 新提问重置纠偏配额
+    pS->bAutoCompactDone = false;   // 2026.09.09 v2.1.132 新提问重置超限自愈配额
     pS->eMode = Submitting;
     pS->sPendingPrompt = a_sText;   // 原始提问入栈（注入内容不进撤销栈，保持用户可见语义）
 
@@ -2353,7 +2373,14 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     // guide.md 投喂策略（需求3）：仅「首次新建会话」或「guide.md 自上次投喂后发生变化」时注入，
     //   避免每次续问都重复投喂冗长指南；用内容 SHA256 判变，哈希随 assistant.json 持久化。
     //   即：初始化投喂 → 后续打开工程仅恢复上下文不投喂 → guide.md（重新生成 / 同步 agent 改动）后自动重投。
-    QString sPrompt = a_sText;
+    // 2026.09.09 v2.1.130 用户请求显式框架（实害：pi+本地 spark2.5-4b，请求几~几十字
+    //   无标记地夹在 pi 注入的 1700 字全局规则与 AutoCode 尾部 1900 字记录/记忆规则之间，
+    //   弱模型对规则 blob 只回「收到」「我来」应付、不动手——加【用户本轮请求】定界与
+    //   反应付指令，全后端生效）。
+    QString sPrompt = QStringLiteral(
+        "【用户本轮请求】\n%1\n\n"
+        "（以上为本轮唯一任务：需要动手的请用工具实际执行并给出结果，"
+        "禁止只用「收到」「我来」等确认语应付。）").arg(a_sText);
     const QString sGuide = m_pPm->ReadGuide();
     if (!sGuide.isEmpty()) {
         const QString sHash = QString::fromLatin1(
@@ -2366,49 +2393,83 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             if (bFirst) {
                 // 首次新建会话：仍全文投喂（保证模型一定拿到工程认知，一次性成本）。
                 sPrompt = QStringLiteral(
-                    "以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再回答用户问题："
-                    "\\n---\\n%1\\n---\\n\\n\\n用户问题：%2").arg(sGuide, a_sText);
+                    "以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再处理用户请求："
+                    "\\n---\\n%1\\n---\\n\\n%2").arg(sGuide, sPrompt);
             } else {
                 // 2026.08.27 变更重投瘦身（大工程助手每步极慢主因之一）：只投一句话让
                 //   agent 用 Read 自取——读多少缓存多少，与 Claude Code 按需探索同口径。
                 sPrompt = QStringLiteral(
                     "【项目指南已更新】.autodev/guide.md 自上次阅读后有变化，"
                     "请先用 Read 工具读取 .autodev/guide.md 同步项目认知，"
-                    "再处理用户问题。\\n\\n\\n用户问题：%1").arg(a_sText);
+                    "再处理用户请求。\\n\\n\\n%1").arg(sPrompt);
             }
         }
     }
     // 需求4：非只读会话强制 agent 自治写 record.md——实际修改源码后必须追加一行，
     //   作为 guide.md 增量同步的触发信号与输入（sTools 已放行 Write/Edit）。
-    if (!a_bReadOnly) {
+    //   2026.09.07 v2.1.124 防带偏补句（实测：回灌历史里出现过追加 record.md 的操作 +
+    //   本规则的具体步骤描述，模型把「追加记录」本身当任务执行、无视真实提问）：
+    //   明示本规则是条件性约束不是任务。
+    if (a_iPerm != PermReadOnly) {
         sPrompt.append(QStringLiteral(
-            "\\n\\n---\\n【强制记录规则】如果你在本次回答中实际修改了工程源码文件，结束前必须向 "
+            "\\n\\n---\\n【以下为附加工程约定（背景约束、不是任务——仅在满足各自条件时遵守，"
+            "不要主动执行，更不要以确认语代替处理上面的用户请求）】\\n【强制记录规则】如果你在本次回答中实际修改了工程源码文件，结束前必须向 "
             "`.autodev/record.md` **追加**恰好一行，格式："
             "`[yyyy-MM-dd HH:mm] 助手 | <简述改了哪些文件/做了什么>`（时间用 `date` 命令取当前时刻）。"
             "必须用 Edit 工具在文件末尾追加（先 Read 再 Edit 末尾行），**严禁用 Write 覆盖整个 record.md**。"
-            "纯查询/只读操作不要写。此记录是项目指南（guide.md）自动同步的依据。"));
+            "纯查询/只读操作不要写。此记录是项目指南（guide.md）自动同步的依据。"
+            "**本规则是条件性约束、不是本轮任务：仅当你本轮确实改动了源码才适用；"
+            "绝不要把「追加记录」本身当作要执行的工作，也不要因历史对话中出现过该操作"
+            "而主动执行。**"));
     }
-    // 2026.08.15 (记忆跟着任务走) 选中任务时注入其 memory.md 经验；非只读轮附追加规则。
+    // 2026-09-11 权限三态指令（下拉框替代原只读勾选）：手工审批/只读轮在提示词层
+    //   注入对应强制约束（自动审批不注入任何额外文字，保持零干扰）——手工审批是
+    //   唯一的软约束层（deny 名单无法表达「先问再做」）；只读指令同时补齐
+    //   dsh/codex/hermes 后端（它们忽略 deny 名单，只认提示词）。
+    if (a_iPerm == PermManual) {
+        sPrompt.append(QStringLiteral(
+            "\n\n---\n【手工审批模式（本轮强制）】你在执行任何会改动工程文件或系统状态的操作"
+            "（Edit/Write、创建/删除/重命名文件、非只读的 Bash 命令等）之前，必须先征得用户"
+            "明确同意，二选一：\n"
+            "① 有 ask_user 工具（Claude Code 后端）→ 直接调用它向用户提问确认；\n"
+            "② 其他后端 → 运行以下命令弹出确认对话框（会弹出窗口，用户作答回写到 stdout，"
+            "退出码 0=已答复 / 2=取消 / 3=超时）：\n"
+            "   bash:  \"$AUTOCODE_ASK_EXE\" --ask 600 \"你要确认的问题\"\n"
+            "   cmd:   %AUTOCODE_ASK_EXE% --ask 600 \"你要确认的问题\"\n"
+            "答复内容表示拒绝、或退出码非 0 时不得执行，并按用户意见调整方案；"
+            "未经同意严禁先执行后汇报；纯查询/只读操作无需审批。"));
+    } else if (a_iPerm == PermReadOnly) {
+        sPrompt.append(QStringLiteral(
+            "\n\n---\n【只读模式（本轮强制）】仅允许查询类操作（Read/Grep/Glob 等）与纯分析，"
+            "禁止修改、创建、删除任何文件，禁止执行任何有改动的命令；直接输出分析结论与建议，"
+            "不要尝试调用写入类工具。"));
+    }
+    // 2026.09.09 v2.1.134 任务信息瘦身（用户需求：选中任务也只提示、不注入全文——
+    //   长记忆+长规则夹在提示词里会稀释用户请求的权重、带偏模型）：仅一行可选指引，
+    //   是否 Read 取用由助手自行决定（与 guide.md 变更重投的“按需自取”同口径）；
+    //   非只读轮把经验沉淀闭环压进同一行（条件性一句：改了源码才追加，纯查询不写）。
+    //   memory.md 读写链路不变（读=助手按需自取，写=末尾追加一行）。
     if (!a_sTaskId.isEmpty() && m_pPm != nullptr) {
-        const QString sMemory = m_pPm->ReadTaskMemory(a_sTaskId);
-        if (!sMemory.isEmpty()) {
-            sPrompt.append(QStringLiteral(
-                "\\n\\n---\\n【任务经验记忆】以下是当前任务（id=%1）此前沉淀的经验"
-                "（`.autodev/tasks/%1/memory.md`），动手前请先参考：\\n%2\\n")
-                .arg(a_sTaskId, sMemory));
-        }
-        if (!a_bReadOnly) {
-            sPrompt.append(QStringLiteral(
-                "\\n【强制经验沉淀规则】若本次你实际修改了工程源码或有了新发现"
-                "（实际可用的构建命令、踩坑及解法、关键文件路径），结束前必须向 "
-                "`.autodev/tasks/%1/memory.md` **末尾追加**一条经验，格式："
-                "`- [助手] <一条经验>`。必须先 Read 再用 Edit 在末尾追加"
-                "（文件不存在时允许首次用 Write 创建）；**严禁用 Write 覆盖整个文件**。"
-                "纯查询/只读操作不要写。").arg(a_sTaskId));
+        const bool bHasMemory = QFile::exists(m_pPm->TaskMemoryFile(a_sTaskId));
+        if (bHasMemory || a_iPerm != PermReadOnly) {   // 只读轮且无记忆文件：连指引也不加，零干扰
+            QString sTaskHint = QStringLiteral(
+                "\n\n（可选）当前选中任务 id=%1，任务经验文件为 `.autodev/tasks/%1/memory.md`")
+                .arg(a_sTaskId);
+            if (bHasMemory) {
+                sTaskHint += QStringLiteral("，如对你有帮助可先 Read 再动手");
+            }
+            if (a_iPerm != PermReadOnly) {
+                sTaskHint += QStringLiteral(
+                    "；若本轮实际修改了源码或有新发现，结束前向该文件末尾追加一行"
+                    " `- [助手] <一条经验>`（先 Read 再 Edit，文件不存在可首次 Write 创建，"
+                    "勿整文件覆盖，纯查询不写）");
+            }
+            sTaskHint += QStringLiteral("。");
+            sPrompt.append(sTaskHint);
         }
     }
-    // —— 统一备份（方案 §6.1/§6.3）：非只读轮投递前快照 + 回退告知注入 ——
-    if (!a_bReadOnly) {
+    // —— 统一备份（方案 §6.1/§6.3）：非只读轮（自动/手工审批均可能改动）投递前快照 + 回退告知注入 ——
+    if (a_iPerm != PermReadOnly) {
         const QString sOwner = a_sTaskId.isEmpty() ? QStringLiteral("global") : a_sTaskId;
         int iNoticeTarget = 0;
         QString sNoticeOwner;
@@ -2632,6 +2693,9 @@ void CTaskOrchestrator::OnAdhocInfo(const QString& a_sAsstId, const QString& a_s
 }
 
 void CTaskOrchestrator::OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText) {
+    if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        pS->sLastAsstText = a_sText;   // 2026.09.09 v2.1.131 纠偏判据：终答=最后一条
+    }
     emit sigAdhocAssistantText(a_sAsstId, a_sText);
     // 2026.09.02 回灌记录：轮内 assistant 输出记入缓存，供每轮独立会话的后端
     //   下一轮回灌（claude/pi 原生续接用不到）；下次外部提交时面板会整体重建
@@ -2665,11 +2729,19 @@ QString CTaskOrchestrator::BuildAdhocHistoryBlock(const SAdhocSession& a_S,
     if (aLines.isEmpty()) {
         return QString();
     }
+    // 2026.09.07 v2.1.124 回灌结构防带偏（实测 .claude 工程：用户问「你现在用的是什么
+    //   模型？」，历史里上一轮的 record.md 追加叙述 + 尾部【强制记录规则】的具体操作
+    //   步骤让模型把「追加记录」当成现行任务执行、完全无视提问）：①前置声明强调历史仅
+    //   背景、已完成任务不重复执行；②历史后用【最新指令】明确本轮作答对象，把短提问从
+    //   噪音里拉出来。实际 prompt = 本块 + "\n\n" + 用户 prompt（含规则尾部）。
     return QStringLiteral(
         "【历史对话回灌】当前后端每轮为独立会话，无法原生延续此前的对话上下文。"
         "以下是你（助手）与本用户最近的真实对话记录（时间升序，个别长条目已截断），"
-        "请将其视为你亲历的连续对话，在此基础上继续处理后面的最新指令：\n"
-        "---\n%1\n---").arg(aLines.join(QLatin1Char('\n')));
+        "请将其视为你亲历的连续对话。**历史仅作背景参考：其中已执行完毕的任务/操作一律"
+        "不要重复执行**。\n---\n%1\n---\n【最新指令】下面才是本轮要处理的用户提问，"
+        "请直接围绕它作答；除非提问本身要求延续历史事项，否则不要执行历史中出现过的"
+        "任何操作。")
+        .arg(aLines.join(QLatin1Char('\n')));
 }
 
 void CTaskOrchestrator::AppendAdhocTranscriptLine(SAdhocSession& a_S, const QString& a_sLine) {
@@ -2689,6 +2761,9 @@ void CTaskOrchestrator::AppendAdhocTranscriptLine(SAdhocSession& a_S, const QStr
 
 void CTaskOrchestrator::OnAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool,
                                        const QString& a_sInput) {
+    if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        pS->bTurnSawTool = true;   // 2026.09.09 v2.1.131 纠偏判据：本轮有真实工具工作
+    }
     emit sigAdhocToolUse(a_sAsstId, a_sTool, a_sInput);
 }
 
@@ -2711,15 +2786,21 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             ? pS->dtStart.msecsTo(QDateTime::currentDateTime()) : 0;
         // 2026.08.27 runner 已逐消息实时上抛（sigUsageDelta）时收尾报 0/0（防任务侧
         //   双计），此处回退用本轮实时累计值归集——助手消耗统计不丢失。
+        // 2026.09.05 per-助手：回退取该会话自己的 iLive*（旧全局 m_iLive* 在并发
+        //   助手下会把别人的计数算进来——混计修复）。
         qint64 iIn = a_iIn, iOut = a_iOut;
-        if (iIn == 0 && iOut == 0 && (m_iLiveIn > 0 || m_iLiveOut > 0)) {
-            iIn = m_iLiveIn;
-            iOut = m_iLiveOut;
+        if (iIn == 0 && iOut == 0 && (pS->iLiveIn > 0 || pS->iLiveOut > 0)) {
+            iIn  = pS->iLiveIn;
+            iOut = pS->iLiveOut;
         }
         emit sigAdhocUsage(a_sAsstId, iIn, iOut, a_dCost, iElapsedMs,
                            pS->pRunner ? pS->pRunner->LastReqCount() : 0);
     }
-    ResetLiveUsage();   // 归集完成后才清零（顺带 sigLiveUsage(0,0) 收起「本轮」显示）
+    // 归集完成后才清零（顺带 sigAdhocLiveUsage(id,0,0) 收起该助手页内「本轮」显示；
+    //   2026.09.05 per-助手：不再 ResetLiveUsage 全局清零——任务侧实时计量不受助手收尾影响）。
+    pS->iLiveIn  = 0;
+    pS->iLiveOut = 0;
+    emit sigAdhocLiveUsage(a_sAsstId, 0, 0);
     pS->dtStart = QDateTime();
 
     switch (pS->eMode) {
@@ -2788,6 +2869,34 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 emit sigAdhocFinished(a_sAsstId);
                 return;
             }
+            // 2026.09.09 v2.1.132 上下文超限自愈（实害：pi 会话堆积超窗口，pi 自身
+            //   不自动压缩——01:42 实测 ctx=60000 时 66888 token 请求照发 → 400）：
+            //   识别 exceeds the available context size / exceed_context_size
+            //   → 自动走压缩两步（摘要→重播种）后重发原提问，每条限一次。
+            if ((a_sResult.contains(QLatin1String("exceeds the available context size"),
+                                   Qt::CaseInsensitive)
+                 || a_sResult.contains(QLatin1String("exceed_context_size"),
+                                        Qt::CaseInsensitive))
+                && !pS->sSid.isEmpty() && !pS->bAutoCompactDone) {
+                pS->bAutoCompactDone = true;
+                pS->bAutoCompactActive = true;
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("compact_start"),
+                    QStringLiteral("⚠ 上下文超出模型窗口，自动压缩对话后重发原请求…"));
+                pS->eMode = CompactSummarize;
+                // 2026.09.09 v2.1.133 关键：摘要请求发往【全新会话】并内联对话记录
+                // （aTranscript 缓存，24k 字）——原会话已超窗，摘要请求在其上必再 400
+                // （v2.1.132 实害：01:53「未能生成摘要」即此）。暂存原 sid 供失败回退。
+                pS->sCompactBaseSid = pS->sSid;
+                pS->sSid.clear();
+                const QString sRecap = pS->aTranscript.isEmpty()
+                    ? QStringLiteral("(此前对话的文字记录不可用)")
+                    : pS->aTranscript.join(QChar::LineFeed).left(20000);
+                StartAdhocStage(*pS, QStringLiteral(
+                    "以下是与用户此前对话的文字记录（部分截断）。请用约 300 token 精炼总结，"
+                    "用于在新会话中恢复上下文。只输出总结正文，结构为：1) 用户意图与关键决定；"
+                    "2) 已查看/改动的文件；3) 待办与注意事项。\n---\n%1\n---").arg(sRecap));
+                return;
+            }
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("stage_failed"),
                 QStringLiteral("✗ 助手调用失败：%1").arg(a_sResult.left(200)));
             // #6 失败（崩溃/异常退出/返回 is_error）时也刷新上下文按钮：发 -1 显示「—」，
@@ -2796,6 +2905,25 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             pS->eMode = Idle;
             pS->sPendingPrompt.clear();
             emit sigAdhocFinished(a_sAsstId);
+            return;
+        }
+        // 2026.09.09 v2.1.131 确认语应付自动纠偏（实害：本地 spark2.5-4b 收到规则重的
+        //   prompt 只回「收到」「我来」零工具零结果——v2.1.130 请求定界后仍复发，模型能力
+        //   层短板靠机制兜底）：本轮成功但 ①非只读 ②全程零工具 ③终答 1~6 字 ④本条提问
+        //   未纠偏过 → 同会话自动追发执行指令重试一轮（口径仿 max-turns 续跑：推进 sid、
+        //   不压栈、保持 Submitting；每用户提问限一次，SubmitAdhoc 重置）。
+        const QString sTrimAsst = pS->sLastAsstText.trimmed();
+        if (pS->iPerm != PermReadOnly && !pS->bNudgeUsed && !pS->bTurnSawTool
+                && !sTrimAsst.isEmpty() && sTrimAsst.size() <= 6) {
+            pS->bNudgeUsed = true;
+            pS->sSid = a_sSid.isEmpty() ? pS->sSid : a_sSid;   // 链推进到本轮
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("nudge"),
+                QStringLiteral("⚠ 助手仅回复了「%1」而没有执行任何工作，自动追发执行指令重试…")
+                    .arg(sTrimAsst.left(12)));
+            StartAdhocStage(*pS, QStringLiteral(
+                "你上一条只回复了确认语而没有做任何事。请立即动手处理用户此前的请求："
+                "先用工具读取相关工程文件定位问题，再实际修改并验证，最后说明结果；"
+                "不要再以任何确认语结束。"));
             return;
         }
         // 压栈 (prompt, newSid) 并推进链基点；sid 为空（异常）则不压栈，链不动。
@@ -2809,7 +2937,7 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         emit sigAdhocModel(a_sAsstId, pS->pRunner ? pS->pRunner->LastModel() : QString());
         emit sigAdhocContext(a_sAsstId, pS->pRunner ? pS->pRunner->LastContextFill() : 0);
         // 需求4：非只读会话完成 → 触发 guide.md 增量同步（空闲 3 分钟节流，见构造函数）。
-        if (!pS->bReadOnly && m_pPm != nullptr) {
+        if (pS->iPerm != PermReadOnly && m_pPm != nullptr) {
             m_tGuideSyncIdle.start();
         }
         emit sigAdhocEvent(a_sAsstId, QStringLiteral("done"), QStringLiteral("已完成"));
@@ -2817,7 +2945,7 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         //   失败/续跑中断路径不消费（队列保留，待下一次成功提问后续发，原语义不变）。
         if (!pS->aPendingInjects.isEmpty()) {
             const QString sNext = pS->aPendingInjects.takeFirst();
-            SubmitAdhoc(a_sAsstId, sNext, pS->bReadOnly, pS->sLastTaskId);
+            SubmitAdhoc(a_sAsstId, sNext, pS->iPerm, pS->sLastTaskId);
             return;
         }
         emit sigAdhocFinished(a_sAsstId);
@@ -2828,6 +2956,13 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         if (!a_bOk || pS->sSummary.isEmpty()) {
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("compact_fail"),
                 QStringLiteral("✗ 未能生成摘要，已取消压缩"));
+            // 2026.09.09 v2.1.133 超限自愈路径摘要在新会话做：失败回退暂存的原 sid
+            //   （链基点不丢，用户可手动清理后重试）。
+            if (!pS->sCompactBaseSid.isEmpty()) {
+                pS->sSid = pS->sCompactBaseSid;
+                pS->sCompactBaseSid.clear();
+            }
+            pS->bAutoCompactActive = false;
             pS->eMode = Idle;
             emit sigAdhocFinished(a_sAsstId);
             return;
@@ -2842,7 +2977,9 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
     case CompactReseed: {
         if (!a_bOk || a_sSid.isEmpty()) {
             // 重播种失败：回退到压缩前链基点（栈未动），保持会话连续。
-            pS->sSid = pS->aStack.isEmpty() ? QString() : pS->aStack.last().second;
+            // 2026.09.09 v2.1.133 超限自愈路径优先回退暂存的原 sid（栈可能为空/陈旧）。
+            pS->sSid = !pS->sCompactBaseSid.isEmpty() ? pS->sCompactBaseSid
+                       : (pS->aStack.isEmpty() ? QString() : pS->aStack.last().second);
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("compact_fail"),
                 QStringLiteral("✗ 压缩失败，已保留原对话"));
         } else {
@@ -2855,9 +2992,26 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             emit sigAdhocContext(a_sAsstId, pS->pRunner ? pS->pRunner->LastContextFill() : 0);
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("compact_done"),
                 QStringLiteral("✔ 已压缩上下文"));
+            // 2026.09.09 v2.1.133 旧对话记录随压缩作废（新会话由摘要起头；
+            //   下次外部提交时面板按块重建权威记录）。
+            pS->aTranscript.clear();
+            pS->sCompactBaseSid.clear();
         }
         pS->eMode = Idle;
         emit sigAdhocFinished(a_sAsstId);
+        // 2026.09.09 v2.1.132 超限自愈收尾：压缩完成后自动重发原提问（经完整
+        //   SubmitAdhoc 链：定界/规则全新构建）；压缩失败则交还用户手发。
+        if (pS->bAutoCompactActive) {
+            pS->bAutoCompactActive = false;
+            const QString sResend = pS->sPendingPrompt;
+            const int iResendPerm = pS->iPerm;
+            const QString sResendTask = pS->sLastTaskId;
+            if (!sResend.trimmed().isEmpty()) {
+                QTimer::singleShot(0, this, [this, a_sAsstId, sResend, iResendPerm, sResendTask]() {
+                    SubmitAdhoc(a_sAsstId, sResend, iResendPerm, sResendTask);
+                });
+            }
+        }
         return;
     }
     case Idle:
