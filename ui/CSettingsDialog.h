@@ -22,7 +22,8 @@ class CProjectManager;
 //   - 运行策略 [Policy]：单阶段最大迭代 / 续跑上限 / 评审续跑上限
 //   - Agent    [Agent]：claude 命令 / ask_user 提问超时 / 联网检索开关
 //   - 评审     [Review]：多视角并行视角数
-//   - 助手     [Adhoc]：autocompact 压缩比例（窗口百分比）/ 上下文窗口上限（0=自动）
+//   - 助手     [Adhoc]：autocompact 压缩比例（窗口百分比）；上下文窗口上限设置项
+//             2026.09.27 已删（入口收敛到上下文进度条右键，未设按模型自动探测）
 //   - 目录排除 [Scan]/[Backup]：指纹扫描 / 备份恢复的排除目录（逗号分隔；空=内置默认）
 class CSettingsDialog : public QDialog {
     Q_OBJECT
@@ -51,6 +52,8 @@ public:
     int     AgentBackend() const;
     QString DshNodePath() const;
     QString DshRoot() const;
+    // 2026.09.27 DSH 额外可写目录（[Dsh] ExtraWriteDirs；';' 分隔；沙箱 DACL 放行）。
+    QStringList DshExtraWriteDirs() const;
     QString DshProvider() const;
     QString DshModel() const;
     // 2026.08.18 DSH 计费单价（$/百万 token）：DSH 只报 token，客户端按单价折算费用。
@@ -93,12 +96,24 @@ public:
     QList<SDshModelEntry> HermesModels() const;
     int     HermesActiveModel() const;
     int     AutoCompactPct() const;
-    qint64  ContextLimit() const;
+    // 2026.09.23 助手单轮 --max-turns（默认 40，10..200）——大重构触顶可放大。
+    int     AdhocMaxTurns() const;
+    // 2026.09.23 v3.0.219 工作量评估开关（缺省开；关=恒用基值）。
+    bool    AdhocMaxTurnsAuto() const;
     QString ScanExcludeDirs() const;
     QString BackupExcludeDirs() const;
+    QString ExplorerHiddenDirs() const;   // 2026.09.23 资源管理器隐藏目录（全量清单原文）
+    // 2026-09-26 内置测试沙箱（[Sandbox]：Agent 后代 GUI 窗口自动收纳/录像）。
+    bool SandboxEnable() const;
+    bool SandboxAutoGhost() const;
+    bool SandboxRecord() const;
+    int  SandboxFps() const;
+    int  SandboxRetainDays() const;
 
     // 2026.08.27 窗口几何持久化：accept / reject / 标题栏关闭都经 done()，在此统一
     //   落盘 [SettingsWindow]（exe 同级 config.ini）；下次打开恢复位置与大小。
+    //   2026.09.26 修「每开一次下漂 31px」：保存改用框架原点坐标（详见 done() 注释），
+    //   与构造期 move() 的建窗前框架语义同坐标系，往返零漂移。
     void done(int a_r) override;
 
 private:
@@ -188,6 +203,7 @@ private:
     bool        m_bDshInstalled     = false;
     QLineEdit*  m_pEditDshNode      = nullptr;
     QLineEdit*  m_pEditDshRoot      = nullptr;
+    QLineEdit*  m_pEditDshWsRoot    = nullptr;   // 2026.09.27 额外可写目录（';' 分隔）
     QLineEdit*  m_pEditDshProvider  = nullptr;
     QDoubleSpinBox* m_pSpinDshPriceIn        = nullptr;   // 计费单价：纯输入
     QDoubleSpinBox* m_pSpinDshPriceCacheRead = nullptr;   // 计费单价：缓存读
@@ -275,9 +291,17 @@ private:
     QPushButton* m_pBtnHermesModelDel    = nullptr;
     QPushButton* m_pBtnHermesModelActive = nullptr;
     QSpinBox*   m_pSpinCompactPct   = nullptr;
-    QSpinBox*   m_pSpinCtxLimit     = nullptr;
+    QSpinBox*   m_pSpinMaxTurns     = nullptr;   // 2026.09.23 助手轮次上限（[Adhoc] MaxTurns）
+    QCheckBox*  m_pChkMaxTurnsAuto = nullptr;   // 2026.09.23 工作量评估开关（[Adhoc] MaxTurnsAuto）
     QLineEdit*  m_pEditScanDirs     = nullptr;
     QLineEdit*  m_pEditBackupDirs   = nullptr;
+    QLineEdit*  m_pEditExplHidden   = nullptr;   // 2026.09.23 资源管理器隐藏目录（[Explorer] HiddenDirs）
+    // 2026-09-26 内置测试沙箱（[Sandbox]）
+    QCheckBox*  m_pChkSbxEnable   = nullptr;   // 总开关
+    QCheckBox*  m_pChkSbxAuto     = nullptr;   // 自动收纳新窗口
+    QCheckBox*  m_pChkSbxRecord   = nullptr;   // 自动录像
+    QSpinBox*   m_pSpinSbxFps     = nullptr;   // 录制帧率
+    QSpinBox*   m_pSpinSbxRetain  = nullptr;   // 录像保留天数
     // 2026.08.27 几何持久化用的配置管理器引用（非拥有；构造时留存，done() 落盘用）。
     CProjectManager* m_pPm = nullptr;
     // 2026.09 后端版本管理 D6 判据（构造注入透传给 CVersionDialog；空=放行）。

@@ -3,6 +3,7 @@
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QWidgetAction>   // 2026.09.26 最近打开按钮面板内嵌子菜单
 #include <QAction>
 #include <QStatusBar>
 #include <QSplitter>
@@ -24,10 +25,14 @@
 #include <QUuid>
 #include <QDateTime>
 #include <QTimer>
+#include <QThreadPool>   // 2026-10-01 沙箱命令异步化：投线程池执行（MTA COM）
+#include <objbase.h>     // CoInitializeEx（WIN32_LEAN_AND_MEAN 裁掉了 ole2）
+#include <algorithm>
 #include <QFileSystemWatcher>
 #include <QFileInfo>
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QProcess>
 #include <QCoreApplication>
 #include <QGuiApplication>
@@ -65,10 +70,13 @@
 #include "CTitleBar.h"
 #include "CTipStyle.h"   // 2026.09.10 v2.2.156 全局 tooltip 11 号字体 + 长文本自动换行
 #include "CRollbackDialog.h"   // FR-6 历史版本回退对话框
+#include "CCodeReviewDialog.h"   // 2026-09-30 资源管理器右键代码审查（ReviewSdk）
 #include "CProjectManager.h"
 #include "CTaskOrchestrator.h"
 #include "CClaudeRunner.h"
 #include "CAgentRunnerFactory.h"   // 2026.08.18 后端单选分派（自带 CDeepSeekRunner.h）
+#include "sandbox/CSandboxManager.h"   // 2026-09-26 内置测试沙箱
+#include "sandbox/CSandboxDialog.h"
 #include "CCodexRunner.h"         // 第四后端 CodexHarness 参数回填/探测自愈
 #include "CPiAgentRunner.h"        // 2026.08.19 第三后端 PIAgent 参数回填/探测自愈
 #include "CHermesRunner.h"        // 第五后端 Hermes 参数回填（任务 3213cdbf）
@@ -79,6 +87,7 @@
 #include <core/CVersion.h>
 #include "CStageMachine.h"   // 2026.08.15 流程档位：GetFlowStages（新建任务全勾判定）
 #include "CRecentProjectsDialog.h"
+#include "CRecentChipsPanel.h"   // 2026.09.26 最近打开按钮面板（子菜单内嵌）
 #include "CSettingsDialog.h"
 #include "CAskUserDialog.h"
 #include "CAboutDialog.h"
@@ -226,6 +235,47 @@ void CMainWindow::ApplySharedModelsToRunners() {
     const QList<SDshModelEntry> aPi = m_pPm->LoadPiModels(&iPiAct);
     const QList<SDshModelEntry> aCodex = m_pPm->LoadCodexModels(&iCodexAct);
     const QList<SDshModelEntry> aHermes = m_pPm->LoadHermesModels(&iHermesAct);
+    // 2026.09.23 v3.1.229 搬机自愈（用户报告：复制的 config.ini 缺 [CodexModels]/
+    //   [DshModels] 节——源机两套 ini 分叉的现场态）：共享表非空且四表有缺节时，
+    //   把合并后的共享表回写到缺的节（幂等；下次启动/旧工具读原节不再「模型未配置」）。
+    //   仅在无任务覆盖时写（SettingsCfgPath=全局；覆盖态由保存链路自行同步，避免双源）。
+    {
+        const QList<SDshModelEntry>* apTables[] = { &aPi, &aDsh, &aHermes, &aCodex };
+        const int aiActs[] = { iPiAct, iDshAct, iHermesAct, iCodexAct };
+        const bool bAnyMissing = aPi.isEmpty() || aDsh.isEmpty()
+                                 || aHermes.isEmpty() || aCodex.isEmpty();
+        const bool bAnyHas = !aPi.isEmpty() || !aDsh.isEmpty()
+                            || !aHermes.isEmpty() || !aCodex.isEmpty();
+        if (bAnyMissing && bAnyHas && !m_pPm->TaskConfigOverlayActive()) {
+            const int iHave = [&apTables, &aiActs]() {
+                for (int i = 0; i < 4; ++i) {
+                    if (aiActs[i] >= 0 && !apTables[i]->isEmpty()) {
+                        return i;
+                    }
+                }
+                return -1;
+            }();
+            if (iHave >= 0) {
+                const SSharedModels stPre = MergeSharedModelTables(
+                    { aPi, aDsh, aHermes, aCodex },
+                    { iPiAct, iDshAct, iHermesAct, iCodexAct }, iHave);
+                if (!stPre.aModels.isEmpty() && stPre.iActive >= 0) {
+                    if (aDsh.isEmpty()) {
+                        m_pPm->SaveDshModels(stPre.aModels, stPre.iActive);
+                    }
+                    if (aPi.isEmpty()) {
+                        m_pPm->SavePiModels(stPre.aModels, stPre.iActive);
+                    }
+                    if (aHermes.isEmpty()) {
+                        m_pPm->SaveHermesModels(stPre.aModels, stPre.iActive);
+                    }
+                    if (aCodex.isEmpty()) {
+                        m_pPm->SaveCodexModels(stPre.aModels, stPre.iActive);
+                    }
+                }
+            }
+        }
+    }
     const QList<QList<SDshModelEntry>> aTables = { aPi, aDsh, aHermes, aCodex };
     const QList<int> aActives = { iPiAct, iDshAct, iHermesAct, iCodexAct };
     // 共享当前项优先取「当前后端」自己表的激活条目（保任务级/后端级已选模型不被
@@ -254,6 +304,7 @@ void CMainWindow::ApplySharedModelsToRunners() {
         CHermesRunner::SetHermesModel(stE.sModelId);
         CHermesRunner::SetHermesApiKey(stE.sApiKey);
         CHermesRunner::SetHermesBaseUrl(stE.sBaseURL);
+        CHermesRunner::SetHermesApi(stE.sApi);   // 2026.09.21 协议感知：anthropic 端点 → config.yaml api_mode
         CHermesRunner::SetHermesRuntimeLimits(stE.iCtx, stE.iMaxTok);
     }
 }
@@ -272,12 +323,23 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     // 2026.08.18 Agent 后端与 DSH 参数回填（全局单选：工厂分派 + CDeepSeekRunner 进程级静态）。
     // 2026.08.19 第三后端 PIAgent（Backend=3）。
     {
+        // 2026.09.19 后端切换清会话链：切换前后端不同且非启动路径（启动时会话尚未装载，
+        //   档载入侧 backend 键守卫已覆盖）→ 清各助手 sid/撤销栈。覆盖三路：热重载
+        //   （OnConfigFileChanged，另一实例改后端）/任务档重应用（ApplyTaskConfigOverlay）
+        //   /启动以外的一切重应用。设置页保存路径在 OnSettingsAccepted 里另有同款挂钩。
+        const int iBackendBefore = CAgentRunnerFactory::IsDsh() ? 2
+                                  : CAgentRunnerFactory::IsPi() ? 3
+                                  : CAgentRunnerFactory::IsCodex() ? 4
+                                  : CAgentRunnerFactory::IsHermes() ? 5 : 1;
         const int iBackendStartup = m_pPm->LoadAgentBackend();
         CAgentRunnerFactory::SetBackend(iBackendStartup == 2 ? CAgentRunnerFactory::BackendDsh
                                         : iBackendStartup == 3 ? CAgentRunnerFactory::BackendPi
                                         : iBackendStartup == 4 ? CAgentRunnerFactory::BackendCodex
                                         : iBackendStartup == 5 ? CAgentRunnerFactory::BackendHermes
                                                                : CAgentRunnerFactory::BackendClaude);
+        if (!a_bStartup && iBackendStartup != iBackendBefore) {
+            ClearAssistantSessionsOnBackendSwitch();
+        }
     }
     // 2026.08.18 自动配置：DSH 根目录——config 显式键优先；空或失效（键指向的目录
     //   无 bin.js/cordis.yml，如 config.ini 随发布包带到别的机器后的死路径）时探测
@@ -293,6 +355,8 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     }
     CDeepSeekRunner::SetDshRootPath(sDshRootStartup);
     CDeepSeekRunner::SetDshNodePath(m_pPm->LoadDshNodePath());
+    // 2026.09.27 额外可写目录（[Dsh] ExtraWriteDirs；授 ACE 放行 pwsh 沙箱）。
+    CDeepSeekRunner::SetDshExtraWriteDirs(m_pPm->LoadDshExtraWriteDirs());
     CDeepSeekRunner::SetDshBinJsPath(m_pPm->LoadDshBinJsPath());
     CDeepSeekRunner::SetDshCordisPath(m_pPm->LoadDshCordisPath());
     CDeepSeekRunner::SetDshProvider(m_pPm->LoadDshProvider());
@@ -356,16 +420,10 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     CCodexRunner::SetCodexNodePath(m_pPm->LoadCodexNodePath());
     CCodexRunner::SetCodexProvider(m_pPm->LoadCodexProvider());
     CCodexRunner::SetCodexWireApi(m_pPm->LoadCodexWireApi());
-    // 2026.08.21 Codex 自定义大模型表：四后端共享同一份（见下方 ApplySharedModelsToRunners）。
-    // 配置了 Codex 后端但本机不可用 → 启动即明确警告（口径同 DSH/Pi）。
-    if (a_bStartup && CAgentRunnerFactory::IsCodex()) {
-        const QString sCodexErr = CCodexRunner::CodexConfigError();
-        if (!sCodexErr.isEmpty()) {
-            ExecMsgBox(QMessageBox::Warning, QStringLiteral("Agent 后端（CodexHarness）不可用"),
-                sCodexErr + QStringLiteral("\n\n当前后端为 CodexHarness，问题解决前任务/助手/guide "
-                                          "将无法启动；也可到设置中切回 Claude Code。"), this);
-        }
-    }
+    // 2026.08.21 Codex 自定义大模型表：四后端共享同一份——模型静态变量由下方
+    //   ApplySharedModelsToRunners 统一注入，可用性检查在其后（v3.1.230：检查原先
+    //   在注入之前，CodexEffModel 恒空 → 后端=Codex 时无论配置多完整启动必误报
+    //   「模型未配置」；检查块移至 ApplySharedModelsToRunners 之后，口径同 Hermes）。
     // 第五后端 Hermes（任务 3213cdbf）：参数回填（口径同 Pi/Codex 静态注入；
     //   ~/.hermes 运行时配置由 StartStage 幂等自愈写，此处不落盘）。
     CHermesRunner::SetHermesRoot(m_pPm->LoadHermesRoot());
@@ -380,6 +438,19 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     //   ~/.codex 自愈写（原 Codex 块行为）。Pi 的 Set 会同步合成写 ~/.pi/agent/
     //   models.json（原行为）。
     ApplySharedModelsToRunners();
+    // 配置了 Codex 后端但本机不可用 → 启动即明确警告（口径同 DSH/Pi）。
+    // 2026.09.24 v3.1.230 移到 ApplySharedModelsToRunners 之后：CodexConfigError 的
+    //   模型判据（激活条目/固定路由静态变量）唯一注入点就是 ApplySharedModelsToRunners，
+    //   先查后注 → 恒报「CodexHarness 模型未配置」（实测配置完整仍弹；v3.1.229 修的
+    //   磁盘缺节自愈解决不了这层时序）。真缺配置时检查照样触发，只消除误报。
+    if (a_bStartup && CAgentRunnerFactory::IsCodex()) {
+        const QString sCodexErr = CCodexRunner::CodexConfigError();
+        if (!sCodexErr.isEmpty()) {
+            ExecMsgBox(QMessageBox::Warning, QStringLiteral("Agent 后端（CodexHarness）不可用"),
+                sCodexErr + QStringLiteral("\n\n当前后端为 CodexHarness，问题解决前任务/助手/guide "
+                                          "将无法启动；也可到设置中切回 Claude Code。"), this);
+        }
+    }
     // 配置了 Hermes 后端但本机不可用 → 启动即明确警告（口径同 DSH/Pi/Codex）。
     if (a_bStartup && CAgentRunnerFactory::IsHermes()) {
         const QString sHermesErr = CHermesRunner::HermesConfigError();
@@ -392,6 +463,11 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     // 2026.08.15 扫描排除目录回填（[Scan] ExcludeDirs；空=恢复内置默认）。
     // 2026.08.18 修：逐项 trim（逗号后空格不再让排除失效）+ 空也下发（清空即回默认）。
     CGuideFingerprintScanner::SetExcludeDirs(ScanDirList(m_pPm->LoadScanExcludeDirs()));
+    // 2026.09.23 资源管理器显示隐藏清单（[Explorer] HiddenDirs；缺键=内置默认）。
+    if (m_pTaskPanel != nullptr) {
+        m_pTaskPanel->SetExplorerHiddenDirs(
+            ScanDirList(m_pPm->LoadExplorerHiddenDirs()));
+    }
 }
 
 CMainWindow::CMainWindow(QWidget* a_pParent)
@@ -479,11 +555,20 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
         connect(m_pCfgReloadTm, &QTimer::timeout, this, &CMainWindow::OnConfigFileChanged);
     }
 
+    // 2026-10-02 助手运行态孤儿看门狗：10s 交叉核对面板 bRunning 与编排器会话活性，
+    //   结束信号丢失（档切换竞态丢 finished 等）时自动恢复输入栏，不再永卡到重启。
+    m_pAdhocHealthTm = new QTimer(this);
+    m_pAdhocHealthTm->setInterval(10000);
+    connect(m_pAdhocHealthTm, &QTimer::timeout, this, &CMainWindow::OnAdhocHealthCheck);
+    m_pAdhocHealthTm->start();
+
     // 编排器 → 执行面板
     connect(m_pOrch, &CTaskOrchestrator::sigStageLog,   this, &CMainWindow::OnStageLog);
     connect(m_pOrch, &CTaskOrchestrator::sigStageEvent, this, &CMainWindow::OnStageEvent);
     connect(m_pOrch, &CTaskOrchestrator::sigTaskChanged,this, &CMainWindow::OnTaskChanged);
     connect(m_pOrch, &CTaskOrchestrator::sigTaskFinished,this, &CMainWindow::OnTaskFinished);
+    // 2026.09.22 评审升级人工介入：评审多次驳回熔断暂停时弹窗问放行/再迭代/保持暂停。
+    connect(m_pOrch, &CTaskOrchestrator::sigReviewEscalated, this, &CMainWindow::OnReviewEscalated);
     // 结构化对话流信号 → 直接接面板（渲染 Claude Code 风格对话流）
     connect(m_pOrch, &CTaskOrchestrator::sigAssistantText,
             m_pExecPanel, &CExecutionPanel::OnAssistantText);
@@ -503,6 +588,17 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             m_pExecPanel, &CExecutionPanel::OnAdhocLog);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocEvent,
             m_pExecPanel, &CExecutionPanel::OnAdhocEvent);
+    // 2026.09.18 暂存提示词生命周期：排队轮启动（面板此刻渲染正式用户块）/队列作废（清空暂存框）。
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocPendingStarted,
+            m_pExecPanel, &CExecutionPanel::OnAdhocPendingStarted);
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocPendingDropped,
+            m_pExecPanel, &CExecutionPanel::OnAdhocPendingDropped);
+    // 2026.09.20 暂存框编辑/删除未发送排队指令：面板 → 编排器 aPendingInjects 同步
+    //   （双份队列，按原文本匹配；未命中=已被合并消费，面板侧已自行保持一致）。
+    connect(m_pExecPanel, &CExecutionPanel::sigAdhocQueuedRemove,
+            m_pOrch, &CTaskOrchestrator::RemoveQueuedAdhoc);
+    connect(m_pExecPanel, &CExecutionPanel::sigAdhocQueuedEdit,
+            m_pOrch, &CTaskOrchestrator::EditQueuedAdhoc);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocContext,
             m_pExecPanel, &CExecutionPanel::SetAdhocContext);
     // 2026.08.27 本轮实时计量（任务/助手通用）→ 费用栏右侧“本轮 ↑x ↓y”。
@@ -526,10 +622,19 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocRunning,
             m_pExecPanel, [this](const QString& a_sAsstId) {
         m_pExecPanel->SetAsstRunning(a_sAsstId, true);   // id 幂等置位（手动路径已自置）
+        // 2026.09.23 起跑即同步粘性后端到面板镜像：助手输出块的说话人标签取镜像
+        //   （v3.1.228 修正块标签用粘性后端），首提绑定/切后端后跑的会话镜像也能及时
+        //   跟上，块标注不再靠兑底全局猜。
+        if (m_pOrch != nullptr) {
+            m_pExecPanel->UpdateAsstBackend(a_sAsstId, m_pOrch->AsstAdhocBackend(a_sAsstId));
+        }
     });
     // 面板输入栏 → 编排器（经本窗口转发）
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocSubmit,
             this, &CMainWindow::OnAdhocSubmit);
+    // 2026-09-22 助手右键「自动重命名」：面板收集提示词 → 编排器借会话交 Agent 总结。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstAutoRename,
+            this, &CMainWindow::OnAsstAutoRename);
     // 2026.08.15 助手消耗归集：一次成功调用 → 当前档任务（费用/输入/输出/耗时）。
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocUsage,
             this, &CMainWindow::OnAdhocUsage);
@@ -541,6 +646,12 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     //   不影响其他并发助手）
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocStop,
             this, [this](const QString& a_sAsstId) { m_pOrch->StopAdhoc(a_sAsstId); });
+    // 2026-10-02 跨档幽灵接线：点击幽灵 Tab → 切回归属任务/工程档（同档幂等，无循环）；
+    //   幽灵轮次结束 → 最终块落其档 + 面板除名 + 编排器会话释放。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstForeignActivated,
+            this, &CMainWindow::OnAsstForeignActivated);
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstForeignFinished,
+            this, &CMainWindow::OnAsstForeignFinished);
     // 上下文窗口上限调整 → 持久化到 config.ini（编排器无需感知，面板自身用 m_iContextLimit）。
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocContextLimitChanged,
             this, [this](qint64 a_iLimit) {
@@ -588,6 +699,21 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
 
     // 启动 ask_user 提问服务：监听 AutoCodeMcpAsk-<PID>，供孙进程 MCP server 转发提问。
     StartAskServer();
+
+    // 2026-09-26 内置测试沙箱：Agent 后代 GUI 窗口自动幽灵化收纳 + MP4 录像；
+    //   同桥 ({type:sbx}) 承接 sandbox_* MCP 工具与 --sandbox CLI。退出时 closeEvent
+    //   统一 Shutdown（全部还原 + 停录像）；启动时先还原上次崩溃残留的幽灵窗口。
+    m_pSbx = new CSandboxManager(this);
+    {
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable     = m_pPm->LoadSandboxEnable();
+        stCfg.bAutoGhost  = m_pPm->LoadSandboxAutoGhost();
+        stCfg.bRecord     = m_pPm->LoadSandboxRecord();
+        stCfg.iFps        = m_pPm->LoadSandboxFps();
+        stCfg.iRetainDays = m_pPm->LoadSandboxRetainDays();
+        m_pSbx->SetConfig(stCfg);
+        m_pSbx->Start();
+    }
 
     // 图标/标题栏右键弹系统菜单：应用级原生消息过滤器（先于 Qt 内部处理，见类注释）。
     const HWND hWndMain = reinterpret_cast<HWND>(winId());
@@ -714,12 +840,37 @@ void CMainWindow::CreateUi() {
     connect(m_pTaskPanel, &CTaskListPanel::sigRenameTask,  this, &CMainWindow::OnRenameTask); // 2026.08.20 重命名
     connect(m_pTaskPanel, &CTaskListPanel::sigAutoNameTask, this, &CMainWindow::OnAutoNameTask); // 2026.08.20 自动命名
     connect(m_pOrch, &CTaskOrchestrator::sigAutoNameDone,   this, &CMainWindow::OnAutoNameDone); // 2026.08.20 Agent 起名回调
+    // 2026-09-22 助手自动重命名回调：编排器 → 面板回填 sName/sDesc（含失败事件行）。
+    connect(m_pOrch, &CTaskOrchestrator::sigAsstAutoNameDone, m_pExecPanel,
+            &CExecutionPanel::ApplyAsstAutoName);
     // FR-3：资源管理器「添加到聊天框」→ 注入助手输入框。
     connect(m_pTaskPanel, &CTaskListPanel::sigAddToChat,
             m_pExecPanel, &CExecutionPanel::AppendToAdhocInput);
     // 2026.08.18 资源管理器双击文本文件 → 执行面板「助手」右侧 Tab 内嵌显示。
+    //   2026-09-30 改 lambda 转发：ShowFileTab 新增 a_iLine 缺省参数，PMF 直连会因
+    //   形参多于信号被 static_assert 拦下（缺省实参不参与 PMF 连接匹配）。
     connect(m_pTaskPanel, &CTaskListPanel::sigFileOpen,
-            m_pExecPanel, &CExecutionPanel::ShowFileTab);
+            m_pExecPanel, [this](const QString& a_sAbs, bool a_bSwitch) {
+        m_pExecPanel->ShowFileTab(a_sAbs, a_bSwitch);
+    });
+    // 2026-09-30 资源管理器右键「代码审查」→ 非模态审查对话框（ReviewSdk+当前后端）。
+    //   同一时刻只开一个（已开则切目标重审）；对话框双击发现行 → 文件预览定位。
+    connect(m_pTaskPanel, &CTaskListPanel::sigCodeReview,
+            this, [this](const QString& a_sAbsPath) {
+        if (m_pReviewDlg != nullptr) {
+            m_pReviewDlg->close();   // WA_DeleteOnClose 自动销毁（QPointer 随之置空）
+        }
+        m_pReviewDlg = new CCodeReviewDialog(a_sAbsPath, this);
+        m_pReviewDlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(m_pReviewDlg, &CCodeReviewDialog::sigOpenFile,
+                this, [this](const QString& a_sAbs, int a_iLine) {
+            m_pExecPanel->ShowFileTab(a_sAbs, true, a_iLine);
+        });
+        // 2026-10-02「按建议修复」：修复提示词注入当前助手提问框（同「添加到聊天框」链路）。
+        connect(m_pReviewDlg, &CCodeReviewDialog::sigFixToChat,
+                m_pExecPanel, &CExecutionPanel::AppendToAdhocInput);
+        m_pReviewDlg->show();
+    });
     // FR-3：任务运行中介入输入栏 → 编排器 InjectTaskMessage。
     connect(m_pExecPanel, &CExecutionPanel::sigTaskInject,
             this, &CMainWindow::OnTaskInject);
@@ -740,14 +891,33 @@ void CMainWindow::CreateMenus() {
 
     auto* pMenu = m_pMenuBar->addMenu(QStringLiteral("工程(&P)"));
 
-    auto* pActNew = pMenu->addAction(QStringLiteral("新建工程..."));
-    connect(pActNew, &QAction::triggered, this, &CMainWindow::OnNewProject);
-
+    // 2026.09.22 v3.0.205 移除「新建工程...」菜单项（用户需求：与打开工程重复）——
+    //   两者实现除对话框标题外完全相同，且「打开工程目录...」的目录选择对话框
+    //   本就支持选空目录从零建工程，功能完全被覆盖。
     auto* pActOpen = pMenu->addAction(QStringLiteral("打开工程目录..."));
     connect(pActOpen, &QAction::triggered, this, &CMainWindow::OnOpenProject);
 
-    // 「最近打开」子菜单（位置：打开之后、Guide 之前）。内容由 RebuildRecentMenu 动态填充。
+    // 「最近打开」子菜单（位置：打开之后、Guide 之前）。2026.09.26 v3.1.239
+    //   面板化：子菜单内嵌 CRecentChipsPanel（QWidgetAction）——自绘按钮 + 流式行
+    //   布局 + 底部状态栏，取代旧 20 条 QAction。内嵌而非独立弹窗是关键决策：
+    //   QMenu 打开期间独占鼠标事件路由，独立顶层窗口收不到点击；内嵌则子菜单
+    //   全部语义白拿（悬停弹出/位置一致/移到其他菜单项自动隐藏/点按钮才收起）。
     m_pMenuRecent = pMenu->addMenu(QStringLiteral("最近打开"));
+    m_pRecentPanel = new CRecentChipsPanel(
+        [this](const QString& sPath) { OnRecentChipOpen(sPath); },
+        [this]() { OnRecentChipMore(); });
+    {
+        auto* pWgtAct = new QWidgetAction(m_pMenuRecent);
+        pWgtAct->setDefaultWidget(m_pRecentPanel);
+        m_pMenuRecent->addAction(pWgtAct);
+        // 每次弹出前取最新 MRU（打开/删除/热重载后均无需手工同步）
+        connect(m_pMenuRecent, &QMenu::aboutToShow, this, [this]() {
+            if (m_pPm != nullptr && m_pRecentPanel != nullptr) {
+                m_pRecentPanel->Refresh(m_pPm->RecentProjects(),
+                                        m_pPm->RecentOpenCounts());
+            }
+        });
+    }
 
     auto* pActSyncGuide = pMenu->addAction(QStringLiteral("同步 Guide"));
     pActSyncGuide->setToolTip(QStringLiteral(
@@ -781,6 +951,12 @@ void CMainWindow::CreateMenus() {
     pActRollback->setToolTip(QStringLiteral(
         "查看/回退代码备份历史（选中任务时按任务档过滤，无任务时为工程全局档）"));
     connect(pActRollback, &QAction::triggered, this, &CMainWindow::OnRollbackTurnOpen);
+    // 2026-09-26 内置测试沙箱：Agent 启动的 GUI 窗口自动隐藏收纳（无扰测试 + MP4 录像）。
+    auto* pActSandbox = pMenuFunc->addAction(QStringLiteral("测试沙箱..."));
+    pActSandbox->setToolTip(QStringLiteral(
+        "查看/管理内置测试沙箱：Agent 启动的 GUI 程序窗口自动隐藏收纳（不抢焦点、"
+        "点击穿透、不打扰用户），Agent 经 sandbox_* 工具操控/截图，全程 MP4 录像"));
+    connect(pActSandbox, &QAction::triggered, this, &CMainWindow::OnSandboxDialog);
 
     // 帮助菜单（FR-9）
     auto* pMenuHelp = m_pMenuBar->addMenu(QStringLiteral("帮助(&H)"));
@@ -1050,6 +1226,15 @@ void CMainWindow::UpdateWindowTitle() {
     }
 }
 
+void CMainWindow::ClearAssistantSessionsOnBackendSwitch() {
+    // 2026.09.20 v2.4.193 语义变更（用户需求：助手不支持中途换 Harness → 发送提示词时
+    //   自动忽略全局设置、继续用该助手当前的 Harness）：**不再清会话链**——粘性绑定由
+    //   会话 sBackend 承载（EnsureAdhocRunner 按绑定后端建 runner，v2.4.183 的清除
+    //   语义废止）。此处仅状态栏提示新规则（新建助手才会用新后端）。
+    SetStatus(QStringLiteral("Agent 后端已切换：已有助手继续使用各自原后端；"
+                             "新建助手将使用新后端"));
+}
+
 void CMainWindow::ApplyTaskConfigOverlay(CTaskInfo* a_pTask) {
     // 2026.09.09 v2.1.143 任务级配置覆盖（说明见 CProjectManager.h 同名节）：
     //   选中任务 → 参数源切到任务档（缺键合并回填自全局）；取消选中/删除/切工程 →
@@ -1195,7 +1380,8 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
     // guide.md 缺失不再在打开工程时扫描，改为启动任务时作为初始任务自动生成（见 OnStartTask）。
 
     // 成功打开才记录历史（失败路径已提前 return，FR-2.2）。
-    // 注：新建工程目录（OnNewProject）同样走此入口，按 FR-2.3 临时默认计入 —— 待 Q-6 确认。
+    // 注：2026.09.22 起「新建工程」菜单已删（与打开工程重复），从零建工程走
+    //   OnOpenProject 选空目录，同样经此入口计入最近 —— 待 Q-6 确认的历史项。
     RecordRecent(a_sDir);
 
     // 工程就绪：启用提示词 agent 输入栏（ClearTasks 已先禁用，此处恢复）
@@ -1218,17 +1404,6 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
             ExecMsgBox(QMessageBox::Warning, QStringLiteral("代码回退"),
                 QStringLiteral("检测到上次回退被中断的残留，还原现场失败：%1").arg(sErr), this);
         }
-    }
-}
-
-void CMainWindow::OnNewProject() {
-    // 2026.08.20 初始定位=上次选择的目录（config.ini [UI] LastProjectDir），无记录回退 exe 目录。
-    const QString sDir = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("选择/新建工程目录"), m_pPm->LastBrowseDir());
-    if (!sDir.isEmpty()) {
-        m_pPm->SetLastBrowseDir(sDir);
-        m_iCfgSelfSaveMs = QDateTime::currentMSecsSinceEpoch();   // 2026.08.20 自身保存打点
-        OpenProjectDir(sDir);
     }
 }
 
@@ -1364,7 +1539,8 @@ void CMainWindow::OnVersionManage() {
     //   → 对话框更新前阻断式确认（口径同设置页后端切换保护，仅收敛到单后端）。
     const int iCurBackend = CAgentRunnerFactory::IsDsh() ? 2
                           : CAgentRunnerFactory::IsPi() ? 3
-                          : CAgentRunnerFactory::IsCodex() ? 4 : 1;
+                          : CAgentRunnerFactory::IsCodex() ? 4
+                          : CAgentRunnerFactory::IsHermes() ? 5 : 1;
     CVersionDialog::FBusyCheck fnBusy = [this, iCurBackend](int a_iBackend) {
         return a_iBackend == iCurBackend && m_pOrch != nullptr
             && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning());
@@ -1384,7 +1560,8 @@ void CMainWindow::OnSettings() {
     CSettingsDialog stDlg(m_pPm, this, [this](int a_iBackend) {
         const int iCurBackend = CAgentRunnerFactory::IsDsh() ? 2
                               : CAgentRunnerFactory::IsPi() ? 3
-                              : CAgentRunnerFactory::IsCodex() ? 4 : 1;
+                              : CAgentRunnerFactory::IsCodex() ? 4
+                              : CAgentRunnerFactory::IsHermes() ? 5 : 1;
         return a_iBackend == iCurBackend && m_pOrch != nullptr
             && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning());
     }, (m_pExecPanel != nullptr && m_pExecPanel->CurrentTask() != nullptr)
@@ -1400,24 +1577,32 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveReviewParallel(stDlg.ReviewParallel());
     m_pPm->SaveClaudeCmd(stDlg.ClaudeCmd());
     m_pPm->SaveAskTimeoutSec(stDlg.AskTimeoutSec());
-    // 2026.08.18 后端切换保护：任务/助手/guide 任一运行中禁止切后端——旧 runner
-    //   正在跑、切换只对新拉起生效，半新半旧混跑会让阶段产物跨后端语义错乱。
-    //   Backend 键拒存（保持原值），其余键照常；DSH 参数非运行敏感，直接落。
+    // 2026.08.18 后端切换保护（2026.09.21 收窄，用户需求）：任务 runner 或 guide
+    //   运行中仍拒切后端——Backend 键保持原值（其余键照常落）；任务多阶段续跑
+    //   复用同一 sid 链，中途换后端会跨后端语义错乱。助手已豁免：v2.4.193 起助手
+    //   粘性后端（会话绑定 sBackend，全局切换不影响任何已有助手——运行中也不
+    //   受影响，仅新建助手用新后端），EnsureAdhocRunner 的占用不重建守卫兜底
+    //   运行中实例绝不被换，助手运行中允许切换无逻辑问题。
     const int iNewBackend = stDlg.AgentBackend();
     // 2026.08.19 三后端化：切换判定改为「目标后端 ≠ 工厂当前后端」（旧二元比较
     //   (==2)!=IsDsh() 无法覆盖 pi↔dsh 间的切换）。
+    // 2026.09.19 补 Hermes（5）：旧映射 ...IsCodex()?4:1 把 Hermes 当 Claude，
+    //   claude↔hermes 互切不判变更（忙时不拦）且无法触发切换后清会话链。
     const int iCurBackend = CAgentRunnerFactory::IsDsh() ? 2
                            : CAgentRunnerFactory::IsPi() ? 3
-                           : CAgentRunnerFactory::IsCodex() ? 4 : 1;
+                           : CAgentRunnerFactory::IsCodex() ? 4
+                           : CAgentRunnerFactory::IsHermes() ? 5 : 1;
     const bool bBackendChanged = (iNewBackend != iCurBackend);
-    const bool bBusy = (m_pOrch != nullptr && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning()))
+    const bool bBusy = (m_pOrch != nullptr && m_pOrch->IsRunnerBusy())
         || (m_pPm != nullptr && m_pPm->IsGuideBusy());
     bool bBackendSaved = true;
     if (bBackendChanged && bBusy) {
         bBackendSaved = false;
         ExecMsgBox(QMessageBox::Warning, QStringLiteral("设置"),
-                   QStringLiteral("有任务/助手/guide 正在运行，Agent 后端切换已保留原值"
-                                  "（其余设置已保存）。请空闲后再切换。"), this);
+                   QStringLiteral("有任务或 guide 正在运行，Agent 后端切换已保留原值"
+                                  "（其余设置已保存）。请空闲后再切换。\n"
+                                  "注：助手运行中不影响切换——已有助手继续用各自原后端，"
+                                  "仅新建助手使用新后端。"), this);
     } else {
         m_pPm->SaveAgentBackend(iNewBackend);
         // 2026.09.03 v2.0.105 选 Hermes 后端保存时自动敷设 oneshot 事件补丁：
@@ -1440,6 +1625,16 @@ void CMainWindow::OnSettings() {
     // 2026.08.18 轻量自动配置：根目录单字段落盘；root 生效时清掉旧 bin/cordis 显式键
     //   （解析优先级=显式键>root 推导，清键防双源歧义；root 留空则旧键原样保留作回退）。
     m_pPm->SaveDshRoot(stDlg.DshRoot());
+    // 2026.09.27 额外可写目录落盘 + 授/撤 ACE（当前工程根派生 SID；新加的授、
+    //   移除的撤；运行中进程下一轮 EnsureProcess 自愈补授）。
+    {
+        const QStringList aOld = CDeepSeekRunner::DshExtraWriteDirs();
+        const QStringList aNew = stDlg.DshExtraWriteDirs();
+        m_pPm->SaveDshExtraWriteDirs(aNew);
+        CDeepSeekRunner::SetDshExtraWriteDirs(aNew);
+        const QString sCurProj = (m_pPm != nullptr) ? m_pPm->ProjectDir() : QString();
+        CDeepSeekRunner::ApplyExtraWriteDirs(sCurProj, aNew, aOld);
+    }
     m_pPm->SaveDshNodePath(stDlg.DshNodePath());
     if (!stDlg.DshRoot().isEmpty()) {
         m_pPm->SaveDshBinJsPath(QString());
@@ -1460,9 +1655,34 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveWebSearch(stDlg.WebSearch());
     m_pPm->SaveExpertAssistant(stDlg.ExpertAssistant());
     m_pPm->SaveAutoCompactPct(stDlg.AutoCompactPct());
-    m_pPm->SaveAdhocContextLimit(stDlg.ContextLimit());
+    // 2026.09.27 「上下文窗口上限」设置项已删：[Adhoc] ContextLimit 不再由设置页读写，
+    //   入口收敛到上下文进度条右键「设置上下文大小…」（已存值继续生效，未设按模型探测）。
+    m_pPm->SaveAdhocMaxTurns(stDlg.AdhocMaxTurns());   // 2026.09.23 助手轮次上限（下一条提示词即时生效）
+    m_pPm->SaveAdhocMaxTurnsAuto(stDlg.AdhocMaxTurnsAuto());   // 2026.09.23 v3.0.219 工作量评估开关
     m_pPm->SaveScanExcludeDirs(stDlg.ScanExcludeDirs());
     m_pPm->SaveBackupExcludeDirs(stDlg.BackupExcludeDirs());
+    // 2026.09.23 资源管理器显示隐藏目录：落盘 + 立即应用到树（含已加载行重隐/重显）。
+    m_pPm->SaveExplorerHiddenDirs(stDlg.ExplorerHiddenDirs());
+    if (m_pTaskPanel != nullptr) {
+        m_pTaskPanel->SetExplorerHiddenDirs(ScanDirList(stDlg.ExplorerHiddenDirs()));
+    }
+    // 2026-09-26 内置测试沙箱：落盘 + 热应用到管理器（开关/帧率即时生效，
+    //   录像开关对后续新收纳窗口生效；存量窗口录像保持原状）。
+    m_pPm->SaveSandboxEnable(stDlg.SandboxEnable());
+    m_pPm->SaveSandboxAutoGhost(stDlg.SandboxAutoGhost());
+    m_pPm->SaveSandboxRecord(stDlg.SandboxRecord());
+    m_pPm->SaveSandboxFps(stDlg.SandboxFps());
+    m_pPm->SaveSandboxRetainDays(stDlg.SandboxRetainDays());
+    if (m_pSbx != nullptr) {
+        CSandboxManager::SSbxCfg stSbx;
+        stSbx.bEnable     = stDlg.SandboxEnable();
+        stSbx.bAutoGhost  = stDlg.SandboxAutoGhost();
+        stSbx.bRecord     = stDlg.SandboxRecord();
+        stSbx.iFps        = stDlg.SandboxFps();
+        stSbx.iRetainDays = stDlg.SandboxRetainDays();
+        m_pSbx->SetConfig(stSbx);
+        m_pSbx->ReloadConfig();
+    }
     m_iCfgSelfSaveMs = QDateTime::currentMSecsSinceEpoch();   // 2026.08.20 自身保存打点（跳过自触发重载）
 
     // —— 应用到运行期内存 ——
@@ -1481,6 +1701,12 @@ void CMainWindow::OnSettings() {
                                         : iNewBackend == 4 ? CAgentRunnerFactory::BackendCodex
                                         : iNewBackend == 5 ? CAgentRunnerFactory::BackendHermes
                                                            : CAgentRunnerFactory::BackendClaude);
+        // 2026.09.19 后端切换清会话链：档载入侧 backend 键守卫的运行期对应物——旧后端的
+        //   sid/撤销栈交给新后端必错（PixelPorter 实害：pi 切 claude 后首轮报
+        //   「No conversation found with session ID」）；对话历史/统计不受影响。
+        if (bBackendChanged) {
+            ClearAssistantSessionsOnBackendSwitch();
+        }
     }
     // 2026.08.18 根目录应用运行期：显式值优先；空或失效（死路径自愈）时探测 exe
     //   同级并自动回填落盘（设置页装完 DSH → 确定 → 探测命中即写 config.ini，
@@ -1619,6 +1845,7 @@ void CMainWindow::OnSettings() {
             CHermesRunner::SetHermesModel(stE.sModelId);
             CHermesRunner::SetHermesApiKey(stE.sApiKey);
             CHermesRunner::SetHermesBaseUrl(stE.sBaseURL);
+            CHermesRunner::SetHermesApi(stE.sApi);   // 2026.09.21 协议感知：anthropic 端点 → config.yaml api_mode
             CHermesRunner::SetHermesRuntimeLimits(
                 CHermesRunner::ClampCtx(stE.iCtx), CHermesRunner::ClampMaxTok(stE.iMaxTok));
         }
@@ -1631,9 +1858,6 @@ void CMainWindow::OnSettings() {
                 sHermesErr + QStringLiteral("\n\n后端已切到 Hermes，问题解决前任务/助手/guide "
                                           "无法启动；也可重新打开设置切回 Claude Code。"), this);
         }
-    }
-    if (m_pExecPanel != nullptr) {
-        m_pExecPanel->SetUserContextLimit(stDlg.ContextLimit());
     }
     // 2026.08.18 修：逐项 trim + 空清单恢复内置默认（与启动路径同源，见 ScanDirList）。
     CGuideFingerprintScanner::SetExcludeDirs(ScanDirList(stDlg.ScanExcludeDirs()));
@@ -1665,38 +1889,10 @@ void CMainWindow::RebuildRecentMenu() {
     if (m_pMenuRecent == nullptr) {
         return;
     }
-    m_pMenuRecent->clear();
-
-    const QStringList aRecent = m_pPm->RecentProjects();
-    const int iTotal = aRecent.size();
-
-    if (iTotal == 0) {
-        // 空历史：禁用占位项，不显示「...」（FR-7.1 / AC-2）。
-        auto* pEmpty = new QAction(QStringLiteral("（空）"), m_pMenuRecent);
-        pEmpty->setEnabled(false);
-        m_pMenuRecent->addAction(pEmpty);
-        return;
-    }
-
-    // 前 min(N, 上限) 条加为可点 QAction。
-    const int iShown = qMin(iTotal, s_kiMaxRecentMenu);
-    for (int i = 0; i < iShown; ++i) {
-        const QString sPath = aRecent.at(i);
-        const QString sName = QDir(sPath).dirName();
-        const QString sText = QStringLiteral("%1（%2）").arg(sName, sPath);
-        auto* pAct = new QAction(sText, m_pMenuRecent);
-        pAct->setData(sPath);
-        connect(pAct, &QAction::triggered, this, &CMainWindow::OnRecentProject);
-        m_pMenuRecent->addAction(pAct);
-    }
-
-    // 超过上限 → 末尾加「...」哨兵（FR-4.3 / AC-6）。
-    if (iTotal > s_kiMaxRecentMenu) {
-        auto* pMore = new QAction(QStringLiteral("..."), m_pMenuRecent);
-        pMore->setData(QString());   // 空串作哨兵
-        connect(pMore, &QAction::triggered, this, &CMainWindow::OnOpenAllRecent);
-        m_pMenuRecent->addAction(pMore);
-    }
+    // 2026.09.26 v3.1.239 面板化：条目内容不再走 QAction（面板在菜单 aboutToShow
+    //   时自取最新 MRU），此处只管空历史置灰（面板不展示空态）。
+    m_pMenuRecent->menuAction()->setEnabled(
+        m_pPm != nullptr && !m_pPm->RecentProjects().isEmpty());
 }
 
 void CMainWindow::RecordRecent(const QString& a_sDir) {
@@ -1707,20 +1903,35 @@ void CMainWindow::RecordRecent(const QString& a_sDir) {
     RebuildRecentMenu();
 }
 
-void CMainWindow::OnRecentProject() {
-    auto* pAct = qobject_cast<QAction*>(sender());
-    if (pAct == nullptr) {
-        return;
+void CMainWindow::OnRecentChipOpen(const QString& a_sPath) {
+    // 2026.09.26 面板按钮点击：先收菜单链（选定动作，整条菜单关闭），
+    //   再复用统一打开入口（在席锁确认/计数累加/MRU 置顶全在其中）。
+    CloseRecentMenus();
+    if (!a_sPath.isEmpty()) {
+        OpenProjectDir(a_sPath);
     }
-    const QString sPath = pAct->data().toString();
-    if (sPath.isEmpty()) {
-        return;   // 理论上哨兵不进此槽，双保险判空
+}
+
+void CMainWindow::OnRecentChipMore() {
+    // 面板「更多...」：先收菜单链再开全量对话框（对话框是模态 exec，
+    //   菜单不收会叠在对话框下面且吞交互）。
+    CloseRecentMenus();
+    OnOpenAllRecent();
+}
+
+void CMainWindow::CloseRecentMenus() {
+    if (m_pMenuRecent != nullptr) {
+        m_pMenuRecent->hide();
+        // 父级工程菜单（addMenu 父子关系）一并收起，菜单栏回到空闲态。
+        if (auto* pMenu = qobject_cast<QMenu*>(m_pMenuRecent->parentWidget())) {
+            pMenu->hide();
+        }
     }
-    OpenProjectDir(sPath);   // 复用统一入口（FR-5.1）
 }
 
 void CMainWindow::OnOpenAllRecent() {
-    CRecentProjectsDialog dlg(m_pPm->RecentProjects(), this);
+    CRecentProjectsDialog dlg(m_pPm->RecentProjects(), m_pPm->RecentOpenCounts(),
+                              m_pPm->ConfigFilePath(), this);
     const int iRc = dlg.exec();
     // 2026.08.20 右键删除：无论 OK/取消，被删条目都从 MRU 移除并落盘、重建菜单。
     const QStringList aRemoved = dlg.RemovedPaths();
@@ -2219,7 +2430,11 @@ void CMainWindow::OnDeleteTask(CTaskInfo* a_pTask) {
         }
     }
 
-    // 5. 释放对象（a_pTask 已从所属列表移除，不会悬垂于列表）
+    // 5. 释放对象（a_pTask 已从所属列表移除，不会悬垂于列表）；而板若正指向该任务
+    //   （挂起档切换场景 m_pCur≠面板任务）同步摘下，防 OnAdhocSubmit 等解引用已释放内存。
+    if (m_pExecPanel != nullptr && m_pExecPanel->CurrentTask() == a_pTask) {
+        m_pExecPanel->SetCurrentTask(nullptr);
+    }
     delete a_pTask;
 
     // 6. 刷新两表（历史表从 DB 重拉，确保删行后一致）
@@ -2267,6 +2482,10 @@ void CMainWindow::OnRemoveTask(CTaskInfo* a_pTask) {
         m_pExecPanel->SetCurrentTask(nullptr);
         ApplyTaskConfigOverlay(nullptr);   // 2026.09.09 v2.1.143 任务删除/移除：参数源回全局
         LoadAssistantState();       // 回退工程全局档（无则清空）
+    }
+    // 2026.09.28 面板可能仍指向被移除任务（挂起档切换 m_pCur≠面板任务）：摘下防悬垂。
+    if (m_pExecPanel != nullptr && m_pExecPanel->CurrentTask() == a_pTask) {
+        m_pExecPanel->SetCurrentTask(nullptr);
     }
 
     delete a_pTask;   // 活跃副本回收（DB 记录与 task.json 均保留，再次执行靠 OnReviveTask 重建）
@@ -2363,7 +2582,7 @@ void CMainWindow::OnEscalation(CTaskInfo* a_pTask, const QString& a_sEventText) 
     const QString sReportPath =
         m_pPm->TaskDir(a_pTask->Id()) + QStringLiteral("/escalation.md");
     QString sDetail;
-    QFile fReport(sReportPath);
+    CFrwDevice fReport(sReportPath);
     if (fReport.open(QIODevice::ReadOnly | QIODevice::Text)) {
         sDetail = QString::fromUtf8(fReport.readAll());
         fReport.close();
@@ -2428,6 +2647,47 @@ void CMainWindow::OnTaskChanged(CTaskInfo* a_pTask) {
     }
 }
 
+void CMainWindow::OnReviewEscalated(CTaskInfo* a_pTask) {
+    // 2026.09.22 评审人工介入（用户需求：审核失败时允许人工确认后继续）：
+    //   评审多次驳回熔断暂停时弹窗——人工放行（视为评审通过继续）/ 再迭代一轮 / 保持暂停。
+    //   [Policy] ReviewAskOnEscalate=0 时不弹，退回旧版静默升级（无人值守跑批）。
+    if (a_pTask == nullptr || m_pPm == nullptr || m_pOrch == nullptr) {
+        return;
+    }
+    if (!m_pPm->LoadReviewAskOnEscalate()) {
+        return;
+    }
+    const QString sReport = m_pPm->TaskDir(a_pTask->Id())
+        + QStringLiteral("/escalation.md");
+    QMessageBox box(this);
+    QFont fBox = box.font();
+    fBox.setPointSize(11);
+    box.setFont(fBox);
+    box.setWindowTitle(QStringLiteral("评审人工介入"));
+    box.setIcon(QMessageBox::Warning);
+    box.setText(QStringLiteral(
+        "任务「%1」的评审阶段已迭代多次仍被驳回，已按迭代上限暂停。\n\n"
+        "可选择：\n"
+        "· 人工放行，继续 —— 忽略本次驳回，视为评审通过继续推进后续流程；\n"
+        "· 再迭代一轮 —— 重置迭代计数并重跑回炉阶段（评审意见仍会注入）；\n"
+        "· 保持暂停 —— 稍后在任务列表点「继续」自行处理。\n\n"
+        "评审报告：%2")
+        .arg(a_pTask->Name(), sReport));
+    QPushButton* pPass = box.addButton(QStringLiteral("人工放行，继续"), QMessageBox::AcceptRole);
+    QPushButton* pRerun = box.addButton(QStringLiteral("再迭代一轮"), QMessageBox::ActionRole);
+    QPushButton* pWait = box.addButton(QStringLiteral("保持暂停"), QMessageBox::RejectRole);
+    box.setDefaultButton(pWait);   // Esc/回车缺省＝保守：不动流程
+    box.exec();
+    if (box.clickedButton() == pPass) {
+        m_pOrch->ResolveReviewEscalation(a_pTask, 0);
+    } else if (box.clickedButton() == pRerun) {
+        m_pOrch->ResolveReviewEscalation(a_pTask, 1);
+    } else {
+        Q_UNUSED(pWait);
+        m_pOrch->ResolveReviewEscalation(a_pTask, 2);
+    }
+}
+
 void CMainWindow::OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk) {
     if (a_pTask == nullptr) {
         return;
@@ -2464,6 +2724,10 @@ void CMainWindow::OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk) {
             m_pExecPanel->SetCurrentTask(nullptr);
             ApplyTaskConfigOverlay(nullptr);   // 2026.09.09 v2.1.143 任务终态归档：参数源回全局
             LoadAssistantState();       // 回退工程全局档（无则清空）
+        }
+        // 2026.09.28 面板可能仍指向终态归档任务（挂起档切换 m_pCur≠面板任务）：摘下防悬垂。
+        if (m_pExecPanel != nullptr && m_pExecPanel->CurrentTask() == a_pTask) {
+            m_pExecPanel->SetCurrentTask(nullptr);
         }
         delete a_pTask;   // 活跃副本回收（DB 记录与 task.json 均保留，再次执行靠 OnReviveTask 重建）
         m_pTaskPanel->SetTasks(m_aTasks);   // 当前表少一行
@@ -2521,6 +2785,17 @@ void CMainWindow::OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText
     }
 }
 
+void CMainWindow::OnAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts) {
+    // 2026-09-22 助手自动重命名：面板已收集好提示词，转编排器借会话交 Agent 总结名称+说明；
+    //   同步失败（工程未开/无会话/全部助手忙）也走面板 ApplyAsstAutoName 留失败事件行。
+    if (m_pOrch == nullptr || !m_pOrch->AutoNameAsstNow(a_sAsstId, a_sPrompts)) {
+        if (m_pExecPanel != nullptr) {
+            m_pExecPanel->ApplyAsstAutoName(a_sAsstId, false, QString(),
+                QStringLiteral("当前无可用的空闲助手会话（或工程未打开），请稍后再试"));
+        }
+    }
+}
+
 void CMainWindow::OnAdhocUndo(const QString& a_sAsstId) {
     if (m_pOrch != nullptr) {
         m_pOrch->UndoAdhoc(a_sAsstId);
@@ -2575,6 +2850,18 @@ void CMainWindow::OnTaskInject(const QString& a_sTaskId, const QString& a_sText)
     m_pOrch->InjectTaskMessage(pTask, a_sText);
 }
 
+// 2026-09-26 内置测试沙箱管理对话框（非模态）：重复点击只抬升已有窗口。
+void CMainWindow::OnSandboxDialog() {
+    if (m_pSbxDlg == nullptr) {
+        m_pSbxDlg = new CSandboxDialog(m_pSbx, this);
+        m_pSbxDlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(m_pSbxDlg, &QObject::destroyed, this, [this]() { m_pSbxDlg = nullptr; });
+    }
+    m_pSbxDlg->show();
+    m_pSbxDlg->raise();
+    m_pSbxDlg->activateWindow();
+}
+
 void CMainWindow::StartAskServer() {
     // 管道名绑定主窗口进程 PID，多实例互不串扰；removeServer 防上次残留。
     const QString sName = QStringLiteral("AutoCodeMcpAsk-%1").arg(QCoreApplication::applicationPid());
@@ -2607,7 +2894,9 @@ void CMainWindow::OnAskConnection() {
     });
     // 2026-09-12 串行改排队：多助手并发手工审批可同时到达（claude ask_user 与
     //   dsh/pi/codex/hermes 的 --ask 子进程同桥），先答先问不丢连接。
-    if (m_pAskClient != nullptr) {
+    // 2026.09.28 弹窗期间（m_pAskClient 已置空）新连接同样入队：旧实现会直通
+    //   ActivateAskClient 弹出嵌套第二张模态框，外层连接超时断连即丢答案。
+    if (m_pAskClient != nullptr || m_bAskDialogOpen) {
         m_aAskQueue.append(pSock);
         return;
     }
@@ -2641,7 +2930,27 @@ void CMainWindow::OnAskReadyRead() {
             continue;
         }
         const QJsonObject oAsk = stDoc.object();
-        if (oAsk.value(QStringLiteral("type")).toString() != QStringLiteral("ask")) {
+        const QString sMsgType = oAsk.value(QStringLiteral("type")).toString();
+        // 2026-09-26 内置沙箱命令通道（一连接一命令）：{type:sbx,cmd,args} →
+        //   CSandboxManager::Execute → 回 {type:sbxres,ok,text} 后断连。不弹窗不
+        //   摘连接，直接在当前连接上应答（与 ask 的模态弹窗不同，毫秒~秒级返回）。
+        if (sMsgType == QStringLiteral("sbx")) {
+            // 2026-10-01 异步化（修「UI+助手全卡死」）：旧实现在此同步调 Execute——
+            //   UIA/截图遇 hung 窗口或输入法钩子死锁时 UI 线程永久阻塞（UIA 的 STA
+            //   回调又需 UI 泵消息，循环等待；MeloTTS 实例实测卡死 2h+）。改为入队投
+            //   线程池，连接移交队列，结果回包后断连。UI 线程即刻返回继续泵消息。
+            const QString sCmd = oAsk.value(QStringLiteral("cmd")).toString();
+            const QJsonObject oSbxArgs = oAsk.value(QStringLiteral("args")).toObject();
+            QPointer<QLocalSocket> pSbxSock = m_pAskClient;
+            m_pAskClient = nullptr;
+            m_bufAsk.clear();
+            if (!m_aAskQueue.isEmpty()) {
+                ActivateAskClient(m_aAskQueue.takeFirst());
+            }
+            EnqueueSbx(pSbxSock, sCmd, oSbxArgs);
+            break;   // 一连接一命令（连接由沙箱队列接管，结果回写后断连）
+        }
+        if (sMsgType != QStringLiteral("ask")) {
             continue;
         }
         // 解析 question + options
@@ -2656,8 +2965,20 @@ void CMainWindow::OnAskReadyRead() {
         QPointer<QLocalSocket> pSock = m_pAskClient;
         m_pAskClient = nullptr;
         m_bufAsk.clear();
+        m_bAskDialogOpen = true;   // 模态期门禁：期间到达的新连接在 OnAskConnection 排队
         // 弹窗（模态 exec：阻塞到用户作答，期间对话框可交互）
         CAskUserDialog dlg(sQuestion, aOptions, this);
+        // 2026-10-01 对端超时断连（MCP 子进程 600s 上限）自动收框：旧实现对端放弃后
+        //   对话框仍无限挂着——模态挡住主窗口，后续 ask 连接排队连环超时；用户
+        //   迟到的作答也无处可送。QPointer 防已答后 reject 误用（已关对话框拒收无害）。
+        {
+            QPointer<CAskUserDialog> pDlg = &dlg;
+            connect(pSock, &QLocalSocket::disconnected, this, [pDlg]() {
+                if (pDlg != nullptr) {
+                    pDlg->reject();
+                }
+            });
+        }
         QJsonObject oReply;
         if (dlg.exec() == QDialog::Accepted && !dlg.AnswerText().isEmpty()) {
             oReply.insert(QStringLiteral("type"), QStringLiteral("answer"));
@@ -2665,6 +2986,7 @@ void CMainWindow::OnAskReadyRead() {
         } else {
             oReply.insert(QStringLiteral("type"), QStringLiteral("cancel"));
         }
+        m_bAskDialogOpen = false;   // 弹窗已关：后续连接可直连激活
         if (pSock != nullptr
             && pSock->state() != QLocalSocket::UnconnectedState) {
             const QByteArray aBytes = QJsonDocument(oReply).toJson(QJsonDocument::Compact);
@@ -2677,6 +2999,155 @@ void CMainWindow::OnAskReadyRead() {
             ActivateAskClient(m_aAskQueue.takeFirst());
         }
         break;   // 一连接一问
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-10-01 沙箱命令异步化：入队 → 线程池（MTA COM）执行 → queued 回 UI 写包。
+// 队首即在飞；看门狗 150s 兑底（对端 MCP/CLI 均有 180s 上限，保证总有回包）。
+// ---------------------------------------------------------------------------
+void CMainWindow::EnqueueSbx(QLocalSocket* a_pSock, const QString& a_sCmd,
+                             const QJsonObject& a_oArgs) {
+    SSbxReq stReq;
+    stReq.iSeq = ++m_iSbxSeq;
+    stReq.pSock = a_pSock;
+    stReq.iT0Ms = QDateTime::currentMSecsSinceEpoch();
+    stReq.sCmd = a_sCmd;
+    stReq.oArgs = a_oArgs;
+    if (m_pSbx == nullptr) {
+        // 主实例未初始化：直接回包，不占队列。
+        QJsonObject oReply;
+        oReply.insert(QStringLiteral("type"), QStringLiteral("sbxres"));
+        oReply.insert(QStringLiteral("ok"), false);
+        oReply.insert(QStringLiteral("text"), QStringLiteral("[沙箱不可用：主实例未初始化]"));
+        if (a_pSock != nullptr && a_pSock->state() != QLocalSocket::UnconnectedState) {
+            a_pSock->write(QJsonDocument(oReply).toJson(QJsonDocument::Compact) + "\n");
+            a_pSock->flush();
+            a_pSock->disconnectFromServer();
+        }
+        return;
+    }
+    m_qSbx.append(stReq);
+    if (m_pSbxWd == nullptr) {
+        m_pSbxWd = new QTimer(this);
+        m_pSbxWd->setInterval(5000);
+        connect(m_pSbxWd, &QTimer::timeout, this, &CMainWindow::OnSbxWatchdog);
+    }
+    m_pSbxWd->start();
+    DispatchSbx();
+}
+
+void CMainWindow::DispatchSbx() {
+    if (m_pSbx == nullptr) {
+        return;
+    }
+    // 2026-10-01 并行分发：每请求各投一池线程（叶子操作无锁化后，CSandboxManager
+    //   的 m_mtxState 只在状态段串行，互不饿死）；看门狗兑底 150s 回包。
+    for (int i = 0; i < m_qSbx.size(); ++i) {
+        if (m_qSbx.at(i).iT0Ms > 0) {   // 正 T0 = 未投出
+            const qint64 iSeq = m_qSbx[i].iSeq;
+            const QString sCmd = m_qSbx[i].sCmd;
+            const QJsonObject oArgs = m_qSbx[i].oArgs;
+            m_qSbx[i].iT0Ms = -m_qSbx[i].iT0Ms;   // 置负标记已投池
+            // 线程池 + MTA COM：UIA 客户端在 MTA 下无 STA 消息泵依赖，消除
+            // 「UI 线程泵不动 → UIA 回调卡死」的循环等待路径。
+            QThreadPool::globalInstance()->start([this, iSeq, sCmd, oArgs]() {
+                const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                QString sText;
+                const bool bOk = m_pSbx->Execute(sCmd, oArgs, sText);
+                if (SUCCEEDED(hrCom)) {
+                    CoUninitialize();
+                }
+                // 回 UI 线程写包（窗口已析构则安全丢弃）。
+                QMetaObject::invokeMethod(this,
+                    [this, iSeq, bOk, sText]() { OnSbxDone(iSeq, bOk, sText); },
+                    Qt::QueuedConnection);
+            });
+        }
+    }
+}
+
+void CMainWindow::OnSbxDone(qint64 a_iSeq, bool a_bOk, const QString& a_sText) {
+    FinishSbx(a_iSeq, a_bOk, a_sText);
+    DispatchSbx();
+}
+
+void CMainWindow::FinishSbx(qint64 a_iSeq, bool a_bOk, const QString& a_sText) {
+    const int iIdx = static_cast<int>(
+        std::find_if(m_qSbx.cbegin(), m_qSbx.cend(),
+                     [a_iSeq](const SSbxReq& st) { return st.iSeq == a_iSeq; })
+        - m_qSbx.cbegin());
+    if (iIdx >= m_qSbx.size()) {
+        return;   // 已被看门狗摘除（超时回包过）——丢弃迟到结果
+    }
+    const SSbxReq stReq = m_qSbx.takeAt(iIdx);
+    QJsonObject oReply;
+    oReply.insert(QStringLiteral("type"), QStringLiteral("sbxres"));
+    oReply.insert(QStringLiteral("ok"), a_bOk);
+    oReply.insert(QStringLiteral("text"), a_sText);
+    if (stReq.pSock != nullptr && stReq.pSock->state() != QLocalSocket::UnconnectedState) {
+        stReq.pSock->write(QJsonDocument(oReply).toJson(QJsonDocument::Compact) + "\n");
+        stReq.pSock->flush();
+        stReq.pSock->disconnectFromServer();
+    }
+}
+
+void CMainWindow::OnSbxWatchdog() {
+    if (m_qSbx.isEmpty()) {
+        if (m_pSbxWd != nullptr) {
+            m_pSbxWd->stop();
+        }
+        return;
+    }
+    const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
+    const qint64 iLimitMs = 150000;   // < MCP/CLI 对端 180s 等待上限
+    for (int i = m_qSbx.size() - 1; i >= 0; --i) {
+        const qint64 iT0 = qAbs(m_qSbx.at(i).iT0Ms);   // 负值=已投池在飞
+        if (iNow - iT0 > iLimitMs) {
+            const qint64 iSeq = m_qSbx.at(i).iSeq;
+            qWarning("[SbxWd] 命令 %lld (%s) 超时 150s，回错误包（池线程若仍 hung 则泄漏）",
+                     iSeq, qPrintable(m_qSbx.at(i).sCmd));
+            FinishSbx(iSeq, false,
+                      QStringLiteral("[沙箱命令超时：目标窗口无响应或 UIA 阻塞，建议检查被测程序后重试]"));
+        }
+    }
+    if (m_qSbx.isEmpty() && m_pSbxWd != nullptr) {
+        m_pSbxWd->stop();
+    }
+}
+
+void CMainWindow::OnAdhocHealthCheck() {
+    // 2026-10-02 孤儿 busy 看门狗：面板 bRunning=true 但编排器侧会话不存在/runner
+    //   无活性（进程已终、无宽限/重试）＝结束信号在某一环节丢失（实测：档切换竞态
+    //   丢 OnAdhocFinished；防御其他未知漏发路径）——连续两次不健康即自动恢复输入栏
+    //   并记事件。正常链路全程同线程同步，不存在合法的「面板 running 而会话无活性」
+    //   空档，二次确认仅兑底极端调度场景。
+    if (m_pOrch == nullptr || m_pExecPanel == nullptr) {
+        return;
+    }
+    const QStringList aRunning = m_pExecPanel->RunningAsstIds();
+    for (const QString& sId : aRunning) {
+        if (m_pOrch->IsAsstAdhocRunning(sId)) {
+            m_aAdhocSuspect.remove(sId);
+            continue;
+        }
+        if (!m_aAdhocSuspect.contains(sId)) {
+            m_aAdhocSuspect.insert(sId);   // 首次不健康：待下轮复确认
+            continue;
+        }
+        m_aAdhocSuspect.remove(sId);
+        m_pExecPanel->SetAsstRunning(sId, false);
+        m_pExecPanel->OnAdhocEvent(sId, QStringLiteral("self_heal"),
+            QStringLiteral("⚠ 检测到助手运行态孤儿（进程已结束但结束信号丢失，可能因档切换竞态），"
+                           "已自动恢复输入栏；若刚才的工作未完成请重发指令"));
+    }
+    // 疑点表里已不在运行列表的 id 清掉（助手被删/档切换重建）
+    for (auto it = m_aAdhocSuspect.begin(); it != m_aAdhocSuspect.end();) {
+        if (!aRunning.contains(*it)) {
+            it = m_aAdhocSuspect.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -2816,32 +3287,81 @@ void CMainWindow::SaveAssistantState() {
         m_pOrch == nullptr || m_pExecPanel == nullptr) {
         return;
     }
-    // 2026.09.03 多助手并发：全部助手的编排器会话现值回填面板镜像（per-助手 常驻，
-    //   不再区分运行/激活归属），随后整档 v2 序列化（backend / active / assistants[]）。
-    const QJsonArray aProbe = m_pExecPanel->AssistantsToJson();
-    for (const QJsonValue& v : aProbe) {
-        if (v.isObject()) {
-            const QString sId = v.toObject().value(QStringLiteral("id")).toString();
-            if (!sId.isEmpty()) {
-                SyncOrchToPanel(sId);
+    // 2026-10-02 分组落盘（跨档幽灵配套）：面板助手按 sOwnerKey 分组——
+    //   · 视图档（owner == m_pExecPanel->ViewKey()）全量覆盖（面板持有该档完整集合，
+    //     增删改以面板为准）；
+    //   · 外档（owner ≠ 视图 key，只含运行中幽灵）合并覆盖：读该档现文件，按 id 用
+    //     面板幽灵的最新块/会话链覆写同名项，其余 id 原样保留（不丢该档未载入的助手）。
+    //   每组独立写自己的档文件；无该组面板成员则不写（未动过的档保持原样）。
+    auto fnWriteGroup = [this](const QString& a_sKey, const QJsonArray& a_aGroup) {
+        if (a_aGroup.isEmpty()) {
+            return;
+        }
+        QJsonArray aFinal = a_aGroup;
+        QString sActive;
+        if (a_sKey == m_pExecPanel->ViewKey()) {
+            sActive = m_pExecPanel->ActiveAsstId();   // 本档：当前激活助手
+        } else {
+            // 外档：合并盘上现档（面板幽灵覆写同名 id，其余保留）；
+            //   active 取盘上值（幽灵档的激活态无意义），无盘档回退首个。
+            const QByteArray aOld = a_sKey.isEmpty()
+                ? m_pPm->ReadAssistantState()
+                : m_pPm->ReadTaskAssistantState(a_sKey);
+            QJsonArray aMerged;
+            QJsonObject oOldRoot;
+            const QJsonDocument stOld = QJsonDocument::fromJson(aOld);
+            if (stOld.isObject()) {
+                oOldRoot = stOld.object();
+                sActive = oOldRoot.value(QStringLiteral("active")).toString();
+            }
+            QHash<QString, bool> aNewIds;
+            for (const QJsonValue& v : aFinal) {
+                aNewIds.insert(v.toObject().value(QStringLiteral("id")).toString(), true);
+            }
+            if (oOldRoot.contains(QStringLiteral("assistants"))) {
+                for (const QJsonValue& v : oOldRoot.value(QStringLiteral("assistants")).toArray()) {
+                    const QString sId = v.toObject().value(QStringLiteral("id")).toString();
+                    if (!aNewIds.contains(sId)) {
+                        aMerged.append(v);   // 盘上其余 id 保留
+                    }
+                }
+            }
+            aMerged = aFinal + aMerged;   // 面板幽灵在前（覆写版优先）
+            aFinal = aMerged;
+            if (sActive.isEmpty()) {
+                sActive = aFinal.at(0).toObject().value(QStringLiteral("id")).toString();
             }
         }
+        QJsonObject oRoot;
+        oRoot[QStringLiteral("version")]     = 2;
+        oRoot[QStringLiteral("backend")]     = CAgentRunnerFactory::BackendName();
+        oRoot[QStringLiteral("active")]      = sActive;
+        oRoot[QStringLiteral("assistants")]  = aFinal;
+        const QByteArray aData = QJsonDocument(oRoot).toJson(QJsonDocument::Compact);
+        if (a_sKey.isEmpty()) {
+            m_pPm->WriteAssistantState(aData);
+        } else {
+            m_pPm->WriteTaskAssistantState(a_sKey, aData);
+        }
+    };
+
+    // 会话现值回填（全量探测：本档 + 幽灵；SyncOrchToPanel 按 id 幂等）。
+    const QList<CExecutionPanel::SAsst> aSnapProbe = m_pExecPanel->AllAsstsSnapshot();
+    for (const CExecutionPanel::SAsst& st : aSnapProbe) {
+        SyncOrchToPanel(st.sId);
+        m_pExecPanel->UpdateAsstBackend(st.sId, m_pOrch->AsstAdhocBackend(st.sId));
     }
-    QJsonObject oRoot;
-    oRoot[QStringLiteral("version")]     = 2;
-    // 2026.08.18 sid/撤销栈是后端私有（claude 与 DSH 会话 id 互不相通）：存档记后端名，
-    //   LoadAssistantState 还原时后端不符则丢弃各助手 sid/撤销栈（对话块等其余字段后端无关照常恢复）。
-    oRoot[QStringLiteral("backend")]     = CAgentRunnerFactory::BackendName();
-    oRoot[QStringLiteral("active")]      = m_pExecPanel->ActiveAsstId();   // 重开时回到上次查看的助手
-    oRoot[QStringLiteral("assistants")]  = m_pExecPanel->AssistantsToJson();
-    const QByteArray aData = QJsonDocument(oRoot).toJson(QJsonDocument::Compact);
-    // 助手档按任务分档：选中任务 → .autodev/tasks/<id>/assistant.json（跟着任务走）；
-    //   无选中 → 工程全局 .autodev/assistant.json（与旧版完全兼容）。
-    //   key 取自当前 m_pCur——切换流程（SwitchAssistantArchive）保证 m_pCur 只在旧档落盘后才改。
-    if (m_pCur != nullptr) {
-        m_pPm->WriteTaskAssistantState(m_pCur->Id(), aData);
-    } else {
-        m_pPm->WriteAssistantState(aData);
+
+    // 视图档（全量覆盖）
+    fnWriteGroup(m_pExecPanel->ViewKey(), m_pExecPanel->AssistantsToJson());
+    // 外档幽灵（各归各档，合并覆盖）
+    QSet<QString> aDone;
+    for (const CExecutionPanel::SAsst& st : aSnapProbe) {
+        const QString sKey = st.sOwnerKey;
+        if (sKey != m_pExecPanel->ViewKey() && !aDone.contains(sKey)) {
+            aDone.insert(sKey);
+            fnWriteGroup(sKey, m_pExecPanel->AssistantsJsonOf(sKey));
+        }
     }
 }
 
@@ -2849,6 +3369,16 @@ void CMainWindow::LoadAssistantState() {
     if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty() ||
         m_pOrch == nullptr || m_pExecPanel == nullptr) {
         return;
+    }
+    // 2026-10-02 跨档幽灵：视图 key 跟 m_pCur（载入档）；档重建前摘下全部运行中助手
+    //   （跨档幽灵 + 本档运行者——切回归属档也不能杀在跑轮次，v3.2.259 E2E 实测误杀），
+    //   载完挂回：外档者粗体 Tab 继续跨档可见，本档者转正常。
+    m_pExecPanel->SetViewKey(m_pCur != nullptr ? m_pCur->Id() : QString());
+    const QString sOldTaskName = (m_pCur != nullptr) ? m_pCur->Name() : QString();
+    const QList<CExecutionPanel::SAsst> aPhantoms = m_pExecPanel->TakeRunningForReload();
+    QSet<QString> aKeepIds;
+    for (const CExecutionPanel::SAsst& st : aPhantoms) {
+        aKeepIds.insert(st.sId);
     }
     // 助手档按任务分档：选中任务读其私有档，否则读工程全局档（与 SaveAssistantState 对称）。
     const bool bTaskKey = (m_pCur != nullptr);
@@ -2858,9 +3388,12 @@ void CMainWindow::LoadAssistantState() {
         // 无存档（该任务还没用过助手 / 工程首次打开）：显式清空当前助手态。
         //   不能直接 return——否则上一档（别的任务或全局）的会话链/对话块会串进这一档，
         //   且随后的变更保存会把串来的内容写进本档文件。
-        m_pOrch->ResetAdhocSessions();   // 2026.09.03 多助手并发：空档清全部会话
+        m_pOrch->ResetAdhocSessions(aKeepIds);   // 空档清会话（幽灵会话保留）
         m_pExecPanel->ResetAssistants();
         m_pExecPanel->SetAdhocContext(QString(), 0);   // 激活助手复位后其快照归零
+        if (!aPhantoms.isEmpty()) {
+            m_pExecPanel->AttachForeignAssistants(aPhantoms, sOldTaskName);
+        }
         return;
     }
     const QJsonDocument oDoc = QJsonDocument::fromJson(aData);
@@ -2868,34 +3401,35 @@ void CMainWindow::LoadAssistantState() {
         return;
     }
     const QJsonObject oRoot = oDoc.object();
-    // 2026.08.18 后端校验：存档后端 ≠ 当前后端 → sid/撤销栈丢弃（claude --resume 吃到 DSH
-    //   sid 会直接报错；DSH 侧虽能自愈换新 sid，也一并跳过保持两方向语义一致）。
-    //   旧档无 backend 键 → 视为 claude（历史上唯一后端）；DSH 遇到旧 claude sid 自换新，安全。
+    // 2026.09.20 v2.4.193 粘性后端（取代旧「后端不符则清 sid/撤销栈」守卫）：逐助手
+    //   读 per-assistant "backend" 键（旧档无此键 → 回退档根 backend 键），随会话绑定
+    //   （LoadOrchFromPanel → LoadAsstAdhoc）——助手继续用它当时的 Harness，与当前
+    //   全局设置无关；未绑定（无键且根也无）的助手首次提交时才绑当前全局。
     const QString sBackend = oRoot.value(QStringLiteral("backend")).toString();
-    const bool bBackendOk = sBackend.isEmpty() || sBackend == CAgentRunnerFactory::BackendName();
     if (oRoot.contains(QStringLiteral("assistants"))) {
-        // v2 多助手档：逐助手恢复（后端不符 → 清各助手 sid/stack，块照常恢复）。
+        // v2 多助手档：逐助手恢复（粘性后端：无 per-assistant 键的旧助手回退档根
+        //   backend——即它们当时的后端；当前全局设置不影响已存档的助手绑定）。
         QJsonArray aAssts = oRoot.value(QStringLiteral("assistants")).toArray();
-        if (!bBackendOk) {
-            for (QJsonValueRef v : aAssts) {
-                if (v.isObject()) {
-                    QJsonObject o = v.toObject();
-                    o[QStringLiteral("sid")] = QString();
-                    o[QStringLiteral("stack")] = QJsonArray();
-                    v = o;
+        for (QJsonValueRef v : aAssts) {
+            if (v.isObject()) {
+                QJsonObject o = v.toObject();
+                if (!o.contains(QStringLiteral("backend"))) {
+                    o[QStringLiteral("backend")] = sBackend;   // 旧档回退档根后端
                 }
+                v = o;
             }
         }
         m_pExecPanel->LoadAssistantsFromJson(
             aAssts, oRoot.value(QStringLiteral("active")).toString());
     } else {
         // 旧版单助手档 → 兼容为单助手「助手」（旧任务打开后第一个助手即显示历史日志）。
-        const QString sSid = bBackendOk
-            ? oRoot.value(QStringLiteral("sid")).toString() : QString();
-        const QJsonArray aStack = bBackendOk
-            ? oRoot.value(QStringLiteral("stack")).toArray() : QJsonArray();
+        // 2026.09.20 v2.4.193 粘性后端：旧守卫（后端不符则丢 sid/stack）取消——助手
+        //   绑定档根 backend（它当时的 Harness），sid/stack 全量保留。
+        const QString sSid = oRoot.value(QStringLiteral("sid")).toString();
+        const QJsonArray aStack = oRoot.value(QStringLiteral("stack")).toArray();
         QJsonObject oOne;
         oOne[QStringLiteral("name")]      = QStringLiteral("助手");
+        oOne[QStringLiteral("backend")]   = sBackend;   // 粘性绑定档根后端
         oOne[QStringLiteral("sid")]       = sSid;
         oOne[QStringLiteral("guideHash")] = oRoot.value(QStringLiteral("guideHash")).toString();
         oOne[QStringLiteral("stack")]     = aStack;
@@ -2911,20 +3445,27 @@ void CMainWindow::LoadAssistantState() {
     // 统一收尾：2026.09.03 多助手并发——全部助手的会话链装进编排器（per-助手 常驻），
     //   进度条按激活助手快照还原。
     const QString sAct = m_pExecPanel->ActiveAsstId();
-    m_pOrch->ResetAdhocSessions();   // 先清旧档全部会话（含 runner，防档串）
+    m_pOrch->ResetAdhocSessions(aKeepIds);   // 先清旧档会话（含 runner，防档串；运行中全保留）
+    if (!aKeepIds.isEmpty()) {
+        m_pExecPanel->DropAsstEntries(QStringList(aKeepIds.begin(), aKeepIds.end()));   // 保留 id 的文件版让位
+    }
     const QJsonArray aAll = m_pExecPanel->AssistantsToJson();
     for (const QJsonValue& v : aAll) {
         if (!v.isObject()) { continue; }
         const QJsonObject o = v.toObject();
         const QString sId = o.value(QStringLiteral("id")).toString();
-        if (sId.isEmpty()) { continue; }
+        if (sId.isEmpty() || aKeepIds.contains(sId)) { continue; }   // 保留 id：会话活着，不覆盖
         m_pOrch->LoadAsstAdhoc(sId,
                                o.value(QStringLiteral("sid")).toString(),
                                o.value(QStringLiteral("stack")).toArray(),
-                               o.value(QStringLiteral("guideHash")).toString());
+                               o.value(QStringLiteral("guideHash")).toString(),
+                               o.value(QStringLiteral("backend")).toString());   // 2026.09.20 粘性后端
     }
     if (!sAct.isEmpty()) {
         m_pExecPanel->SetAdhocContext(sAct, m_pExecPanel->AsstCtxFill(sAct));
+    }
+    if (!aPhantoms.isEmpty()) {
+        m_pExecPanel->AttachForeignAssistants(aPhantoms, sOldTaskName);
     }
 }
 
@@ -2947,7 +3488,8 @@ void CMainWindow::LoadOrchFromPanel(const QString& a_sAsstId) {
     }
     m_pOrch->LoadAsstAdhoc(a_sAsstId, m_pExecPanel->AsstSid(a_sAsstId),
                            m_pExecPanel->AsstStack(a_sAsstId),
-                           m_pExecPanel->AsstGuideHash(a_sAsstId));
+                           m_pExecPanel->AsstGuideHash(a_sAsstId),
+                           m_pExecPanel->AsstBackend(a_sAsstId));   // 2026.09.20 粘性后端
 }
 
 void CMainWindow::OnAsstSwitched(const QString& a_sOldId, const QString& a_sNewId) {
@@ -2976,6 +3518,41 @@ void CMainWindow::OnAsstRemoved(const QString& a_sId, const QString& a_sNewActiv
     SaveAssistantState();
 }
 
+void CMainWindow::OnAsstForeignActivated(const QString& a_sOwnerKey) {
+    // 2026-10-02 点击外档幽灵 Tab：切回归属（任务选中/取消到工程档）。
+    //   SwitchAssistantArchive 同档早退保证幂等（重复点击/重建期重入无循环）。
+    if (m_pExecPanel == nullptr || m_pTaskPanel == nullptr) {
+        return;
+    }
+    CTaskInfo* pTarget = nullptr;
+    if (!a_sOwnerKey.isEmpty()) {
+        for (CTaskInfo* p : m_aTasks) {
+            if (p != nullptr && p->Id() == a_sOwnerKey) {
+                pTarget = p;
+                break;
+            }
+        }
+    }
+    if (pTarget != nullptr) {
+        m_pTaskPanel->SelectTask(pTarget);   // 内部 emit sigTaskSelected → OnTaskSelected 全链
+    } else {
+        // 归属工程档（或任务已删）：取消选中回工程档（面板空白点击同链）。
+        m_pTaskPanel->DeselectAll();
+    }
+}
+
+void CMainWindow::OnAsstForeignFinished(const QString& a_sAsstId) {
+    // 2026-10-02 外档幽灵轮次结束：最终块（含 done/收尾事件）落其归属档 → 面板除名 →
+    //   编排器会话释放（后续该任务再选中时经 LoadAsstAdhoc 从档恢复会话链）。
+    if (m_pOrch == nullptr || m_pExecPanel == nullptr) {
+        return;
+    }
+    SyncOrchToPanel(a_sAsstId);
+    SaveAssistantState();   // 分组落盘：该幽灵最新块随其档合并写入
+    m_pExecPanel->RemoveAsstEntry(a_sAsstId);
+    m_pOrch->RemoveAsstAdhoc(a_sAsstId);
+}
+
 void CMainWindow::OnAdhocRunFinished(const QString& a_sAsstId) {
     // 2026.09.03 多助手并发：该助手一轮结束——编排器会话现值回填其面板镜像（供落盘）。
     //   面板运行标记由其后连接的 OnAdhocFinished(id) 清除；无换载步骤。
@@ -2983,33 +3560,26 @@ void CMainWindow::OnAdhocRunFinished(const QString& a_sAsstId) {
         return;
     }
     SyncOrchToPanel(a_sAsstId);
+    // 2026-10-02 v3.0.220 挂起切换机制随「跨档幽灵」移除（档切换即时完成，无收尾补切）。
+    //   外档幽灵的收尾（最终块落其档 + 除名）走面板 sigAsstForeignFinished（OnAsstForeignFinished）。
 }
 
 void CMainWindow::SwitchAssistantArchive(CTaskInfo* a_pNewTask) {
-    // 助手档切换原语（跟着任务走）：停跑 → 旧档落盘 → 切 m_pCur → 恢复新档。
+    // 助手档切换原语（跟着任务走）：旧档落盘 → 切 m_pCur → 恢复新档。
     //   所有改变 m_pCur 的路径必须经此函数（而非裸赋值），否则旧档永不落盘、
     //   且 OnTaskSelected 里按 m_pCur 推导的存档 key 会把 A 任务的对话写进 B 任务的档。
+    //   2026-10-02 跨档幽灵（取代 v3.0.220 挂起切换）：运行中助手不再阻塞档切换——
+    //   旧档（含运行助手最新块）落盘后立即切新档，运行中助手以「外档幽灵」保留在面板
+    //   （粗体 Tab + 任务名 tooltip、输入禁用、点击切回），轮次继续跑、块持续落其档。
     const QString sOldKey = (m_pCur != nullptr) ? m_pCur->Id() : QString();
     const QString sNewKey = (a_pNewTask != nullptr) ? a_pNewTask->Id() : QString();
     if (sOldKey == sNewKey) {
         m_pCur = a_pNewTask;   // 同档（重复点选 / SelectTask 触发的二次 OnTaskSelected）：早退
         return;
     }
-    // 2026.08.26 取消选中（空白点击→a_pNewTask=nullptr）不再杀在跑助手：此前无条件
-    //   StopAdhoc——用户只是想看工程全局/取消选中，助手一轮被硬停。现在空目标且助手
-    //   在跑时跳过档切换（保持 m_pCur 与助手档不动，运行痕迹继续落旧档），本轮结束后
-    //   用户再点一次空白即完成真正的切档。任务→任务的切换仍按原语义停跑换档。
-    if (a_pNewTask == nullptr && m_pOrch != nullptr && m_pOrch->IsAnyAdhocRunning()) {
-        return;
-    }
-    // 1) 在跑的助手先停：⏹ 停止事件经 AppendAdhocBlock → sigAdhocBlocksChanged →
-    //    SaveAssistantState 写入【旧】key 文件（此时 m_pCur 仍指向旧任务，痕迹留在旧对话里）。
-    if (m_pOrch != nullptr && m_pOrch->IsAnyAdhocRunning()) {
-        m_pOrch->StopAllAdhoc();   // 2026.09.03 多助手并发：档内全部助手整组停
-    }
-    // 2) 旧档最终落盘（sid/撤销栈/guideHash/块/ctxFill 全量快照）。
+    // 1) 旧档最终落盘（分组：视图档全量 + 外档幽灵合并；运行中助手的最新块随组写入）。
     SaveAssistantState();
-    // 3) 切换 + 恢复新档（无档则显式清空，见 LoadAssistantState 空档分支）。
+    // 2) 切换 + 恢复新档（LoadAssistantState 内摘/挂幽灵 + 保留其会话；无档显式清空）。
     m_pCur = a_pNewTask;
     LoadAssistantState();
 }
@@ -3043,6 +3613,52 @@ void CMainWindow::ClearTasks() {
 }
 
 void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
+    // 2026.09.18 v2.3.175 退出确认（用户需求：任务/助手在跑时关窗弹提示，明确说明当前
+    //   工作、缺省选「否」）：命中任一运行态（流水线 runner/任一助手/改码前备份）先弹
+    //   确认框；取消则忽略关闭事件。后续退出路径（落盘/持久化）保持原有行为不变。
+    if (m_pOrch != nullptr
+            && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning()
+                || m_pOrch->IsBackupRunning())) {
+        QStringList aLines;
+        if (m_pOrch->IsRunnerBusy()) {
+            QString sLine = QStringLiteral("• 任务正在运行");
+            if (const CTaskInfo* pRun = m_pOrch->RunningTask()) {
+                sLine = QStringLiteral("• 任务「%1」正在运行").arg(pRun->Name());
+                if (const SStageDef* pDef = FindStage(pRun->CurrentStage())) {
+                    sLine += QStringLiteral("（阶段：%1）").arg(pDef->sNameZh);
+                }
+            }
+            aLines.append(sLine);
+        }
+        if (m_pExecPanel != nullptr) {
+            for (const QString& sId : m_pOrch->RunningAdhocIds()) {
+                aLines.append(QStringLiteral("• 助手「%1」正在运行")
+                                 .arg(m_pExecPanel->AsstDisplayName(sId)));
+            }
+        }
+        if (m_pOrch->IsBackupRunning()) {
+            aLines.append(QStringLiteral("• 改码前备份正在进行"));
+        }
+        QMessageBox oBox(this);
+        oBox.setIcon(QMessageBox::Warning);
+        oBox.setWindowTitle(QStringLiteral("退出 AutoCode"));
+        oBox.setText(QStringLiteral(
+            "当前有正在进行的工作：\n%1\n"
+            "退出将中断上述工作（中断的任务可稍后从任务列表「再次执行」继续，"
+            "助手对话已实时落盘不受影响）。\n\n确定要退出 AutoCode 吗？")
+            .arg(aLines.join(QChar('\n'))));
+        QPushButton* pBtnExit = oBox.addButton(
+            QStringLiteral("退出"), QMessageBox::YesRole);
+        QPushButton* pBtnCancel = oBox.addButton(
+            QStringLiteral("取消"), QMessageBox::NoRole);
+        oBox.setDefaultButton(pBtnCancel);   // 缺省选择：否（不退出）
+        oBox.setEscapeButton(pBtnCancel);    // Esc 同取消（误触保护）
+        oBox.exec();
+        if (oBox.clickedButton() != pBtnExit) {
+            a_pEvent->ignore();
+            return;
+        }
+    }
     // #1/#6 关闭前落盘助手状态 + 刷新所有挂起脏任务的对话流（去抖 timer 可能尚未到期）。
     if (m_pPm != nullptr && !m_pPm->ProjectDir().isEmpty() && m_pExecPanel != nullptr) {
         SaveAssistantState();
@@ -3081,6 +3697,11 @@ void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
                 QStringLiteral("ArtifactsSplit"),
                 QString::fromLatin1(m_pExecPanel->ArtifactsSplitState().toBase64()));
         }
+    }
+    // 2026-09-26 内置沙箱收尾：停钩子/扫描，全部停录像并还原幽灵窗口——
+    //   不还原会留下隐形窗口直到重启（用户无感知点击穿透假死）。
+    if (m_pSbx != nullptr) {
+        m_pSbx->Shutdown();
     }
     QMainWindow::closeEvent(a_pEvent);
 }

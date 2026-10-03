@@ -24,6 +24,18 @@ if /i "%~1"=="/hermes" set "HERMES_ONLY=1"
 ::      版本管理对话框「更新」调用，tag 由 AutoCode 经 ls-remote 解析后传入）----
 set "DSH_UPDATE=0"
 if /i "%~1"=="/update-dsh" set "DSH_UPDATE=1"
+:: ---- 参数/update-pi <Pi根> = 更新 PIAgent（版本管理对话框「更新」调用；Pi根=第 2 参
+::      带引号，配置的当前根（含 pi\ 子目录）：git pull --ff-only + pnpm install/build
+::      （dist 不入库必须重建）+ 同步 exe 侧部署副本（若与根不同目录））----
+set "PI_UPDATE=0"
+set "PI_UP_ROOT=%~2"
+if /i "%~1"=="/update-pi" set "PI_UPDATE=1"
+:: ---- 参数/hermes-update <Hermes根> = 更新既有 Hermes 安装（版本管理对话框「更新」
+::      调用；Hermes根=第 2 参带引号，配置的当前根，覆盖默认的脚本同级 HermesHarness；
+::      既有布局自动 fetch+reset——Node 形态含 pnpm 重建、Python 形态含补丁重敷）----
+set "HERMES_UPD=0"
+if /i "%~1"=="/hermes-update" set "HERMES_UPD=1"
+if /i "%~1"=="/hermes-update" set "HERMES_ONLY=1"
 :: ---- 参数/hermes-patch <root> = 给部署根 hermes_cli\oneshot.py 敷设 AutoCode
 ::      事件补丁（软编码：补丁源=脚本同级 hermes_oneshot_patch.py，venv python 执行；
 ::      幂等已含标记跳过。程序侧选 Hermes 后端保存时与 StartStage 兜底时自动调用）----
@@ -44,8 +56,13 @@ if "!DSH_UPDATE!"=="1" if not "%~3"=="" set "DSH_ROOT=%~3"
 for %%i in ("%~dp0HermesHarness") do set "HERMES_ROOT=%%~fi"
 set "HERMES_URL=%~2"
 if "!HERMES_URL!"=="" set "HERMES_URL=https://github.com/nousresearch/hermes-agent"
+:: 2026.09.20 /hermes-update 模式：第 2 参是【Hermes 根】而非仓库地址——覆盖默认
+::   HERMES_ROOT（兼容外部部署布局，同 /update-dsh 第 3 参口径）。
+if "!HERMES_UPD!"=="1" if not "%~2"=="" set "HERMES_ROOT=%~2"
 
 if "!DSH_UPDATE!"=="1" goto :BANNER_DSH_UPDATE
+if "!PI_UPDATE!"=="1" goto :BANNER_PI_UPDATE
+if "!HERMES_UPD!"=="1" goto :BANNER_HERMES
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
 if "!PI_ONLY!"=="1" goto :BANNER_PI
 if "!CODEX_ONLY!"=="1" goto :BANNER_CODEX
@@ -143,6 +160,7 @@ echo.
 
 :: ---- 1. 选择 Claude Code 接入后端（单装/更新模式跳过）----
 if "!DSH_UPDATE!"=="1" goto :UPDATE_DSH
+if "!PI_UPDATE!"=="1" goto :PI_UPDATE
 if "!DSH_ONLY!"=="1" goto :DETECT
 if "!PI_ONLY!"=="1" goto :DETECT
 if "!HERMES_ONLY!"=="1" goto :DETECT
@@ -562,6 +580,13 @@ if exist "!HERMES_ROOT!\dist\cli.js" (
     set "HFORM=NEW"
 )
 
+if "!HERMES_UPD!"=="1" if "!HFORM!"=="NEW" (
+    echo [错误] 该路径不是有效的 Hermes 安装根（未检出 dist\cli.js /
+    echo        hermes-agentun_agent.py）：
+    echo        !HERMES_ROOT!
+    echo        请到设置页 Hermes 页确认「根目录」配置后重试。
+    goto :HERMES_END
+)
 if "!HFORM!"=="NEW" (
     echo [安装] 浅克隆 Hermes 仓库 - 需联网，约几十 MB ...
     git !GIT_PROXY_ARGS! clone --depth 1 "!HERMES_URL!" "!HERMES_ROOT!\hermes-agent"
@@ -767,6 +792,110 @@ if exist "!PI_DST!\pi\packages\coding-agent\dist\cli.js" (
 echo.
 
 :PI_END
+goto :VERIFY
+
+:: ---- /update-pi 横幅（2026.09.20 版本管理「更新 PIAgent」）----
+:BANNER_PI_UPDATE
+echo ============================================================
+echo   更新 PIAgent（git pull + pnpm install/build）
+echo   更新根：!PI_UP_ROOT!
+echo   策略：git pull --ff-only（保留本地提交）
+echo         → pnpm 重建 dist（dist 不入库，必须重建）
+echo         → 同步 exe 侧部署副本（若与更新根不同目录）
+echo ============================================================
+echo.
+goto :ADMIN
+
+:: ---- /update-pi 更新段：按配置的 Pi 根自动更新（用户需求：旧 PI_SRC 兜底
+::      指向 exe 上级 PIAgent，外部源仓（如 QT\PIAgent）必报「源目录无效」）----
+:PI_UPDATE
+echo ============================================================
+echo   更新 PIAgent（根：!PI_UP_ROOT!）
+echo ============================================================
+if "!PI_UP_ROOT!"=="" (
+    echo [错误] 缺少 Pi 根参数。用法：install_env.bat /update-pi ^<Pi根^>
+    goto :PI_UPDATE_END
+)
+where git >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Git - 更新需要 Git，请先安装后重试。
+    goto :PI_UPDATE_END
+)
+where node >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 缺少 Node.js - 构建需要 Node 运行时，请先安装后重试。
+    goto :PI_UPDATE_END
+)
+set "PI_UP_PI=!PI_UP_ROOT!\pi"
+if not exist "!PI_UP_PI!\package.json" (
+    echo [错误] 路径不是有效的 PIAgent 根（缺 pi\package.json）：!PI_UP_ROOT!
+    echo        请到设置页 PIAgent 页确认「根目录」配置后重试。
+    goto :PI_UPDATE_END
+)
+set "PI_UP_REPO="
+if exist "!PI_UP_PI!\.git" set "PI_UP_REPO=!PI_UP_PI!"
+if "!PI_UP_REPO!"=="" if exist "!PI_UP_ROOT!\.git" set "PI_UP_REPO=!PI_UP_ROOT!"
+if "!PI_UP_REPO!"=="" (
+    echo [错误] 未找到 git 仓库（!PI_UP_ROOT! 与其下 pi\ 均无 .git）。
+    echo        该根可能是纯拷贝：请在源仓更新后用「安装 PIAgent…（本机源）」重部署。
+    goto :PI_UPDATE_END
+)
+echo [更新] git pull --ff-only（保留本地提交；分叉/冲突会失败并提示）...
+pushd "!PI_UP_REPO!"
+git pull --ff-only
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] git pull 失败 - 请到 !PI_UP_REPO! 手动处理（git status 查看分叉/
+    echo        冲突，提交或 rebase 后）重跑本更新。
+    goto :PI_UPDATE_END
+)
+popd
+where pnpm >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [安装] pnpm 包管理器 pnpm@11.7.0 ...
+    call npm install -g pnpm@11.7.0
+    call :RefreshPath
+    where pnpm >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo [错误] pnpm 安装失败 - 请手动执行 npm install -g pnpm@11.7.0 后重跑。
+        goto :PI_UPDATE_END
+    )
+)
+pushd "!PI_UP_PI!"
+echo [更新] pnpm install（依赖同步，数分钟）...
+call pnpm install
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] pnpm install 失败 - 请查看上方输出（网络/镜像）后重跑（可续跑）。
+    goto :PI_UPDATE_END
+)
+echo [更新] pnpm build（dist 不入库，必须重建；数分钟）...
+call pnpm run build
+if !errorlevel! neq 0 (
+    popd
+    echo [错误] 构建失败 - 请查看上方输出排查（Node 版本建议 22+）。
+    goto :PI_UPDATE_END
+)
+popd
+if not exist "!PI_UP_PI!\packages\coding-agent\dist\cli.js" (
+    echo [错误] 构建后仍未找到 packages\coding-agent\dist\cli.js - 请查看上方输出。
+    goto :PI_UPDATE_END
+)
+:: 部署副本同步：exe 侧 PIAgent 与更新根不同目录时才有意义（同目录=根即部署位，跳过）。
+for %%i in ("%~dp0PIAgent") do set "PI_DST=%%~fi"
+if /i not "!PI_DST!"=="!PI_UP_ROOT!" (
+    echo [同步] exe 侧部署副本 robocopy（!PI_UP_PI! → !PI_DST!\pi）...
+    if not exist "!PI_DST!" mkdir "!PI_DST!"
+    robocopy "!PI_UP_PI!" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+    if !errorlevel! GEQ 8 (
+        echo [错误] robocopy 失败（退出码 !errorlevel!）- 主更新已完成，副本未同步。
+    )
+)
+echo [OK] PIAgent 更新完成：!PI_UP_ROOT!
+echo        回到版本管理窗点「刷新版本」；AutoCode 配置的根未改动。
+echo.
+
+:PI_UPDATE_END
 goto :VERIFY
 
 :: ---- DSH 更新段（/update-dsh <tag>：fetch+reset 保留本地 + pnpm 重建 + 部署组合文件；

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QObject>
 #include <QString>
@@ -90,6 +90,17 @@ public:
     bool ReadFile(int a_iSeq, const QString& a_sRelPath, QByteArray& a_bufOut, QString& a_sErr) const;
     int  PurgeOwner(const QString& a_sOwner);           // 删 owner 全部版本+GC，返回释放 blob 数
     int  GcOrphanBlobs();                               // 无引用 blob 清理，返回删除数
+    // 2026.09.21 基准截断（用户需求：回退历史太多时选指定记录为基准、删更早的全部记录）：
+    //   删除所有 seq < a_iBaseSeq 的 meta（基准本身保留=最老可回退点）+ 孤儿 blob GC。
+    //   安全性依据：每版 manifest 全量自包含（path→hash 完整清单），删旧版不影响存活版
+    //   可恢复性；唯一例外=同源引用版（v1.4.85 无差异 alias，仅 base 指针）——凡 base
+    //   落在删除区间的先**物化**（基版 files 拷入该 meta、摘除 base 键，原子重写）再删。
+    //   a_bDryRun=true 只统计不动盘（确认框预估用）。安全阀：notice.json 待恢复现场拒绝；
+    //   GC 跳过 10 分钟内新写入的 blob（并发备份 blob 先落盘、meta 后提交的窗口保护）。
+    //   2026.09.21 补 a_iDeletedBlobs：删除的内容块文件数（完成提示「删了多少文件」用）。
+    bool TruncateBefore(int a_iBaseSeq, bool a_bDryRun,
+                        int& a_iDeletedVersions, int& a_iDeletedBlobs,
+                        qint64& a_iFreedBytes, QString& a_sErr);
     bool HasRestoreTmp() const;                         // _restore_tmp 残留探测
     bool DiscardRestoreTmp(QString& a_sErr);            // 丢弃残留现场（删 _restore_tmp，自 HarnessAgent 平移）
     bool RestoreFromTmp(QString& a_sErr);               // 残留现场还原（_restore_tmp 拷回源码根）
@@ -204,6 +215,9 @@ public:
     void RemoveRecent(const QString& a_sDir);
     // 当前 MRU 历史列表（内存，最前 = 最近打开）。
     QStringList RecentProjects() const;
+    // 2026.09.20 打开次数统计（与 RecentProjects 同序同长；旧档无计数键 → 1）：
+    //   AddRecent 每次命中累加，用于观察各工程的使用/修改频率。
+    QList<int> RecentOpenCounts() const { return m_aiRecentOpens; }
     // 从 exe 同级 config.ini 载入历史到内存（程序启动时调一次）。
     void LoadRecent();
     // 清空历史（本期 UI 不暴露，预留）。
@@ -289,12 +303,22 @@ public:
     // 单阶段最大迭代次数（驳回重跑熔断阈值，默认 3；合法 1..9）。
     bool SaveMaxIter(int a_iN);
     int  LoadMaxIter();
+    // 2026.09.22 评审驳回迭代熔断升级时弹人工介入窗（放行/再迭代/保持暂停）；缺省开，置 0 回旧静默口径。
+    bool LoadReviewAskOnEscalate();
     // 驳回后单阶段最大续跑次数（默认 3；合法 1..9）。
     bool SaveMaxResume(int a_iN);
     int  LoadMaxResume();
     // 评审阶段驳回后最大续跑次数（默认 1；合法 1..9）。
     bool SaveReviewResume(int a_iN);
     int  LoadReviewResume();
+
+    // ---- 代码审查引擎（config.ini 的 [Review] 段，2026-09-30 ReviewSdk 接入）----
+    // 任务 CodeReview 阶段静态预审开关（SdkOnStage，缺省开；关=回到纯 agent 评审）。
+    bool LoadReviewSdkOnStage();
+    // 单轮送审文件上限（SdkMaxFiles，缺省 12；防大改动任务预审耗时失控）。
+    int  LoadReviewSdkMaxFiles();
+    // 单文件 LLM 调用超时秒（SdkTimeoutSec，缺省 600；合法 60..3600）。
+    int  LoadReviewSdkTimeoutSec();
 
     // ---- Agent 运行参数（config.ini 的 [Agent] 段，设置对话框可改）----
     // claude 命令（默认 "claude"；可用绝对路径指向指定安装）。
@@ -315,6 +339,11 @@ public:
     //   固定布局由此推导；空=启动时探测 exe 同级 DeepSeekHarness 目录）。
     bool    SaveDshRoot(const QString& a_sRoot);
     QString LoadDshRoot();
+    // 2026.09.27 DSH 额外可写目录（[Dsh] ExtraWriteDirs；';' 分隔）：pwsh 沙箱的写
+    //   强制是纯 NTFS DACL，对额外目录授工作区写 SID 的 ACE 即放行（见
+    //   CDeepSeekRunner::ApplyExtraWriteDirs）；典型=插件工程的关联项目产物目录。
+    bool    SaveDshExtraWriteDirs(const QStringList& a_aDirs);
+    QStringList LoadDshExtraWriteDirs();
     // DSH 三路径（node.exe / bin.js / cordis.yml；空=未配置/按根目录推导，StartStage 前置校验报失败）。
     bool    SaveDshNodePath(const QString& a_sPath);
     QString LoadDshNodePath();
@@ -431,6 +460,30 @@ public:
     bool    SaveBackupExcludeDirs(const QString& a_sDirs);
     QString LoadBackupExcludeDirs() const;
 
+    // ---- 资源管理器显示隐藏目录（config.ini 的 [Explorer] HiddenDirs，逗号分隔）----
+    // 2026.09.23：内置硬编码隐藏清单（build/.git/.vs/node_modules）配置化——显式
+    //   配置整体覆盖内置默认（清空=全可见），缺键=内置默认。与备份排除/扫描排除
+    //   互不相干（那两个管备份范围与指纹扫描，这个只管资源管理器树显不显示）。
+    bool    SaveExplorerHiddenDirs(const QString& a_sDirs);
+    QString LoadExplorerHiddenDirs() const;
+    // 内置默认清单（缺键时的生效值；设置页预填用，与面板默认同源）。
+    static QString DefaultExplorerHiddenDirs();
+
+    // ---- 内置测试沙箱（2026-09-26，config.ini [Sandbox]，全局键不随任务覆盖）----
+    // Enable 总开关（默认开）：Agent 后代 GUI 窗口自动幽灵化收纳 + sandbox_* 命令通道；
+    // AutoGhost 自动收纳（默认开）；Record 自动录像（2026.10.02 起默认关，勾选后 MP4 存 exe\sandbox\rec）；
+    // Fps 录制帧率 1..15（默认 5）；RetainDays 录像保留天数 1..365（默认 7，启动清理）。
+    bool SaveSandboxEnable(bool a_bOn);
+    bool LoadSandboxEnable() const;
+    bool SaveSandboxAutoGhost(bool a_bOn);
+    bool LoadSandboxAutoGhost() const;
+    bool SaveSandboxRecord(bool a_bOn);
+    bool LoadSandboxRecord() const;
+    bool SaveSandboxFps(int a_iFps);
+    int  LoadSandboxFps() const;
+    bool SaveSandboxRetainDays(int a_iDays);
+    int  LoadSandboxRetainDays() const;
+
     // ---- 助手上下文窗口上限持久化（config.ini 的 [Adhoc] ContextLimit）----
     // 0=未设（回退按模型自动探测）；LoadAdhocContextLimit 无记录/非法值返回 0。
     bool   SaveAdhocContextLimit(qint64 a_iLimit);
@@ -438,9 +491,19 @@ public:
 
     // ---- 专家助手开关持久化（config.ini 的 [Adhoc] ExpertAssistant）----
     // 2026.08.26 闭环改造：启用后助手提交改码提示词时自动做编译/测试验证并回注重试；
-    // 缺省开启（1）；0=手工禁用（回到纯对话模式）。LoadExpertAssistant 无记录返回 true。
+    // 缺省关闭（0，2026.09.26 用户定稿）；1=手工启用（深度模式「规划→执行→验证」闭环）。
+    //   LoadExpertAssistant 无记录返回 false。
     bool SaveExpertAssistant(bool a_bOn);
     bool LoadExpertAssistant() const;
+    // 2026.09.26 专家助手深度链重启上限（[Adhoc] ExpertRestarts，默认 1；钳 0..5；
+    //   0=不自动重启；实现已在 .cpp，此前缺头文件声明导致编译断——补齐）。
+    int  LoadExpertRestarts() const;
+    // 2026.09.23 助手单轮 --max-turns（默认 40，合法 10..200）——大重构触顶可放大。
+    bool SaveAdhocMaxTurns(int a_iN);
+    int  LoadAdhocMaxTurns() const;
+    // 2026.09.23 v3.0.219 工作量评估开关（1=自动上调，0=恒用基值；缺省开）。
+    bool SaveAdhocMaxTurnsAuto(bool a_bOn);
+    bool LoadAdhocMaxTurnsAuto() const;
 
     // ---- FR-6 代码回退：源码备份 / 恢复 / 版本清单（纯本地 Qt 文件系统操作）----
     // 全量镜像工程源码到 .autodev/tasks/<id>/backups/<seq>/，返回版本序号（0=失败）。
@@ -473,6 +536,12 @@ public:
                          QByteArray& a_bufOut, QString& a_sErr) const;
     int  PurgeOwner(const QString& a_sOwner);
     int  GcOrphanBlobs();
+    // 2026.09.21 基准截断：删 seq<基准 的全部统一库版本+孤儿 blob GC（转发 CBackupStore：
+    //   TruncateBefore；存活引用版先物化）。dry-run 只预估不动盘。a_iDeletedBlobs=删除
+    //   的内容块文件数。
+    bool TruncateUnifiedBefore(int a_iBaseSeq, bool a_bDryRun,
+                               int& a_iDeletedVersions, int& a_iDeletedBlobs,
+                               qint64& a_iFreedBytes, QString& a_sErr);
     bool HasRestoreTmp() const;                 // _restore_tmp 残留探测（Open 尾/回退引擎前置）
     bool RestoreFromTmp(QString& a_sErr);       // 残留现场还原（拷回工程根）
     bool LoadPendingNotice(int& a_iTargetSeq, QString& a_sOwner) const;
@@ -545,6 +614,7 @@ private:
     std::atomic<bool> m_bFpSyncRunning = false;        // 2026.08.26 指纹同步后台线程占用标志（防重入/并发写 guide）
 
     QStringList   m_aRecentProjects;   // MRU，最前为最近
+    QList<int>    m_aiRecentOpens;     // 2026.09.20 打开次数（与上表同序：AddRecent 命中累加/新条目=1）
     // 统一备份库（惰性构造；mutable：const 适配层方法内构造）。
     mutable CBackupStore* m_pBackupStore = nullptr;
     mutable QMutex  m_MutexStore;             // 惰性构造互斥（后台 stage 线程并发）

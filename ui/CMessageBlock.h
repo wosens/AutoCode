@@ -6,6 +6,7 @@
 #include <QStringList>
 
 class QLabel;
+class QFrame;
 class QTextBrowser;
 class QPlainTextEdit;
 class QToolButton;
@@ -74,6 +75,8 @@ private:
     static QString PrettyLegacyJsonLine(const QString& a_sText);
     // 工具卡标题（含 ▶/▼ 箭头、首条摘要与合并 ×N 计数）
     QString HeaderText(bool a_bArrowDown) const;
+    // 2026.09.22 工具卡标题单行化：按当前宽度省略号截断（ElideMiddle），全文进 tooltip
+    void UpdateToolHeaderText();
     // 工具卡：构造 diff/入参内容
     void RebuildToolContent();
 
@@ -97,6 +100,9 @@ private:
 
     // Event / System / Error
     QLabel*         m_pLabel = nullptr;
+    // 2026.09.18 用户提示词（eventKind=user）顶部贯穿左右的 3px 分隔横线
+    //   （仅助手日志的用户块；构建于 SetEvent 首次遇到 user 时，幂等）。
+    QFrame*         m_pUserSep = nullptr;
     // System 折叠组：已归组的系统行（Error 不折叠，无此列表）
     QStringList     m_aSysLines;
 };

@@ -45,6 +45,9 @@ private slots:
     // 2026.08.24 文件列表右键菜单（「查看变更」）。
     void OnFilesContextMenu(const QPoint& a_pos);
     void OnFilesCellDoubleClicked(int a_iRow, int a_iCol);
+    // 2026.09.21 版本列表右键菜单（「设为基准：删除更早记录」）。
+    void OnVersionsContextMenu(const QPoint& a_pos);
+    void OnSetBaseline();
 
 private:
     void BuildUi();

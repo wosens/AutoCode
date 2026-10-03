@@ -69,6 +69,7 @@ private slots:
         CHermesRunner::SetHermesModel(QString());
         CHermesRunner::SetHermesApiKey(QString());
         CHermesRunner::SetHermesBaseUrl(QString());
+        CHermesRunner::SetHermesApi(QString());   // 2026.09.21 协议静态项同步还原
     }
 
     void cleanup() {
@@ -374,8 +375,18 @@ private slots:
         QVERIFY(!CHermesRunner::HermesConfigError().isEmpty());
         CHermesRunner stRunner;
         QSignalSpy spyFinished(&stRunner, &CAgentRunnerBase::sigFinished);
+        // 环境隔离（勿回退）：探测链 1.5/3/4 会命中本机 HERMES_HOME 与 PATH 上的真实
+        //   hermes（2026.09.02 起机器级安装，install_env.bat 写 HKCU/PATH）——显式根无 CLI
+        //   时短路失效 → 真实 hermes -z 启动 ~10s → 5s 超时假失败。配置错误路径在
+        //   StartStage 内同步 emit，隔离后可立即还原环境。
+        const QByteArray aOldHome = qgetenv("HERMES_HOME");
+        const QByteArray aOldPath = qgetenv("PATH");
+        qputenv("HERMES_HOME", "");
+        qputenv("PATH", "C:\\Windows\\System32;C:\\Windows");
         stRunner.StartStage(oTmp.path(), QStringLiteral("hi"),
                             QString(), 1, QString(), false, 0, false);
+        qputenv("HERMES_HOME", aOldHome);
+        qputenv("PATH", aOldPath);
         QTRY_COMPARE_WITH_TIMEOUT(spyFinished.size(), 1, 5000);
         QCOMPARE(spyFinished.at(0).at(0).toBool(), false);
         QVERIFY(!stRunner.IsRunning());
@@ -463,6 +474,71 @@ private slots:
         QVERIFY(f2.open(QIODevice::ReadOnly));
         QCOMPARE(f2.readAll(), aFirst);
         f2.close();
+    }
+
+    // 2026.09.21 协议感知：anthropic-messages 端点 → model 段写 api_mode:
+    //   "anthropic_messages"（hermes 主运行时据此切 Anthropic 传输——他机
+    //   GLM-5.3 网关 /claude 路由 404 实录的修复）；openai/空协议 → 显式
+    //   "chat_completions"；协议切换后重写（旧值行移除，恰一处）。
+    void testEnsureHermesHomeConfigApiMode() {
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sYaml = oTmp.path() + QStringLiteral("/config.yaml");
+        CHermesRunner::SetHermesModel(QStringLiteral("glm-5.3"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("k-1"));
+        // anthropic-messages 端点（Claude Code 同链路）→ api_mode=anthropic_messages。
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://gw:9000/claude"));
+        CHermesRunner::SetHermesApi(QStringLiteral("anthropic-messages"));
+        QVERIFY(CHermesRunner::EnsureHermesHomeConfig(sYaml));
+        {
+            QFile f(sYaml);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString sTxt = QString::fromUtf8(f.readAll());
+            f.close();
+            QCOMPARE(sTxt.count(QStringLiteral("api_mode:")), 1);
+            QVERIFY(sTxt.contains(QStringLiteral("api_mode: \"anthropic_messages\"")));
+            QVERIFY(sTxt.contains(QStringLiteral("base_url: \"http://gw:9000/claude\"")));
+        }
+        // 幂等：同配置再调产物不变。
+        QByteArray aBefore;
+        {
+            QFile f(sYaml);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            aBefore = f.readAll();
+            f.close();
+        }
+        QVERIFY(CHermesRunner::EnsureHermesHomeConfig(sYaml));
+        {
+            QFile f(sYaml);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QCOMPARE(f.readAll(), aBefore);
+            f.close();
+        }
+        // 切回 openai 协议端点 → api_mode 重写为 chat_completions（旧行移除）。
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://gw:9000/api/v1"));
+        CHermesRunner::SetHermesApi(QStringLiteral("openai-completions"));
+        QVERIFY(CHermesRunner::EnsureHermesHomeConfig(sYaml));
+        {
+            QFile f(sYaml);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString sTxt = QString::fromUtf8(f.readAll());
+            f.close();
+            QCOMPARE(sTxt.count(QStringLiteral("api_mode:")), 1);
+            QVERIFY(sTxt.contains(QStringLiteral("api_mode: \"chat_completions\"")));
+            QVERIFY(!sTxt.contains(QStringLiteral("anthropic_messages")));
+            QVERIFY(sTxt.contains(QStringLiteral("base_url: \"http://gw:9000/api/v1\"")));
+        }
+        // 空协议（历史条目）→ 同 openai 口径。
+        CHermesRunner::SetHermesApi(QString());
+        QVERIFY(CHermesRunner::EnsureHermesHomeConfig(sYaml));
+        {
+            QFile f(sYaml);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QVERIFY(QString::fromUtf8(f.readAll())
+                        .contains(QStringLiteral("api_mode: \"chat_completions\"")));
+            f.close();
+        }
+        CHermesRunner::SetHermesApi(QString());   // 还原静态态，防污染后续用例
     }
 
     // v1.4.97 便携口径：exe 形态不再写 ~/.hermes（hermes-agent 只认部署根
@@ -648,11 +724,24 @@ private slots:
         QVERIFY2(!sOut.contains(QStringLiteral("hidden")), "隐藏目录应剪枝");
         QVERIFY2(!sOut.contains(QStringLiteral("junk")), "node_modules 应剪枝");
         QVERIFY2(sOut.contains(QStringLiteral("SKILL.md")), "应含 SKILL.md 路径供模型读取");
-        // ④ 空目录集 → 空串（不注入）。
-        QVERIFY(CAgentRunnerBase::SharedSkillsCatalogFromDirs(QStringList()).isEmpty());
-        // ⑤ 不存在的目录 → 空串。
-        QVERIFY(CAgentRunnerBase::SharedSkillsCatalogFromDirs(
-            { sRoot + QStringLiteral("/nope") }).isEmpty());
+        // ④ 空目录集 → 2026-09-26 起不再空串：内置沙箱铁律块无条件注入
+        //    （Agent 启动的 GUI 窗口自动收纳 + sandbox_* 命令，不依赖任何技能安装），
+        //    但技能清单本体仍为空（无技能名/无 SKILL.md 路径）。
+        {
+            const QString sEmpty = CAgentRunnerBase::SharedSkillsCatalogFromDirs(QStringList());
+            QVERIFY2(!sEmpty.isEmpty(), "内置沙箱铁律块应无条件注入");
+            QVERIFY2(sEmpty.contains(QStringLiteral("内置沙箱")),
+                     "空目录也应含沙箱铁律块");
+            QVERIFY2(!sEmpty.contains(QStringLiteral("SKILL.md：")),
+                     "无技能时不应有技能清单条目");
+        }
+        // ⑤ 不存在的目录 → 同 ④（仅沙箱铁律块，无技能清单）。
+        {
+            const QString sNone = CAgentRunnerBase::SharedSkillsCatalogFromDirs(
+                { sRoot + QStringLiteral("/nope") });
+            QVERIFY(!sNone.isEmpty());
+            QVERIFY(!sNone.contains(QStringLiteral("SKILL.md：")));
+        }
         // ⑥ 截断与钉选（2026.09.13）：详情预算 12KB 必然截断；钉选技能 ui-sandbox
         //    按字母序本排最后（真实机上排在第 289/294 位），旧版直接截断丢弃
         //    =「助手不自动使用沙箱技能」根因之一；现置顶永不被截，剩余技能压成名字串兑底。

@@ -1,4 +1,5 @@
-#include "CTaskListPanel.h"
+﻿#include "CTaskListPanel.h"
+#include "ui/CMenuIcon.h"
 
 #include <QTabWidget>
 #include <QListWidget>
@@ -184,6 +185,9 @@ CTaskListPanel::CTaskListPanel(QWidget* a_pParent)
     //   2026.08.21 增加 a_bSwitchTab：双击=true 切到预览页；单击=false 只加载不切页。
     connect(m_pExplorer, &CProjectExplorerPanel::sigFileOpen,
             this, &CTaskListPanel::sigFileOpen);
+    // 2026-09-30 转发「代码审查」信号给主窗口（弹 CCodeReviewDialog）。
+    connect(m_pExplorer, &CProjectExplorerPanel::sigCodeReview,
+            this, &CTaskListPanel::sigCodeReview);
     m_pVSplit->addWidget(m_pExplorer);
     // 初始默认上段高度 ≈ 旧限高（5 行 Tab + 按钮行），与改造前观感一致；
     //   精确值不关键，restoreState 命中即被覆盖，setSizes 只定首次布局。
@@ -368,6 +372,23 @@ void CTaskListPanel::RestoreSelection(CTaskInfo* a_pTarget) {
     }
 }
 
+void CTaskListPanel::DeselectAll()
+{
+    // 2026-10-02 程序化取消选中（外档幽灵点击回工程档用）：置 m_bAllowDeselect 后清
+    // 两表选中，走正常选中变更链（emit sigTaskSelected(nullptr) → OnTaskSelected 切档）。
+    m_bAllowDeselect = true;
+    if (m_pListCur != nullptr && m_pListCur->currentItem() != nullptr) {
+        m_pListCur->setCurrentItem(nullptr);
+        return;
+    }
+    if (m_pTreeHis != nullptr && m_pTreeHis->currentItem() != nullptr) {
+        m_pTreeHis->setCurrentItem(nullptr);
+        return;
+    }
+    m_bAllowDeselect = false;
+    emit sigTaskSelected(nullptr);   // 本就无选中（视觉已对齐）：直接触发链
+}
+
 void CTaskListPanel::SelectTask(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
@@ -403,6 +424,13 @@ void CTaskListPanel::SetProjectRoot(const QString& a_sDir) {
     // FR-3：转发给资源管理器刷新文件树根（空串=清空树）。
     if (m_pExplorer != nullptr) {
         m_pExplorer->SetRoot(a_sDir);
+    }
+}
+
+void CTaskListPanel::SetExplorerHiddenDirs(const QStringList& a_aNames) {
+    // 2026.09.23 资源管理器显示隐藏清单透传（设置保存/热重载/启动应用共用）。
+    if (m_pExplorer != nullptr) {
+        m_pExplorer->SetHiddenDirs(a_aNames);
     }
 }
 
@@ -672,11 +700,11 @@ void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
     CTaskInfo* pTask = TaskOf(pItem);
     if (pTask == nullptr) { return; }
     QMenu menu(this);
-    QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5（移首位：查看优先于再次执行）
+    QAction* pActView = menu.addAction(MenuIcon(QStringLiteral("ow-view")), QStringLiteral("查看任务内容"));   // FR-5（移首位：查看优先于再次执行）
     menu.addSeparator();   // 查看与再次执行之间加分隔线
-    QAction* pActRename = menu.addAction(QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
-    QAction* pActAutoName = menu.addAction(QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
-    QAction* pActRetry = menu.addAction(QStringLiteral("再次执行"));
+    QAction* pActRename = menu.addAction(MenuIcon(QStringLiteral("ow-rename")), QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
+    QAction* pActAutoName = menu.addAction(MenuIcon(QStringLiteral("ow-autoname")), QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
+    QAction* pActRetry = menu.addAction(MenuIcon(QStringLiteral("ow-rerun")), QStringLiteral("再次执行"));
     menu.addSeparator();   // 删除是破坏性操作，与常规项分隔
     QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
     QAction* pSel = menu.exec(m_pTreeHis->viewport()->mapToGlobal(a_pos));
@@ -703,11 +731,11 @@ void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     CTaskInfo* pTask = TaskOf(pItem);
     if (pTask == nullptr) { return; }
     QMenu menu(this);
-    QAction* pActView = menu.addAction(QStringLiteral("查看任务内容"));   // FR-5
+    QAction* pActView = menu.addAction(MenuIcon(QStringLiteral("ow-view")), QStringLiteral("查看任务内容"));   // FR-5
     menu.addSeparator();   // 查看与移除之间加分隔线
-    QAction* pActRename = menu.addAction(QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
-    QAction* pActAutoName = menu.addAction(QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
-    QAction* pActRemove = menu.addAction(QStringLiteral("移除"));
+    QAction* pActRename = menu.addAction(MenuIcon(QStringLiteral("ow-rename")), QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
+    QAction* pActAutoName = menu.addAction(MenuIcon(QStringLiteral("ow-autoname")), QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
+    QAction* pActRemove = menu.addAction(MenuIcon(QStringLiteral("ow-remove")), QStringLiteral("移除"));
     QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
     QAction* pSel = menu.exec(m_pListCur->viewport()->mapToGlobal(a_pos));
     if (pSel == pActView) {

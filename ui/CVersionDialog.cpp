@@ -16,6 +16,7 @@
 #include <QLineEdit>
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QFont>
 #include <QHBoxLayout>
@@ -51,7 +52,7 @@ const int kiQueryTimeoutMs       = 15 * 1000;   // 联网查询硬超时（npm/l
 
 // package.json → version（open 失败/解析错/无字段→空串）。
 QString fnReadPkgVersion(const QString& a_sPkgPath) {
-    QFile stFile(a_sPkgPath);
+    CFrwDevice stFile(a_sPkgPath);
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }
@@ -102,6 +103,10 @@ void CVersionDialog::SetupUi() {
     setFont(stFont);
 
     m_pTable = new QTableWidget(5, 5, this);
+    // 2026.09.20 列表字体显式 11 号（用户要求；不依赖继承，若全局默认变动仍恒 11）
+    //   + 行高 28px（11 号字舒适行高，防视觉偏小拥挤），窗口高度随行高微增。
+    m_pTable->setFont(stFont);
+    m_pTable->verticalHeader()->setDefaultSectionSize(28);
     m_pTable->setHorizontalHeaderLabels(QStringList()
         << QStringLiteral("后端") << QStringLiteral("当前版本")
         << QStringLiteral("最新版本") << QStringLiteral("结论") << QStringLiteral("操作"));
@@ -167,7 +172,7 @@ void CVersionDialog::SetupUi() {
     });
     connect(m_pBtnClose, &QPushButton::clicked, this, &QDialog::reject);
 
-    resize(760, 345);   // 2026.09 增 Hermes 行 5：随行数加高
+    resize(760, 380);   // 2026.09 增 Hermes 行 5 + 2026.09.20 行高 28px：随行数/行高加高
     UpdateInfoLine();
 }
 
@@ -218,15 +223,27 @@ void CVersionDialog::RefreshLocalVersions() {
                 : QStringLiteral("v%1").arg(sCodexVer));
 
     // —— 行 5 Hermes（2026.09 增补）：ResolveHermesCli 探测（根目录/同级
-    //   HermesHarness/PATH 三态，同设置页 DetectHermesInstalled）→ 根包
-    //   package.json 直读；无远端发布源，「最新版本」恒「未查询」。
+    //   HermesHarness/PATH 三态，同设置页 DetectHermesInstalled）；
+    //   2026.09.21 本地版本改优先取发布 tag（git describe 最近可达 v* tag，
+    //   日历版本核心，与远端最新 tag 同口径可比）；describe 不可用（非 git
+    //   部署/无 tag）回退包版本号直读（仅展示，Verdict 不参与比对）。
     const bool bHermesInstalled = !CHermesRunner::ResolveHermesCli().isEmpty();
-    const QString sHermesVer = bHermesInstalled ? CHermesRunner::ResolveHermesVersion()
-                                                : QString();
-    m_asLocalVer[5] = sHermesVer;
+    const QString sHermesRepo = bHermesInstalled ? CHermesRunner::HermesGitRepoDir()
+                                                 : QString();
+    // 比对用（日历版本核心）与显示用分离：非 git 部署的包版本号（如 0.21.3）
+    //   与日历 tag（2026.9.14）不同构，绝不能进 m_asLocalVer[5] 参与比对。
+    QString sHermesCalVer = sHermesRepo.isEmpty() ? QString()
+        : ParseHermesDescribe(RunGitSync(
+            QStringList() << QStringLiteral("describe") << QStringLiteral("--tags")
+                          << QStringLiteral("--match") << QStringLiteral("v[0-9]*")
+                          << QStringLiteral("--abbrev=0") << QStringLiteral("HEAD"),
+            sHermesRepo));
+    m_asLocalVer[5] = sHermesCalVer;   // 空=无法参与 tag 比对（Verdict 明示无法比对）
+    const QString sHermesShow = !sHermesCalVer.isEmpty() ? sHermesCalVer
+        : (bHermesInstalled ? CHermesRunner::ResolveHermesVersion() : QString());
     SetLocalCell(5, !bHermesInstalled ? QStringLiteral("未安装")
-                : sHermesVer.isEmpty() ? QStringLiteral("未知")
-                : QStringLiteral("v%1").arg(sHermesVer));
+                : sHermesShow.isEmpty() ? QStringLiteral("未知")
+                : QStringLiteral("v%1").arg(sHermesShow));
 
     // 结论列随本地版本联动（Claude 行待探测收尾回调补算）。
     m_asLocalVer[1].clear();
@@ -257,6 +274,19 @@ void CVersionDialog::OnClaudeLocalDone(int a_iExitCode, const QString& a_sOut) {
     RefreshVerdicts();
     UpdateUpdateButtons();
     UpdateInfoLine();
+}
+
+QString CVersionDialog::RunGitSync(const QStringList& a_aArgs, const QString& a_sWorkDir) {
+    // 同步短命令捕获：仅本地 git 快调用（rev-parse/remote get-url，<1s）；
+    //   3s 兑底超时防卡 UI。失败/超时 → 空串（调用方自行兑底）。
+    QProcess stProc;
+    stProc.setWorkingDirectory(a_sWorkDir);
+    stProc.start(QStringLiteral("git.exe"), a_aArgs);
+    if (!stProc.waitForStarted(2000) || !stProc.waitForFinished(3000)) {
+        return QString();
+    }
+    return QString::fromUtf8(stProc.readAllStandardOutput())
+        .split(QLatin1Char('\n')).first().trimmed();   // 首行（rev-parse/get-url 单行输出）
 }
 
 void CVersionDialog::QueryLatestAll() {
@@ -328,6 +358,61 @@ void CVersionDialog::QueryLatestAll() {
         [fnQueryDone](int a_iExitCode, const QString& a_sOut) {
             fnQueryDone(2, a_iExitCode, a_sOut, true);
         });
+    // 2026.09.21 Hermes：发布 tag 版本号比对（同 DSH tag 口径）——最新版 =
+    //   git ls-remote --tags 最大 v* 发布 tag（此前 09.20 用 HEAD sha 比对，
+    //   被 main tip 高频提交刷成永远「有更新」，且旧结论「无语义化远端版本」
+    //   实为误判：上游有 34 个 v2026.M.D 发布 tag）。本地版本同步重读
+    //   git describe（发布 tag 核心语以供 Verdict）；非 git 部署均明示无法比对。
+    m_sHermesSyncAt.clear();
+    QString sHermesUrl;
+    const QString sHermesRepo = CHermesRunner::HermesGitRepoDir();
+    if (!sHermesRepo.isEmpty()) {
+        m_asLocalVer[5] = ParseHermesDescribe(RunGitSync(
+            QStringList() << QStringLiteral("describe") << QStringLiteral("--tags")
+                          << QStringLiteral("--match") << QStringLiteral("v[0-9]*")
+                          << QStringLiteral("--abbrev=0") << QStringLiteral("HEAD"),
+            sHermesRepo));
+        SetLocalCell(5, m_asLocalVer[5].isEmpty()
+            ? QStringLiteral("未知")
+            : QStringLiteral("v%1").arg(m_asLocalVer[5]));
+        sHermesUrl = RunGitSync(
+            QStringList() << QStringLiteral("remote") << QStringLiteral("get-url")
+                          << QStringLiteral("origin"),
+            sHermesRepo);
+        // 上次 fetch 时刻（.git/FETCH_HEAD mtime）：更新按钮的 git fetch 会刷新
+        //   它——「有新版本」尾注提示同步时点，供用户判断是否需要再次更新。
+        const QFileInfo stFh(QDir(sHermesRepo).filePath(QStringLiteral(".git/FETCH_HEAD")));
+        if (stFh.exists()) {
+            const QDateTime stAt = stFh.lastModified();
+            m_sHermesSyncAt = stAt.date() == QDate::currentDate()
+                ? stAt.toString(QStringLiteral("HH:mm"))
+                : stAt.toString(QStringLiteral("MM-dd HH:mm"));
+        }
+    } else {
+        m_asLocalVer[5].clear();
+    }
+    if (sHermesUrl.isEmpty()) {
+        sHermesUrl = QStringLiteral("https://github.com/nousresearch/hermes-agent");
+    }
+    StartPooledProcess(EProcQueryHermes, QStringLiteral("git.exe"),
+        QStringList() << QStringLiteral("ls-remote") << QStringLiteral("--tags")
+                      << sHermesUrl,
+        kiQueryTimeoutMs,
+        [this](int a_iExitCode, const QString& a_sOut) {
+            // 逐行 "<sha>\trefs/tags/v2026.9.14[^{}]"；取最大发布 tag 版本核心。
+            QString sSha;
+            const QString sVer = a_iExitCode == 0
+                ? PickLatestHermesTag(a_sOut.split(QLatin1Char('\n')), &sSha)
+                : QString();
+            if (!sVer.isEmpty()) {
+                m_asLatestVer[5] = sVer;
+            }
+            SetLatestCell(5, m_asLatestVer[5].isEmpty()
+                ? QStringLiteral("未查询")
+                : m_asLatestVer[5]);
+            RefreshVerdicts();
+            UpdateInfoLine();
+        });
     UpdateInfoLine();
 }
 
@@ -396,29 +481,41 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
                                "处理后重跑）；完成后回到本窗点「刷新版本」。"));
             return;
         }
-        // 源码形态：重部署本机源仓（exe 上级 PIAgent）→ 先确认源仓已拉新，
-        //   否则 robocopy 复制到的仍是旧源（design §3.3 前置文案显性化）。
+        // 2026.09.20 源码形态：自动按当前配置的 Pi 根更新（用户需求：旧流程固定走 bat
+        //   的 PI_SRC 兑底=exe 上级 PIAgent，外部源仓（如 QT\PIAgent）必报「源目录无效」）。
+        //   bat /update-pi <根>：git pull --ff-only（保留本地提交）+ pnpm install/build
+        //   （dist 不入库必须重建）+ exe 侧部署副本同步（与根不同目录时）。
+        const QString sPiRoot = CPiAgentRunner::PiRootPath();
+        if (sPiRoot.isEmpty() || !CPiAgentRunner::LooksLikePiRoot(sPiRoot)) {
+            QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
+                QStringLiteral("当前配置的 PIAgent 根无效：\n%1\n\n"
+                               "请到设置页 PIAgent 页确认根目录后重试。")
+                    .arg(QDir::toNativeSeparators(sPiRoot)));
+            return;
+        }
         if (!QFile::exists(sBat)) {
             QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
                 QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。").arg(sBatNative));
             return;
         }
         const int iRet = QMessageBox::question(this, QStringLiteral("更新 PIAgent"),
-            QStringLiteral("源码形态：将重部署本机源仓（exe 上级 PIAgent）到程序目录。\n"
-                           "请先在源仓拉取最新代码（git pull），否则版本不变。\n\n"
-                           "仍要继续吗？"),
+            QStringLiteral("将在当前 PIAgent 根的源仓执行更新：\n%1\n\n"
+                           "git pull --ff-only（保留本地提交）→ pnpm install + build\n"
+                           "（dist 不入库必须重建，数分钟）→ 同步 exe 侧部署副本（如不同目录）。\n\n"
+                           "仍要继续吗？").arg(QDir::toNativeSeparators(sPiRoot)),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (iRet != QMessageBox::Yes) {
             return;
         }
         if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 PIAgent"),
-                QStringLiteral("\"%1\" /pi").arg(sBatNative))) {
+                QStringLiteral("\"%1\" /update-pi \"%2\"")
+                    .arg(sBatNative, QDir::toNativeSeparators(sPiRoot)))) {
             QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
                 QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
             return;
         }
         QMessageBox::information(this, QStringLiteral("更新 PIAgent"),
-            QStringLiteral("已在管理员窗口中启动重部署（源码形态）。\n\n"
+            QStringLiteral("已在管理员窗口中启动更新（git pull + pnpm 重建）。\n\n"
                            "窗口出现「[OK]」才算完成（出现 [错误] 按提示"
                            "处理后重跑）；完成后回到本窗点「刷新版本」。"));
         break;
@@ -446,16 +543,48 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
         break;
     }
     case 5: {
-        // 未安装态直达「在线安装」（口径同设置页 OnInstallHermesNet）：提权跑
-        //   exe 同级 install_env.bat /hermes <仓库地址>（git 克隆 + pnpm 构建；
-        //   已装时脚本自动改 fetch+reset，本窗已装态按钮禁用走设置页，双保险）。
-        //   仓库地址不落 config（对齐其他后端无此项），点击时输入框现场给定。
+        // 2026.09.20 已装态真更新（旧版禁用指设置页）：按当前配置的 Hermes 根跑
+        //   bat /hermes-update <根>——既有布局自动 fetch+reset（Node 形态含 pnpm
+        //   重建；Python 形态含补丁重敷），保留本地文件（DSH 同口径）；根无效时
+        //   才指设置页。未安装态仍直达「在线安装」（口径同设置页 OnInstallHermesNet）。
         if (!CHermesRunner::ResolveHermesCli().isEmpty()) {
-            QMessageBox::information(this, QStringLiteral("Hermes"),
-                QStringLiteral("已检测到本机 Hermes 安装。\n\n"
-                               "更新请到设置页 Hermes 组用「联网安装（git）」"
-                               "拉取更新（已装时自动 fetch+reset），或"
-                               "「本机源安装（离线）」重部署。"));
+            const QString sHermesRoot = CHermesRunner::HermesRoot();
+            if (sHermesRoot.isEmpty()
+                    || !CHermesRunner::LooksLikeHermesRoot(sHermesRoot)) {
+                QMessageBox::information(this, QStringLiteral("更新 Hermes"),
+                    QStringLiteral("已检测到本机 Hermes，但配置的根目录无效：\n%1\n\n"
+                                   "请到设置页 Hermes 页确认根目录；或用「联网安装（git）」"
+                                   "在 exe 同级 HermesHarness 重装。")
+                        .arg(QDir::toNativeSeparators(sHermesRoot)));
+                return;
+            }
+            if (!QFile::exists(sBat)) {
+                QMessageBox::warning(this, QStringLiteral("更新 Hermes"),
+                    QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。")
+                        .arg(sBatNative));
+                return;
+            }
+            const int iRetH = QMessageBox::question(this, QStringLiteral("更新 Hermes"),
+                QStringLiteral("将在当前 Hermes 根执行更新：\n%1\n\n"
+                               "git fetch + reset --hard origin/HEAD（保留 node_modules/venv 等"
+                               "本地文件）→ 依形态重建（Node：pnpm install+build；Python："
+                               "补丁重敷 + hermes --version 验证）。\n\n"
+                               "仍要继续吗？").arg(QDir::toNativeSeparators(sHermesRoot)),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (iRetH != QMessageBox::Yes) {
+                return;
+            }
+            if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 Hermes"),
+                    QStringLiteral("\"%1\" /hermes-update \"%2\"")
+                        .arg(sBatNative, QDir::toNativeSeparators(sHermesRoot)))) {
+                QMessageBox::warning(this, QStringLiteral("更新 Hermes"),
+                    QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
+                return;
+            }
+            QMessageBox::information(this, QStringLiteral("更新 Hermes"),
+                QStringLiteral("已在管理员窗口中启动更新。\n\n"
+                               "窗口出现「[OK]」才算完成（出现 [错误] 按提示"
+                               "处理后重跑，可续装）；完成后回到本窗点「刷新版本」。"));
             return;
         }
         bool bOk = false;
@@ -615,19 +744,16 @@ void CVersionDialog::UpdateUpdateButtons() {
               .arg(CCodexRunner::ExpectedCodexVersion())
         : QStringLiteral("未安装：请先在设置页 Agent 组「安装 CodexHarness…」"));
 
-    // Hermes：无固定远端发布源（无 ls-remote 可解析的 tag/npm 包），已装时行内
-    //   「更新」恒禁用——更新统一走设置页 Hermes 组：「联网安装（git）」（已装时
-    //   脚本自动改 fetch+reset 更新）或「本机源安装（离线）」（robocopy 重部署）。
-    //   未安装时按钮改「在线安装」并直达同一条 git 安装链路（OnUpdateBackend
+    // Hermes：已装态「更新」直连 /hermes-update <配置根>（2026.09.20 真更新：旧版恒禁用
+    //   指设置页）；未装时按钮改「在线安装」直达同一条 git 安装链路（OnUpdateBackend
     //   case 5，仓库地址点击时输入框现场给定，不落 config）。
     const bool bHermesInstalled = !CHermesRunner::ResolveHermesCli().isEmpty();
     m_aBtnUpdate[5]->setText(bHermesInstalled ? QStringLiteral("更新")
                                               : QStringLiteral("在线安装"));
-    m_aBtnUpdate[5]->setEnabled(!bHermesInstalled);
+    m_aBtnUpdate[5]->setEnabled(true);
     m_aBtnUpdate[5]->setToolTip(bHermesInstalled
-        ? QStringLiteral(
-            "Hermes 无固定联网更新源：请到设置页 Hermes 组用「联网安装（git）」"
-            "拉取更新（已装时自动 fetch+reset），或「本机源安装（离线）」重部署")
+        ? QStringLiteral("按当前配置的 Hermes 根更新：git fetch+reset（保留本地文件；"
+                         "Node 形态含 pnpm 重建，Python 形态含补丁重敷）")
         : QStringLiteral("联网安装 Hermes Harness（git 克隆 + pnpm 构建，提权）；"
                          "仓库地址点击后输入（git URL 或本机仓库路径）"));
 }
@@ -773,7 +899,9 @@ void CVersionDialog::RefreshVerdicts() {
             SetVerdictCell(1, QStringLiteral("读取中…"));
             continue;
         }
-        SetVerdictCell(iBackend, Verdict(m_asLocalVer[iBackend], m_asLatestVer[iBackend], iBackend));
+        SetVerdictCell(iBackend, Verdict(m_asLocalVer[iBackend], m_asLatestVer[iBackend],
+                                         iBackend,
+                                         iBackend == 5 ? m_sHermesSyncAt : QString()));
     }
 }
 
@@ -914,8 +1042,57 @@ QString CVersionDialog::TagToVersion(const QString& a_sTag) {
     return reCore.match(s).hasMatch() ? s : a_sTag.trimmed();
 }
 
+QString CVersionDialog::PickLatestHermesTag(const QStringList& a_aLines, QString* a_pShaOut) {
+    // 逐行 ls-remote --tags 输出："<40位sha>\trefs/tags/v2026.9.14" 或附注 tag
+    //   剥离行 "...v2026.9.14^{}"（指向 commit 实体）。同版本名同时出现轻量与
+    //   剥离行时优先 ^{} 的 sha。杂项 tag（backup/、premerge 等）不匹配 v<数字>
+    //   直接排除。取 QVersionNumber 最大者。
+    static const QRegularExpression reLine(
+        QStringLiteral("^([0-9a-f]{40})\\s+refs/tags/(v\\d+(?:\\.\\d+)+)(\\^\\{\\})?\\s*$"),
+        QRegularExpression::MultilineOption);
+    QString sBestVer;
+    QString sBestSha;
+    QVersionNumber vBest;
+    for (const QString& sLine : a_aLines) {
+        const QRegularExpressionMatch m = reLine.match(sLine.trimmed());
+        if (!m.hasMatch()) {
+            continue;
+        }
+        const QString sVer = m.captured(2).mid(1);   // 去前导 v
+        const QVersionNumber vCur = QVersionNumber::fromString(sVer);
+        const bool bPeeled = m.captured(3).isEmpty();
+        if (vCur.isNull()) {
+            continue;
+        }
+        if (vCur > vBest) {
+            vBest = vCur;
+            sBestVer = sVer;
+            sBestSha = m.captured(1);
+        } else if (vCur == vBest && !bPeeled) {
+            // 同版本附注 tag：轻量行 sha=tag 对象，^{} 行 sha=commit 实体 → 覆盖。
+            sBestSha = m.captured(1);
+        }
+    }
+    if (sBestVer.isEmpty()) {
+        return QString();
+    }
+    if (a_pShaOut != nullptr) {
+        *a_pShaOut = sBestSha;
+    }
+    return sBestVer;
+}
+
+QString CVersionDialog::ParseHermesDescribe(const QString& a_sDescribe) {
+    // "v2026.9.14" / "v2026.9.14-4881-gc4f5dd0dad" → "2026.9.14"；
+    //   无 v<数字(.数字)+> 核心（如空串/致命错误文本）→ 空串。
+    static const QRegularExpression reDescribe(
+        QStringLiteral("^v?(\\d+(?:\\.\\d+)+)"));
+    const QRegularExpressionMatch m = reDescribe.match(a_sDescribe.trimmed());
+    return m.hasMatch() ? m.captured(1) : QString();
+}
+
 QString CVersionDialog::Verdict(const QString& a_sLocal, const QString& a_sLatest,
-                                int a_iBackend) {
+                                int a_iBackend, const QString& a_sHermesSyncAt) {
     // 优先级链：backend==2 超基线不兼容（先于“相等”——不兼容版本即便==远端
     //   也不能误导为“已是最新”）→ 相等 → backend==4 锁定 → latest 空 →
     //   新版 → 其它不等。
@@ -935,6 +1112,32 @@ QString CVersionDialog::Verdict(const QString& a_sLocal, const QString& a_sLates
         if (!vLat.isNull() && vLat > vBase) {
             return QStringLiteral("最新版 %1 不受支持（上游移除示例包），保持 %2")
                 .arg(sLatest, CDeepSeekRunner::SupportedDshTag());
+        }
+    }
+    if (a_iBackend == 5) {
+        // 2026.09.21 Hermes：发布 tag 版本号比对（同其余 Harness 的发布语义；
+        //   a_sLocal=git describe 日历版本核心，a_sLatest=远端最大发布 tag 核心，
+        //   HEAD sha 不再进结论）。相等=已最新；远端>本地=有新版本（附上次同步
+        //   时刻尾注）；本地空=非 git 部署明示；本地>远端/解析失败=落入通用
+        //   「与远端不同」；latest 空=落入通用「未查询」。
+        if (!sLatest.isEmpty() && sLocal.isEmpty()) {
+            return QStringLiteral("远端最新发布 v%1（本地非 git 部署，无法比对）")
+                .arg(sLatest);
+        }
+        if (!sLatest.isEmpty() && !sLocal.isEmpty()) {
+            const QVersionNumber vLoc = QVersionNumber::fromString(sLocal);
+            const QVersionNumber vLat = QVersionNumber::fromString(sLatest);
+            if (!vLoc.isNull() && !vLat.isNull() && vLoc == vLat) {
+                return QStringLiteral("已是最新（v%1）").arg(sLatest);
+            }
+            if (!vLoc.isNull() && !vLat.isNull() && vLat > vLoc) {
+                const QString sSync = a_sHermesSyncAt.trimmed().isEmpty()
+                    ? QString()
+                    : QStringLiteral("（本地上次同步 %1）").arg(a_sHermesSyncAt.trimmed());
+                return QStringLiteral("有新版本 v%1%2").arg(sLatest, sSync);
+            }
+            // 本地>远端（describe tag 新于远端查询值，短暂竞态）或任一不可解析
+            //   → 落入通用「与远端不同」。
         }
     }
     if (!sLocal.isEmpty() && sLocal == sLatest) {

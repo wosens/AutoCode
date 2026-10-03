@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QElapsedTimer>
 #include <QJsonObject>
@@ -65,6 +65,20 @@ public:
     //   node 留空时走 PATH 的 "node"（本机装了 node 即零配置）。
     static void SetDshRootPath(const QString& a_sRoot);
     static QString DshRootPath();
+    // 2026.09.27 DSH 额外可写目录（[Dsh] ExtraWriteDirs；';' 分隔）：DSH pwsh 沙箱
+    //   workspace-write 的强制是纯 NTFS DACL（拒绝标记由 stderr 特征分类，无路径
+    //   预检），可写根=会话 cwd=工程根，令牌限制组里带确定性工作区写 SID
+    //   （sha256(规范化工程根)→S-1-4-x-y）。对额外目录授同一 SID 的标准 ACE
+    //   （Allow，OI|CI，Write+Delete）即放行——零 harness 改动，对已部署副本全部
+    //   生效。典型：插件工程产物拷 关联项目\\Execute\\PlugIns 时把该目录加进来。
+    //   fs 文本写工具（fs-sandbox 路径检查）仍限工程根——二进制/拷贝走 pwsh 即可。
+    static void SetDshExtraWriteDirs(const QStringList& a_aDirs);
+    static QStringList DshExtraWriteDirs();
+    // 授/撤 ACE（幂等：已有精确 ACE 跳过；命名互斥防多实例竞态）：a_aRevoke 里不在
+    //   a_aGrant 的目录被撤销。返回失败目录数（0=全部成功；失败不阻断，日志可见）。
+    static int ApplyExtraWriteDirs(const QString& a_sWorkDir,
+                                  const QStringList& a_aGrant,
+                                  const QStringList& a_aRevoke = QStringList());
     // 2026.09.10 双布局：上游 dsh-v0.1.2 起移除 packages/examples（jsonrpc-demo/
     //   spine-demo），JSON-RPC SDK 转正为官方 profile（dsh CLI + --profile sdk）。
     //   DshLayoutOf 按 root 内入口文件判型：Legacy=examples/jsonrpc-demo/bin.js，

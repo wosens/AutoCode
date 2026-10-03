@@ -8,9 +8,20 @@
 #include <QSplitter>
 #include <QScrollBar>
 #include <QFile>
+#include <QLineEdit>
+#include <QCheckBox>
+#include <QPushButton>
+#include <QToolButton>
+#include <QShortcut>
+#include <QTextCursor>
+#include <QTextDocument>
+#include <QTextBlock>
+#include <QPalette>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QDir>
+#include "CMenuIcon.h"
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -70,6 +81,18 @@ void BuildHexPage(const QByteArray& a_aAll, qsizetype a_iOff, QString& a_sHex, Q
     }
 }
 
+// 2026.09.22 文件内查找高亮：命中后编辑器无焦点（焦点在查找输入框），QTextEdit
+//   /QPlainTextEdit 对无焦点选区按 QPalette::Inactive 组的 Highlight 绘制，Windows
+//   缺省为浅灰，命中文字看不清；这里把 Inactive 组改为蓝底白字（有焦点时仍走
+//   系统 Active 原生蓝，两态观感一致且始终可读）。
+void ApplyFindSelectionPalette(QWidget* a_pEdit) {
+    QPalette stPal = a_pEdit->palette();
+    const QColor clrBlue(0x00, 0x78, 0xD7);   // 系统选中蓝（Win11 强调色）
+    stPal.setColor(QPalette::Inactive, QPalette::Highlight, clrBlue);
+    stPal.setColor(QPalette::Inactive, QPalette::HighlightedText, Qt::white);
+    a_pEdit->setPalette(stPal);
+}
+
 QPlainTextEdit* MakeMonoEdit(QWidget* a_pParent) {
     auto* p = new QPlainTextEdit(a_pParent);
     p->setReadOnly(true);
@@ -79,7 +102,35 @@ QPlainTextEdit* MakeMonoEdit(QWidget* a_pParent) {
     f.setFamily(QStringLiteral("Consolas"));
     f.setPointSize(10);
     p->setFont(f);
+    ApplyFindSelectionPalette(p);   // 十六进制 ASCII 列查找命中同样需要蓝底高亮
     return p;
+}
+
+// 2026.09.22 文件内查找执行体：QTextEdit/QPlainTextEdit 共用的 find 包装——命中
+//   即选中并滚动（编辑器原生行为）；循环开启时未命中则回卷到文档首/尾重试一次。
+//   模板双型：QTextBrowser(纯文本/MD/HTML) 与 QPlainTextEdit(hex ASCII 列)。
+template<class T>
+bool FindInEditor(T* a_pEdit, const QString& a_sText, bool a_bBackward, bool a_bCase, bool a_bWrap) {
+    if (a_pEdit == nullptr || a_sText.isEmpty()) {
+        return false;
+    }
+    QTextDocument::FindFlags fl;
+    if (a_bBackward) {
+        fl |= QTextDocument::FindBackward;
+    }
+    if (a_bCase) {
+        fl |= QTextDocument::FindCaseSensitively;
+    }
+    if (a_pEdit->find(a_sText, fl)) {
+        return true;
+    }
+    if (!a_bWrap) {
+        return false;
+    }
+    QTextCursor c = a_pEdit->textCursor();
+    c.movePosition(a_bBackward ? QTextCursor::End : QTextCursor::Start);
+    a_pEdit->setTextCursor(c);
+    return a_pEdit->find(a_sText, fl);
 }
 
 } // namespace
@@ -124,6 +175,11 @@ public:
         m_pAsc->verticalScrollBar()->setValue(0);
     }
 
+    // 2026.09.22 查找落在 ASCII 列（可读列，命中即选中；hex 列是字节码无查找意义）。
+    bool FindText(const QString& a_sText, bool a_bBackward, bool a_bCase, bool a_bWrap) {
+        return FindInEditor(m_pAsc, a_sText, a_bBackward, a_bCase, a_bWrap);
+    }
+
 
 
 private:
@@ -153,6 +209,7 @@ void CFilePreviewWidget::BuildUi() {
     m_pText->setLineWrapMode(QTextBrowser::NoWrap);
     m_pText->setFont(fMono);
     m_pText->setOpenExternalLinks(false);
+    ApplyFindSelectionPalette(m_pText);   // 查找命中无焦点时蓝底可读
     m_pStack->addWidget(m_pText);
 
     // [1] Markdown
@@ -162,6 +219,7 @@ void CFilePreviewWidget::BuildUi() {
     QFont fMd;
     fMd.setPointSize(11);
     m_pMd->setFont(fMd);
+    ApplyFindSelectionPalette(m_pMd);
     m_pStack->addWidget(m_pMd);
 
     // [2] HTML
@@ -169,6 +227,7 @@ void CFilePreviewWidget::BuildUi() {
     m_pHtml->setReadOnly(true);
     m_pHtml->setOpenExternalLinks(true);
     m_pHtml->setFont(fMd);
+    ApplyFindSelectionPalette(m_pHtml);
     m_pStack->addWidget(m_pHtml);
 
     // [3] 十六进制
@@ -186,14 +245,153 @@ void CFilePreviewWidget::BuildUi() {
     auto* pLay = new QVBoxLayout(this);
     pLay->setContentsMargins(0, 0, 0, 0);
     pLay->setSpacing(0);
+    BuildFindUi(pLay);   // 2026.09.22 顶部查找工具栏 + 可展开查找栏
     pLay->addWidget(m_pStack, 1);
     pLay->addWidget(m_pStat);
 }
 
+// 2026.09.22 顶部工具栏（常驻「查找」按钮）+ 查找栏（Ctrl+F/按钮展开，Esc 关闭）。
+//   执行链：按钮/回车 → OnFindTriggered → FindText（当前视图分发）。选项：
+//   ↑上一个/↓下一个（↓缺省，回车=↓、Shift+回车=↑）、区分大小写（缺省关）、
+//   循环查找（缺省关，关时到底未命中即报「未找到」）。
+void CFilePreviewWidget::BuildFindUi(QVBoxLayout* a_pLay) {
+    // —— 工具栏（常驻） ——
+    m_pToolBar = new QWidget(this);
+    auto* pTbLay = new QHBoxLayout(m_pToolBar);
+    pTbLay->setContentsMargins(4, 2, 4, 2);
+    pTbLay->setSpacing(4);
+    QFont fTb = m_pToolBar->font();
+    fTb.setPointSize(11);
+    m_pToolBar->setFont(fTb);
+
+    m_pBtnFind = new QToolButton(m_pToolBar);
+    m_pBtnFind->setIcon(MenuIcon(QStringLiteral("ow-search")));
+    m_pBtnFind->setText(QStringLiteral("查找"));
+    m_pBtnFind->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_pBtnFind->setAutoRaise(true);
+    m_pBtnFind->setToolTip(QStringLiteral(
+        "打开查找栏（快捷键 Ctrl+F）"));
+    pTbLay->addWidget(m_pBtnFind);
+    pTbLay->addStretch(1);
+    connect(m_pBtnFind, &QToolButton::clicked, this, &CFilePreviewWidget::OnFindOpen);
+    // Ctrl+F（WidgetWithChildrenShortcut：焦点在本预览页内任一子控件时可用）。
+    //   唯一快捷键源（不在按钮上再设 setShortcut，防歧义双触发）。
+    auto* pScFind = new QShortcut(QKeySequence::Find, this);
+    pScFind->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(pScFind, &QShortcut::activated, this, &CFilePreviewWidget::OnFindOpen);
+
+    // —— 查找栏（初始隐藏） ——
+    m_pFindBar = new QWidget(this);
+    auto* pFLay = new QHBoxLayout(m_pFindBar);
+    pFLay->setContentsMargins(4, 2, 4, 2);
+    pFLay->setSpacing(4);
+    m_pFindBar->setFont(fTb);
+
+    pFLay->addWidget(new QLabel(QStringLiteral("查找:"), m_pFindBar));
+    m_pEditFind = new QLineEdit(m_pFindBar);
+    m_pEditFind->setPlaceholderText(
+        QStringLiteral("输入内容，回车下一个，Shift+回车上一个"));
+    m_pEditFind->setClearButtonEnabled(true);
+    m_pEditFind->setMinimumWidth(180);
+    pFLay->addWidget(m_pEditFind, 1);
+
+    m_pChkCase = new QCheckBox(QStringLiteral("区分大小写"), m_pFindBar);
+    m_pChkCase->setToolTip(QStringLiteral("勾选后按大小写精确匹配（缺省不区分）"));
+    pFLay->addWidget(m_pChkCase);
+    m_pChkWrap = new QCheckBox(QStringLiteral("循环"), m_pFindBar);
+    m_pChkWrap->setToolTip(
+        QStringLiteral("到底后回卷到另一端继续查找（缺省不循环，到底即停）"));
+    pFLay->addWidget(m_pChkWrap);
+
+    m_pBtnPrev = new QPushButton(QStringLiteral("↑ 上一个"), m_pFindBar);
+    m_pBtnPrev->setToolTip(QStringLiteral("向上查找（Shift+回车）"));
+    pFLay->addWidget(m_pBtnPrev);
+    m_pBtnNext = new QPushButton(QStringLiteral("↓ 下一个"), m_pFindBar);
+    m_pBtnNext->setToolTip(QStringLiteral("向下查找（缺省方向，回车）"));
+    m_pBtnNext->setDefault(false);
+    pFLay->addWidget(m_pBtnNext);
+
+    m_pLblFindSt = new QLabel(m_pFindBar);
+    m_pLblFindSt->setStyleSheet(QStringLiteral("color:#c0392b;"));
+    pFLay->addWidget(m_pLblFindSt);
+
+    auto* pBtnClose = new QToolButton(m_pFindBar);
+    pBtnClose->setText(QStringLiteral("✕"));
+    pBtnClose->setToolTip(QStringLiteral("关闭查找栏（Esc）"));
+    pBtnClose->setAutoRaise(true);
+    pFLay->addWidget(pBtnClose);
+
+    m_pFindBar->hide();
+    connect(m_pEditFind, &QLineEdit::returnPressed, this,
+            [this]() { OnFindTriggered(false); });
+    // Shift+回车 = 上一个（QLineEdit 无原生修饰键信号，快捷键补位）。
+    auto* pScPrev = new QShortcut(QKeySequence(QStringLiteral("Shift+Return")), m_pEditFind);
+    pScPrev->setContext(Qt::WidgetShortcut);
+    connect(pScPrev, &QShortcut::activated, this, [this]() { OnFindTriggered(true); });
+    auto* pScEsc = new QShortcut(QKeySequence(Qt::Key_Escape), m_pFindBar);
+    pScEsc->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(pScEsc, &QShortcut::activated, this, [this]() {
+        m_pFindBar->hide();
+        m_pLblFindSt->clear();
+        // 焦点还给当前视图（继续滚动/复制等键盘操作）。
+        if (m_pStack->currentWidget() != nullptr) {
+            m_pStack->currentWidget()->setFocus();
+        }
+    });
+    connect(pBtnClose, &QToolButton::clicked, this, [this]() {
+        m_pFindBar->hide();
+        m_pLblFindSt->clear();
+        if (m_pStack->currentWidget() != nullptr) {
+            m_pStack->currentWidget()->setFocus();
+        }
+    });
+    connect(m_pBtnPrev, &QPushButton::clicked, this, [this]() { OnFindTriggered(true); });
+    connect(m_pBtnNext, &QPushButton::clicked, this, [this]() { OnFindTriggered(false); });
+    // 查找词变化 → 清陈旧「未找到」提示（命中状态随词刷新）。
+    connect(m_pEditFind, &QLineEdit::textChanged, this,
+            [this]() { m_pLblFindSt->clear(); });
+
+    a_pLay->addWidget(m_pToolBar);
+    a_pLay->addWidget(m_pFindBar);
+}
+
+void CFilePreviewWidget::OnFindOpen() {
+    m_pFindBar->show();
+    m_pEditFind->setFocus();
+    m_pEditFind->selectAll();
+}
+
+void CFilePreviewWidget::OnFindTriggered(bool a_bBackward) {
+    m_pLblFindSt->clear();
+    const QString sText = m_pEditFind->text();
+    if (sText.isEmpty()) {
+        return;
+    }
+    if (!FindText(sText, a_bBackward, m_pChkCase->isChecked(), m_pChkWrap->isChecked())) {
+        m_pLblFindSt->setText(QStringLiteral("未找到"));
+    }
+}
+
+bool CFilePreviewWidget::FindText(const QString& a_sText, bool a_bBackward,
+                                   bool a_bCase, bool a_bWrap) {
+    QWidget* pCur = m_pStack->currentWidget();
+    if (pCur == m_pHexWrap && m_pHexWrap != nullptr) {
+        return static_cast<CFileHexView*>(m_pHexWrap)
+            ->FindText(a_sText, a_bBackward, a_bCase, a_bWrap);
+    }
+    if (QTextBrowser* pView = qobject_cast<QTextBrowser*>(pCur)) {
+        return FindInEditor(pView, a_sText, a_bBackward, a_bCase, a_bWrap);
+    }
+    return false;
+}
+
 void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
     m_sCurPath = a_sAbsPath;
+    if (m_pLblFindSt != nullptr) {
+        m_pLblFindSt->clear();   // 2026.09.22 换文件清陈旧「未找到」提示
+    }
     const QFileInfo stInfo(a_sAbsPath);
-    QFile stFile(a_sAbsPath);
+    CFrwDevice stFile(a_sAbsPath);
     if (stInfo.isDir() || !stFile.open(QIODevice::ReadOnly)) {
         m_pText->setPlainText(QStringLiteral("无法读取文件：\n%1").arg(a_sAbsPath));
         m_pStat->setText(QString());
@@ -361,4 +559,35 @@ void CFilePreviewWidget::ShowHex(const QByteArray& a_aBytes) {
             QStringLiteral(" · 十六进制仅显示前 %1KB").arg(kiHexPageSize / 1024));
     }
     m_pStack->setCurrentWidget(m_pHexWrap);
+}
+
+// 2026-09-30 代码审查定位：滚动到 1-based 指定行并整行选中（文本/MD/HTML 视图；
+// 十六进制无行号语义忽略）。当前栈页非文本类时优先在对应浏览器上定位（文件已加载）。
+void CFilePreviewWidget::GotoLine(int a_iLine) {
+    if (a_iLine < 1) {
+        return;
+    }
+    QTextBrowser* pView = qobject_cast<QTextBrowser*>(m_pStack->currentWidget());
+    if (pView == nullptr) {
+        // 十六进制页等：切回纯文本页再定位（审查目标均为文本代码文件）。
+        m_pStack->setCurrentWidget(m_pText);
+        pView = m_pText;
+        if (pView == nullptr) {
+            return;
+        }
+    }
+    QTextDocument* pDoc = pView->document();
+    if (pDoc == nullptr || pDoc->blockCount() < 1) {
+        return;
+    }
+    const int iLine = qMin(a_iLine, pDoc->blockCount());
+    const QTextBlock stBlk = pDoc->findBlockByNumber(iLine - 1);
+    if (!stBlk.isValid()) {
+        return;
+    }
+    QTextCursor cur(pDoc);
+    cur.setPosition(stBlk.position());
+    cur.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
+    pView->setTextCursor(cur);
+    pView->ensureCursorVisible();
 }

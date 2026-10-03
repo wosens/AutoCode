@@ -1,6 +1,7 @@
 ﻿#include "CArtifactView.h"
 
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QByteArray>
 
 CArtifactView::CArtifactView(QWidget* a_pParent)
@@ -10,7 +11,7 @@ CArtifactView::CArtifactView(QWidget* a_pParent)
 }
 
 void CArtifactView::ShowFile(const QString& a_sFilePath) {
-    QFile stFile(a_sFilePath);
+    CFrwDevice stFile(a_sFilePath);
     if (!stFile.open(QIODevice::ReadOnly)) {
         setPlainText(QStringLiteral("无法读取: %1").arg(a_sFilePath));
         return;

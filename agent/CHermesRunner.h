@@ -55,6 +55,10 @@ public:
     //    纯内存不落盘，由 CMainWindow 启动/设置保存路径回填——口径同 Pi/Codex）——
     static void    SetHermesRoot(const QString& a_sRoot);
     static QString HermesRoot();
+    // 2026.09.20 版本管理「最新版本」比对用：部署根下的 git 仓目录——exe 形态
+    //   （venv）= venv 上级（hermes-agent 仓根，含 root\hermes-agent 与平铺两布局）；
+    //   Node 形态 = cli.js 所在根；robocopy 拷贝部署（无 .git）→ 空串（无法比对）。
+    static QString HermesGitRepoDir();
     static void    SetHermesNodePath(const QString& a_sPath);
     static QString HermesNodePath();
     static void    SetHermesModel(const QString& a_sModel);
@@ -63,6 +67,14 @@ public:
     static QString HermesApiKey();
     static void    SetHermesBaseUrl(const QString& a_sUrl);
     static QString HermesBaseUrl();
+    // 2026.09.21 激活模型条目的 API 协议（sApi：anthropic-messages / openai-
+    //   completions）：Hermes custom provider 默认走 OpenAI chat/completions wire，
+    //   选中 Anthropic 协议端点（如网关 /claude 路由）时需在 config.yaml model
+    //   段写 api_mode: anthropic_messages，否则 OpenAI 客户端往 <base>/chat/
+    //   completions 发请求 → 网关 404「Route /claude/chat/completions not found」
+    //   → 重试 3 次退出 code 2（他机 GLM-5.3 实录）。
+    static void    SetHermesApi(const QString& a_sApi);
+    static QString HermesApi();
     // 激活模型条目的 contextWindow/maxTokens 回填（设置页/启动路径传入）；
     //   写 ~/.hermes 前经 qMin 钳位（kHermesMaxTokCap/kHermesCtxCap 单点收口）。
     static void    SetHermesRuntimeLimits(qint64 a_iCtx, int a_iMaxTok);
@@ -79,7 +91,11 @@ public:
     //   hermes-agent 的 HERMES_HOME）；找不到/非 exe 形态返回空串。
     static QString ResolveHermesHomeForExe(const QString& a_sCli);
     // exe 形态幂等注入部署根 config.yaml 的 model 段（default=模型 /
-    //   provider="custom" / base_url / api_key 四键；读-比-短路 + 临时文件
+    //   provider="custom" / base_url / api_key 四键 + api_mode（仅选中
+    //   anthropic-messages 协议端点时写入，2026.09.21；hermes _API_MODE_ALIASES
+    //   认 anthropic-messages→anthropic_messages，主运行时
+    //   _resolve_plain_custom_api_mode 读 model_cfg["api_mode"] 切 Anthropic
+    //   传输——<base>/v1/messages，同 Claude Code 链路）；读-比-短路 + 临时文件
     //   rename 原子替换；段内旧同名键行全部移除后在段首插一组——防 YAML 同键
     //   后位覆盖前位失效）。返回 false = 静态配置不全或写入失败（调用方提示
     //   不阻断启动）。a_sYamlPath 显式传入（单测离线/StartStage 共用）。

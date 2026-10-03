@@ -1,6 +1,7 @@
 ﻿#include "CTaskOrchestrator.h"
 
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QTextStream>
 #include <QDateTime>
 #include <QTimer>
@@ -9,6 +10,7 @@
 #include <QProcess>
 #include <QStandardPaths>
 #include <QRegularExpression>
+#include <QSet>
 #include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -20,6 +22,8 @@
 #include "core/CTaskInfo.h"
 #include "core/CStageMachine.h"
 #include "core/StageDef.h"
+#include "review/CReviewSdkClient.h"
+#include "review/CReviewService.h"
 
 CTaskOrchestrator::CTaskOrchestrator(CProjectManager* a_pPm, QObject* a_pParent)
     : QObject(a_pParent), m_pPm(a_pPm) {
@@ -61,6 +65,12 @@ CTaskOrchestrator::~CTaskOrchestrator() {
     }
     if (m_thAdhocBackup.joinable()) {
         m_thAdhocBackup.join();
+    }
+    // 2026-09-30 预审服务回收（先停在跑轮；服务自身析构会停线程）。
+    if (m_pSdkReview != nullptr) {
+        m_pSdkReview->Stop();
+        m_pSdkReview->deleteLater();
+        m_pSdkReview = nullptr;
     }
     // 2026.09.03 多助手并发：释放全部助手会话（runner 交 deleteLater 随父对象回收）。
     for (auto it = m_aAdhoc.begin(); it != m_aAdhoc.end(); ++it) {
@@ -191,6 +201,9 @@ void CTaskOrchestrator::StartTask(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
     }
+    m_bSingleStageRerun = false;   // 2026.09.28 清残留：单阶段重跑期间被停止时标志不随 Advance
+                                    //   复位，残留 true 会把下一个正常任务的盲个阶段误判为重跑截停
+    m_hEscalatedReview.remove(a_pTask->Id());   // 2026.09.22 重新启动即作废待裁决的升级（静默升级语义）
     a_pTask->SetPauseRequested(false);
     a_pTask->SetStopRequested(false);
 
@@ -314,6 +327,7 @@ void CTaskOrchestrator::StopTask(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
     }
+    m_bSingleStageRerun = false;   // 2026.09.28 停止即作废重跑标志（防残留误伤后续任务）
     a_pTask->SetStopRequested(true);
     // 2026.08.15 主动停止即时收尾：runner Stop 已改静默（不再借 kill 触发的 Crashed→sigFinished
     //   收尾——旧路径把用户停止误报成「claude 进程崩溃 + 阶段失败」），任务终态在此直接落 Stopped；
@@ -331,6 +345,18 @@ void CTaskOrchestrator::StopTask(CTaskInfo* a_pTask) {
     if (m_pCurTask == a_pTask) {
         StopReviewRunners();
     }
+    // 2026-09-30 SDK 静态预审期间停止：预审服务停 + 任务立即落 Stopped（分钟级预审
+    //   不能让 UI 等待；OnSdkPreReviewDone 的 StopRequested 分支兜底防双发）。
+    if (m_bSdkReviewRunning && m_sSdkReviewTaskId == a_pTask->Id()) {
+        if (m_pSdkReview != nullptr) {
+            m_pSdkReview->Stop();
+        }
+        if (a_pTask->Status() != ETaskStatus::Stopped) {
+            a_pTask->SetStatus(ETaskStatus::Stopped);
+            StageEvent(a_pTask, QStringLiteral("stopped"), QStringLiteral("任务已停止"));
+            emit sigTaskFinished(a_pTask, false);
+        }
+    }
     // 编译门是独立异步进程，停止时一并终止，避免 OnBuildFinished 在已停止的任务上继续推进。
     if (m_pBuildProc && m_pBuildProc->state() != QProcess::NotRunning && m_pCurTask == a_pTask) {
         m_pBuildProc->kill();
@@ -343,6 +369,12 @@ void CTaskOrchestrator::StopAll() {
     // 2026.08.22 先 join 后台备份线程：备份期间 BackupTree 长时间使用 CProjectManager
     // 的 store 指针，若不等待就切工程（Open → delete m_pBackupStore）会 use-after-free；
     // 备份为纯文件 IO（秒级），阻塞等待可接受。
+    // 2026.09.28 与析构同口径：join 前先请求中止——首轮全量扫描大工程可达数十分钟，
+    //   无条件等待会把 UI 卡死在切工程路径上。
+    if (m_pPm != nullptr) {
+        m_pPm->RequestBackupAbort();
+    }
+    m_bSingleStageRerun = false;   // 2026.09.28 停止即作废重跑标志
     if (m_thBackup.joinable()) {
         m_thBackup.join();
     }
@@ -357,6 +389,10 @@ void CTaskOrchestrator::StopAll() {
         m_pRunner->Stop();   // 2026.08.15 崩溃宽限期一并终止
     }
     StopReviewRunners();   // 评审并行 runner 一并终止，防切工程泄漏进程
+    // 2026-09-30 SDK 预审一并停（预审期间切工程/关程序不留后台 LLM 调用）。
+    if (m_bSdkReviewRunning && m_pSdkReview != nullptr) {
+        m_pSdkReview->Stop();
+    }
     if (m_pBuildProc != nullptr && m_pBuildProc->state() != QProcess::NotRunning) {
         m_pBuildProc->kill();
         m_pBuildProc->waitForFinished(3000);
@@ -368,6 +404,11 @@ void CTaskOrchestrator::StopAll() {
 bool CTaskOrchestrator::IsRunnerBusy() const {
     // 主 runner 在跑 或 任一评审并行 runner 在跑 → 全工程忙（堵抢占口子用）。
     // 2026.08.15 崩溃宽限期/快速失败重试等待期间 IsRunning()==false 但 runner 仍被占用，一并计入。
+    // 2026.09.28 编译门在跑也计入：旧实现构建期间 m_pRunner 空闲，StartTask 可启动另一
+    //   任务并改写 m_pCurTask，OnBuildFinished 会把构建结论记到新任务并错误推进其阶段。
+    if (m_pBuildProc != nullptr && m_pBuildProc->state() != QProcess::NotRunning) {
+        return true;
+    }
     if (m_pRunner != nullptr
         && (m_pRunner->IsRunning() || m_pRunner->IsGraceActive()
             || m_pRunner->IsRetryPending())) {
@@ -547,7 +588,7 @@ void CTaskOrchestrator::OnReviewViewFinished(CTaskInfo* a_pTask, const QString& 
     st.dCost = a_dCost; st.iIn = a_iIn; st.iOut = a_iOut;
     st.eDec = EReviewDecision::Pass;   // 默认 Pass：无决策行（max-turns/abstain）不参与一票否决
     if (QFileInfo::exists(sViewPath)) {
-        QFile stFile(sViewPath);
+        CFrwDevice stFile(sViewPath);
         if (stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
             st.sSummary = QTextStream(&stFile).readAll();
         }
@@ -674,8 +715,10 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
         }
         a_pTask->IncStageIter();
         if (a_pTask->StageIter() > MaxIter()) {
+            m_hEscalatedReview.insert(a_pTask->Id(), eCur);   // 2026.09.22 记住升级时的评审阶段（人工放行从它推进）
             a_pTask->SetCurrentStage(eBack);
             a_pTask->SetPauseRequested(true);   // 升级到用户
+            a_pTask->SetStatus(ETaskStatus::Paused);   // 2026.09.22 必须落 Paused：旧路径停在 Running 会被 StartTask 早退拒续（升级后无法「继续」）
             WriteEscalationReport(a_pTask, eBack);
             const QString sDigest = ExtractRejectDigest(a_pTask);
             StageEvent(a_pTask, QStringLiteral("escalation"),
@@ -684,6 +727,7 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
                     .arg(QStringLiteral(".autodev/tasks/%1/escalation.md").arg(a_pTask->Id()))
                     .arg(sDigest.left(120)));
             emit sigTaskChanged(a_pTask);
+            emit sigReviewEscalated(a_pTask);   // 2026.09.22 人工介入：UI 弹窗问放行/再迭代/保持暂停
             return;   // 升级，不自动推进
         }
         a_pTask->SetCurrentStage(eBack);
@@ -709,6 +753,55 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
     a_pTask->SetCurrentStage(*oNext);
     emit sigTaskChanged(a_pTask);
     QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+}
+
+void CTaskOrchestrator::ResolveReviewEscalation(CTaskInfo* a_pTask, int a_iChoice) {
+    // 2026.09.22 评审升级人工裁决回灌（sigReviewEscalated 弹窗的三个选项）。
+    //   守卫：任务空/工程关/待裁决记录已被清（重新启动过）→ 忽略，防对已漂移状态重复动作。
+    if (a_pTask == nullptr || m_pPm == nullptr) {
+        return;
+    }
+    const QString sId = a_pTask->Id();
+    if (!m_hEscalatedReview.contains(sId)) {
+        return;   // 已裁决过或任务重启过：忽略
+    }
+    const EStage eReview = m_hEscalatedReview.value(sId);
+    m_hEscalatedReview.remove(sId);
+
+    if (a_iChoice == 0) {
+        // 人工放行：视为评审通过，从升级时的评审阶段按 Pass 口径推进下一阶段。
+        a_pTask->SetPauseRequested(false);
+        a_pTask->ResetStageIter();
+        a_pTask->SetLastSessionId(QString());
+        StageEvent(a_pTask, QStringLiteral("manual_pass"),
+            QStringLiteral("✔ 人工确认：评审驳回经用户确认放行，继续推进（质量责任转用户确认）"));
+        const std::optional<EStage> oNext = CStageMachine::NextStage(TaskFlow(a_pTask), eReview);
+        if (!oNext.has_value()) {
+            a_pTask->SetCurrentStage(eReview);
+            a_pTask->SetStatus(ETaskStatus::Done);
+            StageEvent(a_pTask, QStringLiteral("done"), QStringLiteral("🎉 任务全部完成"));
+            emit sigTaskFinished(a_pTask, true);
+            return;
+        }
+        a_pTask->SetCurrentStage(*oNext);
+        emit sigTaskChanged(a_pTask);
+        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        return;
+    }
+    if (a_iChoice == 1) {
+        // 再迭代一轮：重置迭代计数（新一轮完整预算）后重跑回炉阶段（升级时已置为当前阶段）。
+        a_pTask->SetPauseRequested(false);
+        a_pTask->ResetStageIter();
+        StageEvent(a_pTask, QStringLiteral("manual_rerun"),
+            QStringLiteral("↻ 人工介入：重置迭代计数，重跑当前阶段"));
+        emit sigTaskChanged(a_pTask);
+        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        return;
+    }
+    // 2 = 保持暂停：任务维持 Paused（升级语义不变，用户可稍后点「继续」重跑）。
+    StageEvent(a_pTask, QStringLiteral("manual_pause"),
+        QStringLiteral("⏸ 人工介入：保持暂停，等待用户处理（可稍后点「继续」重跑）"));
+    emit sigTaskChanged(a_pTask);
 }
 
 void CTaskOrchestrator::RunCurrentStage(CTaskInfo* a_pTask) {
@@ -813,7 +906,18 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
     if (a_pTask != m_pCurTask) {
         m_aPendingTaskInjects.clear();
     }
+    // 2026-09-30 CodeReview 阶段 SDK 静态预审：变更文件先逐个过 ReviewSdk（分钟级、
+    //   后台线程），完成后带发现重入本函数注入 prompt——agent 评审多一份确定性输入。
+    //   配置关闭/dll 缺失/无变更清单 → 直接走原路径（零侵入）。
+    if (a_stDef.eStage == EStage::CodeReview && MaybeStartSdkPreReview(a_pTask, a_stDef)) {
+        return;
+    }
     QString sPrompt = BuildPrompt(a_pTask, a_stDef);
+    // 2026-09-30 SDK 预审结论块注入（同任务有块则附上；中断续跑路径同样附加）。
+    if (a_stDef.eStage == EStage::CodeReview
+        && m_sSdkReviewTaskId == a_pTask->Id() && !m_sSdkReviewBlock.isEmpty()) {
+        sPrompt += m_sSdkReviewBlock;
+    }
     // 2026.08.15 (熔断人工决策) 指导意见已并入本轮 prompt，一次性消费，防泄漏到后续阶段。
     if (!a_pTask->ResumeGuidance().isEmpty()) {
         a_pTask->SetResumeGuidance(QString());
@@ -849,6 +953,10 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
         //   保持续跑语义不回退成全量 prompt。
         QString sResume = QStringLiteral(
             "继续完成本阶段未完成的工作，从上次中断处接着做；不要重复已完成的改动。");
+        // 2026-09-30 SDK 预审结论随续跑指令一并携带（预审已在会话中断前完成）。
+        if (m_sSdkReviewTaskId == a_pTask->Id() && !m_sSdkReviewBlock.isEmpty()) {
+            sResume += m_sSdkReviewBlock;
+        }
         if (!m_aPendingTaskInjects.isEmpty()) {
             sResume += QStringLiteral("\n\n【用户介入指令】以下是任务运行期间用户提交的"
                                       "追加指令，请在继续工作时优先遵循、一并落实：\n%1")
@@ -875,8 +983,211 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
     }
 }
 
+CReviewService* CTaskOrchestrator::SdkReviewSvc() {
+    if (m_pSdkReview == nullptr) {
+        m_pSdkReview = new CReviewService(this);   // parent=this，析构统一回收
+    }
+    return m_pSdkReview;
+}
+
+QStringList CTaskOrchestrator::ParseChangedFilesList(const QString& a_sChangedMdAbs,
+                                                     const QString& a_sProjectDir) {
+    // changed_files.md（开发阶段落盘）行格式："+ <相对路径>" 新增 / "M <相对路径>" 修改 /
+    //   "- <相对路径>" 删除——只取前两类且磁盘上仍存在的（写入清单后又被删的剔陈）。
+    QStringList aOut;
+    if (a_sChangedMdAbs.isEmpty() || a_sProjectDir.isEmpty()
+        || !QFileInfo::exists(a_sChangedMdAbs)) {
+        return aOut;
+    }
+    CFrwDevice stFile(a_sChangedMdAbs);
+    if (!stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return aOut;
+    }
+    const QStringList aLines = QTextStream(&stFile).readAll()
+                                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    QSet<QString> seen;
+    for (QString sLine : aLines) {
+        sLine = sLine.trimmed();
+        if (sLine.size() < 3) {
+            continue;
+        }
+        const QChar cMark = sLine.at(0);
+        if (cMark != QLatin1Char('+') && cMark != QLatin1Char('M')
+            && cMark != QLatin1Char('m')) {
+            continue;   // '-' 删除行 / 其他说明文本
+        }
+        QString sRel = sLine.mid(1).trimmed();
+        if (sRel.isEmpty()) {
+            continue;
+        }
+        sRel.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        if (QDir::isAbsolutePath(sRel)) {
+            continue;   // 清单约定相对工程根；绝对路径属异常写法，跳过防误审
+        }
+        const QString sAbs = QDir::cleanPath(a_sProjectDir + QLatin1Char('/') + sRel);
+        if (!QFileInfo::exists(sAbs) || !QFileInfo(sAbs).isFile()) {
+            continue;
+        }
+        const QString sKey = sAbs.toLower();   // Windows 大小写不敏感去重
+        if (!seen.contains(sKey)) {
+            seen.insert(sKey);
+            aOut.append(sAbs);
+        }
+    }
+    return aOut;
+}
+
+bool CTaskOrchestrator::MaybeStartSdkPreReview(CTaskInfo* a_pTask, const SStageDef& a_stDef) {
+    if (a_pTask == nullptr || m_pPm == nullptr || m_bSdkReviewRunning) {
+        return false;
+    }
+    if (!m_pPm->LoadReviewSdkOnStage()) {
+        return false;   // 配置关闭：回纯 agent 评审
+    }
+    // 引擎可用性：dll 缺失/导出不全 → 一次性事件提示后按关闭处理（不阻断主流程）。
+    CReviewSdkClient* pSdk = CReviewSdkClient::Get();
+    QString sErr;
+    if (!pSdk->EnsureLoaded(&sErr)) {
+        static bool s_bWarned = false;
+        if (!s_bWarned) {
+            s_bWarned = true;
+            StageEvent(a_pTask, QStringLiteral("sdk_review"),
+                QStringLiteral(" ⚠ 审查引擎不可用，静态预审已跳过：%1").arg(sErr));
+        }
+        return false;
+    }
+    // 变更清单：任务自己的 changed_files.md（非全局最新——多任务并发防串档）。
+    const QString sChangedMd = m_pPm->TaskDir(a_pTask->Id())
+                             + QStringLiteral("/changed_files.md");
+    const QDateTime dtMt = QFileInfo(sChangedMd).lastModified();
+    // 复用判定：同任务/同迭代/清单未变且已有结论 → 不重跑（拒绝回炉重审同代码）。
+    if (m_sSdkReviewTaskId == a_pTask->Id()
+        && m_iSdkReviewIter == a_pTask->StageIter()
+        && dtMt.isValid() && m_dtSdkChangedMt.isValid() && m_dtSdkChangedMt == dtMt
+        && !m_sSdkReviewBlock.isEmpty()) {
+        return false;
+    }
+    QStringList aFiles = ParseChangedFilesList(sChangedMd, a_pTask->ProjectDir());
+    if (aFiles.isEmpty()) {
+        // 无送审文件（Develop 未落盘清单/清单为空）：清块直走 agent 评审。
+        m_sSdkReviewBlock.clear();
+        m_sSdkReviewTaskId.clear();
+        return false;
+    }
+    const int iCap = m_pPm->LoadReviewSdkMaxFiles();
+    const bool bTrunc = aFiles.size() > iCap;
+    if (bTrunc) {
+        aFiles = aFiles.mid(0, iCap);
+    }
+    CReviewService* pSvc = SdkReviewSvc();
+    if (pSvc == nullptr) {
+        return false;
+    }
+    m_bSdkReviewRunning = true;
+    m_sSdkReviewTaskId  = a_pTask->Id();
+    m_iSdkReviewIter    = a_pTask->StageIter();
+    m_dtSdkChangedMt    = dtMt;
+    m_sSdkReviewBlock.clear();
+    StageEvent(a_pTask, QStringLiteral("sdk_review"),
+        QStringLiteral("▶ 静态预审 %1 个变更文件（ReviewSdk %2，后端 %3）%4")
+            .arg(QString::number(aFiles.size()), pSdk->Version(),
+                 CAgentRunnerFactory::BackendDisplayName(),
+                 bTrunc ? QStringLiteral("（超上限截断）") : QString()));
+    const QPointer<CTaskInfo> pGuard(a_pTask);
+    const SStageDef stDef = a_stDef;
+    m_cSdkDone = connect(pSvc, &CReviewService::sigReviewDone, this,
+        [this, pGuard, stDef](bool bOk, bool bStopped, const QString& sJson,
+                              const QString& sMd, int iFiles, int iFindings) {
+            disconnect(m_cSdkDone);
+            if (pGuard.isNull()) {
+                m_bSdkReviewRunning = false;
+                return;   // 预审期间任务被删除/归档回收
+            }
+            OnSdkPreReviewDone(pGuard.data(), stDef, bOk, bStopped, sJson, sMd,
+                               iFiles, iFindings);
+        });
+    if (!pSvc->Start(a_pTask->ProjectDir(), aFiles, m_pPm->LoadReviewSdkTimeoutSec())) {
+        disconnect(m_cSdkDone);
+        m_bSdkReviewRunning = false;
+        m_sSdkReviewBlock.clear();
+        StageEvent(a_pTask, QStringLiteral("sdk_review"),
+                   QStringLiteral(" ⚠ 静态预审启动失败，本轮跳过注入"));
+        return false;
+    }
+    return true;
+}
+
+void CTaskOrchestrator::OnSdkPreReviewDone(CTaskInfo* a_pTask, const SStageDef& a_stDef,
+                                           bool bOk, bool bStopped, const QString& sJson,
+                                           const QString& sMd, int iFiles, int iFindings) {
+    m_bSdkReviewRunning = false;
+    // 报告落盘（任务私有目录，供事后查阅；失败静默——不影响注入）。
+    if (m_pPm != nullptr && !sMd.isEmpty()) {
+        const QString sPath = m_pPm->TaskDir(a_pTask->Id())
+                            + QStringLiteral("/sdk_review.md");
+        CFrwDevice stFile(sPath);
+        if (stFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            stFile.write(sMd.toUtf8());
+            stFile.close();
+        }
+    }
+    // 注入块：正常完成→发现清单（或「未发现问题」）；被停止→部分结果降级说明；
+    //   全失败→不注入（agent 自行评审，预审仅是增强输入而非门禁）。
+    if (!bOk && !bStopped) {
+        m_sSdkReviewBlock.clear();
+        StageEvent(a_pTask, QStringLiteral("sdk_review_failed"),
+                   QStringLiteral(" ✖ 静态预审失败（全部文件送审失败），本轮不注入"));
+    } else if (bStopped) {
+        m_sSdkReviewBlock = QStringLiteral(
+            "\n\n## SDK 静态审查发现（ReviewSdk 预审被停止，仅部分完成）\n"
+            "静态预审被提前停止：送审 %1 个文件、发现 %2 条。以下为已完成部分，"
+            "请以你自己的代码审查为主。\n```json\n%3\n```\n")
+            .arg(QString::number(iFiles), QString::number(iFindings), sJson.left(16000));
+        StageEvent(a_pTask, QStringLiteral("sdk_review"),
+            QStringLiteral(" ◼ 静态预审被停止（送审 %1，发现 %2 条）")
+                .arg(QString::number(iFiles), QString::number(iFindings)));
+    } else if (iFindings == 0) {
+        m_sSdkReviewBlock = QStringLiteral(
+            "\n\n## SDK 静态审查发现（ReviewSdk 预审）\n"
+            "送审 %1 个变更文件，静态审查未发现问题。\n")
+            .arg(QString::number(iFiles));
+        StageEvent(a_pTask, QStringLiteral("sdk_review"),
+                   QStringLiteral(" ✔ 静态预审完成：送审 %1，未发现问题")
+                       .arg(QString::number(iFiles)));
+    } else {
+        m_sSdkReviewBlock = QStringLiteral(
+            "\n\n## SDK 静态审查发现（ReviewSdk 预审结果，需复核）\n"
+            "以下是对本轮变更文件逐个静态审查的发现（共 %1 条，级别 high/medium/low，"
+            "完整报告见 {{TASK_DIR}}/sdk_review.md）。请逐条核实后纳入你的审查结论：\n"
+            "- 属实且达到 critical/major 严重度的并入问题列表并影响决策；\n"
+            "- 误报/过时的在总体评价中说明排除理由（不必逐条展开）。\n"
+            "```json\n%2\n```\n")
+            .arg(QString::number(iFindings), sJson.left(16000));
+        StageEvent(a_pTask, QStringLiteral("sdk_review"),
+            QStringLiteral(" ✔ 静态预审完成：送审 %1，发现 %2 条（详情 sdk_review.md）")
+                .arg(QString::number(iFiles), QString::number(iFindings)));
+    }
+    // —— 续跑 CodeReview 阶段（守卫同备份线程口径）——
+    if (a_pTask->StopRequested()) {
+        if (a_pTask->Status() != ETaskStatus::Stopped) {   // StopTask 可能已收尾，防双发
+            a_pTask->SetStatus(ETaskStatus::Stopped);
+            StageEvent(a_pTask, QStringLiteral("stopped"), QStringLiteral("任务已停止"));
+            emit sigTaskFinished(a_pTask, false);
+        }
+        return;
+    }
+    if (IsRunnerBusy() && m_pCurTask != a_pTask) {
+        a_pTask->SetStatus(ETaskStatus::Paused);
+        StageEvent(a_pTask, QStringLiteral("busy"),
+            QStringLiteral("已有任务运行中，本任务暂置暂停，请先完成或停止当前任务"));
+        emit sigTaskChanged(a_pTask);
+        return;
+    }
+    LaunchStage(a_pTask, a_stDef);
+}
+
 QString CTaskOrchestrator::BuildPrompt(CTaskInfo* a_pTask, const SStageDef& a_stDef) {
-    QFile stFile(GetPromptsDir() + QStringLiteral("/") + a_stDef.sPromptFile);
+    CFrwDevice stFile(GetPromptsDir() + QStringLiteral("/") + a_stDef.sPromptFile);
     QString sTpl;
     if (stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QTextStream stIn(&stFile);
@@ -906,7 +1217,7 @@ QString CTaskOrchestrator::BuildPrompt(CTaskInfo* a_pTask, const SStageDef& a_st
                                   + RejectFeedbackFile(a_stDef.eStage);
         QString sFeedback;
         if (QFileInfo::exists(sReviewPath)) {
-            QFile stReview(sReviewPath);
+            CFrwDevice stReview(sReviewPath);
             if (stReview.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 QTextStream stIn(&stReview);
                 sFeedback = stIn.readAll();
@@ -1178,6 +1489,21 @@ void CTaskOrchestrator::Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a
         return;
     }
 
+    // 2026.09.22 (2d9e4c0c 教训) 文档生产阶段 max-turns 降级：Design/Plan 轮次耗尽但
+    //   本阶段产物已在本轮落盘（StageOutputFresh：存在+非空+mtime>=阶段起点）→ 不判死、
+    //   不再续跑，直接放行推进——产物事实优先于轮次计数，质量由下游评审把关
+    //   （ReviewDesign/ReviewPlan 驳回可回炉，复用轻评审降级同思路）。
+    if (!a_bOk && m_pRunner != nullptr && m_pRunner->LastWasMaxTurns()
+        && IsDocProduceStage(eCur)
+        && pDef != nullptr && !pDef->sOutput.isEmpty()
+        && StageOutputFresh(a_pTask, eCur)) {
+        StageEvent(a_pTask, QStringLiteral("maxturns_output_ok"),
+            QStringLiteral("⚠ %1 达到轮次上限，但 %2 已落盘，放行推进（质量由下游评审把关）")
+                .arg(pDef->sNameZh).arg(pDef->sOutput));
+        ProceedToNext(a_pTask, a_sResult);
+        return;
+    }
+
     // 续跑：max-turns 命中（非真错误）且阶段可续跑且未超上限 → 自动 --resume 续跑，而非判死。
     if (!a_bOk && m_pRunner != nullptr && m_pRunner->LastWasMaxTurns()
         && !a_pTask->LastSessionId().isEmpty()
@@ -1209,6 +1535,28 @@ void CTaskOrchestrator::Advance(CTaskInfo* a_pTask, bool a_bOk, const QString& a
         StageEvent(a_pTask, QStringLiteral("stage_failed"),
             QStringLiteral("✗ %1 失败：%2").arg(pDef ? pDef->sNameZh : QString()).arg(sWhy));
         emit sigTaskFinished(a_pTask, false);
+        return;
+    }
+
+    // 2026.09.22 假完成拦截（2d9e4c0c 实证）：Design 派后台探查代理后结束回合等通知，
+    //   runner 把「回合结束」当阶段成功，design.md 根本没写 → 下一阶段 need_input 把整个
+    //   阶段推倒重来，30 轮探索全部作废。产物未落盘时不推下一阶段：--resume 同会话催落盘
+    //   （证据都在会话里，只差写出文件，续跑几轮即可收尾）；催一次仍无产物才走既有回退路径。
+    if (a_bOk && IsDocProduceStage(eCur)
+        && pDef != nullptr && !pDef->sOutput.isEmpty()
+        && !StageOutputFresh(a_pTask, eCur)
+        && !a_pTask->LastSessionId().isEmpty()
+        && a_pTask->ResumeCount() < ReviewResume()) {
+        a_pTask->IncResumeCount();
+        StageEvent(a_pTask, QStringLiteral("flush_output"),
+            QStringLiteral("⚠ %1 回合已结束但 %2 尚未写出，同会话续跑催落盘（第 %3/%4 次）")
+                .arg(pDef->sNameZh).arg(pDef->sOutput)
+                .arg(a_pTask->ResumeCount()).arg(ReviewResume()));
+        ReRunResume(a_pTask, QStringLiteral(
+            "你上一回合结束了，但本阶段产物文件尚未写出。请【立即】把已完成的探索与分析结论"
+            "写入 %1（此前已写的部分保留并补全），然后结束。"
+            "禁止再派发后台代理或任何新的探索；若个别探查未返回，基于已有证据给出保守结论并标注未知项。")
+            .arg(QStringLiteral(".autodev/tasks/%1/%2").arg(a_pTask->Id(), pDef->sOutput)));
         return;
     }
 
@@ -1248,8 +1596,10 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
             }
             a_pTask->IncStageIter();
             if (a_pTask->StageIter() > MaxIter()) {
+                m_hEscalatedReview.insert(a_pTask->Id(), eCur);   // 2026.09.22 记住升级时的评审阶段（人工放行从它推进）
                 a_pTask->SetCurrentStage(eBack);
                 a_pTask->SetPauseRequested(true);  // 升级到用户
+                a_pTask->SetStatus(ETaskStatus::Paused);   // 2026.09.22 必须落 Paused：旧路径停在 Running 会被 StartTask 早退拒续（升级后无法「继续」）
                 WriteEscalationReport(a_pTask, eBack);
                 const QString sDigest = ExtractRejectDigest(a_pTask);
                 StageEvent(a_pTask, QStringLiteral("escalation"),
@@ -1258,6 +1608,11 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
                         .arg(StageNameZh(eBack)).arg(MaxIter())
                         .arg(QStringLiteral(".autodev/tasks/%1/escalation.md").arg(a_pTask->Id()))
                         .arg(sDigest.left(120)));
+                emit sigTaskChanged(a_pTask);
+                emit sigReviewEscalated(a_pTask);   // 2026.09.22 人工介入：UI 弹窗问放行/再迭代/保持暂停
+                return;   // 2026.09.28 升级即停：不再调度 RunCurrentStage（对齐 FinishReviewStage；
+                          //   旧实现升级后仍 singleShot，若定时器触发前用户已裁决放行/再迭代会
+                          //   造成同阶段双启动竞态）
             } else {
                 a_pTask->SetCurrentStage(eBack);
                 const QString sDigest = ExtractRejectDigest(a_pTask);
@@ -1406,7 +1761,7 @@ QString CTaskOrchestrator::ResolveBuildCommand(CTaskInfo* a_pTask) const {
     }
     const QString sRoot = a_pTask->ProjectDir();
     // 1) 用户/agent 显式配置优先（最可控）。
-    QFile stBt(sRoot + QStringLiteral("/.autodev/build.txt"));
+    CFrwDevice stBt(sRoot + QStringLiteral("/.autodev/build.txt"));
     if (stBt.open(QIODevice::ReadOnly | QIODevice::Text)) {
         const QString sLine = QTextStream(&stBt).readLine().trimmed();
         if (!sLine.isEmpty()) {
@@ -1418,7 +1773,7 @@ QString CTaskOrchestrator::ResolveBuildCommand(CTaskInfo* a_pTask) const {
     //    无 presets 则退回通用 cmake -S -B build。本工程自此走 cmake，不再依赖手维护 .sln。
     if (QFileInfo::exists(sRoot + QStringLiteral("/CMakeLists.txt"))) {
         QString sCfgPreset, sBuildPreset;
-        QFile stPf(sRoot + QStringLiteral("/CMakePresets.json"));
+        CFrwDevice stPf(sRoot + QStringLiteral("/CMakePresets.json"));
         if (stPf.open(QIODevice::ReadOnly)) {
             const QJsonDocument stDoc = QJsonDocument::fromJson(stPf.readAll());
             stPf.close();
@@ -1485,7 +1840,7 @@ QString CTaskOrchestrator::ReadBuildVerdict(CTaskInfo* a_pTask) const {
     if (a_pTask == nullptr || m_pPm == nullptr) {
         return QString();
     }
-    QFile stIn(m_pPm->TaskDir(a_pTask->Id()) + QStringLiteral("/build_verdict.md"));
+    CFrwDevice stIn(m_pPm->TaskDir(a_pTask->Id()) + QStringLiteral("/build_verdict.md"));
     if (!stIn.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return QString();
     }
@@ -1518,7 +1873,7 @@ int CTaskOrchestrator::EstimateDevTurns(CTaskInfo* a_pTask) const {
     if (a_pTask == nullptr) {
         return 80;
     }
-    QFile stP(a_pTask->ProjectDir() + QStringLiteral("/") +
+    CFrwDevice stP(a_pTask->ProjectDir() + QStringLiteral("/") +
               QStringLiteral(".autodev/tasks/%1/plan.md").arg(a_pTask->Id()));
     if (!stP.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return 80;   // 无 plan（如 bugfix 流或尚未生成）→ 默认
@@ -1536,13 +1891,58 @@ int CTaskOrchestrator::EstimateDevTurns(CTaskInfo* a_pTask) const {
     return qBound(40, 40 + 10 * iTasks, 150);
 }
 
+int CTaskOrchestrator::EstimateDocTurns(CTaskInfo* a_pTask) const {
+    // 2026.09.22 (2d9e4c0c 教训)：文档生产阶段（Design/Plan）轮次按 requirements.md 规模动态给。
+    //   大需求（17FR+26AC、跨 4 个代码区域）固定 30 轮连探索都做不完；行数是需求体量
+    //   最稳定的代理指标（FR/AC 条目越多行数越多），每 6 行 +1 轮，下限 50、上限 110。
+    if (a_pTask == nullptr) {
+        return 50;
+    }
+    CFrwDevice stR(a_pTask->ProjectDir() + QStringLiteral("/") +
+              QStringLiteral(".autodev/tasks/%1/requirements.md").arg(a_pTask->Id()));
+    if (!stR.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return 50;   // 无需求文档（如 bugfix 流）→ 默认档
+    }
+    const QString sReq = QTextStream(&stR).readAll();
+    const int iLines = sReq.count(QLatin1Char('\n')) + 1;
+    return qBound(50, 40 + iLines / 6, 110);
+}
+
 bool CTaskOrchestrator::IsResumeEligible(EStage a_eStage) {
     // 仅长运行的代码改写阶段允许 max-turns 续跑（文档/评审阶段短，续跑意义不大）。
     // Verify 编译失败可 --resume 续跑修复（design §3.2.6）。
+    // 2026.09.22 (2d9e4c0c 教训)：Design/Plan 纳入——design.md/plan.md 是增量落盘的，
+    //   --resume 保住已探索证据接着写；此前每次重跑都是零记忆从零探索，同样 30 轮的墙撞 3 次
+    //   （实测烧掉 17.1M input token 后任务判死，而孤儿进程在判死后 23 分钟写完了完整的 design.md）。
     return a_eStage == EStage::Develop
         || a_eStage == EStage::BugFix
         || a_eStage == EStage::Test
-        || a_eStage == EStage::Verify;
+        || a_eStage == EStage::Verify
+        || a_eStage == EStage::Design
+        || a_eStage == EStage::Plan;
+}
+
+bool CTaskOrchestrator::IsDocProduceStage(EStage a_eStage) {
+    // 2026.09.22：产出单一文档、内容增量落盘、下游有评审把关的生产阶段（Design/Plan）。
+    //   与 IsLightReviewStage 对偶：评审是「读代码写结论」，此处是「读代码写方案」，
+    //   max-turns 时凭已落盘产物降级放行都安全（质量由 ReviewDesign/ReviewPlan 把关）。
+    return a_eStage == EStage::Design || a_eStage == EStage::Plan;
+}
+
+bool CTaskOrchestrator::StageOutputFresh(CTaskInfo* a_pTask, EStage a_eStage) const {
+    // 2026.09.22：阶段产物「本轮已写出」判定——文件存在、非空、mtime >= m_dtStageStart
+    //   （LaunchStage/ReRunResume 起点；m_dtStageStart 无效时退化为仅存在性判定）。
+    //   缺失/过期 = 假完成，编排器据此催落盘或回退，不再被「回合结束」表象蒙蔽。
+    const SStageDef* pDef = FindStage(a_eStage);
+    if (a_pTask == nullptr || m_pPm == nullptr
+        || pDef == nullptr || pDef->sOutput.isEmpty()) {
+        return false;
+    }
+    const QFileInfo stFi(m_pPm->TaskDir(a_pTask->Id()) + QStringLiteral("/")
+                         + pDef->sOutput);
+    return stFi.exists() && stFi.size() > 0
+        && (!m_dtStageStart.isValid()
+            || stFi.lastModified() >= m_dtStageStart);
 }
 
 bool CTaskOrchestrator::IsLightReviewStage(EStage a_eStage) {
@@ -1612,15 +2012,14 @@ QString CTaskOrchestrator::IterationStrategyHint(int a_iIter) {
 }
 
 bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
-    // 2026.08.20 (自动命名) 定稿素材源——只读两处：
-    //   ① 任务内容：用户原始需求（多行取「信息量最大」的一行：最长且 ≤80 字，退首个
-    //      非空行）——任务名首先应反映用户要什么；
-    //   ② 工程 guide.md：首个非泛型标题（尾注括号优先）——任务内容为空时兜底。
-    //   不再读 requirements.md / intake.md 等阶段产物（模板腔标题，「需求收集 — 任务 xxx」
+    // 2026.08.20 (自动命名) 素材源定稿：只读任务内容（用户原始需求）。2026.09.21
+    //   用户口径收紧：**自动命名只根据任务内容，不读工程信息**——原 guide.md 标题
+    //   兜底分支已删（工程信息不是本任务的内容，混入会带偏命名）。也不读
+    //   requirements.md / intake.md 等阶段产物（模板腔标题，「需求收集 — 任务 xxx」
     //   「用户原始需求」两轮误命名皆源于此）。
-    //   统一清洗（去 #/*/_/` 标记与「— 任务 id」装饰）后按「一句话简短描述」口径：
-    //   取首子句（不足 10 字顺延到下一子句边界），截断 24 字。SetName 发 sigChanged，
-    //   由 CMainWindow 落盘 task.json 并刷新 UI。
+    //   统一清洗（去 #/*/_/` 标记与「— 任务 id」装饰、TrimNamePunct 剥尾标点）后按
+    //   「一句话简短描述」口径：取首子句（不足 10 字顺延到下一子句边界），截断 24 字。
+    //   SetName 发 sigChanged，由 CMainWindow 落盘 task.json 并刷新 UI。
 
     // 泛型素材判定：模板章节名/阶段名/纯元数据，作任务名无信息量，全部跳过。
     static const QStringList aGeneric = {
@@ -1672,44 +2071,13 @@ bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
     //    旧「最长行优先」策略把 79 字压线的编号细节条款（第 7 条）当主旨、抠出「资源管理器右键菜单增加」
     //    丢掉任务主旨的实害勿回退——需求文档首行几乎总是主旨陈述，细节行再长也是子项。
     sCandidate = CTaskInfo::ExtractNameFromRequest(a_pTask->UserRequest());
-    // 首行/最长行均不可用（全泛型）：退首个非空行原文（后续 isGeneric 复核会走 guide 兜底）。
+    // 首行/最长行均不可用（空）：退首个非空行原文（后续清洗+泛型复核）。
     if (sCandidate.isEmpty()) {
         for (const QString& sLine : a_pTask->UserRequest().split(QLatin1Char('\n'))) {
             const QString s = sLine.trimmed();
             if (!s.isEmpty()) { sCandidate = s; break; }
         }
     }
-    // ② 工程 guide.md 兜底（任务内容为空时）：首个非泛型标题；标题尾注括号常承载标题
-    //   本体（「需求规格 — 任务 xxx（网页版飞机大战）」→「网页版飞机大战」），尾注含
-    //   guide/任务/阶段等元词时跳过。
-    if (isGeneric(sCandidate)) {
-        QFile stGuide(a_pTask->ProjectDir() + QStringLiteral("/.autodev/guide.md"));
-        if (stGuide.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            const QString sGuide = QTextStream(&stGuide).readAll();
-            static const QRegularExpression reHeading(
-                QStringLiteral("(?m)^#{1,3}\\s*(.+?)\\s*$"));
-            QRegularExpressionMatchIterator it = reHeading.globalMatch(sGuide);
-            static const QRegularExpression reParenTail(
-                QStringLiteral("[（(]([^（）()]{4,30})[)）][\\s]*$"));
-            while (it.hasNext()) {
-                const QString sRaw = it.next().captured(1).trimmed();
-                const QRegularExpressionMatch mParen = reParenTail.match(sRaw);
-                if (mParen.hasMatch()) {
-                    const QString sParen = mParen.captured(1).trimmed();
-                    if (!isGeneric(sParen) && !sParen.contains(QStringLiteral("guide"),
-                            Qt::CaseInsensitive)) {
-                        sCandidate = sParen;
-                        break;
-                    }
-                }
-                QString s = sRaw;
-                s.remove(reDecor);
-                s = s.trimmed();
-                if (!isGeneric(s)) { sCandidate = s; break; }
-            }
-        }
-    }
-
     // 清洗：去 Markdown 强调/代码标记与残留 #/「— 任务 id」装饰，压缩空白；
     //   「一句话简短描述」口径——取首个子句边界（，,。;；：:）之前的短句，首子句不足
     //   10 字则顺延到下一子句边界（「创建一个网页版小游戏：竖版飞机大战」优于只取冒号前），
@@ -1739,8 +2107,11 @@ bool CTaskOrchestrator::MaybeAutoNameTask(CTaskInfo* a_pTask) {
     if (sCandidate.size() > 24) {
         sCandidate = sCandidate.left(24).trimmed();
     }
-    if (sCandidate.isEmpty()) {
-        return false;   // 无可用素材：保留临时名，标记不清（下次 Intake 重跑再试）
+    sCandidate = CTaskInfo::TrimNamePunct(sCandidate);   // 2026.09.21 尾标点/引号剥离
+    if (sCandidate.isEmpty() || isGeneric(sCandidate)) {
+        return false;   // 无可用素材/纯泛型（如「如题」）：保留临时名，标记不清
+                        //   （下次 Intake 重跑 Agent 定稿再试）——2026.09.21 只根据
+                        //   任务内容口径：guide 兜底已删，泛型名宁缺毋滥。
     }
 
     a_pTask->SetAutoNamed(true);   // 2026.09.10 v2.2.152：本地启发式名只是临时名——保留
@@ -1778,34 +2149,90 @@ bool CTaskOrchestrator::AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId
         // 借用助手被占用（用户提问/压缩/上一次命名中）：本地启发式兜底，避免命名饿死。
         return MaybeAutoNameTask(a_pTask);
     }
-    // 素材①：任务内容（用户原始需求，截 2000 字防提示词膨胀）。
+    // 素材：任务内容（用户原始需求，截 2000 字防提示词膨胀）——2026.09.21 用户口径：
+    //   自动命名只根据任务内容，不读工程信息（guide.md 段已删，并明令 Agent 不读文件）。
     QString sReq = a_pTask->UserRequest().left(2000).trimmed();
     if (sReq.isEmpty()) {
-        sReq = QStringLiteral("（用户需求为空，请结合项目指南推断本任务主旨）");
+        // 任务内容为空：没有素材可命名——直接本地兜底（也会失败返回，保留临时名），
+        //   不再拿「结合项目指南推断」当素材（旧文案会诱导 Agent 读工程信息）。
+        return MaybeAutoNameTask(a_pTask);
     }
-    // 素材②：工程 guide.md（截 4000 字）。
-    QString sGuide = m_pPm->ReadGuide().left(4000).trimmed();
-    const QString sGuideSec = sGuide.isEmpty()
-        ? QStringLiteral("（项目指南为空）")
-        : QStringLiteral("以下是当前工程的项目指南（guide.md）：\\n---\\n%1\\n---").arg(sGuide);
     const QString sPrompt = QStringLiteral(
         "【任务命名】请为下面的任务起一个简短的中文任务名称。\n\n"
-        "%1\n\n用户的任务需求（任务内容）：\n---\n%2\n---\n\n"
+        "用户的任务需求（任务内容全文）：\n---\n%1\n---\n\n"
         "命名要求：\n"
-        "1. 一句话描述任务要做什么（如「创建一个竖版的飞机大战游戏」），不超过 20 个字；\n"
-        "2. 需求常为多行编号文档——名称必须概括任务的整体目标（通常就是首句主旨句，\n"
-        "   如「自动拉取/提交/推送代码的工具」），绝不要抓取某一条编号细节、界面元素或子功能片段\n"
-        "   当名称（如「资源管理器右键菜单」）；\n"
-        "3. 结合项目指南理解任务在工程中的定位，名称要具体、能区分于其他任务；\n"
+        "1. 只根据上面的任务内容命名，不要读取任何文件或目录；\n"
+        "2. 一句话描述任务要做什么，不超过 20 个字；名称通常就是首句主旨句，保留其中\n"
+        "   原有的动词开头（如「开发大模型网关插件」不要删成「大模型网关插件」）；\n"
+        "3. 需求常为多行编号文档——名称必须概括任务的整体目标（如「自动拉取/提交/推送\n"
+        "   代码的工具」），绝不要抓取某一条编号细节、界面元素或子功能片段当名称\n"
+        "   （如「资源管理器右键菜单」）；\n"
         "4. 不要包含「任务」「需求」这类泛型词，不要带任务 id；\n"
-        "5. 只输出名称本身：不要任何解释、引号、标点结尾或多余文字。")
-        .arg(sGuideSec, sReq);
+        "5. 只输出名称本身：不要任何解释、引号、句尾冒号等标点结尾或多余文字。")
+        .arg(sReq);
     pS->pAutoNameTask = a_pTask;
     pS->iPerm = PermReadOnly;    // 纯命名：禁 Bash/Edit/Write
     pS->sPendingPrompt.clear();
     pS->eMode = AutoNaming;
     StageEvent(a_pTask, QStringLiteral("auto_naming"),
-        QStringLiteral("⚙ 正在结合任务内容与 guide.md 请 Agent 生成任务名称…"));
+        QStringLiteral("⚙ 正在根据任务内容请 Agent 生成任务名称…"));
+    StartAdhocStage(*pS, sPrompt);
+    return true;
+}
+
+bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts) {
+    // 2026-09-22 助手自动重命名：右键菜单「自动重命名」→ 面板收集该助手全部用户提示词
+    //   经 sigAsstAutoRename → CMainWindow 转到这里。优先借用该助手自己的会话（fork
+    //   一次性只读分支，不动撤销栈）；其忙则借用任一空闲会话；全忙/无会话返回 false。
+    //   结果在 OnAdhocFinished 的 AsstAutoNaming 分支解析两行（名称+说明）后发
+    //   sigAsstAutoNameDone → 面板回填 sName/sDesc 并落盘。
+    if (a_sAsstId.isEmpty() || a_sPrompts.trimmed().isEmpty()) {
+        return false;
+    }
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        return false;   // 工程未开（会话/运行时依赖工程）
+    }
+    auto fnBusy = [](SAdhocSession* a_pS) {
+        return a_pS->pRunner != nullptr
+            && (a_pS->pRunner->IsRunning() || a_pS->pRunner->IsGraceActive()
+                || a_pS->pRunner->IsRetryPending());
+    };
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    if (pS == nullptr) {
+        // 目标会话尚未建（新建助手还没发过提示词等异常态）：直接建它自己的会话
+        //   （用助手自己的粘性后端/全局后端，不借别人的）。
+        pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
+    }
+    if (fnBusy(pS)) {
+        // 目标会话被占用（用户提问/压缩中）：借用任一空闲会话（命名无会话语义，一次性分支）。
+        SAdhocSession* pIdle = nullptr;
+        for (SAdhocSession* pCand : m_aAdhoc) {
+            if (pCand != pS && !fnBusy(pCand)) { pIdle = pCand; break; }
+        }
+        if (pIdle == nullptr) {
+            return false;   // 全忙：调用方提示稍后再试
+        }
+        pS = pIdle;
+    }
+    const QString sPrompt = QStringLiteral(
+        "【助手命名】某个 AI 助手收到过下面这批用户提示词，请为该助手起名并写一句说明。\n\n"
+        "用户发给该助手的全部提示词（按时间顺序编号）：\n---\n%1\n---\n\n"
+        "输出要求：\n"
+        "1. 只根据上面的提示词内容总结，不要读取任何文件或目录；\n"
+        "2. 第一行：助手名称——不超过 10 个汉字，概括这些提示词共同的主题或用途，\n"
+        "   保留动词开头，不要「助手」「任务」这类泛型词；\n"
+        "3. 第二行：助手说明——一到两句话（不超过 60 字），概括用户在这个助手里\n"
+        "   主要在做什么、达到了什么目的；\n"
+        "4. 严格只输出这两行：第一行名称、第二行说明；不要任何解释、引号、编号、\n"
+        "   Markdown 标记或多余文字。")
+        .arg(a_sPrompts);
+    pS->sAutoNameTargetAsst = a_sAsstId;
+    pS->iPerm = PermReadOnly;    // 纯命名：禁 Bash/Edit/Write（用户下次提交时由面板回写）
+    pS->sPendingPrompt.clear();
+    pS->eMode = AsstAutoNaming;
+    // 进行中提示直投被命名的助手流（执行可能在借用的其他助手会话上，其 Tab 只亮运行态）。
+    emit sigAdhocEvent(a_sAsstId, QStringLiteral("auto_naming"),
+        QStringLiteral("⚙ 正在根据历史提示词请 Agent 生成助手名称与说明…"));
     StartAdhocStage(*pS, sPrompt);
     return true;
 }
@@ -1833,7 +2260,7 @@ void CTaskOrchestrator::RecordVerifySummary(CTaskInfo* a_pTask, bool a_bOk,
     if (pDef != nullptr && !pDef->sOutput.isEmpty()) {
         const QString sPath = a_pTask->ProjectDir() + QStringLiteral("/") +
             QStringLiteral(".autodev/tasks/%1/%2").arg(a_pTask->Id(), pDef->sOutput);
-        QFile stFile(sPath);
+        CFrwDevice stFile(sPath);
         if (stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
             QTextStream stIn(&stFile);
             const QString sAll = stIn.readAll();
@@ -1886,7 +2313,7 @@ EReviewDecision CTaskOrchestrator::ParseReviewDecision(CTaskInfo* a_pTask,
         // m_dtStageStart 无效（理论不会）时退化为不读文件，避免误用过期内容。
         if (stFi.exists() && m_dtStageStart.isValid() &&
             stFi.lastModified() >= m_dtStageStart) {
-            QFile stFile(sPath);
+            CFrwDevice stFile(sPath);
             if (stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 QTextStream stIn(&stFile);
                 sText += QStringLiteral("\n") + stIn.readAll();
@@ -1945,7 +2372,7 @@ QString CTaskOrchestrator::ExtractRejectDigest(CTaskInfo* a_pTask) {
     if (!QFileInfo::exists(sPath)) {
         return QString();
     }
-    QFile stFile(sPath);
+    CFrwDevice stFile(sPath);
     if (!stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return QString();
     }
@@ -2010,6 +2437,10 @@ bool CTaskOrchestrator::IsReviewStage(EStage a_eStage) {
 int CTaskOrchestrator::MaxTurnsFor(CTaskInfo* a_pTask, EStage a_eStage) const {
     switch (a_eStage) {
         case EStage::Develop:    return EstimateDevTurns(a_pTask);   // 按 plan.md 任务数动态给
+        // 2026.09.22 (2d9e4c0c 教训) 文档生产阶段动态预算：大需求（17FR+26AC 跨多模块）
+        //   30 轮连探索都做不完，max-turns 判死前从未走到写产物那一步；按需求规模动态抬升。
+        case EStage::Design:
+        case EStage::Plan:       return EstimateDocTurns(a_pTask);
         case EStage::CodeReview: return 40;   // (F) 审查多文件需更多预算；(C) 降级兜底防判死
         case EStage::BugFix:
         case EStage::Test:
@@ -2045,7 +2476,7 @@ QString CTaskOrchestrator::MinorityFeedbackBlock(CTaskInfo* a_pTask, const SStag
     }
     const QString sPath = m_pPm->TaskDir(a_pTask->Id()) + QStringLiteral("/")
                          + pPrevDef->sOutput;
-    QFile stFile(sPath);
+    CFrwDevice stFile(sPath);
     if (!stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return QString();
     }
@@ -2132,8 +2563,12 @@ bool CTaskOrchestrator::EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a
         if (a_pTask->StageIter() > MaxIter()) {
             a_pTask->SetCurrentStage(eProducer);
             a_pTask->SetPauseRequested(true);
+            a_pTask->SetStatus(ETaskStatus::Paused);   // 2026.09.28 对齐 FinishReviewStage/ProceedToNext
+                                                          //   升级分支：必须落 Paused，否则停在 Running 会被
+                                                          //   StartTask 早退拒续，任务卡死只能重启程序
             StageEvent(a_pTask, QStringLiteral("escalation"),
                 QStringLiteral("⚠ 多次回退仍未生成 %1，已暂停并升级到用户处理").arg(sInput));
+            emit sigTaskChanged(a_pTask);
             return false;
         }
 
@@ -2156,12 +2591,16 @@ bool CTaskOrchestrator::EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a
 //   - 压缩：/compact 在 headless 无效 → 「摘要→开新会话重播种」两步 + --autocompact 150k 自动兜底。
 // ---------------------------------------------------------------------------
 void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
-    // 2026.09.03 多助手并发：runner per-助手（独立 QProcess，各起各的进程）；后端漂移
-    //   时非占用清该会话链（runner + sid + 撤销栈 + guide 基线 + 回灌缓存），回到首条
-    //   新会话状态；占用中本次仍用旧后端。信号连接以 lambda 捕获助手 id 注入路由——
-    //   会话被删（RemoveAsstAdhoc/Reset）时 runner 一并销毁且 disconnect，无悬垂。
+    // 2026.09.03 多助手并发：runner per-助手（独立 QProcess，各起各的进程）。
+    // 2026.09.20 助手粘性后端（v2.4.193，用户需求：助手不支持中途换 Harness → 发送时
+    //   忽略全局设置、继续用该助手当前 Harness）：会话绑定后端 sBackend（空=未绑定，
+    //   首次提交时绑当前全局），runner 按绑定后端创建/保留——全局切换不再清会话链
+    //   （v2.4.183 清除语义由粘性取代；runner ≠ 绑定后端的漂移重建仅剩跨机拷贝档等
+    //   边缘场景，链清空 + 自愈链仍兑底）。占用中（运行/宽限/重试）本次仍用旧 runner。
+    const QString sBound = a_S.sBackend.isEmpty()
+        ? CAgentRunnerFactory::BackendName() : a_S.sBackend;
     if (a_S.pRunner != nullptr) {
-        if (a_S.pRunner->BackendName() == CAgentRunnerFactory::BackendName()) {
+        if (a_S.pRunner->BackendName() == sBound) {
             return;
         }
         if (a_S.pRunner->IsRunning() || a_S.pRunner->IsGraceActive()
@@ -2175,8 +2614,10 @@ void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
         a_S.aTranscript.clear();   // 2026.09.02 回灌缓存随会话链一并作废（跨后端历史无意义）
         a_S.sGuideHash.clear();
         a_S.aPendingInjects.clear();   // 会话链整体作废，排队指令随行
+        emit sigAdhocPendingDropped(a_S.sId);   // 2026.09.18 面板暂存框同步作废
     }
-    a_S.pRunner = CAgentRunnerFactory::Create(this);
+    a_S.sBackend = sBound;
+    a_S.pRunner = CAgentRunnerFactory::CreateFor(sBound, this);
     // 连 ad-hoc 专属槽（不复用 OnRunner*，与任务 runner 隔离）；lambda 捕获该会话 id
     //   作为路由首参——多助手并发时各流各归各的 Tab。
     const QString sId = a_S.sId;
@@ -2223,7 +2664,8 @@ void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
 }
 
 void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
-                                        bool a_bDropLastUser) {
+                                        bool a_bDropLastUser, int a_iTurnsOverride,
+                                        const QString& a_sToolsDeny) {
     EnsureAdhocRunner(a_S);
     // 新轮次开始：该会话本轮实时计量清零（2026.09.05 per-助手，带 id 收起其页内标签；
     //   不再碰全局 m_iLive*——那是任务阶段专用）。
@@ -2235,10 +2677,14 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     const QString sWorkDir = m_pPm ? m_pPm->ProjectDir() : QString();
     // deny 黑名单（bypass 下 allow 失效、deny 生效）：只读轮=禁 Bash/Edit/Write；
     //   自动/手工审批轮=ToolsDev() 现返回空串=全开（手工审批的约束在提示词层，见
-    //   SubmitAdhoc 的【手工审批模式】指令）。
-    const QString sTools = (a_S.iPerm == PermReadOnly)
-        ? QStringLiteral("Bash,Edit,Write")
-        : ToolsDev();
+    //   SubmitAdhoc 的【手工审批模式】指令）。2026.09.26 专家模式规划/验证轮经
+    //   a_sToolsDeny 覆盖（非 null 即生效：均禁 Edit/Write，保「规划/验证不改码」
+    //   的职责分离；执行轮仍全开）。
+    const QString sTools = (!a_sToolsDeny.isNull())
+        ? a_sToolsDeny
+        : ((a_S.iPerm == PermReadOnly)
+            ? QStringLiteral("Bash,Edit,Write")
+            : ToolsDev());
     // fork 链：有当前 sid 则 --resume + --fork-session 产生新 sid 分支，旧 sid 保持不污染
     //   （实测确认 → #4 O(1) 撤销可行）；无 sid（首条提问 / CompactReseed 前已清空）则纯新建会话。
     const bool bFork = !a_S.sSid.isEmpty();
@@ -2256,9 +2702,83 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     if (!sHistory.isEmpty()) {
         sFinalPrompt = sHistory + QStringLiteral("\\n\\n") + a_sPrompt;
     }
-    a_S.pRunner->StartStage(sWorkDir, sFinalPrompt, sTools, 40,
+    // 2026.09.23 v3.0.219 轮次预算：SubmitAdhoc 按提示词难度评估（iTurnsBudget），
+    //   内部链路（命名/续跑等未评估路径）回退全局基值。
+    a_S.pRunner->StartStage(sWorkDir, sFinalPrompt, sTools,
+                            (a_iTurnsOverride > 0 ? a_iTurnsOverride
+                                : (a_S.iTurnsBudget > 0 ? a_S.iTurnsBudget
+                                                       : AdhocMaxTurns())),
                             a_S.sSid, bFork, iAutoCompactK, /*a_bEnableAskUser=*/true);
     emit sigAdhocRunning(a_S.sId);   // 面板进该助手运行态（手动发送已自置，此处兜自动续发/压缩）
+}
+
+int CTaskOrchestrator::AdhocMaxTurns() const {
+    // 2026.09.23 助手单轮 --max-turns 配置化（[Adhoc] MaxTurns，默认 40，10..200）：
+    //   大型多文件重构 40 轮常打满（LayoutDesign「打磨布局设计器」12 问 11 次触顶实测），
+    //   允许用户按工程工作量放大；每次提问实时读，设置保存/任务级覆盖即时生效。
+    return (m_pPm != nullptr) ? m_pPm->LoadAdhocMaxTurns() : 40;
+}
+
+bool CTaskOrchestrator::AdhocMaxTurnsAuto() const {
+    // 2026.09.23 v3.0.219 [Adhoc] MaxTurnsAuto（缺省开）；m_pPm 空回退开。
+    return (m_pPm != nullptr) ? m_pPm->LoadAdhocMaxTurnsAuto() : true;
+}
+
+int CTaskOrchestrator::EstimateAdhocTurns(const QString& a_sUserText, int a_iBaseTurns) {
+    // 2026.09.23 v3.0.219 工作量评估（用户需求：运行前评估任务难度自动设轮次）：
+    //   纯本地启发式——零 token、零额外 LLM 往返、毫秒级。四个信号：
+    //   ① 编号/条目行数（“1.” “1、” “①” “-” 开头）——每多一个子任务 +12；
+    //   ② 显式点名的源文件（xxx.cpp/.h/.py/…去重）——每个 +10，封顶 5 个；
+    //   ③ 重活关键词（重构/重写/全部/批量/自测/构建/编译/测试/验证/排查/修复…去重）——
+    //      每个 +8，封顶 4 个；
+    //   ④ 文本长度（长需求≈多子任务）——200 字以上每 400 字 +6。
+    //   只升不降：a_iBaseTurns 是用户设的底线（小问题不缩水）；封顶 200（与 SpinBox 上限一致）。
+    //   实测锚点：LayoutDesign Q12（2 编号+600 字）→ 58；重设计长文（1.5k 字+多关键词）→ 90+；
+    //   配合既有 max-turns 自动续跑 2 次（有效预算 ×3），重活也不断流。
+    const int iBase = qBound(10, a_iBaseTurns, 200);
+    const QString sText = a_sUserText.simplified();
+    if (sText.isEmpty()) {
+        return iBase;
+    }
+    // ① 编号/条目行
+    int nIssues = 0;
+    const QStringList aLines = a_sUserText.split(QLatin1Char('\n'));
+    static const QRegularExpression reItem(
+        QStringLiteral("^\\s*(?:\\d+[.、)）]|[(（]\\d+[)）]|[①②③④⑤⑥⑦⑧⑨⑩]|[-•*])"));
+    for (const QString& sLn : aLines) {
+        if (reItem.match(sLn).hasMatch()) {
+            ++nIssues;
+        }
+    }
+    // ② 点名源文件（去重）
+    static const QRegularExpression reFile(
+        QStringLiteral("([A-Za-z0-9_\\-.]+\\.(?:cpp|h|hpp|cc|cxx|c|py|js|ts|qml|ui|rc|md|json|xml|yml|yaml|bat|cmake|txt))(?![A-Za-z0-9_.\\-])"),
+        QRegularExpression::CaseInsensitiveOption);
+    QSet<QString> aFiles;
+    for (auto it = reFile.globalMatch(sText); it.hasNext(); ) {
+        aFiles.insert(it.next().captured(1).toLower());
+    }
+    // ③ 重活关键词（去重命中）
+    static const QStringList aHeavy = {
+        QStringLiteral("重构"), QStringLiteral("重写"), QStringLiteral("全部"),
+        QStringLiteral("所有"), QStringLiteral("整体"), QStringLiteral("批量"),
+        QStringLiteral("彻底"), QStringLiteral("自测"), QStringLiteral("构建"),
+        QStringLiteral("编译"), QStringLiteral("回归"), QStringLiteral("测试"),
+        QStringLiteral("验证"), QStringLiteral("排查"), QStringLiteral("修复"),
+        QStringLiteral("迁移"), QStringLiteral("梳理"),
+    };
+    int nHeavy = 0;
+    for (const QString& sKw : aHeavy) {
+        if (sText.contains(sKw)) {
+            ++nHeavy;
+        }
+    }
+    int iEst = iBase;
+    iEst += 12 * qMax(0, nIssues - 1);
+    iEst += 10 * qMin(aFiles.size(), 5);
+    iEst += 8 * qMin(nHeavy, 4);
+    iEst += 6 * qMax(0, (sText.size() - 200) / 400);
+    return qBound(iBase, iEst, 200);
 }
 
 int CTaskOrchestrator::MaxIter() const {
@@ -2305,6 +2825,10 @@ void CTaskOrchestrator::InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_s
             .arg(a_sText.left(120)));
 }
 
+// 2026.09.26 深度模式运行期覆盖（测试桩，SetAdhocDeepOverride 写）：-1=按 config.ini
+//   [Adhoc] ExpertAssistant；0/1=强制关/开。定义前置：SubmitAdhoc 在前、实现在后。
+static int g_iAdhocDeepOverride = -1;
+
 void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText,
                                     int a_iPerm, const QString& a_sTaskId,
                                    const QStringList* a_pTranscript) {
@@ -2349,9 +2873,34 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             QStringLiteral("请先打开一个工程再使用助手"));
         return;
     }
+    // 2026.09.20 粘性后端绑定/提示：未绑定会话首次提交时绑当前全局（之后不再随全局
+    //   变化）；已绑定且 ≠ 全局时——仅当全局自上次提交后变化才发一次提示（避免每轮
+    //   噪声），告知用户本助手继续用原 Harness、新建助手才用新后端。
+    const QString sGlobal = CAgentRunnerFactory::BackendName();
+    if (pS->sBackend.isEmpty()) {
+        pS->sBackend = sGlobal;
+    } else if (pS->sBackend != sGlobal && pS->sLastSeenGlobal != sGlobal) {
+        emit sigAdhocEvent(a_sAsstId, QStringLiteral("sticky"),
+            QStringLiteral("本助手继续使用 %1 后端（全局已切换为 %2）；新建助手将使用 %2")
+                .arg(CAgentRunnerFactory::DisplayNameOf(pS->sBackend),
+                     CAgentRunnerFactory::DisplayNameOf(sGlobal)));
+    }
+    pS->sLastSeenGlobal = sGlobal;
     pS->iPerm = a_iPerm;
     pS->sLastTaskId = a_sTaskId;   // 自动续发排队指令时沿用同任务档（记忆注入）
     pS->iResume = 0;   // 新提问：max-turns 自动续跑计数清零
+    // 2026.09.23 v3.0.219 工作量评估：按本条提示词难度自动上调轮次预算（MaxTurnsAuto
+    //   可关）；预算随会话存续——续跑/纠偏/压缩重发沿用（同一条提问工作量不变）。
+    {
+        const int iBase = AdhocMaxTurns();
+        pS->iTurnsBudget = AdhocMaxTurnsAuto()
+            ? EstimateAdhocTurns(a_sText, iBase) : iBase;
+        if (pS->iTurnsBudget > iBase) {
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("turns_budget"),
+                QStringLiteral("⚙ 工作量评估：本轮任务较重，轮次上限 %1 → %2")
+                    .arg(iBase).arg(pS->iTurnsBudget));
+        }
+    }
     pS->bNudgeUsed = false;   // 2026.09.09 v2.1.131 新提问重置纠偏配额
     pS->bAutoCompactDone = false;   // 2026.09.09 v2.1.132 新提问重置超限自愈配额
     pS->eMode = Submitting;
@@ -2483,6 +3032,37 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
         }
         AsyncAdhocBackup(a_sAsstId, sOwner, a_sText);
     }
+    // 2026.09.26 专家助手深度模式（用户需求：ExpertAssistant 开启 + 非只读轮自动执行
+    //   深度链，用 token 换质量）：规划Agent 先分析请求制定计划+验收标准 → 执行轮照计划
+    //   实施 → 验证Agent 独立编译/测试核验 → 未过自动回炉（上限 MaxIter）→ 回炉耗尽
+    //   自动重启整链（上限 [Adhoc] ExpertRestarts）。关闭=纯对话模式（原行为直投）。
+    //   g_iAdhocDeepOverride（测试桩）：-1=按配置；0/1=强制关/开。
+    //   2026.10.02 查询类请求跳过整链（IsAdhocQueryPrompt）：查询/咨询不需要规划与
+    //   验证步骤，直投纯对话行为；深链辅助轮（规划/验证）的 assistant 输出压缩上屏
+    //   （CompressDeepAuxText）——结论一眼可见、验证长文不再夹在中间刷屏。
+    {
+        const int iDeep = (g_iAdhocDeepOverride >= 0)
+            ? g_iAdhocDeepOverride
+            : ((a_iPerm != PermReadOnly && m_pPm != nullptr
+                    && m_pPm->LoadExpertAssistant()) ? 1 : 0);
+        if (iDeep == 1 && IsAdhocQueryPrompt(a_sText)) {
+            // 2026.10.02 查询类请求跳过深度链（用户需求：查询功能不需要验证步骤）：
+            //   规划/验证是改码质量保障，对查询纯属干扰（多两轮 LLM 往返+验证长文
+            //   刷屏）；直投原行为（纯对话模式），事件行留痕。
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_skip_query"),
+                QStringLiteral("ℹ 查询类请求，跳过专家模式深度链（直接回答）"));
+        } else if (iDeep == 1) {
+            pS->bDeepActive = true;
+            pS->iDeepRetry = 0;
+            pS->iDeepRestart = 0;
+            pS->sDeepPlan.clear();
+            pS->sDeepFailSummary.clear();
+            pS->sDeepExecPrompt = sPrompt;
+            StartDeepPlan(*pS);
+            return;
+        }
+    }
+    pS->bDeepActive = false;
     StartAdhocStage(*pS, sPrompt, /*a_bDropLastUser=*/true);
 }
 
@@ -2502,6 +3082,7 @@ void CTaskOrchestrator::UndoAdhoc(const QString& a_sAsstId) {
         return;
     }
     pS->aPendingInjects.clear();   // 撤销回退链：未发出的排队指令一并作废
+    emit sigAdhocPendingDropped(a_sAsstId);   // 2026.09.18 面板暂存框同步作废
     if (pS->aStack.isEmpty()) {
         emit sigAdhocEvent(a_sAsstId, QStringLiteral("warn"),
             QStringLiteral("没有可撤销的提问"));
@@ -2568,6 +3149,7 @@ void CTaskOrchestrator::StopAdhoc(const QString& a_sAsstId) {
     if (pS != nullptr) {
         pS->eMode = Idle;
         pS->sPendingPrompt.clear();
+        pS->bDeepActive = false;   // 2026.09.26 深度链中断：停止后不再回炉/重启
     }
     emit sigAdhocFinished(a_sAsstId);
 }
@@ -2589,6 +3171,21 @@ bool CTaskOrchestrator::IsAsstAdhocRunning(const QString& a_sAsstId) const {
                 || pS->pRunner->IsRetryPending());
     }
     return false;
+}
+
+QStringList CTaskOrchestrator::RunningAdhocIds() const {
+    // 2026.09.18 退出确认提示用：占用判定与 IsAsstAdhocRunning 同口径
+    //   （含宽限/重试等待——进程未跑但 runner 仍被占用也在列）。
+    QStringList aIds;
+    for (auto it = m_aAdhoc.cbegin(); it != m_aAdhoc.cend(); ++it) {
+        const SAdhocSession* pS = it.value();
+        if (pS != nullptr && pS->pRunner != nullptr
+                && (pS->pRunner->IsRunning() || pS->pRunner->IsGraceActive()
+                    || pS->pRunner->IsRetryPending())) {
+            aIds.append(it.key());
+        }
+    }
+    return aIds;
 }
 
 bool CTaskOrchestrator::IsAnyAdhocRunning() const {
@@ -2616,11 +3213,14 @@ CTaskOrchestrator::SAdhocSession* CTaskOrchestrator::AdhocSess(const QString& a_
 }
 
 void CTaskOrchestrator::LoadAsstAdhoc(const QString& a_sAsstId, const QString& a_sSid,
-                                      const QJsonArray& a_aStack, const QString& a_sGuideHash) {
+                                      const QJsonArray& a_aStack, const QString& a_sGuideHash,
+                                      const QString& a_sBackend) {
     // 助手组恢复（不发信号）：直接覆盖该助手会话链；runner 保持懒建（首跑时 Ensure）。
+    //   2026.09.20 粘性后端：档内 per-assistant backend 随会话装入（空=未绑定）。
     SAdhocSession* pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
     pS->sSid  = a_sSid;
     pS->sGuideHash = a_sGuideHash;
+    pS->sBackend = a_sBackend;
     pS->aStack.clear();
     for (const QJsonValue& v : a_aStack) {
         if (v.isObject()) {
@@ -2644,11 +3244,17 @@ void CTaskOrchestrator::RemoveAsstAdhoc(const QString& a_sAsstId) {
     delete pS;
 }
 
-void CTaskOrchestrator::ResetAdhocSessions() {
+void CTaskOrchestrator::ResetAdhocSessions(const QSet<QString>& a_aKeep) {
     // 档切换/切工程：整组停 + 释放（⏹ 痕迹由调用方在落盘前经 StopAllAdhoc 留下；
     //   此处兜底 Stop 防孤儿进程）。新档助手经 LoadAsstAdhoc 重装。
-    for (auto it = m_aAdhoc.begin(); it != m_aAdhoc.end(); ++it) {
+    //   2026-10-02 a_aKeep：跨档幽灵保留集——外档运行中助手的会话/runner 原样保留
+    //   （不停、不删，轮次继续；面板以其 id 收流），仅清非保留会话。
+    for (auto it = m_aAdhoc.begin(); it != m_aAdhoc.end();) {
         SAdhocSession* pS = it.value();
+        if (a_aKeep.contains(it.key())) {
+            ++it;
+            continue;
+        }
         if (pS->pRunner != nullptr) {
             if (pS->pRunner->IsRunning() || pS->pRunner->IsGraceActive()
                 || pS->pRunner->IsRetryPending()) {
@@ -2657,8 +3263,63 @@ void CTaskOrchestrator::ResetAdhocSessions() {
             pS->pRunner->deleteLater();
         }
         delete pS;
+        it = m_aAdhoc.erase(it);
     }
-    m_aAdhoc.clear();
+}
+
+QString CTaskOrchestrator::MergeQueuedPrompts(const QStringList& a_aPrompts) {
+    // 2026.09.20 多条排队指令 → 一次投送封装：定界防短指令被规则噪音稀释（同 v2.1.130
+    //   【用户本轮请求】定界思路），按序全部执行完毕再统一收尾（防弱模型只挑部分执行）。
+    QString sMerged = QStringLiteral(
+        "用户在助手运行期间陆续提交了 %1 条排队指令。请在本轮一次性全部处理："
+        "按【指令 1】→【指令 %1】的顺序逐条执行完毕，全部完成后再统一收尾总结；"
+        "不要只执行其中一部分，也不要要求用户重发。").arg(a_aPrompts.size());
+    for (int i = 0; i < a_aPrompts.size(); ++i) {
+        sMerged += QStringLiteral("\n\n【指令 %1】\n%2")
+                       .arg(i + 1)
+                       .arg(a_aPrompts.at(i));
+    }
+    return sMerged;
+}
+
+bool CTaskOrchestrator::RemoveQueuedAdhoc(const QString& a_sAsstId, const QString& a_sText) {
+    // 2026.09.20 删除未发送的排队指令（面板暂存框 ✕/右键）：与 aPendingInjects 入队顺序
+    //   同源，按原文本匹配首个即面板暂存框对应行；已被合并消费（轮已起）→ 不命中。
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    if (pS == nullptr) {
+        return false;
+    }
+    const int iIdx = pS->aPendingInjects.indexOf(a_sText);
+    if (iIdx < 0) {
+        return false;
+    }
+    pS->aPendingInjects.removeAt(iIdx);
+    return true;
+}
+
+bool CTaskOrchestrator::EditQueuedAdhoc(const QString& a_sAsstId, const QString& a_sOldText,
+                                        const QString& a_sNewText) {
+    // 2026.09.20 改写未发送的排队指令（面板暂存框编辑）：同文本匹配；新文本空白拒改
+    //   （面板侧已拦，双保险）；续发时按改写后的文本投送。
+    if (a_sNewText.trimmed().isEmpty()) {
+        return false;
+    }
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    if (pS == nullptr) {
+        return false;
+    }
+    const int iIdx = pS->aPendingInjects.indexOf(a_sOldText);
+    if (iIdx < 0) {
+        return false;
+    }
+    pS->aPendingInjects[iIdx] = a_sNewText;
+    return true;
+}
+
+// 2026.09.20 该助手绑定的后端名（粘性；"" = 未绑定——首次提交时才绑当前全局）。
+QString CTaskOrchestrator::AsstAdhocBackend(const QString& a_sAsstId) const {
+    const SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    return pS ? pS->sBackend : QString();
 }
 
 QString CTaskOrchestrator::AsstAdhocSid(const QString& a_sAsstId) const {
@@ -2694,6 +3355,18 @@ void CTaskOrchestrator::OnAdhocInfo(const QString& a_sAsstId, const QString& a_s
 
 void CTaskOrchestrator::OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText) {
     if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        // 2026.10.02 深链辅助轮（规划/验证）输出压缩上屏（用户需求：验证日志别刷屏、
+        //   结论一眼可见）：≤360 字原样，超长保首 300 字+折叠尾注（结论由事件判定行
+        //   呈现）；不记 sLastAsstText（纠偏判据只认执行轮终答）；不记 aTranscript
+        //   （fork 一次性分支文本入回灌历史会带偏下一轮，同 v2.1.124 连发只留末条
+        //   的口径——顺带修复旧版把规划/验证长文也追加进回灌历史的带偏隐患）。
+        if (pS->eMode == DeepPlan || pS->eMode == DeepVerify) {
+            const QString sCompressed = CompressDeepAuxText(a_sText);
+            if (!sCompressed.isEmpty()) {
+                emit sigAdhocAssistantText(a_sAsstId, sCompressed);
+            }
+            return;
+        }
         pS->sLastAsstText = a_sText;   // 2026.09.09 v2.1.131 纠偏判据：终答=最后一条
     }
     emit sigAdhocAssistantText(a_sAsstId, a_sText);
@@ -2779,6 +3452,11 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
     //   语义与单会话版逐分支一致（详见各分支原注释）。
     SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
     if (pS == nullptr) {
+        // 2026-10-02 修「busy 永卡」（MeloTTS 实例：轮收尾时档已切、会话被删，此分支静默
+        //   丢弃 finished——面板 SetAsstRunning(true) 再无人清除：状态图标转不停、Tab 闪点、
+        //   输入栏停「追加指令」直到重启）。面板按 id 清运行态（找不到也无害）；进程侧已由
+        //   ResetAdhocSessions 的 Stop 兜底，无孤儿风险。
+        emit sigAdhocFinished(a_sAsstId);
         return;   // 会话已删（档切换兜底竞态）：丢弃
     }
     if (a_bOk) {
@@ -2820,11 +3498,11 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             emit sigAutoNameDone(pTask, false, QString());
             break;
         }
-        // 清洗：首行 → 去引号/书名号/Markdown 标记/空白 → 截 24 字。
+        // 清洗：首行 → CTaskInfo::TrimNamePunct 剥两侧引号/书名号/Markdown 标记与
+        //   句尾标点（2026.09.21 补尾冒号：「大模型 Harness网关插件:」实害——旧
+        //   reNoise 尾集没有 ：:）→ 截 24 字。
         QString sName = a_sResult.section(QLatin1Char('\n'), 0, 0).trimmed();
-        static const QRegularExpression reNoise(
-            QStringLiteral("^[\"'“”「『<>#*`]+|[\"'“”「』<>#*`。；;，,]+$"));
-        sName.remove(reNoise);
+        sName = CTaskInfo::TrimNamePunct(sName);
         sName = sName.simplified();
         if (sName.size() > 24) { sName = sName.left(24).trimmed(); }
         if (sName.size() < 2) {   // 空名/乱输出：保持原名
@@ -2838,6 +3516,36 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         StageEvent(pTask, QStringLiteral("auto_named"),
             QStringLiteral("⚙ Agent 已自动命名：「%1」").arg(sName));
         emit sigAutoNameDone(pTask, true, sName);
+        break;
+    }
+    case AsstAutoNaming: {
+        // 2026-09-22 助手自动重命名：两行输出——第一行名称（≤10 字，剥标点），其余行
+        //   合成一句说明。不动用户会话栈、不推进 pS->sSid（fork 分支一次性使用）。
+        const QString sTarget = pS->sAutoNameTargetAsst;
+        pS->sAutoNameTargetAsst.clear();
+        pS->eMode = Idle;
+        pS->sPendingPrompt.clear();
+        emit sigAdhocFinished(a_sAsstId);   // 借用的执行会话退出运行态
+        if (sTarget.isEmpty()) { break; }
+        if (!a_bOk) {
+            emit sigAsstAutoNameDone(sTarget, false, QString(),
+                a_sResult.left(120));
+            break;
+        }
+        QString sName = a_sResult.section(QLatin1Char('\n'), 0, 0).trimmed();
+        sName = CTaskInfo::TrimNamePunct(sName);
+        sName = sName.simplified();
+        if (sName.size() > 10) { sName = sName.left(10).trimmed(); }
+        if (sName.size() < 2) {
+            emit sigAsstAutoNameDone(sTarget, false, QString(),
+                QStringLiteral("Agent 未给出有效名称"));
+            break;
+        }
+        // 说明：第二行起到结尾合并为一段（模型偶发第三行补充也收编），剥两侧引号/尾标点，截 80 字。
+        QString sDesc = a_sResult.section(QLatin1Char('\n'), 1).simplified();
+        sDesc = CTaskInfo::TrimNamePunct(sDesc);
+        if (sDesc.size() > 80) { sDesc = sDesc.left(80).trimmed(); }
+        emit sigAsstAutoNameDone(sTarget, true, sName, sDesc);
         break;
     }
     case Submitting: {
@@ -2858,7 +3566,15 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                         "继续完成未完成的工作，从上次中断处接着做；不要重复已完成的改动。"));
                     return;   // 保持 Submitting 模式与 pendingPrompt，续跑成功后正常压栈
                 }
-                // 续跑预算耗尽：压栈断点（本条提问至此告一段落），交还用户接续
+                // 续跑预算耗尽：深度链 → 重启判定（2026.09.26 用户需求：重试导致停止
+                //   时自动重启，重规划携带教训）；纯对话模式 → 压栈断点（本条提问至此
+                //   告一段落），交还用户接续。
+                if (pS->bDeepActive) {
+                    DeepChainRestart(*pS,
+                        QStringLiteral("执行轮次上限耗尽（含自动续跑 2 次）"),
+                        pS->sLastAsstText.left(600));
+                    return;
+                }
                 pS->aStack.append({ pS->sPendingPrompt, a_sSid });
                 emit sigAdhocStateChanged(a_sAsstId);   // 链推进 → 存盘
                 pS->eMode = Idle;
@@ -2897,6 +3613,13 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                     "2) 已查看/改动的文件；3) 待办与注意事项。\n---\n%1\n---").arg(sRecap));
                 return;
             }
+            // 2026.09.26 深度链内执行轮硬失败（上下文超限自愈已在前面 return）：同样进
+            //   重启判定（重规划带上错误教训；重启预算耗尽由 DeepChainRestart 收尾）；
+            //   纯对话模式保持原「报错即停」。
+            if (pS->bDeepActive) {
+                DeepChainRestart(*pS, QStringLiteral("执行轮失败"), a_sResult.left(600));
+                return;
+            }
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("stage_failed"),
                 QStringLiteral("✗ 助手调用失败：%1").arg(a_sResult.left(200)));
             // #6 失败（崩溃/异常退出/返回 is_error）时也刷新上下文按钮：发 -1 显示「—」，
@@ -2926,29 +3649,24 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 "不要再以任何确认语结束。"));
             return;
         }
-        // 压栈 (prompt, newSid) 并推进链基点；sid 为空（异常）则不压栈，链不动。
-        if (!a_sSid.isEmpty()) {
-            pS->aStack.append({ pS->sPendingPrompt, a_sSid });
-            pS->sSid = a_sSid;
-            emit sigAdhocStateChanged(a_sAsstId);   // #1 会话链推进 → 存盘
-        }
-        pS->sPendingPrompt.clear();
-        pS->eMode = Idle;
-        emit sigAdhocModel(a_sAsstId, pS->pRunner ? pS->pRunner->LastModel() : QString());
-        emit sigAdhocContext(a_sAsstId, pS->pRunner ? pS->pRunner->LastContextFill() : 0);
-        // 需求4：非只读会话完成 → 触发 guide.md 增量同步（空闲 3 分钟节流，见构造函数）。
-        if (pS->iPerm != PermReadOnly && m_pPm != nullptr) {
-            m_tGuideSyncIdle.start();
-        }
-        emit sigAdhocEvent(a_sAsstId, QStringLiteral("done"), QStringLiteral("已完成"));
-        // 2026.08.27 运行中排队的追加指令自动续发（同会话续跑，在 sigAdhocFinished 之前）：
-        //   失败/续跑中断路径不消费（队列保留，待下一次成功提问后续发，原语义不变）。
-        if (!pS->aPendingInjects.isEmpty()) {
-            const QString sNext = pS->aPendingInjects.takeFirst();
-            SubmitAdhoc(a_sAsstId, sNext, pS->iPerm, pS->sLastTaskId);
+        // 2026.09.26 专家模式深度链：执行轮成功——有实际工作（本轮调用过工具）→ 起
+        //   独立验证轮（fork 一次性分支，只验证不修复）；纯问答（零工具）→ 跳过验证
+        //   直接收尾。链基点先推进到执行轮 sid（验证/回炉/重启均从它 fork；压栈留待
+        //   链尾统一做）。纯对话模式行为不变。
+        if (pS->bDeepActive) {
+            if (pS->bTurnSawTool && !a_sSid.isEmpty()) {
+                pS->sSid = a_sSid;
+                StartDeepVerify(*pS);
+                return;
+            }
+            if (!pS->bTurnSawTool) {
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_skip_verify"),
+                    QStringLiteral("ℹ 本轮未调用工具（未改动工程），跳过验证"));
+            }
+            FinishAdhocSuccess(*pS, a_sSid);
             return;
         }
-        emit sigAdhocFinished(a_sAsstId);
+        FinishAdhocSuccess(*pS, a_sSid);
         return;
     }
     case CompactSummarize: {
@@ -2989,7 +3707,9 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             pS->sSid = a_sSid;
             emit sigAdhocStateChanged(a_sAsstId);   // #1 链重置 → 存盘
             emit sigAdhocModel(a_sAsstId, pS->pRunner ? pS->pRunner->LastModel() : QString());
-            emit sigAdhocContext(a_sAsstId, pS->pRunner ? pS->pRunner->LastContextFill() : 0);
+            // 2026.09.26 同上：零 usage 发 -1（「—」）不发 0。
+            emit sigAdhocContext(a_sAsstId, pS->pRunner
+                ? (pS->pRunner->LastContextFill() > 0 ? pS->pRunner->LastContextFill() : -1) : 0);
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("compact_done"),
                 QStringLiteral("✔ 已压缩上下文"));
             // 2026.09.09 v2.1.133 旧对话记录随压缩作废（新会话由摘要起头；
@@ -3014,6 +3734,64 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         }
         return;
     }
+    case DeepPlan: {
+        // 2026.09.26 深度链第 1 步收尾：规划产出入会话缓存；失败/空产出 → 回退直投
+        //   原执行提示词（纯对话行为，链继续——执行轮仍会进验证）。
+        if (!a_bOk || a_sResult.trimmed().isEmpty()) {
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_plan_failed"),
+                QStringLiteral("⚠ 规划轮失败（%1），跳过规划直接执行")
+                    .arg(a_sResult.left(240)));
+            pS->eMode = Submitting;
+            StartAdhocStage(*pS, pS->sDeepExecPrompt, /*a_bDropLastUser=*/true);
+            return;
+        }
+        pS->sDeepPlan = a_sResult.trimmed();
+        if (pS->sDeepPlan.size() > 6000) {
+            pS->sDeepPlan = pS->sDeepPlan.left(6000);
+        }
+        emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_plan_done"),
+            QStringLiteral("✔ 规划完成（含验收标准），开始执行"));
+        pS->eMode = Submitting;
+        StartAdhocStage(*pS, pS->sDeepExecPrompt + QStringLiteral(
+            "\n\n---\n【专家模式·实施计划】以下计划由规划Agent基于你的请求生成，供执行参考；"
+            "执行中发现与实际不符时可合理调整，但最终须达成计划中的验收标准：\n%1")
+            .arg(pS->sDeepPlan), /*a_bDropLastUser=*/true);
+        return;
+    }
+    case DeepVerify: {
+        // 2026.09.26 深度链第 3 步收尾：PASS → 链尾统一成功收尾；FAIL/无判定/验证轮
+        //   自身失败 → 回炉重试（上限 MaxIter），耗尽 → DeepChainRestart 重启判定。
+        QString sReasons;
+        const int iVerdict = ParseDeepVerdict(a_sResult, &sReasons);
+        if (iVerdict == 1) {
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_verify_pass"),
+                QStringLiteral("✔ 独立验证通过，专家模式闭环完成"));
+            FinishAdhocSuccess(*pS, pS->sSid);
+            return;
+        }
+        if (sReasons.isEmpty()) {
+            sReasons = (iVerdict == -1 && !a_bOk)
+                ? a_sResult.left(600)
+                : QStringLiteral("验证结论未按约定格式输出（无 VERIFY:PASS/FAIL 判定行）");
+        }
+        if (pS->iDeepRetry < MaxIter()) {
+            ++pS->iDeepRetry;
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_retry"),
+                QStringLiteral("⚠ 验证未通过，自动回炉修复（第 %1/%2 次）：%3")
+                    .arg(pS->iDeepRetry).arg(MaxIter()).arg(sReasons.left(160)));
+            pS->eMode = Submitting;
+            StartAdhocStage(*pS, QStringLiteral(
+                "【专家模式·修复轮】独立验证者报告以下问题未通过验收：\n---\n%1\n---\n"
+                "请在现有改动基础上修复以上全部问题（会话已保留此前的改动与上下文，"
+                "不要重做已通过的部分），对照验收标准逐项处理后，"
+                "简要说明每个问题的修复方式。")
+                .arg(sReasons.left(1500)));
+            return;
+        }
+        DeepChainRestart(*pS,
+            QStringLiteral("验证回炉 %1 次仍未通过").arg(MaxIter()), sReasons);
+        return;
+    }
     case Idle:
     default: {
         // 不应发生（无模式却收到 finished）：仅恢复空闲、启用输入栏。
@@ -3022,5 +3800,275 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         return;
     }
     }
+}
+
+// —— 2026.09.26 专家助手深度模式（规划→执行→验证闭环 + 回炉/重启）——
+
+// 深度模式运行期覆盖（测试桩，定义见 SubmitAdhoc 前）。
+void CTaskOrchestrator::SetAdhocDeepOverride(int a_iMode) {
+    g_iAdhocDeepOverride = a_iMode;
+}
+
+// 专家模式规划/验证轮的 --max-turns 覆盖：轻量辅助轮（只出计划/只跑验收），无需
+// 执行轮的重预算；20 轮足够只读探索大工程 + 编译/测试两三轮。
+static constexpr int k_iDeepAuxTurns = 20;
+
+void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
+    // 深度链第 1 步：规划轮（fork 一次性分支，不动撤销栈/sid 基点）。只读探索，
+    //   产出「目标/实施步骤/验收标准」三段计划；重启时携带历史失败教训重规划。
+    a_S.eMode = DeepPlan;
+    emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_plan"),
+        QStringLiteral("⚙ 专家模式：规划Agent 先分析请求并制定实施计划与验收标准…"));
+    QString sLessons;
+    if (!a_S.sDeepFailSummary.isEmpty()) {
+        sLessons = QStringLiteral(
+            "\n---\n【历史失败教训】此前的尝试未通过独立验证，原因摘要：\n%1\n"
+            "新计划必须规避或正面解决这些问题。").arg(a_S.sDeepFailSummary.left(1500));
+    }
+    const QString sPrompt = QStringLiteral(
+        "【专家模式·规划轮】请分析下面的用户请求并制定实施计划。本轮只输出计划文本，"
+        "禁止修改任何文件（可用 Read/Grep/Glob 等只读工具探索工程）。\n"
+        "计划格式（Markdown，全文 ≤60 行）：\n"
+        "## 目标\n（一两句话）\n"
+        "## 实施步骤\n1. …（每步写明要动的文件/位置，尽量具体可执行）\n"
+        "## 验收标准\n1. …（每条必须客观可验证：可编译、可运行、测试通过、"
+        "文件内容/行为符合预期；禁止「优化」「完善」等主观措辞）\n"
+        "---\n【用户请求】\n%1%2")
+        .arg(a_S.sPendingPrompt.left(2000), sLessons);
+    StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
+                    k_iDeepAuxTurns, QStringLiteral("Edit,Write"));
+}
+
+void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
+    // 深度链第 3 步：验证轮（fork 一次性分支）。独立验证者只核验不修复（禁 Edit/Write），
+    //   按 guide.md 构建说明实际编译/测试 + 逐项核对验收标准，末行输出 VERIFY:PASS/FAIL。
+    a_S.eMode = DeepVerify;
+    emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_verify"),
+        QStringLiteral("🔍 专家模式：验证Agent 按验收标准实际编译/测试核验…"));
+    const QString sCriteria = ExtractDeepCriteria(a_S.sDeepPlan);
+    const QString sPrompt = QStringLiteral(
+        "【专家模式·验证轮】你是独立验证者。执行Agent 刚完成了用户请求的改动，"
+        "请客观验收（只验证、严禁修复、严禁修改任何工程文件）：\n"
+        "1) 逐项核对【验收标准】：需看代码的用 Read 核对，需看行为的实际运行验证；\n"
+        "2) 编译/测试方法优先按 .autodev/guide.md 的构建说明执行；无说明时用工程惯例"
+        "命令（如 cmake --build build、msbuild、pnpm test 等）；\n"
+        "3) 正文逐项给出证据（执行的命令与关键输出/检查的文件与关键行）；\n"
+        "4) 最后一行必须精确输出总结论（二选一）：\n"
+        "   VERIFY:PASS\n"
+        "   VERIFY:FAIL: <原因清单，逐条对应未通过的验收标准>\n"
+        "---\n【验收标准】\n%1\n---\n【用户原始请求】\n%2")
+        .arg(sCriteria, a_S.sPendingPrompt.left(800));
+    StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
+                    k_iDeepAuxTurns, QStringLiteral("Edit,Write"));
+}
+
+void CTaskOrchestrator::DeepChainRestart(SAdhocSession& a_S, const QString& a_sWhy,
+                                         const QString& a_sReasons) {
+    // 重启判定（2026.09.26 用户需求：重试耗尽导致停止时自动重启）：失败教训累积进
+    //   sDeepFailSummary（重规划时注入规避，保尾部 2000 字）→ 未超 [Adhoc]
+    //   ExpertRestarts 则重置回炉计数、重新「规划→执行→验证」；超限 → 保留断点
+    //   收尾交还用户（改动与会话都在，可人工修复后续问）。
+    const int iCap = qBound(0, (m_pPm != nullptr ? m_pPm->LoadExpertRestarts() : 1), 5);
+    if (!a_sReasons.trimmed().isEmpty()) {
+        const QString sAdd = QStringLiteral("[%1] %2")
+            .arg(a_sWhy, a_sReasons.left(600));
+        a_S.sDeepFailSummary = a_S.sDeepFailSummary.isEmpty()
+            ? sAdd : (a_S.sDeepFailSummary + QLatin1Char('\n') + sAdd);
+        if (a_S.sDeepFailSummary.size() > 2000) {   // 保尾部：最新教训优先
+            a_S.sDeepFailSummary = a_S.sDeepFailSummary.right(2000);
+        }
+    }
+    if (a_S.iDeepRestart < iCap) {
+        ++a_S.iDeepRestart;
+        a_S.iDeepRetry = 0;
+        emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_restart"),
+            QStringLiteral("♻ %1——专家模式自动重启深度链（第 %2/%3 次：重新规划→执行→验证）")
+                .arg(a_sWhy).arg(a_S.iDeepRestart).arg(iCap));
+        StartDeepPlan(a_S);
+        return;
+    }
+    emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_fail"),
+        QStringLiteral("✗ 专家模式未能达成验收（%1；已自动重启 %2 次）。"
+                       "会话与改动已保留，可人工检查后发送修复指令")
+            .arg(a_sWhy).arg(a_S.iDeepRestart));
+    FinishAdhocFailure(a_S);
+}
+
+void CTaskOrchestrator::FinishAdhocSuccess(SAdhocSession& a_S, const QString& a_sFinalSid) {
+    // 原 Submitting 成功尾段提炼（2026.09.26）：压栈 (prompt, newSid) 并推进链基点
+    //   （sid 空=异常不压栈、链不动）→ 模型/上下文上报 → guide 同步节流 → 排队指令
+    //   续发（多条合并投送）。深度链 PASS 与纯对话成功统一走这里。
+    if (!a_sFinalSid.isEmpty()) {
+        a_S.aStack.append({ a_S.sPendingPrompt, a_sFinalSid });
+        a_S.sSid = a_sFinalSid;
+        emit sigAdhocStateChanged(a_S.sId);   // #1 会话链推进 → 存盘
+    }
+    a_S.sPendingPrompt.clear();
+    a_S.eMode = Idle;
+    a_S.bDeepActive = false;   // 深度链终结（成功）
+    emit sigAdhocModel(a_S.sId, a_S.pRunner ? a_S.pRunner->LastModel() : QString());
+    // 收尾拿不到 usage（≤0）时发 -1 显示「—」而非误导性的 0（pi+网关响应帧 usage 恒 0）。
+    emit sigAdhocContext(a_S.sId, a_S.pRunner
+        ? (a_S.pRunner->LastContextFill() > 0 ? a_S.pRunner->LastContextFill() : -1) : 0);
+    // 需求4：非只读会话完成 → 触发 guide.md 增量同步（空闲 3 分钟节流，见构造函数）。
+    if (a_S.iPerm != PermReadOnly && m_pPm != nullptr) {
+        m_tGuideSyncIdle.start();
+    }
+    emit sigAdhocEvent(a_S.sId, QStringLiteral("done"), QStringLiteral("已完成"));
+    // 2026.08.27 运行中排队的追加指令自动续发（同会话续跑，在 sigAdhocFinished 之前）；
+    //   2026.09.20 v2.4.185 多条排队指令一次性合并投送：全部出队，逐条转正面板暂存
+    //   块后合并为一次 SubmitAdhoc；单条行为不变（无包装原文投递）。
+    if (!a_S.aPendingInjects.isEmpty()) {
+        QStringList aBatch;
+        for (const QString& s : a_S.aPendingInjects) {
+            if (!s.trimmed().isEmpty()) {
+                aBatch << s;
+            }
+        }
+        a_S.aPendingInjects.clear();
+        for (const QString& s : aBatch) {
+            emit sigAdhocPendingStarted(a_S.sId, s);
+        }
+        if (aBatch.isEmpty()) {
+            // 全空白（防御，正常排队路径已拦空文本）：直接归空闲。
+            emit sigAdhocFinished(a_S.sId);
+        } else if (aBatch.size() == 1) {
+            SubmitAdhoc(a_S.sId, aBatch.first(), a_S.iPerm, a_S.sLastTaskId);
+        } else {
+            emit sigAdhocEvent(a_S.sId, QStringLiteral("batch"),
+                QStringLiteral("已将 %1 条排队指令合并为本轮一次性投送")
+                    .arg(aBatch.size()));
+            SubmitAdhoc(a_S.sId, MergeQueuedPrompts(aBatch),
+                        a_S.iPerm, a_S.sLastTaskId);
+        }
+        return;
+    }
+    emit sigAdhocFinished(a_S.sId);
+}
+
+void CTaskOrchestrator::FinishAdhocFailure(SAdhocSession& a_S) {
+    // 深度链最终失败收尾：保留断点（压栈保会话，用户可发修复指令/「继续」接续）+
+    //   上下文 -1（本轮未正常完成）+ 交还输入栏。
+    if (!a_S.sSid.isEmpty()) {
+        a_S.aStack.append({ a_S.sPendingPrompt, a_S.sSid });
+        emit sigAdhocStateChanged(a_S.sId);
+    }
+    a_S.sPendingPrompt.clear();
+    a_S.eMode = Idle;
+    a_S.bDeepActive = false;   // 深度链终结（失败）
+    emit sigAdhocContext(a_S.sId, -1);
+    emit sigAdhocFinished(a_S.sId);
+}
+
+int CTaskOrchestrator::ParseDeepVerdict(const QString& a_sResult, QString* a_pReasons) {
+    // 纯函数：返回 1=PASS / 0=FAIL（a_pReasons 出该行失败原因） / -1=无判定行。
+    //   FAIL 优先判定：防「VERIFY:FAIL: xxx passed」原因文本误命中 PASS。
+    if (a_pReasons != nullptr) {
+        a_pReasons->clear();
+    }
+    static const QRegularExpression reFail(
+        QStringLiteral("VERIFY\\s*:\\s*FAIL\\b[\uff1a:]?\\s*(.*)$"),
+        QRegularExpression::CaseInsensitiveOption
+        | QRegularExpression::MultilineOption);
+    const auto mFail = reFail.match(a_sResult);
+    if (mFail.hasMatch()) {
+        if (a_pReasons != nullptr) {
+            *a_pReasons = mFail.captured(1).trimmed();
+        }
+        return 0;
+    }
+    static const QRegularExpression rePass(
+        QStringLiteral("VERIFY\\s*:\\s*PASS\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return rePass.match(a_sResult).hasMatch() ? 1 : -1;
+}
+
+QString CTaskOrchestrator::ExtractDeepCriteria(const QString& a_sPlan) {
+    // 纯函数：从规划产物提取「## 验收标准」段（到下一个 ## 标题或文末）；段缺失/
+    //   段体为空 → 回退整份计划（验证轮仍拿到可用输入）；恒截 2000 字。
+    if (a_sPlan.trimmed().isEmpty()) {
+        return QStringLiteral("（规划产物缺失——请按用户原始请求的合理结果验收）");
+    }
+    static const QRegularExpression reSection(
+        QStringLiteral("(?m)^#{0,3}\\s*验收标准\\s*$"));
+    const auto m = reSection.match(a_sPlan);
+    if (!m.hasMatch()) {
+        return a_sPlan.trimmed().left(2000);
+    }
+    const QString sRest = a_sPlan.mid(m.capturedEnd());
+    static const QRegularExpression reNext(QStringLiteral("(?m)^#{1,3}\\s+\\S"));
+    const auto mNext = reNext.match(sRest);
+    QString sBody = mNext.hasMatch() ? sRest.left(mNext.capturedStart()) : sRest;
+    sBody = sBody.trimmed();
+    if (sBody.isEmpty()) {
+        return a_sPlan.trimmed().left(2000);
+    }
+    return sBody.left(2000);
+}
+
+bool CTaskOrchestrator::IsAdhocQueryPrompt(const QString& a_sText) {
+    // 纯函数启发式（2026.10.02）：判定用户请求是否为查询/咨询类（不改码）。
+    //   判据（须同时满足）：① 无改码动词（出现任一即视为改码请求，优先级最高
+    //   ——混合句「解释一下然后修复」按改码处理；「配置/更新」等名词化高频词
+    //   不入表——它们作动词的句子通常无查询信号，仍会正确判改码）；② 有查询
+    //   信号——问号结尾或含查询动词。无任何信号的中性请求默认 false（保守走深度链，宁多验不漏验）。
+    //   注意只判用户原文（SubmitAdhoc 的 a_sText），不判注入定界/规则后的合成
+    //   提示词（规则段含「修改」等词必误判）。
+    const QString sT = a_sText.trimmed();
+    if (sT.isEmpty()) {
+        return false;
+    }
+    static const QStringList aChangeVerbs = {
+        QStringLiteral("修改"), QStringLiteral("实现"), QStringLiteral("添加"),
+        QStringLiteral("增加"), QStringLiteral("新增"), QStringLiteral("创建"),
+        QStringLiteral("新建"), QStringLiteral("删除"), QStringLiteral("移除"),
+        QStringLiteral("重构"), QStringLiteral("修复"), QStringLiteral("编写"),
+        QStringLiteral("开发"), QStringLiteral("优化"),
+        QStringLiteral("安装"), QStringLiteral("升级"),
+        QStringLiteral("部署"), QStringLiteral("调整"), QStringLiteral("完善"),
+        QStringLiteral("搭建"), QStringLiteral("接入"), QStringLiteral("集成"),
+        QStringLiteral("迁移"), QStringLiteral("补充"), QStringLiteral("格式化"),
+        QStringLiteral("重命名"), QStringLiteral("生成"), QStringLiteral("写一"),
+        QStringLiteral("做一"), QStringLiteral("改一"), QStringLiteral("加一"),
+    };
+    for (const QString& sV : aChangeVerbs) {
+        if (sT.contains(sV)) {
+            return false;
+        }
+    }
+    if (sT.endsWith(QLatin1Char('?')) || sT.endsWith(QChar(0xFF1F))) {
+        return true;
+    }
+    static const QStringList aQueryVerbs = {
+        QStringLiteral("是什么"), QStringLiteral("什么是"), QStringLiteral("为什么"),
+        QStringLiteral("怎么"), QStringLiteral("如何"), QStringLiteral("哪些"),
+        QStringLiteral("哪个"), QStringLiteral("有没有"), QStringLiteral("是否"),
+        QStringLiteral("查询"), QStringLiteral("查看"), QStringLiteral("看看"),
+        QStringLiteral("分析"), QStringLiteral("解释"), QStringLiteral("说明"),
+        QStringLiteral("列出"), QStringLiteral("显示"), QStringLiteral("了解"),
+        QStringLiteral("介绍"), QStringLiteral("搜索"), QStringLiteral("什么意思"),
+        QStringLiteral("区别"), QStringLiteral("作用"), QStringLiteral("用法"),
+        QStringLiteral("支持吗"), QStringLiteral("可以吗"), QStringLiteral("能否"),
+        QStringLiteral("帮我看"), QStringLiteral("看一下"), QStringLiteral("读一下"),
+    };
+    for (const QString& sV : aQueryVerbs) {
+        if (sT.contains(sV)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+QString CTaskOrchestrator::CompressDeepAuxText(const QString& a_sText) {
+    // 深链辅助轮（规划/验证）输出压缩（2026.10.02）：≤360 字原样；超长保首 300 字
+    //   + 尾注折叠说明。结论以事件判定行为准（验证轮末行 VERIFY:PASS/FAIL 由
+    //   deep_verify_pass/事件行独立呈现），规划详情完整保留在 sDeepPlan 注入
+    //   执行轮——屏幕只留足够上下文不丢结论。
+    const QString sT = a_sText.trimmed();
+    if (sT.size() <= 360) {
+        return sT;
+    }
+    return sT.left(300) + QStringLiteral(
+        "\n\n…（过程输出较长，已折叠 %1 字；结论以下方判定行为准）").arg(sT.size());
 }
 

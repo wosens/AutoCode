@@ -38,13 +38,25 @@ public:
     static bool IsHermes() { return s_eBackend == BackendHermes; }
     // 当前后端名（与各 runner BackendName() 同词汇表，漂移检测直接字符串比较）。
     static QString BackendName() {
-        switch (s_eBackend) {
+        return NameOf(s_eBackend);
+    }
+    // 2026.09.20 助手粘性后端：任意后端枚举→名（与 BackendName 同源防漂移）。
+    static QString NameOf(EBackend e) {
+        switch (e) {
             case BackendDsh:   return QStringLiteral("dsh");
             case BackendPi:    return QStringLiteral("pi");
             case BackendCodex: return QStringLiteral("codex");
             case BackendHermes: return QStringLiteral("hermes");
             default:           return QStringLiteral("claude");
         }
+    }
+    // 2026.09.20 任意后端名→显示名（粘性提示/Tab tooltip 用）。
+    static QString DisplayNameOf(const QString& a_sName) {
+        if (a_sName == QStringLiteral("dsh"))    return QStringLiteral("DSH");
+        if (a_sName == QStringLiteral("pi"))     return QStringLiteral("PIAgent");
+        if (a_sName == QStringLiteral("codex"))  return QStringLiteral("CodexHarness");
+        if (a_sName == QStringLiteral("hermes")) return QStringLiteral("Hermes");
+        return QStringLiteral("Claude");
     }
     // 后端显示名（UI 展示用：助手对话块说话人标签等，随当前选择的后端走）。
     static QString BackendDisplayName() {
@@ -67,6 +79,16 @@ public:
             case BackendHermes: return new CHermesRunner(a_pParent);
             default:           return new CClaudeRunner(a_pParent);
         }
+    }
+    // 2026.09.20 助手粘性后端（v2.4.193）：按后端名分派（忽略全局单选——会话绑定
+    //   的后端与全局不同时，助手继续用自己的 Harness）。未知名回退当前全局。
+    static CAgentRunnerBase* CreateFor(const QString& a_sName, QObject* a_pParent = nullptr) {
+        if (a_sName == QStringLiteral("dsh"))    return new CDeepSeekRunner(a_pParent);
+        if (a_sName == QStringLiteral("pi"))     return new CPiAgentRunner(a_pParent);
+        if (a_sName == QStringLiteral("codex"))  return new CCodexRunner(a_pParent);
+        if (a_sName == QStringLiteral("hermes")) return new CHermesRunner(a_pParent);
+        if (a_sName == QStringLiteral("claude")) return new CClaudeRunner(a_pParent);
+        return Create(a_pParent);
     }
 
 private:

@@ -15,6 +15,10 @@ public:
     CTaskHistoryDB();
     ~CTaskHistoryDB();
 
+    // 持有 sqlite3* 句柄：禁止拷贝（否则双实例先后析构对同一句柄二次 close）。
+    CTaskHistoryDB(const CTaskHistoryDB&) = delete;
+    CTaskHistoryDB& operator=(const CTaskHistoryDB&) = delete;
+
     // 打开/创建指定路径的库并建表；空路径 = 旧版全局库 <exe 目录>/history.db。
     // 失败返回 false（不阻断程序）。
     bool Open(const QString& a_sDbPath = QString());

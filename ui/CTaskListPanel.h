@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QList>
@@ -43,6 +43,7 @@ public:
     void UpdateTaskRow(CTaskInfo* a_pTask);
     // 在当前表查找并选中指定任务（启动任务时自动选中，使其日志立即显示）。
     void SelectTask(CTaskInfo* a_pTask);
+    void DeselectAll();   // 2026-10-02 程序化取消选中（走正常信号链；幽灵回工程档用）
     // 2026.09.10 v2.2.153 在历史表查找并选中指定任务：任务终态归档后调用，切「历史任务」
     //   页并选中刚结束的任务（发选中信号 → 显示其任务日志，与 SelectTask 对称）。
     void SelectHistoryTask(CTaskInfo* a_pTask);
@@ -54,6 +55,9 @@ public:
 
     // FR-3：切换工程资源管理器根目录（OpenProjectDir 成功后调用）；空串=清空树。
     void SetProjectRoot(const QString& a_sDir);
+
+    // 2026.09.23 资源管理器显示隐藏目录下发（设置保存/热重载/启动应用；透传给面板）。
+    void SetExplorerHiddenDirs(const QStringList& a_aNames);
 
     // 2026.08.18 任务列表高度分隔条：上段(任务Tab+按钮行)/资源管理器之间的垂直 QSplitter
     //   状态存取（CMainWindow 在启动时恢复、关闭时保存，经 CProjectManager 落 [Layout] VSplit）。
@@ -85,6 +89,8 @@ signals:
     // 2026.08.18：资源管理器双击文本文件 → 执行面板「助手」右侧 Tab 内嵌显示（转发）。
     //   2026.08.21 增加切页标志：双击=true 切页；单击=false 只加载内容不切页。
     void sigFileOpen(const QString& a_sAbsPath, bool a_bSwitchTab);
+    // 2026-09-30 代码审查（ReviewSdk）：资源管理器右键 → 主窗口弹审查对话框（转发）。
+    void sigCodeReview(const QString& a_sAbsPath);
     // FR-9：任务列表（Tab）底部相对本 widget 顶部的 y 变化 → 供执行面板同步阶段表高度，
     //       使「阶段表底部」与「任务列表底部」（不含按钮行）对齐，随字体/DPI 自适应。
     //       2026.08.19 仅窗口 resize 路径上报；左栏分隔条拖动不上报（各拖动条互不影响）。

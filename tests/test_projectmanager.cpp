@@ -8,6 +8,7 @@
 #include <QTreeWidget>
 #include <QWindow>          // 窗口级 QTest 鼠标事件（真实输入管线）
 #include <QTabWidget>
+#include <QMainWindow>       // 2026.09.26 设置对话框几何漂移用例（父窗口）
 
 #include <windows.h>       // WritePrivateProfileStringW（坏档构造，与生产代码同通道）
 
@@ -338,6 +339,63 @@ private slots:
 
     // 2026.09.09 v2.1.142 回归：Count 键丢失/被粘连（「[Recent]Count=52」整行被解析器
     //   当节头丢弃）但编号键仍在 → LoadRecent 顺序探测自愈重建，列表不凭空消失。
+    // 2026.09.20 打开次数统计：AddRecent 命中累加/新条目=1、MRU 顺序、
+    //   存取往返（C<i> 键）、旧档无 C 键回退 1、RemoveRecent 随条目同删。
+    void testRecentOpenCountTracking() {
+        RemoveConfig();
+        CProjectManager stPm;
+        stPm.AddRecent(QStringLiteral("C:/CntA"));
+        stPm.AddRecent(QStringLiteral("C:/CntA"));
+        stPm.AddRecent(QStringLiteral("C:/CntA"));
+        stPm.AddRecent(QStringLiteral("C:/CntB"));
+        stPm.AddRecent(QStringLiteral("C:/CntC"));
+        stPm.AddRecent(QStringLiteral("C:/CntC"));
+        QStringList aList = stPm.RecentProjects();
+        QList<int> aOpens = stPm.RecentOpenCounts();
+        QCOMPARE(aList.size(), 3);
+        QCOMPARE(aList.at(0), QStringLiteral("C:/CntC"));   // MRU：最近在前
+        QCOMPARE(aList.at(1), QStringLiteral("C:/CntB"));
+        QCOMPARE(aList.at(2), QStringLiteral("C:/CntA"));
+        QCOMPARE(aOpens, (QList<int>() << 2 << 1 << 3));    // 同序计数
+
+        // 存取往返：新实例 LoadRecent 读回同计数。
+        CProjectManager stPm2;
+        stPm2.LoadRecent();
+        QCOMPARE(stPm2.RecentProjects(), aList);
+        QCOMPARE(stPm2.RecentOpenCounts(), aOpens);
+
+        // 再次打开 A：计数 3→4 且置顶。
+        stPm2.AddRecent(QStringLiteral("C:/CntA"));
+        QCOMPARE(stPm2.RecentProjects().at(0), QStringLiteral("C:/CntA"));
+        QCOMPARE(stPm2.RecentOpenCounts().at(0), 4);
+
+        // RemoveRecent：条目与计数同删。
+        stPm2.RemoveRecent(QStringLiteral("C:/CntB"));
+        QCOMPARE(stPm2.RecentProjects().size(), 2);
+        QCOMPARE(stPm2.RecentOpenCounts().size(), 2);
+        QVERIFY(!stPm2.RecentProjects().contains(QStringLiteral("C:/CntB")));
+    }
+
+    void testRecentOpenCountLegacyConfigDefaults() {
+        // 旧档（无 C<i> 计数键）→ 全部回退 1。
+        const QString sCfg = ConfigPath();
+        QFile fCfg(sCfg);
+        QVERIFY2(fCfg.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                 qPrintable(QStringLiteral("cannot write config: %1").arg(sCfg)));
+        fCfg.write("[Recent]\r\nCount=2\r\n1=C:/LegA\r\n2=C:/LegB\r\n");
+        fCfg.close();
+        CProjectManager stPm;
+        stPm.LoadRecent();
+        QCOMPARE(stPm.RecentProjects().size(), 2);
+        QCOMPARE(stPm.RecentOpenCounts(), (QList<int>() << 1 << 1));
+        // 触发落盘（AddRecent 命中：LegB 计数 1→2 并置顶）→ 新实例读回补写出的 C 键。
+        stPm.AddRecent(QStringLiteral("C:/LegB"));
+        CProjectManager stPm2;
+        stPm2.LoadRecent();
+        QCOMPARE(stPm2.RecentProjects().at(0), QStringLiteral("C:/LegB"));
+        QCOMPARE(stPm2.RecentOpenCounts(), (QList<int>() << 2 << 1));
+    }
+
     void testLoadRecentCountKeyLostFallback() {
         const QString sCfg = ConfigPath();
         QFile fCfg(sCfg);
@@ -586,6 +644,44 @@ private slots:
         }
     }
 
+    // 2026.09.23 v3.1.229 启动链回归（用户报告搬机场景）：后端=codex 但 ini 无
+    //   [CodexModels] 节（只复制了部分节的 config，如 Execute/config.ini 现场）
+    //   ——启动 ApplySharedModelsToRunners 四表合并后 codex 侧应得到共享当前模型
+    //   （基底表 Active 按身份映射，绝不因 codex 表空而报「模型未配置」）。
+    //   旧 exe（v1.9.4-，无公共模型）会真的报模型未配置——本用例兼作新旧分水岭证据。
+    void testStartupCodexMissingTableStillGetsModel() {
+        // 合成现场态 ini：Backend=4 + [PiModels] 1 条 Active=0 + 无其余模型表。
+        const QString sCfg = ConfigPath();
+        QFile::remove(sCfg);
+        {
+            QFile f(sCfg);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("[Agent]\r\nBackend=4\r\n");
+            f.write("[PiModels]\r\nCount=1\r\nActive=0\r\n"
+                    "M0Disp=GLM-5.3\r\n"
+                    "M0URL=http://192.168.118.128:9000/claude\r\n"
+                    "M0Key=k\r\nM0Api=anthropic-messages\r\n"
+                    "M0Model=glm-5.3\r\nM0Ctx=1000000\r\nM0Max=32768\r\n");
+            f.close();
+        }
+        CProjectManager stPm;
+        // 启动同序：四表实读（LoadCodexModels 回退全局）→ 合并（pref=codex）→ 应用 runner。
+        int iDshAct = -1, iPiAct = -1, iCodexAct = -1, iHermesAct = -1;
+        const QList<SDshModelEntry> aDsh    = stPm.LoadDshModels(&iDshAct);
+        const QList<SDshModelEntry> aPi     = stPm.LoadPiModels(&iPiAct);
+        const QList<SDshModelEntry> aCodex  = stPm.LoadCodexModels(&iCodexAct);
+        const QList<SDshModelEntry> aHermes = stPm.LoadHermesModels(&iHermesAct);
+        QVERIFY(aCodex.isEmpty());          // 现场态：codex 表确实空
+        QCOMPARE(iCodexAct, -1);
+        const QList<QList<SDshModelEntry>> aTables = { aPi, aDsh, aHermes, aCodex };
+        const QList<int> aActives = { iPiAct, iDshAct, iHermesAct, iCodexAct };
+        const SSharedModels stM = MergeSharedModelTables(aTables, aActives, /*pref codex=*/3);
+        // 合并后共享表有 glm-5.3，当前项按基底（Pi）Active 映射到 0——codex 不缺模型。
+        QCOMPARE(stM.aModels.size(), 1);
+        QCOMPARE(stM.aModels.at(0).sModelId, QStringLiteral("glm-5.3"));
+        QCOMPARE(stM.iActive, 0);
+    }
+
     // 2026.09.11 模型表列宽可调+持久化（用户需求：鼠标可调每列表头宽度并记忆）：
     // ① 四棵模型树全列 Interactive（含原 Stretch 不可拖的第 1 列）且末列 stretch；
     // ② 真实鼠标拖拽：QTest 合成 press/move/release 在表头分隔线上，验证 QHeaderView
@@ -697,7 +793,128 @@ private slots:
             QVERIFY(bFoundDsh);
         }
     }
+
+    // 2026.09.23 v3.0.217 回归：助手轮次上限配置化（[Adhoc] MaxTurns，默认 40，钼 10..200）
+    //   —— LayoutDesign「打磨布局设计器」12 问 11 次触顶，上限可调的兑底。
+    void testAdhocMaxTurnsConfig() {
+        // ① 无 config.ini/缺键 → 默认 40。
+        {
+            CProjectManager stPm;
+            QCOMPARE(stPm.LoadAdhocMaxTurns(), 40);
+        }
+        // ② 保存 → 读回（正常档 120）。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveAdhocMaxTurns(120));
+            QCOMPARE(stPm.LoadAdhocMaxTurns(), 120);
+        }
+        // ③ 写入越界值被 Save 钼制：>200 → 200，<10 → 10。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveAdhocMaxTurns(500));
+            QCOMPARE(stPm.LoadAdhocMaxTurns(), 200);
+            QVERIFY(stPm.SaveAdhocMaxTurns(1));
+            QCOMPARE(stPm.LoadAdhocMaxTurns(), 10);
+        }
+        // ④ 坏档（绕过 Save 直接写非法原始值）→ Load 兑底回 40。
+        {
+            const QString sCfg = ConfigPath();
+            WritePrivateProfileStringW(L"Adhoc", L"MaxTurns", L"999",
+                                       (LPCWSTR)sCfg.utf16());
+            CProjectManager stPm;
+            QCOMPARE(stPm.LoadAdhocMaxTurns(), 40);
+        }
+    }
+
+    // 2026.09.23 v3.0.219 回归：工作量评估开关（[Adhoc] MaxTurnsAuto，缺省开）。
+    void testAdhocMaxTurnsAutoConfig() {
+        // ① 无 config.ini/缺键 → 默认开。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.LoadAdhocMaxTurnsAuto());
+        }
+        // ② 往返：关 → 读回关；再开 → 读回开。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveAdhocMaxTurnsAuto(false));
+            QVERIFY(!stPm.LoadAdhocMaxTurnsAuto());
+            QVERIFY(stPm.SaveAdhocMaxTurnsAuto(true));
+            QVERIFY(stPm.LoadAdhocMaxTurnsAuto());
+        }
+    }
+
+    // 2026.09.23 v3.1.224 回归：资源管理器显示隐藏目录（[Explorer] HiddenDirs）——
+    //   缺键=内置默认（build,.git,.vs,node_modules）；显式配置整体覆盖；空串=全可见
+    //   （键存在但值为空 ≠ 缺键，GetPrivateProfileStringW 天然区分）。
+    void testExplorerHiddenDirsConfig() {
+        // ① 无 config.ini/缺键 → 内置默认；静态默认同源。
+        {
+            CProjectManager stPm;
+            QCOMPARE(stPm.LoadExplorerHiddenDirs(),
+                     QStringLiteral("build,.git,.vs,node_modules"));
+        }
+        QCOMPARE(CProjectManager::DefaultExplorerHiddenDirs(),
+                 QStringLiteral("build,.git,.vs,node_modules"));
+        // ② 显式配置整体覆盖（用户从清单里删掉 build → build 可见）。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveExplorerHiddenDirs(QStringLiteral(".git,.vs,node_modules")));
+            QCOMPARE(stPm.LoadExplorerHiddenDirs(), QStringLiteral(".git,.vs,node_modules"));
+        }
+        // ③ 空串 = 写空值（键存在）→ 全可见，不是回默认。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveExplorerHiddenDirs(QString()));
+            QCOMPARE(stPm.LoadExplorerHiddenDirs(), QString());
+        }
+        // ④ 删键（手工/外部）→ 回内置默认。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveExplorerHiddenDirs(QStringLiteral(".git")));
+            const QString sCfg = ConfigPath();
+            WritePrivateProfileStringW(L"Explorer", nullptr, nullptr,
+                                       (LPCWSTR)sCfg.utf16());   // 整节删除
+            QCOMPARE(stPm.LoadExplorerHiddenDirs(),
+                     QStringLiteral("build,.git,.vs,node_modules"));
+        }
+    }
+
+    // 2026.09.26 回归：设置对话框几何逐次漂移（用户报告「每次往下跑 31px」，
+    //   根因=构造期 move 在原生窗未建时按 Qt6.8 posIncludesFrame 含框架语义记账）。
+    //   修复=showEvent 回贴精确几何。三轮「构造→show→done 落盘→销毁」断言 y 逐轮相等；
+    //   offscreen 无原生窗口漂移不发生，QSKIP（口径同 test_execpanel recentDialogGeometryNoDrift）。
+    void settingsDialogGeometryNoDrift();
 };
+
+void CTestProjectManager::settingsDialogGeometryNoDrift() {
+    if (QGuiApplication::platformName().compare(QLatin1String("offscreen"),
+                                                Qt::CaseInsensitive) == 0) {
+        QSKIP("真实窗口平台专用（offscreen 无原生窗口，漂移不发生）");
+    }
+    QMainWindow wndParent;
+    wndParent.resize(1280, 800);
+    wndParent.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&wndParent));
+
+    int iPrevY = -1;
+    for (int i = 0; i < 3; ++i) {
+        CProjectManager stPm;
+        CSettingsDialog stDlg(&stPm, &wndParent);
+        stDlg.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&stDlg));
+        QTest::qWait(200);   // 布局激活/最小尺寸钳位/检测定时器首轮都安定
+        const int iY = stDlg.y();
+        const int iFy = stDlg.frameGeometry().y();
+        qDebug() << "round" << i << "clientY=" << iY << "frameY=" << iFy
+                 << "size=" << stDlg.size();
+        stDlg.done(0);   // 与用户关闭同路径：done() 内保存 geometry() 后隐藏
+        QTest::qWait(50);
+        if (iPrevY >= 0) {
+            QCOMPARE(iY, iPrevY);
+        }
+        iPrevY = iY;
+    }
+}
 
 QTEST_MAIN(CTestProjectManager)
 #include "test_projectmanager.moc"

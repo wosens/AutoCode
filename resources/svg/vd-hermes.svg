@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <!-- Hermes：信使之翼（三段羽翼 + 翼骨），琥珀 #D97706（NousResearch Hermes） -->
+  <g stroke="#D97706" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M5 16 Q12 6 27 7 Q22 10 19 11"/>
+    <path d="M5 16 Q13 10 21 11.5 M5 16 Q14 13 22 14"/>
+    <path d="M6 17 Q14 15 23 16.5"/>
+    <path d="M6 17 Q13 19.5 20 18.5"/>
+  </g>
+  <path d="M5 15.5 Q7 16.5 6.5 19 Q4.5 18 5 15.5 Z" fill="#D97706"/>
+</svg>

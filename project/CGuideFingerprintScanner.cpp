@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QTextStream>
 #include <QRegularExpression>
@@ -264,7 +265,7 @@ bool CGuideFingerprintScanner::WriteIncremental(const QString& a_sGuidePath,
                                                 const SGuideChangeSet& a_stChanges,
                                                 const QString& a_sTimestampIso) {
     // 读 guide.md 全文。文件不存在 → 调用方走全量流程。
-    QFile stIn(a_sGuidePath);
+    CFrwDevice stIn(a_sGuidePath);
     if (!stIn.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return false;
     }

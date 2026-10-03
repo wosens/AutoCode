@@ -1,4 +1,4 @@
-#include "CSettingsDialog.h"
+﻿#include "CSettingsDialog.h"
 
 #include <QAbstractItemModel>
 #include <QCheckBox>
@@ -333,10 +333,20 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     const int iDefAskTimeout = (a_pPm != nullptr) ? a_pPm->LoadAskTimeoutSec() : 600;
     const bool bDefWeb = (a_pPm != nullptr) ? a_pPm->LoadWebSearch() : true;
     const int iDefPct = (a_pPm != nullptr) ? a_pPm->LoadAutoCompactPct() : 75;
-    const qint64 iDefCtx = (a_pPm != nullptr) ? a_pPm->LoadAdhocContextLimit() : 0;
-    const bool bDefExpert = (a_pPm != nullptr) ? a_pPm->LoadExpertAssistant() : true;
+    const bool bDefExpert = (a_pPm != nullptr) ? a_pPm->LoadExpertAssistant() : false;
+    const int iDefAdhocTurns = (a_pPm != nullptr) ? a_pPm->LoadAdhocMaxTurns() : 40;
+    const bool bDefAdhocTurnsAuto = (a_pPm != nullptr) ? a_pPm->LoadAdhocMaxTurnsAuto() : true;
     const QString sDefScan = (a_pPm != nullptr) ? a_pPm->LoadScanExcludeDirs() : QString();
     const QString sDefBackup = (a_pPm != nullptr) ? a_pPm->LoadBackupExcludeDirs() : QString();
+    // 2026.09.23 资源管理器隐藏目录：预填生效清单（缺键=内置默认，用户在此基础上增删）。
+    const QString sDefExplHidden = (a_pPm != nullptr) ? a_pPm->LoadExplorerHiddenDirs()
+                                                      : CProjectManager::DefaultExplorerHiddenDirs();
+    // 2026-09-26 内置测试沙箱默认值（[Sandbox]）。
+    const bool bDefSbxEnable = (a_pPm != nullptr) ? a_pPm->LoadSandboxEnable() : true;
+    const bool bDefSbxAuto   = (a_pPm != nullptr) ? a_pPm->LoadSandboxAutoGhost() : true;
+    const bool bDefSbxRec    = (a_pPm != nullptr) ? a_pPm->LoadSandboxRecord() : false;
+    const int  iDefSbxFps    = (a_pPm != nullptr) ? a_pPm->LoadSandboxFps() : 5;
+    const int  iDefSbxRetain = (a_pPm != nullptr) ? a_pPm->LoadSandboxRetainDays() : 7;
     // 2026.08.18 Agent 后端 + DSH 参数回填（默认 1=claude；路径空=未配置）。
     const int iDefBackend = (a_pPm != nullptr) ? a_pPm->LoadAgentBackend() : 1;
     m_iCfgBackend = iDefBackend;   // 2026.08.21 已存后端不可用时不静默弹回（见头文件注）
@@ -353,6 +363,9 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     }
     const QString sDefDshProvider = (a_pPm != nullptr) ? a_pPm->LoadDshProvider()
                                                        : QStringLiteral("glm-custom");
+    // 2026.09.27 额外可写目录回填（';' 分隔原样展示）。
+    const QStringList aDefDshExtra = (a_pPm != nullptr) ? a_pPm->LoadDshExtraWriteDirs()
+                                                        : QStringList();
     const double dDefPriceIn = (a_pPm != nullptr) ? a_pPm->LoadDshPriceInPerM() : 3.0;
     const double dDefPriceCr = (a_pPm != nullptr) ? a_pPm->LoadDshPriceCacheReadPerM() : 0.3;
     const double dDefPriceCw = (a_pPm != nullptr) ? a_pPm->LoadDshPriceCacheWritePerM() : 3.75;
@@ -367,6 +380,11 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     //   m_bDshInstalled 还是默认 false，DSH 选中态被联动逻辑立即弹回 claude。
     m_pEditDshNode->setText(sDefDshNode);
     m_pEditDshRoot->setText(sDefDshRoot);
+    QStringList aExtraShow;
+    for (const QString& s : aDefDshExtra) {
+        aExtraShow.append(QDir::toNativeSeparators(s));
+    }
+    m_pEditDshWsRoot->setText(aExtraShow.join(QLatin1Char(';')));
     m_pEditDshProvider->setText(sDefDshProvider);
     m_pSpinDshPriceIn->setValue(dDefPriceIn);
     m_pSpinDshPriceCacheRead->setValue(dDefPriceCr);
@@ -438,11 +456,19 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pChkWebSearch->setChecked(bDefWeb);
     m_pChkExpertAssistant->setChecked(bDefExpert);
     m_pSpinCompactPct->setValue(iDefPct);
-    // 上下文上限以「千 token」展示更友好：内部 0=自动；展示 0 也表示自动（suffix 提示）。
-    m_pSpinCtxLimit->setValue(
-        static_cast<int>(qBound(qint64(0), iDefCtx / 1000, qint64(4000))));
+    // 2026.09.27 「上下文窗口上限」设置项已删：未设时按模型自动探测；手工覆盖
+    //   入口保留在助手上下文进度条右键「设置上下文大小…」（同一 [Adhoc] ContextLimit）。
+    m_pSpinMaxTurns->setValue(iDefAdhocTurns);
+    m_pChkMaxTurnsAuto->setChecked(bDefAdhocTurnsAuto);
     m_pEditScanDirs->setText(sDefScan);
     m_pEditBackupDirs->setText(sDefBackup);
+    m_pEditExplHidden->setText(sDefExplHidden);
+    // 2026-09-26 内置测试沙箱回填。
+    m_pChkSbxEnable->setChecked(bDefSbxEnable);
+    m_pChkSbxAuto->setChecked(bDefSbxAuto);
+    m_pChkSbxRecord->setChecked(bDefSbxRec);
+    m_pSpinSbxFps->setValue(iDefSbxFps);
+    m_pSpinSbxRetain->setValue(iDefSbxRetain);
     // 2026.08.18 自定义大模型表回填（[DshModels]；空表 / 无激活 = 未启用，走固定路由）。
     m_aDshModels = (a_pPm != nullptr) ? a_pPm->LoadDshModels(&m_iDshActiveModel)
                                       : QList<SDshModelEntry>();
@@ -458,7 +484,16 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     QRect stGeo;
     if (m_pPm != nullptr && m_pPm->LoadSettingsDialogGeometry(stGeo)
         && IsGeoOnScreen(stGeo)) {
-        setGeometry(stGeo);   // 尺寸小于布局最小值时 Qt 自动钳位到最小，安全
+        // 2026.09.25 修「逐次上漂」：setGeometry 改 move()+resize()。
+        // 2026.09.26 修「每开一次下漂 31px」：Qt6.8 构造期（原生窗未建）move() 按
+        //   posIncludesFrame「含框架」语义记账——建窗后窗口实际坐在 frame=请求y /
+        //   client=请求y+31，而 y()/geometry() 在框架 strut 解析前谎报请求 y；
+        //   done() 保存时若用客户区坐标（strut 解析后真值）与恢复侧（框架语义）
+        //   混用 → 每开一次 +31 下漂（打点实证 geometry.y=115 vs frameGeometry.y=84）。
+        //   两侧统一框架原点语义：保存 frameGeometry().x/y（见 done()），此处
+        //   move(stGeo.topLeft()) 即框架原点 → 往返零漂移。尺寸为客户区尺寸不受影响。
+        move(stGeo.topLeft());
+        resize(stGeo.size());
     } else {
         QSize szDef = sizeHint();
         const QScreen* pSc = (parentWidget() != nullptr && parentWidget()->screen() != nullptr)
@@ -485,7 +520,14 @@ void CSettingsDialog::done(int a_r) {
     //   在此统一保存；失败静默（下次用默认几何，不影响功能）。
     // 2026.09.11 模型表列宽同点落盘（用户拖表头调宽后，确定/取消/X 关闭都记忆）。
     if (m_pPm != nullptr) {
-        m_pPm->SaveSettingsDialogGeometry(geometry());
+        // 2026.09.26 修「每开一次下漂 31px」：保存改用框架原点（frameGeometry 的
+        //   x/y）+ 客户区尺寸——构造期 move() 在原生窗未建时按 Qt6.8
+        //   posIncludesFrame「含框架」语义记账，建窗后窗口实际坐在 frame=请求y /
+        //   client=请求y+31（打点实证：done() 时 geometry().y()=115 而
+        //   frameGeometry().y()=84，两坐标系混用→逐次 +31 漂移）。恢复侧同样
+        //   走建窗前 move()（框架语义），两侧同坐标系→精确往返零漂移。
+        m_pPm->SaveSettingsDialogGeometry(
+            QRect(frameGeometry().x(), frameGeometry().y(), width(), height()));
         SaveModelColWidths(m_pPm, m_pTreeDshModels, L"SettingsModelColsDsh");
         SaveModelColWidths(m_pPm, m_pTreePiModels, L"SettingsModelColsPi");
         SaveModelColWidths(m_pPm, m_pTreeCodexModels, L"SettingsModelColsCodex");
@@ -498,28 +540,40 @@ void CSettingsDialog::SetupUi() {
     setWindowTitle(QStringLiteral("设置"));
     setMinimumWidth(520);
 
-    // —— 运行策略 ——
+    // —— 运行策略（2026.09.27 三项合并同一行，压缩纵向占用）——
+    // 2026.09.27 合并行辅助：往 HBox 追加「标签 + 控件」对（addWidget 自动接管
+    //   父子，标签免父参；项间距离由调用方 addSpacing 控制）。
+    auto fnAddPair = [](QHBoxLayout* a_pLay, const QString& a_sLbl, QWidget* a_pWgt,
+                        int a_iStretch = 0) {
+        a_pLay->addWidget(new QLabel(a_sLbl));
+        a_pLay->addWidget(a_pWgt, a_iStretch);
+    };
     auto* pGroupPolicy = new QGroupBox(QStringLiteral("运行策略"), this);
-    auto* pFormPolicy = new QFormLayout(pGroupPolicy);
+    auto* pLayPolicy = new QHBoxLayout(pGroupPolicy);
     m_pSpinMaxIter = new QSpinBox(pGroupPolicy);
     m_pSpinMaxIter->setRange(1, 9);
     m_pSpinMaxIter->setToolTip(QStringLiteral(
         "单个阶段被评审驳回后的最大重跑次数，超过则熔断暂停并升级到用户处理（config.ini [Policy] MaxIter）"));
-    pFormPolicy->addRow(QStringLiteral("单阶段最大迭代次数："), m_pSpinMaxIter);
     m_pSpinMaxResume = new QSpinBox(pGroupPolicy);
     m_pSpinMaxResume->setRange(1, 9);
     m_pSpinMaxResume->setToolTip(QStringLiteral(
         "阶段命中轮次上限后自动 --resume 续跑的封顶次数（[Policy] MaxResume）"));
-    pFormPolicy->addRow(QStringLiteral("阶段续跑上限（次）："), m_pSpinMaxResume);
     m_pSpinReviewResume = new QSpinBox(pGroupPolicy);
     m_pSpinReviewResume->setRange(1, 9);
     m_pSpinReviewResume->setToolTip(QStringLiteral(
         "轻量评审命中轮次上限后催促落盘结论的续跑封顶次数（[Policy] ReviewResume）"));
-    pFormPolicy->addRow(QStringLiteral("评审续跑上限（次）："), m_pSpinReviewResume);
+    fnAddPair(pLayPolicy, QStringLiteral("单阶段最大迭代次数："), m_pSpinMaxIter);
+    pLayPolicy->addSpacing(12);
+    fnAddPair(pLayPolicy, QStringLiteral("阶段续跑上限（次）："), m_pSpinMaxResume);
+    pLayPolicy->addSpacing(12);
+    fnAddPair(pLayPolicy, QStringLiteral("评审续跑上限（次）："), m_pSpinReviewResume);
+    pLayPolicy->addStretch(1);
 
-    // —— Agent ——
+    // —— Agent（2026.09.27 后端/命令/超时三项合并同一行）——
     auto* pGroupAgent = new QGroupBox(QStringLiteral("Agent"), this);
-    auto* pFormAgent = new QFormLayout(pGroupAgent);
+    auto* pLayAgentCol = new QVBoxLayout(pGroupAgent);
+    auto* pRowAgent = new QHBoxLayout();
+    pLayAgentCol->addLayout(pRowAgent);
     // 2026.08.18 后端全局单选：所有用途（任务/评审/助手/guide）统一用同一后端。
     m_pComboBackend = new QComboBox(pGroupAgent);
     m_pComboBackend->addItem(QStringLiteral("Claude Code"), 1);
@@ -530,10 +584,13 @@ void CSettingsDialog::SetupUi() {
     m_pComboBackend->setToolTip(QStringLiteral(
         "编排器使用的 Agent 后端（全局单选，[Agent] Backend）。\n"
         "DeepSeekHarness：JSON-RPC 完整接入（流式过程/token 统计/多轮会话），"
-        "须在下方配置三项路径；切换在空闲时生效（运行中禁止切换）。\n"
+        "须在下方配置三项路径。\n"
+        "切换对已有助手无影响（各助手继续用各自原后端，运行中也不变），"
+        "仅新建助手/新任务用新后端；任务或 guide 运行中切换暂保留原值，空闲后生效。\n"
         "PIAgent：pi coding-agent CLI（--mode json 流式接入，磁盘会话跨进程续跑），"
         "参数在本页 PiAgent 页签配置"));
-    pFormAgent->addRow(QStringLiteral("Agent 后端："), m_pComboBackend);
+    fnAddPair(pRowAgent, QStringLiteral("Agent 后端："), m_pComboBackend);
+    pRowAgent->addSpacing(12);
     connect(m_pComboBackend, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int) { UpdateDshEnabled(); UpdatePiEnabled(); UpdateCodexEnabled();
                              UpdateHermesEnabled(); });
@@ -542,19 +599,20 @@ void CSettingsDialog::SetupUi() {
     m_pEditClaudeCmd->setToolTip(QStringLiteral(
         "claude 命令；默认 claude（PATH 查找），可填绝对路径指定安装（[Agent] ClaudeCmd）。\n"
         "仅在 Claude Code 后端使用"));
-    pFormAgent->addRow(QStringLiteral("claude 命令："), m_pEditClaudeCmd);
+    fnAddPair(pRowAgent, QStringLiteral("claude 命令："), m_pEditClaudeCmd, 1);
+    pRowAgent->addSpacing(12);
     m_pSpinAskTimeout = new QSpinBox(pGroupAgent);
     m_pSpinAskTimeout->setRange(30, 86400);
     m_pSpinAskTimeout->setSuffix(QStringLiteral(" 秒"));
     m_pSpinAskTimeout->setToolTip(QStringLiteral(
         "ask_user 提问等待用户回答的超时（[Agent] AskTimeoutSec，默认 600）。\n"
         "仅 Claude Code 后端生效（DSH 无 ask_user 工具，该项禁用）"));
-    pFormAgent->addRow(QStringLiteral("提问等待超时："), m_pSpinAskTimeout);
+    fnAddPair(pRowAgent, QStringLiteral("提问等待超时："), m_pSpinAskTimeout);
     m_pChkWebSearch = new QCheckBox(QStringLiteral("允许阶段联网检索（WebSearch/WebFetch）"), pGroupAgent);
     m_pChkWebSearch->setToolTip(QStringLiteral(
         "关闭后所有阶段的 --disallowedTools 追加 WebSearch、WebFetch（离线/内网环境用；[Agent] WebSearch）。\n"
         "仅 Claude Code 后端生效（DSH 侧忽略该参数，该项禁用）"));
-    pFormAgent->addRow(QString(), m_pChkWebSearch);
+    pLayAgentCol->addWidget(m_pChkWebSearch);
 
     // 2026.09 后端版本管理入口（任务 23183ccb）：四后端当前/最新版本与更新一站式；
     //   与主窗功能菜单同源（D6 判据由 CMainWindow 注入透传）。
@@ -564,7 +622,7 @@ void CSettingsDialog::SetupUi() {
         "查看四 Agent 后端（Claude Code/DSH/PIAgent/Codex）当前版本与远端最新版，\n"
         "并提供各自更新入口（结果仅本次会话有效，不落盘）"));
     connect(pBtnVersion, &QPushButton::clicked, this, &CSettingsDialog::OnVersionManage);
-    pFormAgent->addRow(QString(), pBtnVersion);
+    pLayAgentCol->addWidget(pBtnVersion);
 
     // —— DeepSeekHarness 参数（后端选中 DSH 时才可用）——
     // 2026.08.18 轻量自动配置：路径收敛为两行——node（留空走 PATH）+ DSH 根目录
@@ -602,6 +660,43 @@ void CSettingsDialog::SetupUi() {
                                 "（packages/examples/jsonrpc-demo/lib/bin.js、examples/autocode-agent/"
                                 "cordis.yml）。留空时启动自动探测 exe 同级/上级的 DeepSeekHarness 目录"
                                 "（[Agent] DshRoot）"), true);
+    // 2026.09.27 额外可写目录（';' 分隔多条）：对每条授工程根派生的工作区写 SID 的
+    //   ACE（纯 NTFS DACL 放行，零 harness 改动）。浏览=追加一条（不清空已有）。
+    {
+        auto* pRowWs = new QWidget(pGroupDsh);
+        auto* pLayWs = new QHBoxLayout(pRowWs);
+        pLayWs->setContentsMargins(0, 0, 0, 0);
+        m_pEditDshWsRoot = new QLineEdit(pRowWs);
+        m_pEditDshWsRoot->setPlaceholderText(
+            QStringLiteral("留空=仅工程内可写；多条用 ; 分隔"));
+        m_pEditDshWsRoot->setToolTip(QStringLiteral(
+            "DSH 沙箱（workspace-write）可写范围之外的目录白名单（[Dsh] ExtraWriteDirs）。\n"
+            "DSH 助手把产物（DLL/EXE 等）拷到关联项目目录（工程根之外）时被沙箱拒绝\n"
+            "（[sandbox: file access denied under workspace-write mode]，且无人值守无\n"
+            "提权通道）。把目标目录加进来即放行（AutoCode 对其授工作区写 SID 的 ACE，\n"
+            "仅影响该目录树，其余范围围栏不变）。\n"
+            "例：工程=插件框架\\流程编辑器，产物拷 插件框架\\Execute\\PlugIns，\n"
+            "则把 插件框架\\Execute\\PlugIns 加进来。目录须已存在；多条用 ; 分隔。\n"
+            "修改后即时生效（运行中助手的下一轮对话也会自愈补授）"));
+        auto* pBtnAddWs = new QPushButton(QStringLiteral("添加…"), pRowWs);
+        connect(pBtnAddWs, &QPushButton::clicked, this, [this]() {
+            const QString sSel = QFileDialog::getExistingDirectory(this, QString());
+            if (sSel.isEmpty()) {
+                return;
+            }
+            const QString sNative = QDir::toNativeSeparators(sSel);
+            const QString sCur = m_pEditDshWsRoot->text().trimmed();
+            if (sCur.isEmpty()) {
+                m_pEditDshWsRoot->setText(sNative);
+            } else if (!sCur.split(QLatin1Char(';'), Qt::SkipEmptyParts)
+                           .contains(sNative, Qt::CaseInsensitive)) {
+                m_pEditDshWsRoot->setText(sCur + QLatin1Char(';') + sNative);
+            }
+        });
+        pLayWs->addWidget(m_pEditDshWsRoot, 1);
+        pLayWs->addWidget(pBtnAddWs);
+        pFormDsh->addRow(QStringLiteral("额外可写目录："), pRowWs);
+    }
     m_pEditDshProvider = new QLineEdit(pGroupDsh);
     m_pEditDshProvider->setPlaceholderText(QStringLiteral("glm-custom"));
     m_pEditDshProvider->setToolTip(QStringLiteral(
@@ -633,34 +728,68 @@ void CSettingsDialog::SetupUi() {
     m_pSpinDshPriceOut = fnPriceSpin(QStringLiteral("输出"));
     pFormDsh->addRow(QStringLiteral("计费单价($/M)："), pRowPrice);
 
-    // —— 评审 / 助手 ——
+    // —— 评审 / 助手（2026.09.27 数值三项合并一行；两开关合并一行）——
+    //   「上下文窗口上限」设置行已删：自动压缩阈值与上下文进度条分母在未设时均按
+    //   模型自动探测（各后端模型表自带窗口）；手工覆盖入口保留在助手上下文进度条
+    //   右键「设置上下文大小…」（同一 [Adhoc] ContextLimit 键，已存值继续生效）。
     auto* pGroupReview = new QGroupBox(QStringLiteral("评审与助手"), this);
-    auto* pFormReview = new QFormLayout(pGroupReview);
+    auto* pLayReviewCol = new QVBoxLayout(pGroupReview);
+    auto* pRowReview = new QHBoxLayout();
+    pLayReviewCol->addLayout(pRowReview);
     m_pSpinReviewPar = new QSpinBox(pGroupReview);
     m_pSpinReviewPar->setRange(1, 8);
     m_pSpinReviewPar->setToolTip(QStringLiteral(
         "每个评审阶段并行拉起的视角数，1=串行回退（[Review] Parallel，默认 3）"));
-    pFormReview->addRow(QStringLiteral("评审并行视角数："), m_pSpinReviewPar);
+    fnAddPair(pRowReview, QStringLiteral("评审并行视角数："), m_pSpinReviewPar);
+    pRowReview->addSpacing(12);
     m_pSpinCompactPct = new QSpinBox(pGroupReview);
     m_pSpinCompactPct->setRange(10, 95);
     m_pSpinCompactPct->setSuffix(QStringLiteral(" %"));
     m_pSpinCompactPct->setToolTip(QStringLiteral(
         "上下文占用达到窗口的该比例时触发自动压缩；阈值 = 窗口 × 比例"
         "（[Adhoc] AutoCompactPct）。\n仅 Claude Code 后端生效（DSH 内置压缩策略，该项禁用）"));
-    pFormReview->addRow(QStringLiteral("自动压缩比例："), m_pSpinCompactPct);
-    m_pSpinCtxLimit = new QSpinBox(pGroupReview);
-    m_pSpinCtxLimit->setRange(0, 4000);
-    m_pSpinCtxLimit->setSuffix(QStringLiteral(" k"));
-    m_pSpinCtxLimit->setSpecialValueText(QStringLiteral("自动"));
-    m_pSpinCtxLimit->setToolTip(QStringLiteral(
-        "助手上下文窗口上限（千 token）；0=按模型自动探测（[Adhoc] ContextLimit）"));
-    pFormReview->addRow(QStringLiteral("上下文窗口上限："), m_pSpinCtxLimit);
+    fnAddPair(pRowReview, QStringLiteral("自动压缩比例："), m_pSpinCompactPct);
+    pRowReview->addSpacing(12);
+    // 2026.09.23 助手轮次上限：单条提示词一次执行的最大迭代数（模型一轮工具调用）。
+    //   大型多文件重构 40 轮常打满（表现为「达到轮次上限，自动续跑」），可按工作量放大；
+    //   触顶时仍会自动续跑 2 次兑底，不会无限跑。
+    m_pSpinMaxTurns = new QSpinBox(pGroupReview);
+    m_pSpinMaxTurns->setRange(10, 200);
+    m_pSpinMaxTurns->setValue(40);
+    m_pSpinMaxTurns->setSuffix(QStringLiteral(" 轮"));
+    m_pSpinMaxTurns->setToolTip(QStringLiteral(
+        "助手单条提示词一次执行的最大轮次（每轮=模型思考+工具调用）；\n"
+        "达到上限会自动续跑（最多 2 次）并提示「达到轮次上限」。\n"
+        "大型多文件重构频繁触顶时调大此项（[Adhoc] MaxTurns，默认 40，10..200）。\n"
+        "更根本的办法是把大任务拆成多条小提示词分步发送"));
+    fnAddPair(pRowReview, QStringLiteral("助手轮次上限："), m_pSpinMaxTurns);
+    pRowReview->addStretch(1);
+    auto* pRowReviewChk = new QHBoxLayout();
+    pLayReviewCol->addLayout(pRowReviewChk);
+    // 2026.09.23 v3.0.219 工作量评估开关：按提示词难度自动上调（纯本地启发式，零 token）。
+    m_pChkMaxTurnsAuto = new QCheckBox(QStringLiteral("按提示词工作量自动上调"), pGroupReview);
+    m_pChkMaxTurnsAuto->setChecked(true);
+    m_pChkMaxTurnsAuto->setToolTip(QStringLiteral(
+        "发送前对提示词做本地工作量评估（零 token、毫秒级）：编号子任务数、点名的源文件数、\n"
+        "重活关键词（重构/自测/构建…）与文本长度综合估算，必要时自动上调本轮轮次预算\n"
+        "（日志会提示「工作量评估：轮次上限 40 → N」）；小任务不受影响，只升不降。\n"
+        "取消勾选则恒用上方基值（[Adhoc] MaxTurnsAuto，默认开）"));
+    pRowReviewChk->addWidget(m_pChkMaxTurnsAuto);
+    pRowReviewChk->addSpacing(12);
     // 2026.08.26 专家助手开关：启用后助手提交改码提示词时自动验证（编译/测试）并回注重试。
-    m_pChkExpertAssistant = new QCheckBox(QStringLiteral("启用专家助手"), pGroupReview);
+    // 2026.09.26 深度模式实现接通：开关真正生效——开启后非只读提交自动走
+    //   「规划→执行→验证」深度链（详见 CTaskOrchestrator::StartDeepPlan 链路）。
+    m_pChkExpertAssistant = new QCheckBox(
+        QStringLiteral("启用专家助手（深度模式）"), pGroupReview);
     m_pChkExpertAssistant->setToolTip(QStringLiteral(
-        "启用后，助手提交改码类提示词时自动执行编译/测试验证，失败自动回注重试（上限 3 次）；\n"
-        "禁用则回到纯对话模式，验证由人工完成（[Adhoc] ExpertAssistant，默认启用）"));
-    pFormReview->addRow(QString(), m_pChkExpertAssistant);
+        "启用后，助手每次非只读提交自动进入深度模式（用 token 换质量，重活免反复手发提示词）：\n"
+        "① 规划Agent 先分析请求，产出实施计划与可验证的验收标准；\n"
+        "② 执行Agent 照计划实施（未改动工程的纯问答自动跳过后续步骤）；\n"
+        "③ 验证Agent 独立按验收标准实际编译/测试核验，未通过自动回炉修复（上限 [Policy] MaxIter 次）；\n"
+        "④ 回炉/续跑耗尽自动重启整链，重新规划并携带失败教训（[Adhoc] ExpertRestarts，默认 1，0..5）；\n"
+        "全部耗尽则保留会话与改动交还人工。禁用则回到纯对话模式（[Adhoc] ExpertAssistant，默认关闭，须手工勾选启用）"));
+    pRowReviewChk->addWidget(m_pChkExpertAssistant);
+    pRowReviewChk->addStretch(1);
 
     // —— 目录排除 ——
     auto* pGroupDirs = new QGroupBox(QStringLiteral("目录排除"), this);
@@ -678,6 +807,60 @@ void CSettingsDialog::SetupUi() {
     m_pEditBackupDirs->setToolTip(QStringLiteral(
         "代码备份/恢复排除的目录名，逗号分隔；留空 = 内置默认（[Backup] ExcludeDirs）"));
     pFormDirs->addRow(QStringLiteral("备份恢复排除："), m_pEditBackupDirs);
+    // 2026.09.23 资源管理器显示隐藏目录：只管树里显不显示，与扫描/备份排除无关。
+    m_pEditExplHidden = new QLineEdit(pGroupDirs);
+    m_pEditExplHidden->setPlaceholderText(QStringLiteral("build,.git,.vs,node_modules"));
+    m_pEditExplHidden->setToolTip(QStringLiteral(
+        "资源管理器树中隐藏的目录名，逗号分隔；清空 = 全部可见。\n"
+        "只管内置资源管理器的显示，与备份排除/指纹扫描排除互不相干。\n"
+        "（[Explorer] HiddenDirs；保存后立即生效，新建/刷新的目录也按新清单处理）"));
+    pFormDirs->addRow(QStringLiteral("资源管理器隐藏目录："), m_pEditExplHidden);
+
+    // —— 内置测试沙箱（2026-09-26）——：Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 +
+    //    点击穿透 + 无任务栏，用户无感），Agent 经 sandbox_* MCP 工具/--sandbox 命令
+    //    操控/截图，全程自动 MP4 录像。 ——
+    // —— 内置测试沙箱（2026-09-26；2026.09.27 开关两项/录像参数各合并一行）——：
+    //    Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 + 点击穿透 + 无任务栏，用户无感），
+    //    Agent 经 sandbox_* MCP 工具/--sandbox 命令操控/截图，全程自动 MP4 录像。 ——
+    auto* pGroupSbx = new QGroupBox(QStringLiteral("测试沙箱"), this);
+    auto* pLaySbxCol = new QVBoxLayout(pGroupSbx);
+    auto* pRowSbxChk = new QHBoxLayout();
+    pLaySbxCol->addLayout(pRowSbxChk);
+    m_pChkSbxEnable = new QCheckBox(QStringLiteral("启用内置测试沙箱"), pGroupSbx);
+    m_pChkSbxEnable->setToolTip(QStringLiteral(
+        "启用后：Agent（助手/任务）启动的 GUI 程序窗口自动隐藏收纳进沙箱——不抢焦点、"
+        "点击穿透、不上任务栏，用户完全无感；Agent 用内置工具截图/点击/输入进行界面"
+        "验证（sandbox_* MCP 工具或 --sandbox 命令）。\n禁用则窗口照常显示"
+        "（[Sandbox] Enable，默认启用）"));
+    pRowSbxChk->addWidget(m_pChkSbxEnable);
+    pRowSbxChk->addSpacing(12);
+    m_pChkSbxAuto = new QCheckBox(QStringLiteral("自动收纳 Agent 启动的新窗口"), pGroupSbx);
+    m_pChkSbxAuto->setToolTip(QStringLiteral(
+        "自动幽灵化：Agent 进程树新出现的顶层窗口自动进沙箱（总开关关闭时此开关"
+        "无效，可用 --sandbox add 手工收纳）（[Sandbox] AutoGhost，默认开）"));
+    pRowSbxChk->addWidget(m_pChkSbxAuto);
+    pRowSbxChk->addStretch(1);
+    m_pChkSbxRecord = new QCheckBox(QStringLiteral("录制测试过程（MP4，含时间戳与点击标记）"), pGroupSbx);
+    m_pChkSbxRecord->setToolTip(QStringLiteral(
+        "每个收纳窗口自动录像（PrintWindow 离屏截帧 + H264 编码），存"
+        " exe\\sandbox\\rec\\；窗口还原/关闭时自动封盘（[Sandbox] Record，默认开）"));
+    pLaySbxCol->addWidget(m_pChkSbxRecord);
+    auto* pRowSbxRec = new QHBoxLayout();
+    pLaySbxCol->addLayout(pRowSbxRec);
+    m_pSpinSbxFps = new QSpinBox(pGroupSbx);
+    m_pSpinSbxFps->setRange(1, 15);
+    m_pSpinSbxFps->setSuffix(QStringLiteral(" fps"));
+    m_pSpinSbxFps->setToolTip(QStringLiteral(
+        "录像帧率；界面验证场景 5fps 足够（文件小、过程可回放）（[Sandbox] Fps，默认 5）"));
+    fnAddPair(pRowSbxRec, QStringLiteral("录像帧率："), m_pSpinSbxFps);
+    pRowSbxRec->addSpacing(12);
+    m_pSpinSbxRetain = new QSpinBox(pGroupSbx);
+    m_pSpinSbxRetain->setRange(1, 365);
+    m_pSpinSbxRetain->setSuffix(QStringLiteral(" 天"));
+    m_pSpinSbxRetain->setToolTip(QStringLiteral(
+        "录像保留天数：启动时清理超期 MP4（[Sandbox] RetainDays，默认 7 天）"));
+    fnAddPair(pRowSbxRec, QStringLiteral("录像保留："), m_pSpinSbxRetain);
+    pRowSbxRec->addStretch(1);
 
     // —— 按钮 ——
     auto* pBtns = new QDialogButtonBox(
@@ -698,6 +881,7 @@ void CSettingsDialog::SetupUi() {
     pLayCommon->addWidget(pGroupAgent);
     pLayCommon->addWidget(pGroupReview);
     pLayCommon->addWidget(pGroupDirs);
+    pLayCommon->addWidget(pGroupSbx);
     pLayCommon->addStretch(1);
 
     auto* pTabDsh = new QWidget(this);
@@ -1431,7 +1615,8 @@ void CSettingsDialog::UpdateDshEnabled() {
     // 2026.08.18 后端专属项反向联动：DSH/PIgent 后端下这四项对运行无效果——claude 命令/
     //   提问等待超时只进 CClaudeRunner（DSH/Pi 用 node 启动、无 ask_user MCP 工具），
     //   联网检索开关与自动压缩比只折算进 claude 专属启动参数（两后端侧忽略并降级提示）。
-    //   选中即禁用防误导，切回 claude 自动恢复。「上下文窗口上限」是后端中立项，保持可用。
+    //   选中即禁用防误导，切回 claude 自动恢复。（2026.09.27 后端中立的「上下文窗口
+    //   上限」设置项已删，入口收敛到上下文进度条右键，此处不再涉及。）
     const int iCurBackend = m_pComboBackend != nullptr ? m_pComboBackend->currentData().toInt() : 1;
     const bool bClaudeOnly = (iCurBackend == 1);
     if (m_pEditClaudeCmd != nullptr)  { m_pEditClaudeCmd->setEnabled(bClaudeOnly); }
@@ -1980,17 +2165,28 @@ void CSettingsDialog::OnInstallPiNpm() {
 }
 
 void CSettingsDialog::DetectPiInstalled(bool a_bSilent) {
-    // 探测安装：根目录框显式值优先（路径存在且 cli.js 在 → 装好；在但缺 cli.js → 半装态
-    //   报诊断），否则 ProbeSiblingRoot 兄弟目录自动探测，命中且根目录为空自动填入（并持久化）。
-    const bool bRootSet = m_pEditPiRoot != nullptr && !m_pEditPiRoot->text().trimmed().isEmpty();
-    const QString sExplicit = bRootSet ? m_pEditPiRoot->text().trimmed() : QString();
+    // 探测安装：根目录框显式值有效 → 装好；显式值失效（典型：config.ini 随发布包
+    //   带到别的机器，显式键还是装机机的绝对路径——2026.09.23 v3.1.230 用户报告
+    //   搬机后「显示已安装但根目录还是源机路径」）→ 同 DSH 口径回退探测 exe 同级
+    //   PIAgent，命中即回填输入框；仍无效再兑 npm 全局布局（cli.js 解析在
+    //   CPiAgentRunner::ResolveCliJsPath 同口径自动回退，根目录可留空）。框空时
+    //   探测命中也自动填入（原行为）。
+    bool bRootSet = m_pEditPiRoot != nullptr && !m_pEditPiRoot->text().trimmed().isEmpty();
+    QString sExplicit = bRootSet ? m_pEditPiRoot->text().trimmed() : QString();
+    if (bRootSet && !CPiAgentRunner::LooksLikePiRoot(sExplicit)) {
+        bRootSet = false;   // 显式键失效：转入探测（同 DSH 搬机死键自愈口径）
+        sExplicit.clear();
+    }
     if (bRootSet) {
         m_bPiInstalled = CPiAgentRunner::LooksLikePiRoot(sExplicit);
     } else {
         const QString sProbed = CPiAgentRunner::ProbeSiblingRoot();
         m_bPiInstalled = !sProbed.isEmpty();
         if (m_bPiInstalled && m_pEditPiRoot != nullptr) {
-            m_pEditPiRoot->setText(QDir::toNativeSeparators(sProbed));   // 自动回填
+            // 自动回填 blockSignals：防 textChanged 即时重检对此 setText 重入（同 Codex）。
+            m_pEditPiRoot->blockSignals(true);
+            m_pEditPiRoot->setText(QDir::toNativeSeparators(sProbed));   // 死键替换/空框回填
+            m_pEditPiRoot->blockSignals(false);
             // 持久化由 CMainWindow（保存路径的探测自愈）与启动回填负责——对话框层
             //   不落盘（与 DSH 同口径，避免在取消时也写 config.ini）。
         }
@@ -2124,6 +2320,22 @@ QString CSettingsDialog::DshRoot() const {
     return m_pEditDshRoot->text().trimmed();
 }
 
+QStringList CSettingsDialog::DshExtraWriteDirs() const {
+    // 2026.09.27 额外可写目录（';' 分隔解析；空项剔除）。
+    if (m_pEditDshWsRoot == nullptr) {
+        return QStringList();
+    }
+    QStringList aDirs;
+    for (const QString& s : m_pEditDshWsRoot->text().split(QLatin1Char(';'),
+                                                           Qt::SkipEmptyParts)) {
+        const QString sT = s.trimmed();
+        if (!sT.isEmpty() && !aDirs.contains(sT)) {
+            aDirs.append(sT);
+        }
+    }
+    return aDirs;
+}
+
 QString CSettingsDialog::DshProvider() const {
     return m_pEditDshProvider->text().trimmed();
 }
@@ -2210,12 +2422,18 @@ bool CSettingsDialog::ExpertAssistant() const {
     return (m_pChkExpertAssistant != nullptr) && m_pChkExpertAssistant->isChecked();
 }
 
-int CSettingsDialog::AutoCompactPct() const {
-    return m_pSpinCompactPct->value();
+bool CSettingsDialog::AdhocMaxTurnsAuto() const {
+    // 2026.09.23 v3.0.219 工作量评估开关（未创建兑底开）。
+    return (m_pChkMaxTurnsAuto == nullptr) || m_pChkMaxTurnsAuto->isChecked();
 }
 
-qint64 CSettingsDialog::ContextLimit() const {
-    return static_cast<qint64>(m_pSpinCtxLimit->value()) * 1000;
+int CSettingsDialog::AdhocMaxTurns() const {
+    // 2026.09.23 助手轮次上限（未创建兑底 40，钳 10..200）。
+    return (m_pSpinMaxTurns != nullptr) ? qBound(10, m_pSpinMaxTurns->value(), 200) : 40;
+}
+
+int CSettingsDialog::AutoCompactPct() const {
+    return m_pSpinCompactPct->value();
 }
 
 QString CSettingsDialog::ScanExcludeDirs() const {
@@ -2224,6 +2442,31 @@ QString CSettingsDialog::ScanExcludeDirs() const {
 
 QString CSettingsDialog::BackupExcludeDirs() const {
     return m_pEditBackupDirs->text().trimmed();
+}
+
+QString CSettingsDialog::ExplorerHiddenDirs() const {
+    return m_pEditExplHidden != nullptr ? m_pEditExplHidden->text().trimmed() : QString();
+}
+
+// —— 内置测试沙箱（2026-09-26；未创建控件时兜底默认值）——
+bool CSettingsDialog::SandboxEnable() const {
+    return (m_pChkSbxEnable == nullptr) || m_pChkSbxEnable->isChecked();
+}
+
+bool CSettingsDialog::SandboxAutoGhost() const {
+    return (m_pChkSbxAuto == nullptr) || m_pChkSbxAuto->isChecked();
+}
+
+bool CSettingsDialog::SandboxRecord() const {
+    return (m_pChkSbxRecord == nullptr) || m_pChkSbxRecord->isChecked();
+}
+
+int CSettingsDialog::SandboxFps() const {
+    return (m_pSpinSbxFps != nullptr) ? qBound(1, m_pSpinSbxFps->value(), 15) : 5;
+}
+
+int CSettingsDialog::SandboxRetainDays() const {
+    return (m_pSpinSbxRetain != nullptr) ? qBound(1, m_pSpinSbxRetain->value(), 365) : 7;
 }
 
 // —— CodexHarness 第四后端（2026 第四后端接入；口径同 Pi 同名方法）——

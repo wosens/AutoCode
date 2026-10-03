@@ -1,6 +1,7 @@
 ﻿#include "CMessageBlock.h"
 
 #include <QLabel>
+#include <QFrame>
 #include <QVBoxLayout>
 #include <QTextBrowser>
 #include <QPlainTextEdit>
@@ -156,6 +157,11 @@ void CMessageBlock::resizeEvent(QResizeEvent* a_pEvent) {
     if (m_eKind == Assistant && m_pBrowser != nullptr) {
         QTimer::singleShot(0, this, &CMessageBlock::slotAdjustBrowserHeight);
     }
+    // 2026.09.22 工具卡标题单行截断：块宽变化（首次布局就绪/视口缩放）→ 按新宽
+    //   重新省略号截断（同上滞后一拍，待子控件布局稳定后再取真实宽度）。
+    if (m_eKind == ToolUse && m_pHeader != nullptr) {
+        QTimer::singleShot(0, this, [this]() { UpdateToolHeaderText(); });
+    }
 }
 
 void CMessageBlock::showEvent(QShowEvent* a_pEvent) {
@@ -165,6 +171,11 @@ void CMessageBlock::showEvent(QShowEvent* a_pEvent) {
     //   resizeEvent）——show 时补一次延迟重排，换行按此时已稳定的视口宽度生效。
     if (m_eKind == Assistant && m_pBrowser != nullptr) {
         QTimer::singleShot(0, this, &CMessageBlock::slotAdjustBrowserHeight);
+    }
+    // 2026.09.22 隐藏页中创建的工具卡从未获得真实宽度（截断被跳过），切回该页
+    //   时块尺寸可能不变（不触发 resizeEvent）——show 时补一次延迟重算。
+    if (m_eKind == ToolUse && m_pHeader != nullptr) {
+        QTimer::singleShot(0, this, [this]() { UpdateToolHeaderText(); });
     }
 }
 
@@ -246,13 +257,18 @@ void CMessageBlock::BuildToolCard() {
         "              border-radius: 4px; padding: 5px 8px; color: #374151; }"
         "QToolButton:hover { background: #e5e7eb; }"
         "QToolButton:checked { background: #e5e7eb; border-color: #9ca3af; }"));
+    // 2026.09.22 标题恒单行：锁高禁止长路径/长命令把折叠头折成多行撚高日志
+    //   （竖向 padding 5×2 + 边框 1×2）；宽度不足时由 UpdateToolHeaderText
+    //   按省略号截断，悬停 tooltip 看全文。水平 Ignored：允许布局压缩到块宽。
+    m_pHeader->setFixedHeight(m_pHeader->fontMetrics().height() + 14);
+    m_pHeader->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     connect(m_pHeader, &QToolButton::toggled, this, [this](bool a_bChecked) {
         m_bExpanded = a_bChecked;
         if (a_bChecked) {
             RebuildToolContent();   // 展开时重建：折叠期间回填的结果/新并入条目此时才呈现
         }
         m_pContent->setVisible(a_bChecked);
-        m_pHeader->setText(HeaderText(a_bChecked));   // 刷新 ▶/▼ 箭头与 ×N 计数
+        UpdateToolHeaderText();   // 刷新 ▶/▼ 箭头与 ×N 计数（含单行截断）
     });
     pV->addWidget(m_pHeader);
 
@@ -378,15 +394,31 @@ void CMessageBlock::RebuildToolContent() {
     }
 }
 
+// 2026.09.22 工具卡标题恒单行：完整标题按当前宽度省略号截断（ElideMiddle 保住
+//   开头工具名与尾部 ×N 计数/路径结尾），全文进 tooltip；宽度未知（未布局）时
+//   先全文，由 resizeEvent/showEvent 的延迟重算兑底截断。
+void CMessageBlock::UpdateToolHeaderText() {
+    if (m_pHeader == nullptr || m_eKind != ToolUse) {
+        return;
+    }
+    const QString sFull = HeaderText(m_bExpanded);
+    m_pHeader->setToolTip(sFull);
+    const int iAvail = m_pHeader->width() - 24;   // 左右 padding 8×2 + 边框 1×2 + 余量
+    if (iAvail <= 0) {
+        m_pHeader->setText(sFull);
+        return;
+    }
+    m_pHeader->setText(m_pHeader->fontMetrics().elidedText(
+        sFull, Qt::ElideMiddle, iAvail));
+}
+
 void CMessageBlock::SetTool(const QString& a_sTool, const QString& a_sInputJson) {
     SToolEntry st;
     st.sTool  = a_sTool;
     st.sInput = a_sInputJson;
     m_aTools.clear();
     m_aTools.append(st);
-    if (m_pHeader != nullptr) {
-        m_pHeader->setText(HeaderText(false));
-    }
+    UpdateToolHeaderText();
     RebuildToolContent();
 }
 
@@ -395,9 +427,7 @@ void CMessageBlock::AddMergedTool(const QString& a_sTool, const QString& a_sInpu
     st.sTool  = a_sTool;
     st.sInput = a_sInputJson;
     m_aTools.append(st);
-    if (m_pHeader != nullptr) {
-        m_pHeader->setText(HeaderText(m_bExpanded));
-    }
+    UpdateToolHeaderText();
     RebuildToolContent();   // 折叠态不可见，重建成本可忽略；展开中追加即时可见
 }
 
@@ -407,6 +437,9 @@ int CMessageBlock::ToolCount() const {
 
 void CMessageBlock::SetResult(const QString& a_sResult) {
     // 2026.08.22 合并卡：结果按到达顺序回填到首个尚无结果的条目（与面板块序一致）
+    if (m_aTools.isEmpty()) {
+        return;   // 2026.09.28 防越界：结果先于 SetTool 到达/异常时序时旧实现会 m_aTools[-1] 写入
+    }
     int iTarget = -1;
     for (int i = 0; i < m_aTools.size(); ++i) {
         if (m_aTools[i].sResult.isEmpty()) { iTarget = i; break; }
@@ -459,6 +492,20 @@ void CMessageBlock::BuildEvent() {
 void CMessageBlock::SetEvent(const QString& a_sKind, const QString& a_sText) {
     if (m_pLabel == nullptr) {
         return;
+    }
+    // 2026.09.18 用户提示词上方贯穿左右的 3px 分隔横线（用户需求：助手日志中用户输入
+    //   的提示词上加横线，宽度 3px）——块布局 margins(0,0,0,0)，横线占满块宽即贯穿
+    //   日志左右；仅 user 块加（其他事件 kind 不加），幂等（重建/重设不叠加）。
+    //   2026.09.19 颜色加深：#d1d5db（gray-300）太浅看不清 → #9ca3af（gray-400，
+    //   与本工程 QMenu 禁用色同色板，白底上清晰可辨且不喧宾夺主）。
+    if (a_sKind == QStringLiteral("user") && m_pUserSep == nullptr) {
+        m_pUserSep = new QFrame(this);
+        m_pUserSep->setFrameShape(QFrame::NoFrame);
+        m_pUserSep->setFixedHeight(3);
+        m_pUserSep->setStyleSheet(QStringLiteral("background-color:#9ca3af;"));
+        if (auto* pLay = qobject_cast<QVBoxLayout*>(layout())) {
+            pLay->insertWidget(0, m_pUserSep);
+        }
     }
     const SEventStyle st = EventStyle(a_sKind);
     // szBullet/szColor 是 UTF-8 字节字面量（❯/🎉/● 等非 ASCII），必须 fromUtf8 解码；

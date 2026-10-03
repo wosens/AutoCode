@@ -108,8 +108,9 @@ void CMessageView::PrependBlocks(const QList<CMessageBlock*>& a_aBlocks) {
     // 与 ScrollBlockToTop 同款锥定手法：同步布局后把锚块滚回视口顶；多帧重锥吸收
     //   Markdown documentSizeChanged 的异步高度收敛（早锥会随高度落定向下漂移）。
     auto fnAnchor = [this, pAnchor]() {
-        if (m_pContent == nullptr) {
-            return;
+        if (m_pContent == nullptr || pAnchor.isNull()) {
+            return;   // 2026.09.28 锚块在重锚帧间隔内被 Clear/淘汰销毁：QPointer 已置空，
+                      //   旧实现仍解引 pAnchor->mapTo 造成空指针崩溃（注释声称的防护实际缺失）
         }
         m_pContent->adjustSize();
         const int iY = pAnchor->mapTo(m_pContent, QPoint(0, 0)).y();

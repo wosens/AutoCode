@@ -357,6 +357,79 @@ int main(int argc, char* argv[]) {
         CCodexRunner::SetCodexModels(QList<SDshModelEntry>(), -1);
     }
 
+    // —— anthropic-messages 端点兑底（2026.09.24 v3.1.231 搬机实害：四后端共享表
+    //    把 Pi 风味条目 glm-5.3 @.../claude 设为当前，Codex 发 /chat/completions
+    //    必 404）：激活条目为 Codex 不可用的 Anthropic 原生端点时，自动改用同表内
+    //    同名模型 + chat 兼容条目；无兑底由 CodexConfigError 前置拦截。
+    {
+        // 前置：合法安装根（CodexConfigError 先查 node/根/版本）。
+        const QString sRootC = oTmp.path() + QStringLiteral("/CodexCompatRoot");
+        Check(fnWritePkg(sRootC, CCodexRunner::ExpectedCodexVersion()),
+              QStringLiteral("写兑底用安装态失败"));
+        CCodexRunner::SetCodexRoot(sRootC);
+        CCodexRunner::SetCodexNodePath(QString());
+        CCodexRunner::SetCodexApiKey(QStringLiteral("sk-fixed-key"));
+        CCodexRunner::SetCodexModel(QStringLiteral("glm-fixed"));
+        CCodexRunner::SetCodexBaseUrl(QStringLiteral("http://fixed:9000/v1"));
+        CCodexRunner::SetCodexWireApi(QStringLiteral("chat"));
+        auto fnAnthropicEntry = []() {
+            SDshModelEntry stE;
+            stE.sDisp    = QStringLiteral("glm-5.3 (Pi 风味)");
+            stE.sBaseURL = QStringLiteral("http://192.168.118.128:9000/claude");
+            stE.sApiKey  = QStringLiteral("sk-anthropic-key");
+            stE.sApi     = QStringLiteral("anthropic-messages");
+            stE.sModelId = QStringLiteral("glm-5.3");
+            stE.iCtx     = 200000;
+            stE.iMaxTok  = 32768;
+            return stE;
+        };
+        // ① 有同名 chat 兑底 → 生效端点/wire/key 落兑底条目，配置不报警。
+        {
+            SDshModelEntry stChat = fnAnthropicEntry();
+            stChat.sDisp    = QStringLiteral("glm-5.3 (chat)");
+            stChat.sBaseURL = QStringLiteral("http://192.168.118.128:9000/api/v1");
+            stChat.sApiKey  = QStringLiteral("sk-chat-key");
+            stChat.sApi     = QStringLiteral("openai-completions");
+            const QString sHome3 = oTmp.path() + QStringLiteral("/fake-codex-home3");
+            QDir().mkpath(sHome3);
+            CCodexRunner::SetCodexModels(
+                QList<SDshModelEntry>{ fnAnthropicEntry(), stChat }, 0);
+            QString sErr;
+            Check(CCodexRunner::WriteCodexUserConfig(&sErr, sHome3),
+                  QStringLiteral("兑底生效时 WriteCodexUserConfig 应成功: %1").arg(sErr));
+            QFile f3(sHome3 + QStringLiteral("/config.toml"));
+            Check(f3.open(QIODevice::ReadOnly), QStringLiteral("config.toml 应已写盘"));
+            const QString sToml3 = QString::fromUtf8(f3.readAll());
+            f3.close();
+            Check(sToml3.contains(QStringLiteral("model = \"glm-5.3\"")),
+                  QStringLiteral("顶层 model 应保持激活条目模型 id"));
+            Check(sToml3.contains(QStringLiteral(
+                      "base_url = \"http://192.168.118.128:9000/api/v1\"")),
+                  QStringLiteral("base_url 应兑底到同名 chat 端点"));
+            Check(!sToml3.contains(QStringLiteral("9000/claude")),
+                  QStringLiteral("anthropic 端点不应出现在写出的 config.toml"));
+            QFile fAuth3(sHome3 + QStringLiteral("/auth.json"));
+            Check(fAuth3.open(QIODevice::ReadOnly), QStringLiteral("auth.json 应已写盘"));
+            const QJsonObject o3 = QJsonDocument::fromJson(fAuth3.readAll()).object();
+            fAuth3.close();
+            Check(o3.value(QStringLiteral("OPENAI_API_KEY")).toString()
+                      == QStringLiteral("sk-chat-key"),
+                  QStringLiteral("兑底条目 key 应写入 auth.json"));
+            Check(CCodexRunner::CodexConfigError().isEmpty(),
+                  QStringLiteral("有兑底时 CodexConfigError 应为空: %1")
+                      .arg(CCodexRunner::CodexConfigError()));
+        }
+        // ② 无同名 chat 兑底 → CodexConfigError 前置拦截并点名 anthropic-messages。
+        {
+            CCodexRunner::SetCodexModels(QList<SDshModelEntry>{ fnAnthropicEntry() }, 0);
+            const QString sErr2 = CCodexRunner::CodexConfigError();
+            Check(sErr2.contains(QStringLiteral("anthropic-messages")),
+                  QStringLiteral("无兑底时应前置拦截并点名 anthropic-messages: %1").arg(sErr2));
+        }
+        // 清理。
+        CCodexRunner::SetCodexModels(QList<SDshModelEntry>(), -1);
+    }
+
     // —— 5. CCodexProxy::RewriteChatRequestBody（max_tokens 注入纯函数，2026.08.21）——
     {
         // chat/completions 载荷：注入 max_tokens（不存在时新增）。

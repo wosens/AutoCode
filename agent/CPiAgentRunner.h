@@ -12,10 +12,23 @@
 
 // PIAgent（pi coding-agent CLI）NDJSON 流式后端 runner（2026.08.19 第三后端接入）。
 //
-// 进程模型与 claude 后端同构：**一阶段一进程**。StartStage 每次启动
-// `node <cli.js> -p --mode json --offline ...`，stdout 为 NDJSON 事件流（首行 session
-// 头，随后 agent_start/turn_start/message_start/message_update/message_end/
-// tool_execution_*/turn_end/agent_end），逐行解析映射到基类信号；进程退出即结束。
+// 进程模型：**一阶段一进程**，2026.09.22 起双形态——
+//   · RPC 形态（优先）：`node <cli.js> --mode rpc ...` 常驻 JSONL 双向管道。prompt 经
+//     stdin 命令帧 {"type":"prompt"} 投递；事件流与一次性 --mode json 完全同构
+//     （toJsonEvent 同一实现，HandleLine 零改动复用）；轮结束信号 = agent_settled
+//     （pi 源码 _runAgentPrompt 的 finally——完整收敛含自动重试/压缩续跑后只发一次），
+//     收到即 closeWriteChannel 触发 pi 落盘优雅退出(exit 0)，走既有成功收尾路径。
+//     **轮中注入（本形态的意义）**：InjectUserTurn → {"type":"steer"} 命令帧，
+//     pi 把用户消息投进正在运行的 agent 迭代（实测：工具执行中注入，下一模型迭代
+//     即收到，与 claude stream-json 注入同效）；Stop 语义不变（置终态+kill）。
+//   · 一次性形态（回退）：`node <cli.js> -p --mode json ...`，stdout 为 NDJSON 事件流
+//     （首行 session 头），进程退出即结束——RPC 探测失败/运行期早夭时自动回退。
+//   能力探测 RpcCapable()（进程内缓存）：cli.js 同级 modes/rpc/rpc-mode.js 存在
+//   （源码树状 dist），或 cli.js 自身含 "extension_ui_request" 协议字面量（npm 单文件
+//   bundle）；运行期早夭（未见会话即非零退出）→ 进程级记忆禁用 RPC 并当轮自动
+//   重拉一次性形态（升级/半安装场景自愈，用户无感）。pi 版本考古：--mode 解析与
+//   "rpc" 值同一提交引入，无「认识 --mode 不认识 rpc」的中间版本，回退只需覆盖
+//   「不认识 --mode」（commander 报错早退非零）。
 //
 // 关键口径（实测/源码核实，见任务目录 pi-json-sampling.md）：
 //   - usage 字段（pi packages/ai Usage）：input/output/cacheRead/cacheWrite（累计口径）；
@@ -23,15 +36,15 @@
 //   - 计费：pi 虽报 usage.cost，按设计决策不采用 → cost 恒 0（费用列显示 "-"）。
 //   - AssistantMessage.stopReason=="length" → subtype="error_max_turns"（复用 claude
 //     词汇，上层 LastWasMaxTurns 自动续跑零改动）。
-//   - prompt 经 stdin 投递 + closeWriteChannel（实测可行，无挂起）。
+//   - 一次性：prompt 经 stdin 投递 + closeWriteChannel；RPC：JSON 命令帧（见上）。
 //   - 会话恢复：pi 磁盘会话跨进程可续——resumeSid 经 --session-id 传入（优于 DSH）；
-//     带 resumeSid 时**禁加** --no-session（否则会话不落盘）。
+//     带 resumeSid 时**禁加** --no-session（否则会话不落盘）。RPC 形态无 session 头
+//     事件，会话 id 改经启动即发的 get_state 命令回读（response.data.sessionId）。
 //   - API key 经 QProcessEnvironment 按 provider 映射注入（不进命令行/日志，NFR-4）。
 //
 // claude 专属参数降级：a_iMaxTurns / a_iAutocompactK / a_bEnableAskUser 忽略
 // （pi 自带自动 compaction、无 ask_user 工具，StartStage 非默认值时提示一次）；
 // a_sDisallowedTools → --exclude-tools；a_bFork 忽略（--session-id 下无 fork 概念）。
-// InjectUserTurn 安全 no-op 返回 false（一次性进程，docs/extensions.md json 模式 UI no-op）。
 class CPiAgentRunner : public CAgentRunnerBase {
     Q_OBJECT
 
@@ -115,6 +128,12 @@ public:
 
     QString BackendName() const override { return QStringLiteral("pi"); }
 
+    // 2026.09.22 RPC 形态能力探测（进程内缓存，见类头注释）：cli.js 同级
+    //   modes/rpc/rpc-mode.js（源码树状 dist）或 cli.js 含 "extension_ui_request"
+    //   协议字面量（npm 单文件 bundle）；运行期早夭后进程级记忆禁用（s_bRpcRuntimeBroken）。
+    static bool RpcCapable();
+    static void ResetRpcCapCacheForTest();   // 单测：清探测缓存（含运行期禁用记忆）
+
     // --session-id 磁盘会话跨进程可续（fork 虽忽略，同 sid 续跑仍携带全部上下文）。
     bool KeepsContextAcrossTurns() const override { return true; }
 
@@ -140,6 +159,8 @@ public:
     // 一次性进程无轮次中插话：恒 false 安全 no-op。
     bool IsRetryPending() const override;
 
+    // 2026.09.22 RPC 形态：运行中且轮未 settle → steer 命令帧（立即生效，实测
+    //   工具执行中注入、下一模型迭代收到）；一次性形态仍 no-op false（上层排队）。
     bool InjectUserTurn(const QString& a_sText) override;
 
 private slots:
@@ -150,6 +171,12 @@ private slots:
 
 private:
     void Reset();                            // 本轮状态清零（StartStage 开头调用）
+    // 2026.09.22 RPC/一次性双形态：StartStage 只存回退参数+定形态，实现移 Impl。
+    void StartStageImpl(const QString& a_sWorkDir, const QString& a_sPrompt,
+                        const QString& a_sDisallowedTools, int a_iMaxTurns,
+                        const QString& a_sResumeSid, bool a_bFork,
+                        int a_iAutocompactK, bool a_bEnableAskUser, bool a_bRpc);
+    void SendRpcFrame(const QJsonObject& a_oCmd);   // JSON 命令帧写 stdin（LF 结尾）
     double ComputeTurnCost() const;          // 轮内 token 分量 × 单价折算（$/M）
     void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
     void HandleMessageEnd(const QJsonObject& oMsg);
@@ -162,7 +189,14 @@ private:
     QByteArray  m_buf;                    // stdout 跨 readyRead 行缓冲
     bool        m_bFinished = false;      // 本轮已发 sigFinished（防重复）
     bool        m_bAgentEnded = false;    // 已收 agent_end（进程退出即按成功收尾）
-    bool        m_bSawSession = false;    // 本轮已收 session 头（失败时避免误报上一轮 sid）
+    bool        m_bSawSession = false;    // 本轮已确认会话 id（一次性=session 头；RPC=get_state 回读）
+    // —— 2026.09.22 RPC 形态状态 ——
+    bool        m_bRpcMode = false;       // 本轮走 RPC 形态（事件帧含 response/agent_settled）
+    bool        m_bRpcSettled = false;    // 已收 agent_settled（轮完整收敛，已关写通道）
+    struct SRetryParams {                 // RPC 早夭自动回退重拉的一次性形态参数
+        QString sWorkDir, sPrompt, sDisallowed, sResumeSid;
+        int iMaxTurns = 30; bool bFork = false; int iAutocompactK = 0; bool bEnableAskUser = false;
+    } m_stRetry;
     QString     m_sTurnText;              // 本轮最后一条 assistant 文本
     QString     m_sLastStopReason;        // 最后一条 assistant 的 stopReason
     // 2026.08.22 最后一次 API 调用错误（message_end stopReason=="error" 的 errorMessage）：

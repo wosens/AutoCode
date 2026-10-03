@@ -4,17 +4,34 @@
 #include <QtTest/QtTest>
 #include <QApplication>
 #include <QTabWidget>
+#include <QTabBar>   // 2026.09.19 Tab 运行闪点回归；2026-09-22 起闪点由 CAsstTabBar 自绘（观察口改 PageRunning）
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QScrollBar>
+#include <QEnterEvent>     // 2026.09.26 按钮面板悬停回归（手工发 Enter/Leave）
+#include <QWheelEvent>     // 菜单内嵌滚轮回归
+#include <QMenu>
+#include <QWidgetAction>
+#include <QAbstractScrollArea>
+#include <numeric>          // std::accumulate（行宽求和断言）
 #include <QLabel>
 #include <QToolButton>
 #include <QPushButton>
 #include <QPlainTextEdit>
+#include <QFrame>
+#include <QSignalSpy>
+#include "ui/CRecentProjectsDialog.h"
+#include "ui/CRecentChipsPanel.h"   // 2026.09.26 v3.1.239 最近打开按钮面板回归
+#include <QTemporaryDir>
+#include <QDebug>
 #include <QComboBox>   // 2026-09-11 权限下拉回归
 #include "ui/CExecutionPanel.h"
+#include "ui/CAsstTabBar.h"   // 2026-09-22 多行 Tab 栏（闪点观察口 PageRunning）
 #include "core/CTaskInfo.h"   // 2026.09.05 v2.0.120 asstBusyIndicator：构造任务刷底部指示器
 #include "ui/CFilePreviewWidget.h"
+#include <QTextBrowser>   // 2026.09.22 文件内查找：选中验证
+#include <QTextCursor>
+#include <QTemporaryFile>
 #include "ui/CMessageView.h"
 #include "ui/CAskUserDialog.h"   // 2026-09-13 助手提问对话框尺寸自适应回归
 #include <QListWidget>
@@ -57,6 +74,8 @@ private slots:
     void taskSwitchLoop();
     void crossAssistantQueue();
     void filePreviewEncoding();
+    // 2026.09.22 文件内查找（工具栏/Ctrl+F）：向下/向上/循环/区分大小写 + 命中选中。
+    void filePreviewFind();
     void viewPagination();
     // 2026.09.04 v2.0.112 Hermes 工具卡：纯文本 preview 入参的组头摘要（OCR
     //   实测组头仅“… ×N”疑摘要丢失；ToolSummary 对非 JSON 输入应兑底原文）。
@@ -84,6 +103,40 @@ private slots:
     //   再次执行/启动任务后用户停在助手日志（用户反馈逻辑不通）；修复统一收在
     //   SetCurrentTask，任何路径（启动/再次执行/点选任务列表）载任务后都应落在任务日志页。
     void setCurrentTaskSelectsLogPage();
+    // 2026.09.23 v3.1.227 回归：无任务选中时阶段条自隐藏（日志 Tab 顶上移到原任务
+    //   进度位置）；载入任务（流非空）恢复显示。
+    void stageBarHidesWithoutTask();
+    // 2026.09.19 后端切换清会话链（面板镜像侧回归）：ClearAsstSessions 清 sid/撤销栈、
+    //   保留对话块（PixelPorter 实害：pi 切 claude 后旧 sid 被带给 claude --resume）。
+    void backendSwitchClearsMirror();
+    // 2026.09.23 v3.1.228 回归：助手输出块说话人标签取该助手粘性后端（非全局）。
+    void asstBlockBackendUsesSticky();
+    // 2026.09.26 v3.1.235 回归：工作结束自动改名——名称仍为原始名（助手N）时收尾
+    //   触发 sigAsstAutoRename；防重入（每轮一次）；非默认名不触发；再发送后可重试。
+    void asstAutoNameOnFinish();
+    // 2026-10-03 运行中请求自动重命名 → 挂起到本轮收尾执行（用户需求）。
+    void asstAutoNameDeferredWhileRunning();
+    // 2026.09.26 v3.1.239 回归：「最近打开」按钮面板（流式行布局/次数渐变色/
+    //   面板交互/菜单内嵌点击——设计定稿见 CRecentChipsPanel 头注）。
+    void recentChipsPanel();
+    void recentChipsPanelMenuEmbed();   // 真实窗口平台专用（offscreen QSKIP）
+    // 2026.09.26 v3.1.241 回归：右键「添加到聊天框」注入长文本后输入框自动长高
+    //   （软换行视觉行计高；封顶 10 行；清空回单行；宽度变窄重算更高）。
+    void adhocInputAutoGrowOnInject();
+    void foreignPhantomLifecycle();
+    // 2026.09.20 最近打开对话框几何持久化（[Layout] RecentWin 往返/坏档/出屏收口）。
+    void recentDialogGeometryPersist();
+    // 2026.09.25 v3.1.230 回归：窗口「每开一次上漂一个标题栏高度」——构造期
+    //   setGeometry 在原生窗口创建时客户区落点恒比请求 y 高 31px（本机 Qt6.8.3
+    //   实测，probe_recentdrift4 四变体对照：仅 move()+resize() 精确），hideEvent
+    //   把偏移值存回 → 下次继续偏。修复=恢复改 move()+resize()。需真实窗口平台。
+    void recentDialogGeometryNoDrift();
+    // 2026.09.18 运行中暂存提示词：不直接上屏、进右下角折叠框；injected 转正上屏；
+    //   排队轮启动（OnAdhocPendingStarted）转正；队列作废（OnAdhocPendingDropped）清空。
+    void stagedPromptsBox();
+    // 2026.09.20 未发送排队指令的删除/编辑：RemoveStagedPrompt/ApplyStagedEdit 同步
+    //   发信号（编排器侧按文本匹配）并保留时间戳前缀；✕ 按钮实际删除条目。
+    void stagedPromptsEditDelete();
     // 2026.09.10 v2.2.156 回归：全局 tooltip 11 号字体 + 长文本自动换行（用户需求：
     //   设置页提示字体太小统一 11 号、长文本自动换行）。①WrapText 转义/换行/边距归零；
     //   ②ApplyGlobal 后 QToolTip::font()==11pt；③实测 QTipLabel：长富文本提示宽度
@@ -96,6 +149,8 @@ private slots:
     void asstPermCombo();   // 2026-09-11 权限下拉：三态缺省/独立/提交携带/持久化
     void askUserDialogSizing();   // 2026-09-13 助手提问对话框：高度自适应/Tooltip/其他项增减高度
     void promptFlyoutHideRule();   // 2026-09-13 历史提问浮层：鼠标位置+500ms 容忍收起（不再 Leave 即收）
+    void asstRenameSafety();       // 2026-09-22 助手改名安全：id 路由/会话链/存档往返不受改名影响
+    void asstTabBarMultiRow();     // 2026-09-22 多行 Tab 栏：换行布局/命中/关闭热区/运行闪点/双击/拖动
 };
 
 void TestExecPanel::taskSwitchLoop() {
@@ -135,7 +190,7 @@ void TestExecPanel::taskSwitchLoop() {
 //   误注入 A 的运行轮，应排队到 B；A 轮结束后自动发送到 B（换载 B 会话后提交）。
 void TestExecPanel::crossAssistantQueue() {
     // 2026.09.03 多助手并发回归：每个助手是独立 Agent——A 运行中切到 B 发送，
-    //   B 的指令应【立即提交】（不再排队等待 A），A/B 同时进入运行态（各 ● 标记），
+    //   B 的指令应【立即提交】（不再排队等待 A），A/B 同时进入运行态（各 ● 闪点标记），
     //   A 结束不影响 B 的运行态；同助手运行中再发仍为追加提交（注入语义）。
     CExecutionPanel panel;
     panel.resize(1000, 700);
@@ -180,15 +235,22 @@ void TestExecPanel::crossAssistantQueue() {
     QCOMPARE(sLastText, QStringLiteral("给B的指令"));
     QVERIFY(panel.AsstRunning(sB));
     QVERIFY(panel.AsstRunning(sA));           // A 仍在跑（并发互不影响）
-    QVERIFY(pTabs->tabText(iB).contains(QStringLiteral("●")));
-    QVERIFY(pTabs->tabText(iA).contains(QStringLiteral("●")));   // 双 ● 并发
+    // 2026.09.19 ● 运行标记从 Tab 文本（静态小黑点）迁为标题旁彩色闪点；
+    //   2026-09-22 随多行 Tab 栏改为 CAsstTabBar 栏内自绘（旧 QLabel tabButton
+    //   方案已废），运行态断言改为查询栏的运行页集合。
+    auto bRunDot = [&pTabs](int i) -> bool {
+        auto* pBar = qobject_cast<CAsstTabBar*>(pTabs->tabBar());
+        return pBar != nullptr && pBar->PageRunning(pTabs->widget(i));
+    };
+    QVERIFY(bRunDot(iB));
+    QVERIFY(bRunDot(iA));                     // 双闪点并发
 
     // A 轮结束：只清 A 的运行态，B 不受影响（旧实现全局单运行位会把 B 也带停）。
     panel.OnAdhocFinished(sA);
     QVERIFY(!panel.AsstRunning(sA));
     QVERIFY(panel.AsstRunning(sB));
-    QVERIFY(pTabs->tabText(iB).contains(QStringLiteral("●")));
-    QVERIFY(!pTabs->tabText(iA).contains(QStringLiteral("●")));
+    QVERIFY(bRunDot(iB));
+    QVERIFY(!bRunDot(iA));
 
     // 同助手追加语义不变：B 运行中在 B 上再发 → 直接提交（注入运行轮）。
     panel.AppendToAdhocInput(QStringLiteral("继续"));
@@ -268,6 +330,67 @@ void TestExecPanel::filePreviewEncoding() {
     }
 }
 
+// 2026.09.22 文件内查找：纯文本视图上验证向下/向上/循环/区分大小写 + 命中选中。
+//   （MD/HTML 走同一 QTextBrowser::find 路径，hex 走 ASCII 列同包装，不逐型重测。）
+void TestExecPanel::filePreviewFind() {
+    QTemporaryFile oFile;   // 无后缀 → 纯文本分支
+    QVERIFY(oFile.open());
+    const QString sBody = QStringLiteral(
+        "alpha beta gamma\nBETA upper\nsecond beta end\n");
+    oFile.write(sBody.toUtf8());
+    oFile.close();
+
+    CFilePreviewWidget w;
+    w.resize(600, 400);
+    w.show();
+    w.ShowFile(oFile.fileName());
+
+    // 取当前可见的 QTextBrowser（纯文本视图；stack 只有 current 可见）。
+    QTextBrowser* pView = nullptr;
+    const auto aViews = w.findChildren<QTextBrowser*>();
+    for (QTextBrowser* p : aViews) {
+        if (p->isVisible()) {
+            pView = p;
+            break;
+        }
+    }
+    QVERIFY(pView != nullptr);
+    QCOMPARE(pView->toPlainText(), sBody);
+
+    // ① 向下逐次命中：三次 beta（大小写不敏感含 BETA），每次命中即选中。
+    QVERIFY(w.FindText(QStringLiteral("beta"), false, false, false));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    QVERIFY(w.FindText(QStringLiteral("beta"), false, false, false));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("BETA"));
+    QVERIFY(w.FindText(QStringLiteral("beta"), false, false, false));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    // ② 到底后无循环 → 未找到。
+    QVERIFY(!w.FindText(QStringLiteral("beta"), false, false, false));
+    // ③ 循环开启 → 回卷命中第一个 beta。
+    QVERIFY(w.FindText(QStringLiteral("beta"), false, false, true));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    QVERIFY(pView->textCursor().position() < 20);
+
+    // ④ 区分大小写：从当前位置（首个 beta 之后）只剩末尾一处 beta（不含 BETA）；
+    //    再向下到底未命中。
+    QVERIFY(w.FindText(QStringLiteral("beta"), false, true, false));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    QVERIFY(!w.FindText(QStringLiteral("beta"), false, true, false));
+
+    // ⑤ 向上：从当前（第 2 个 beta）向上回第 1 个，再向上循环关时到顶未命中。
+    QVERIFY(w.FindText(QStringLiteral("beta"), true, true, false));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    QVERIFY(!w.FindText(QStringLiteral("beta"), true, true, false));
+    // ⑥ 向上循环 → 回卷到末尾命中。
+    QVERIFY(w.FindText(QStringLiteral("beta"), true, true, true));
+    QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("beta"));
+    QVERIFY(pView->textCursor().position() > 30);
+
+    // ⑦ 不存在串恒未命中；空串安全返回 false。
+    QVERIFY(!w.FindText(QStringLiteral("zzz-none"), false, false, true));
+    QVERIFY(!w.FindText(QString(), false, false, true));
+}
+
 // 2026.09.03 反向分页回归：助手流 260 块 → 初始只建最近 200 块；滚动到顶自动补建
 //   更早一段（60 块一次补齐）→ 活件数从全量降为窗口+翻页量；数据层（落盘 JSON）不变。
 void TestExecPanel::viewPagination() {
@@ -327,23 +450,36 @@ void TestExecPanel::viewPagination() {
 
 void TestExecPanel::toolSummaryPlainText() {
     // Hermes v3 事件的 preview 为脱敏纯文本（如 "config.yaml L501"），非 JSON——
-    // 组头摘要应兑底原文（经真实 UI 控件文本验证，不依赖 OCR）。
-    auto fnHead = [](CMessageBlock* pBlk) -> QString {
-        QToolButton* pHead = pBlk->findChild<QToolButton*>(QString(), Qt::FindDirectChildrenOnly);
+    // 组头摘要应兑底原文（经真实 UI 控件验证，不依赖 OCR）。
+    // 2026.09.22 适配 v3.0.208 标题单行化：宽度不足时 text 按中间省略号截断
+    //   （保住头部工具名与尾部 ×N，ElideMiddle 可能吃掉中部文件名），全文在
+    //   tooltip——内容断言改验 tooltip 全文，另保留可见文本的尾部计数检查。
+    auto fnHeadText = [](CMessageBlock* pBlk) -> QString {
+        QToolButton* pHead = pBlk->findChild<QToolButton*>(
+            QString(), Qt::FindDirectChildrenOnly);
         return pHead ? pHead->text() : QString();
+    };
+    auto fnHeadFull = [](CMessageBlock* pBlk) -> QString {
+        QToolButton* pHead = pBlk->findChild<QToolButton*>(
+            QString(), Qt::FindDirectChildrenOnly);
+        return pHead ? pHead->toolTip() : QString();
     };
     CMessageBlock stBlk(CMessageBlock::ToolUse);
     stBlk.SetTool(QStringLiteral("read_file"), QStringLiteral("ChartView.h"));
     stBlk.AddMergedTool(QStringLiteral("read_file"), QStringLiteral("main.cpp"));
     stBlk.show();
-    const QString sHead = fnHead(&stBlk);
-    QVERIFY2(sHead.contains(QStringLiteral("ChartView.h")) && sHead.contains(QStringLiteral("×2")),
-             qPrintable(sHead));
+    qApp->processEvents();
+    QVERIFY2(fnHeadFull(&stBlk).contains(QStringLiteral("ChartView.h"))
+                 && fnHeadFull(&stBlk).contains(QStringLiteral("×2")),
+             qPrintable(fnHeadFull(&stBlk)));
+    QVERIFY2(fnHeadText(&stBlk).contains(QStringLiteral("×2")),
+             qPrintable(fnHeadText(&stBlk)));   // 尾部计数不受 ElideMiddle 影响
     CMessageBlock stBlk2(CMessageBlock::ToolUse);
     stBlk2.SetTool(QStringLiteral("terminal"), QStringLiteral("cmd /c dir /b *.cpp"));
     stBlk2.show();
-    QVERIFY2(fnHead(&stBlk2).contains(QStringLiteral("dir")),
-             qPrintable(fnHead(&stBlk2)));
+    qApp->processEvents();
+    QVERIFY2(fnHeadFull(&stBlk2).contains(QStringLiteral("dir")),
+             qPrintable(fnHeadFull(&stBlk2)));
 }
 
 // 2026.09.05 per-助手控件隔离回归：每个助手 Tab 页内独立输入框/发送按钮/统计栏——
@@ -640,6 +776,35 @@ void TestExecPanel::setCurrentTaskSelectsLogPage() {
     panel.hide();
 }
 
+// 2026.09.23 v3.1.227 回归：无任务选中时阶段条自隐藏（用户需求：日志 Tab 控件的 top
+//   移到任务进度的顶部）——SetCurrentTask(nullptr)/初始空流隐藏，载任务恢复显示。
+void TestExecPanel::stageBarHidesWithoutTask() {
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    // ① 初始（未载任何任务）：阶段条隐藏，不占 58px 布局位。
+    QVERIFY(!panel.StageBarVisible());
+
+    // ② 载任务（RefreshTask 建非空阶段流）：阶段条恢复显示。
+    CTaskInfo task;
+    task.SetId(QStringLiteral("sb-t-1"));
+    task.SetStatus(ETaskStatus::Pending);
+    panel.SetCurrentTask(&task);
+    panel.RefreshTask(&task);
+    QVERIFY(panel.StageBarVisible());
+
+    // ③ 取消选中：再次隐藏，Tab 区顶回原任务进度位置。
+    panel.SetCurrentTask(nullptr);
+    QVERIFY(!panel.StageBarVisible());
+
+    // ④ 同任务重复 SetCurrentTask（重复点选/SelectTask 二次触发）：保持显示。
+    panel.SetCurrentTask(&task);
+    panel.RefreshTask(&task);
+    panel.SetCurrentTask(&task);
+    QVERIFY(panel.StageBarVisible());
+    panel.hide();
+}
+
 // 2026.09.09 有效选中观察口回归：CurrentTask() 必须严格跟随 SetCurrentTask
 // （选中即时指向、取消选中即时置空）。背景：助手提示词的任务信息注入以本值为准
 // （CMainWindow::OnAdhocSubmit），若它与用户可见选中脱钩（如取消选中后仍滞留旧任务），
@@ -739,6 +904,24 @@ void TestExecPanel::testTaskNameExtraction() {
     // ⑤ 空需求/全空白行
     QVERIFY(CTaskInfo::ExtractNameFromRequest(QString()).isEmpty());
     QVERIFY(CTaskInfo::ExtractNameFromRequest(QStringLiteral(" \n \n ")).isEmpty());
+    // ⑥ 2026.09.21 实害（HarnessGatewayPlugin 任务）：裸动词开头保留「开发」+
+    //    行尾冒号剥离——旧版产出「大模型 Harness网关插件:」，用户期望
+    //    「开发大模型Harness网关插件」。
+    const QString sHgp = QStringLiteral(
+        "开发大模型 Harness网关插件:\n"
+        "插件参照：\n"
+        "E:\\x\\GraphContainer\n"
+        "业务参照：\nE:\\y\\HarnessGateway");
+    QCOMPARE(CTaskInfo::ExtractNameFromRequest(sHgp),
+             QStringLiteral("开发大模型 Harness网关插件"));
+    // ⑦ 「动词+一个」仍剥（裸动词不剥的两面性）
+    QCOMPARE(CTaskInfo::ExtractNameFromRequest(QStringLiteral("做一个贪吃蛇游戏")),
+             QStringLiteral("贪吃蛇游戏"));
+    // ⑧ TrimNamePunct：两侧引号书名号与句尾冒号（嵌套循环剥）
+    QCOMPARE(CTaskInfo::TrimNamePunct(QStringLiteral("「大模型网关插件：」")),
+             QStringLiteral("大模型网关插件"));
+    QCOMPARE(CTaskInfo::TrimNamePunct(QStringLiteral("开发XX插件:")),
+             QStringLiteral("开发XX插件"));
 }
 
 // 2026.09.10 v2.2.156 全局 tooltip 样式回归：11 号字体 + 长文本自动换行。
@@ -1006,6 +1189,244 @@ void TestExecPanel::askUserDialogSizing() {
     d2.close();
 }
 
+// 2026-09-22 助手改名安全回归（手动双击改名与右键自动重命名同一变异点：只改 sName[+sDesc]）：
+//   全部路由（激活/发送/Tab 查找/「▾」恢复）与持久化键均在 sId 上——改名后：
+//   ①发送仍路由到同一助手 id；②会话链 sid/撤销栈/粘性后端/权限/统计随档完整往返；
+//   ③说明 sDesc 入 tooltip 首行且随档持久化；④失败路径原名保持。
+void TestExecPanel::asstRenameSafety() {
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+
+    // A：带会话链/撤销栈/粘性后端/权限/统计（改名最怕丢的就是这些）；B：陷钉。
+    QJsonObject oA = MakeAsst(QStringLiteral("助手A"), 3);
+    oA[QStringLiteral("sid")]     = QStringLiteral("sess-abc-111");
+    oA[QStringLiteral("backend")] = QStringLiteral("pi");
+    oA[QStringLiteral("perm")]    = 2;   // 只读
+    {
+        QJsonObject oPair;
+        oPair[QStringLiteral("prompt")] = QStringLiteral("旧提问");
+        oPair[QStringLiteral("sid")]    = QStringLiteral("sess-abc-111");
+        QJsonArray aStack; aStack.append(oPair);
+        oA[QStringLiteral("stack")] = aStack;
+        QJsonObject oUsage;
+        oUsage[QStringLiteral("cost")] = 1.25;
+        oUsage[QStringLiteral("in")]   = 100.0;
+        oUsage[QStringLiteral("out")]  = 50.0;
+        oUsage[QStringLiteral("reqs")] = 3;
+        oUsage[QStringLiteral("ms")]   = 45000.0;
+        oA[QStringLiteral("usage")] = oUsage;
+    }
+    QJsonArray aAssts;
+    aAssts.append(oA);
+    aAssts.append(MakeAsst(QStringLiteral("助手B"), 1));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);   // 分帧重建跑完；激活=第一个助手 A
+    panel.SetAdhocEnabled(true);
+    const QString sId0 = panel.ActiveAsstId();
+    QVERIFY(!sId0.isEmpty());
+
+    // —— 自动改名成功路径：只动 sName/sDesc ——
+    panel.ApplyAsstAutoName(sId0, true, QStringLiteral("调试登录页"),
+                            QStringLiteral("定位并修复登录页键盘焦点"));
+    QCOMPARE(panel.ActiveAsstId(), sId0);   // 激活路由不变（id 锚定）
+    bool bTitle = false;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i) == QStringLiteral("调试登录页")) {
+            bTitle = true;
+            QVERIFY(pTabs->tabToolTip(i).contains(QStringLiteral("键盘焦点")));   // 说明进 tooltip 首行
+        }
+    }
+    QVERIFY(bTitle);
+
+    // —— 失败路径：原名/原说明保持不变 ——
+    panel.ApplyAsstAutoName(sId0, false, QString(), QStringLiteral("Agent 未给出有效名称"));
+    {
+        const QJsonObject oChk = panel.AssistantsToJson().at(0).toObject();
+        QCOMPARE(oChk[QStringLiteral("name")].toString(), QStringLiteral("调试登录页"));
+        QCOMPARE(oChk[QStringLiteral("desc")].toString(), QStringLiteral("定位并修复登录页键盘焦点"));
+    }
+
+    // —— 改名后发送路由：仍提交到同一助手 id ——
+    int iSubmits = 0;
+    QString sLastId;
+    QObject::connect(&panel, &CExecutionPanel::sigAdhocSubmit,
+                     [&](const QString& sId, const QString&, int) { ++iSubmits; sLastId = sId; });
+    panel.AppendToAdhocInput(QStringLiteral("改名后的新指令"));
+    panel.DoAdhocSend();
+    QCOMPARE(iSubmits, 1);
+    QCOMPARE(sLastId, sId0);
+
+    // —— 档往返：name/desc 已更新，id/sid/stack/backend/perm/usage 原样保留 ——
+    const QJsonArray aOut = panel.AssistantsToJson();
+    QCOMPARE(aOut.size(), 2);
+    const QJsonObject oA2 = aOut.at(0).toObject();
+    QCOMPARE(oA2[QStringLiteral("id")].toString(), sId0);
+    QCOMPARE(oA2[QStringLiteral("name")].toString(), QStringLiteral("调试登录页"));
+    QCOMPARE(oA2[QStringLiteral("desc")].toString(), QStringLiteral("定位并修复登录页键盘焦点"));
+    QCOMPARE(oA2[QStringLiteral("sid")].toString(), QStringLiteral("sess-abc-111"));
+    QCOMPARE(oA2[QStringLiteral("backend")].toString(), QStringLiteral("pi"));
+    QCOMPARE(oA2[QStringLiteral("perm")].toInt(), 2);
+    QCOMPARE(oA2[QStringLiteral("stack")].toArray().size(), 1);
+    QCOMPARE(oA2[QStringLiteral("usage")].toObject()[QStringLiteral("cost")].toDouble(), 1.25);
+
+    // —— 重载档（切档等价路径）：说明/会话链仍在 ——
+    panel.LoadAssistantsFromJson(aOut, QString());
+    QTest::qWait(50);
+    const QJsonObject oA3 = panel.AssistantsToJson().at(0).toObject();
+    QCOMPARE(oA3[QStringLiteral("desc")].toString(), QStringLiteral("定位并修复登录页键盘焦点"));
+    QCOMPARE(oA3[QStringLiteral("sid")].toString(), QStringLiteral("sess-abc-111"));
+    QCOMPARE(oA3[QStringLiteral("backend")].toString(), QStringLiteral("pi"));
+
+    // —— 2026-09-22 运行中改名（本问核心时序）：bRunning=true 期间改名只动显示字段 ——
+    //   手动双击与自动重命名共用同一变异点；运行点(SyncAsstTabDot)/暂存队列(aStaged)/
+    //   消耗统计均按 SAsst 结构锚定，与 sName 正交。
+    panel.SetAsstRunning(sId0, true);   // 闪点挂载（tabButton）
+    panel.ApplyAsstAutoName(sId0, true, QStringLiteral("运行期改名"),
+                            QStringLiteral("运行中改名不触碰运行态"));
+    QCOMPARE(panel.ActiveAsstId(), sId0);   // 运行中激活路由仍不变
+    bTitle = false;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i) == QStringLiteral("运行期改名")) {
+            bTitle = true;
+            QVERIFY(pTabs->tabToolTip(i).contains(QStringLiteral("运行中改名不触碰运行态")));
+        }
+    }
+    QVERIFY(bTitle);   // 运行中 Tab 标题/tooltip 照常刷新
+    // 运行中发送 → 暂存队列（aStaged）+ 仍按 id 提交（编排器注入/排队）：改名不影响。
+    panel.AppendToAdhocInput(QStringLiteral("运行中排队指令"));
+    panel.DoAdhocSend();
+    QCOMPARE(iSubmits, 2);
+    QCOMPARE(sLastId, sId0);
+    QCOMPARE(panel.StagedCount(sId0), 1);   // 进的是改名后助手的队列
+    // 轮结束：运行态清零后标题保持新名、说明不丢（RefreshAsstTabTexts 按 sName 重算）。
+    panel.SetAsstRunning(sId0, false);
+    QCOMPARE(pTabs->tabText(pTabs->currentIndex()), QStringLiteral("运行期改名"));
+    QCOMPARE(panel.AssistantsToJson().at(0).toObject()
+             .value(QStringLiteral("desc")).toString(),
+             QStringLiteral("运行中改名不触碰运行态"));
+
+    panel.hide();
+}
+
+// 2026-09-22 多行 Tab 栏回归（自 HarnessAgent/CAgentTabBar 迁移）：
+//   ① 宽度足够单行、变窄自动换行（行数>1），第二行及以后的 Tab 命中/定位
+//      （TabRectAt/TabAtPos）仍准确；② 运行闪点随 SetAsstRunning 起/停（页指针键，
+//      拖动/改名不失效）；③ 关闭「x」只在助手页（点非助手页右缘不触发）；
+//   后半段用独立裸栏（无面板连接，避免双击改名弹模态框卡测试）验证：
+//   ④ 双击发 tabBarDoubleClicked（按多行布局命中）；⑤ 拖动换位发 tabMoved。
+void TestExecPanel::asstTabBarMultiRow() {
+    CExecutionPanel panel;
+    panel.resize(1100, 700);
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    auto* pBar = qobject_cast<CAsstTabBar*>(pTabs->tabBar());
+    QVERIFY(pBar != nullptr);
+
+    // 先验「宽度足够 = 单行」（与原生观感一致）：2 个助手远小于栏宽。
+    QJsonArray aFew;
+    aFew.append(MakeAsst(QStringLiteral("单行助手一"), 1));
+    aFew.append(MakeAsst(QStringLiteral("单行助手二"), 1));
+    panel.LoadAssistantsFromJson(aFew, QString());
+    QTest::qWait(120);
+    QCOMPARE(pBar->TabRowCount(), 1);
+
+    // 40 个长名助手：窗口压窄后必换行。
+    QJsonArray aAssts;
+    for (int i = 0; i < 40; ++i) {
+        aAssts.append(MakeAsst(QStringLiteral("多行回归助手%1号").arg(i), 1));
+    }
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(120);   // 分帧重建 + 「+」页插入
+    QCOMPARE(pTabs->count(), 2 + 40 + 1);   // 日志+产物+40 助手+「+」
+    QVERIFY(pBar->TabRowCount() >= 2);      // 名多宽不够 → 已换行（宽窗口下同样会叠行）
+
+    panel.resize(360, 700);
+    QTest::qWait(120);   // 几何传播 + resizeEvent 重分行
+    QVERIFY(pBar->TabRowCount() >= 2);      // 变窄 → 行数只增不减
+    // 每个 Tab 的 rect 中心 TabAtPos 命中自身（含第二行及以后的行；基类单行
+    // tabAt 在多行下必错，这里验的是自管布局的完整性）。
+    for (int i = 0; i < pTabs->count(); ++i) {
+        // 2026-10-02 阶段产物 Tab 无任务选中时隐藏（setTabVisible）——隐藏页无布局
+        //   rect（CAsstTabBar 跳过不可见项），跳过其 rect/命中断言。
+        if (!pTabs->tabBar()->isTabVisible(i)) {
+            continue;
+        }
+        const QRect rc = pBar->TabRectAt(i);
+        QVERIFY(rc.isValid());
+        QVERIFY(rc.top() >= 0 && rc.bottom() < pBar->TabRowCount() * rc.height());
+        QCOMPARE(pBar->TabAtPos(rc.center()), i);
+    }
+
+    // ② 运行闪点：SetAsstRunning 起/停均同步到栏（页指针键）。
+    const QString sId = panel.ActiveAsstId();
+    QVERIFY(!sId.isEmpty());
+    const int iAsstIdx = pTabs->indexOf(pTabs->currentWidget());
+    panel.SetAsstRunning(sId, true);
+    QVERIFY(pBar->PageRunning(pTabs->widget(iAsstIdx)));
+    panel.SetAsstRunning(sId, false);
+    QVERIFY(!pBar->PageRunning(pTabs->widget(iAsstIdx)));
+
+    // ③ 关闭「x」只在助手页：点助手页关闭热区 → tabCloseRequested；点「日志」
+    //   右缘同位置 → 不触发（选中日志页而已）。
+    QSignalSpy aSpyClose(pTabs, &QTabWidget::tabCloseRequested);
+    const int iLastAsst = pTabs->count() - 2;   // 最后一个助手（「+」前）
+    QTest::mouseClick(pBar, Qt::LeftButton, Qt::NoModifier,
+                      pBar->CloseRectOf(pBar->TabRectAt(iLastAsst)).center());
+    QCOMPARE(aSpyClose.count(), 1);
+    QCOMPARE(aSpyClose.takeFirst().at(0).toInt(), iLastAsst);
+    QTest::qWait(50);   // 软关闭（CloseAsst）摘 Tab
+    QCOMPARE(pTabs->count(), 2 + 40);            // 少一个助手
+    QTest::mouseClick(pBar, Qt::LeftButton, Qt::NoModifier,
+                      pBar->CloseRectOf(pBar->TabRectAt(0)).center());   // 「日志」页右缘：无「x」热区语义
+    QCOMPARE(aSpyClose.count(), 0);
+    QCOMPARE(pTabs->count(), 2 + 40);            // 无页被关
+    panel.hide();
+
+    // —— ④⑤ 裸栏（无面板连接）：双击/拖动 ——
+    CAsstTabWidget stTabs;
+    auto* pBare = new CAsstTabBar;
+    stTabs.setTabBar(pBare);
+    stTabs.setMovable(true);   // 拖动换位需显式开（面板路径在 SetupTabsInteraction 开）
+    for (int i = 0; i < 3; ++i) {
+        stTabs.addTab(new QWidget(&stTabs), QStringLiteral("裸栏页%1").arg(i));
+    }
+    stTabs.resize(260, 200);
+    stTabs.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&stTabs));
+    QTest::qWait(50);
+    // 双击按多行布局命中 → tabBarDoubleClicked（面板接它做改名，不能在面板上试；
+    //   Qt6 QTest 无 mouseDblClick，直接发 MouseButtonDblClick 事件）。
+    QSignalSpy aSpyDbl(pBare, &QTabBar::tabBarDoubleClicked);
+    const int iDblIdx = 2;
+    const QRect rcDbl = pBare->TabRectAt(iDblIdx);
+    QMouseEvent evDbl(QEvent::MouseButtonDblClick, QPointF(rcDbl.center()),
+                      QPointF(pBare->mapToGlobal(rcDbl.center())),
+                      Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(pBare, &evDbl);
+    QCOMPARE(aSpyDbl.count(), 1);
+    QCOMPARE(aSpyDbl.takeFirst().at(0).toInt(), iDblIdx);
+    // 拖动换位：按住页1拖到页2位置 → tabMoved(1,2)，文本序互换。
+    QSignalSpy aSpyMoved(pBare, &QTabBar::tabMoved);
+    const QPoint ptA = pBare->TabRectAt(1).center();
+    const QPoint ptB = pBare->TabRectAt(2).center();
+    QTest::mousePress(pBare, Qt::LeftButton, Qt::NoModifier, ptA);
+    for (int s = 1; s <= 12; ++s) {   // 分步越过拖起阈值，模拟真实拖拽
+        QTest::mouseMove(pBare, ptA + (ptB - ptA) * s / 12);
+        QTest::qWait(10);
+    }
+    QTest::mouseRelease(pBare, Qt::LeftButton, Qt::NoModifier, ptB);
+    QCOMPARE(aSpyMoved.count(), 1);
+    QCOMPARE(aSpyMoved.takeFirst().at(0).toInt(), 1);
+    QCOMPARE(pBare->tabText(1), QStringLiteral("裸栏页2"));
+    QCOMPARE(pBare->tabText(2), QStringLiteral("裸栏页1"));
+    stTabs.hide();
+}
+
 // 2026-09-13 历史提问浮层（≡按钮下拉）收起规则回归：鼠标位置 + 500ms 容忍。
 //   旧规则：浮层 Leave 即收——鼠标移到条目 Tooltip（贴光标在浮层外沿展开）上读全文时
 //   浮层连同 Tooltip 一起消失；新规则：离开区域满 500ms 才收，在 浮层∪按钮∪Tooltip
@@ -1084,6 +1505,738 @@ void TestExecPanel::promptFlyoutHideRule() {
     QTest::qWait(900);
     QVERIFY(pFly->isVisible());
     pFly->hide();
+}
+
+void TestExecPanel::stagedPromptsBox() {
+    // 2026.09.18 运行中发送的提示词暂存链路（右下角折叠框数据源）：
+    //   ①运行中发送 → 不上屏、StagedCount=1、queueBox 可见；
+    //   ②注入生效事件（injected）→ 暂存转正为用户块、框收空隐藏；
+    //   ③再暂存两条 → OnAdhocPendingStarted 按文本匹配转正首条；
+    //   ④OnAdhocPendingDropped 清空；⑤空闲发送仍直接上屏。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手A"), 2));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(50);
+    panel.SetAdhocEnabled(true);
+
+    // 首个助手的 id/输入框（页容器内首个 QPlainTextEdit）。
+    QWidget* pPage = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手A"))) {
+            pPage = pTabs->widget(i);
+            break;
+        }
+    }
+    QVERIFY(pPage != nullptr);
+    auto* pInput = pPage->findChild<QPlainTextEdit*>();
+    QVERIFY(pInput != nullptr);
+    const QJsonArray aBefore = panel.AssistantsToJson();
+    const QString sId = aBefore.at(0).toObject().value(QStringLiteral("id")).toString();
+    const int iBlocksBefore = aBefore.at(0).toObject()
+            .value(QStringLiteral("blocks")).toArray().size();
+
+    // ①运行中发送：暂存不上屏。
+    panel.SetAsstRunning(sId, true);
+    pInput->setPlainText(QStringLiteral("排队第一条"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(panel.StagedCount(sId), 1);
+    QCOMPARE(panel.AssistantsToJson().at(0).toObject()
+             .value(QStringLiteral("blocks")).toArray().size(), iBlocksBefore);
+    auto* pQBox = pPage->findChild<QFrame*>(QStringLiteral("queueBox"));
+    QVERIFY(pQBox != nullptr);
+    QVERIFY(pQBox->isVisible());
+
+    // ②注入生效：转正上屏 + 框收空。
+    panel.OnAdhocEvent(sId, QStringLiteral("injected"),
+                       QStringLiteral("已注入：排队第一条"));
+    QCOMPARE(panel.StagedCount(sId), 0);
+    QVERIFY(!pQBox->isVisible());
+    const QJsonArray aAfterInj = panel.AssistantsToJson();
+    // +2：用户块（先）+「已注入」事件行（后，通用路径追加）。
+    QCOMPARE(aAfterInj.at(0).toObject()
+             .value(QStringLiteral("blocks")).toArray().size(), iBlocksBefore + 2);
+    QCOMPARE(aAfterInj.at(0).toObject()
+             .value(QStringLiteral("blocks")).toArray().at(iBlocksBefore)
+             .toObject().value(QStringLiteral("eventKind")).toString(),
+             QStringLiteral("user"));
+
+    // ③再暂存两条 → 排队轮启动转正首条。
+    pInput->setPlainText(QStringLiteral("排队第二条"));
+    panel.DoAdhocSend(sId);
+    pInput->setPlainText(QStringLiteral("排队第三条"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(panel.StagedCount(sId), 2);
+    panel.OnAdhocPendingStarted(sId, QStringLiteral("排队第二条"));
+    QCOMPARE(panel.StagedCount(sId), 1);
+    QCOMPARE(panel.AssistantsToJson().at(0).toObject()
+             .value(QStringLiteral("blocks")).toArray().size(), iBlocksBefore + 3);
+
+    // ④队列作废：清空。
+    panel.OnAdhocPendingDropped(sId);
+    QCOMPARE(panel.StagedCount(sId), 0);
+
+    // ⑤空闲发送：直接上屏（原行为）。
+    panel.SetAsstRunning(sId, false);
+    pInput->setPlainText(QStringLiteral("空闲直发"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(panel.StagedCount(sId), 0);
+    QCOMPARE(panel.AssistantsToJson().at(0).toObject()
+             .value(QStringLiteral("blocks")).toArray().size(), iBlocksBefore + 4);
+    panel.hide();
+}
+
+void TestExecPanel::backendSwitchClearsMirror() {
+    // 2026.09.20 v2.4.193 粘性后端（取代清链语义）：per-assistant backend 字段在
+    //   面板 JSON 往返中保持——档载入读入、序列化写回（旧档无键 → 不写/空串）。
+    CExecutionPanel panel;
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    QJsonObject oA = MakeAsst(QStringLiteral("助手A"), 3);
+    oA[QStringLiteral("backend")] = QStringLiteral("pi");
+    oA[QStringLiteral("sid")] = QStringLiteral("pi-session-0001");
+    QJsonObject oB = MakeAsst(QStringLiteral("助手B"), 2);   // 旧档无 backend 键
+    aAssts.append(oA);
+    aAssts.append(oB);
+    panel.LoadAssistantsFromJson(aAssts, QString());
+
+    const QString sIdA = panel.AssistantsToJson().at(0).toObject()
+                             .value(QStringLiteral("id")).toString();
+    const QString sIdB = panel.AssistantsToJson().at(1).toObject()
+                             .value(QStringLiteral("id")).toString();
+    QCOMPARE(panel.AsstBackend(sIdA), QStringLiteral("pi"));
+    QCOMPARE(panel.AsstBackend(sIdB), QString());
+
+    const QJsonArray aOut = panel.AssistantsToJson();
+    QCOMPARE(aOut.at(0).toObject().value(QStringLiteral("backend")).toString(),
+             QStringLiteral("pi"));
+    QVERIFY(aOut.at(1).toObject().value(QStringLiteral("backend")).toString().isEmpty());
+}
+
+// 2026.09.23 v3.1.228 回归：助手输出块说话人标签取该助手粘性后端（v2.4.193），
+//   而非渲染时刻的全局后端——用户报告：助手绑 PiAgent、全局切 CodexHarness 后，
+//   日志块仍标 CodexHarness，与 sticky 提示「本助手继续使用 PIAgent」自相矛盾。
+void TestExecPanel::asstBlockBackendUsesSticky() {
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    QJsonObject oA = MakeAsst(QStringLiteral("助手A"), 0);
+    oA[QStringLiteral("backend")] = QStringLiteral("pi");   // 粘性绑定 PiAgent
+    aAssts.append(oA);
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    const QString sIdA = panel.AssistantsToJson().at(0).toObject()
+                             .value(QStringLiteral("id")).toString();
+    QCOMPARE(panel.AsstBackend(sIdA), QStringLiteral("pi"));
+
+    // 注入一条助手输出：块标签应为 PIAgent（粘性），而非当前全局（测试进程工厂缺省 Claude）。
+    panel.OnAdhocAssistantText(sIdA, QStringLiteral("粘性后端块测试"));
+    QTest::qWait(50);
+
+    // 在该助手页的对话流里找说话人标签（“⏺ ” 前缀的 QLabel）。
+    QWidget* pPage = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手A"))) {
+            pPage = pTabs->widget(i);
+            break;
+        }
+    }
+    QVERIFY(pPage != nullptr);
+    QString sSpeaker;
+    const QList<QLabel*> aLabels = pPage->findChildren<QLabel*>();
+    for (const QLabel* pL : aLabels) {
+        const QString s = pL->text();
+        if (s.startsWith(QStringLiteral("⏺ "))) {
+            sSpeaker = s;
+            break;
+        }
+    }
+    QCOMPARE(sSpeaker, QStringLiteral("⏺ PIAgent"));
+    panel.hide();
+}
+
+void TestExecPanel::stagedPromptsEditDelete() {
+    // 2026.09.20 未发送排队指令的删除/编辑（面板侧）：信号同步编排器 aPendingInjects、
+    //   展示文本保留时间戳前缀、✕ 按钮（queueDelBtn）实际删除条目。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手A"), 2));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(50);
+    panel.SetAdhocEnabled(true);
+    QWidget* pPage = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手A"))) {
+            pPage = pTabs->widget(i);
+            break;
+        }
+    }
+    QVERIFY(pPage != nullptr);
+    auto* pInput = pPage->findChild<QPlainTextEdit*>();
+    QVERIFY(pInput != nullptr);
+    const QString sId = panel.AssistantsToJson().at(0).toObject()
+                             .value(QStringLiteral("id")).toString();
+
+    // 运行中暂存两条。
+    panel.SetAsstRunning(sId, true);
+    pInput->setPlainText(QStringLiteral("排队甲"));
+    panel.DoAdhocSend(sId);
+    pInput->setPlainText(QStringLiteral("排队乙"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(panel.StagedCount(sId), 2);
+
+    QSignalSpy aSpyRemove(&panel, &CExecutionPanel::sigAdhocQueuedRemove);
+    QSignalSpy aSpyEdit(&panel, &CExecutionPanel::sigAdhocQueuedEdit);
+
+    // 编辑首条（首条带 [yyyy-MM-dd HH:mm:ss] 时间戳——第二条距首条 <60s 被去抖无前缀）：
+    //   原始文本换新、展示文本保留时间戳前缀、信号带（旧→新）。
+    panel.ApplyStagedEdit(sId, 0, QStringLiteral("排队甲（改）"));
+    QCOMPARE(panel.StagedCount(sId), 2);
+    QCOMPARE(aSpyEdit.size(), 1);
+    QCOMPARE(aSpyEdit.at(0).at(1).toString(), QStringLiteral("排队甲"));
+    QCOMPARE(aSpyEdit.at(0).at(2).toString(), QStringLiteral("排队甲（改）"));
+    // 展示文本（转正时上屏的用户块文本）保留时间戳前缀且含新文本。
+    panel.OnAdhocPendingStarted(sId, QStringLiteral("排队甲（改）"));
+    const QJsonObject oLast = panel.AssistantsToJson().at(0).toObject()
+            .value(QStringLiteral("blocks")).toArray().last().toObject();
+    QVERIFY(oLast.value(QStringLiteral("eventKind")).toString()
+            == QStringLiteral("user"));
+    const QString sUserText = oLast.value(QStringLiteral("text")).toString();
+    QVERIFY(sUserText.contains(QStringLiteral("排队甲（改）")));
+    QVERIFY(sUserText.startsWith(QStringLiteral("[20")));   // 时间戳前缀保留
+
+    // 空白编辑拒改。
+    panel.ApplyStagedEdit(sId, 0, QStringLiteral("   "));
+    QCOMPARE(aSpyEdit.size(), 1);
+
+    // 删除余下的「排队乙」（转正已消费改过的首条）：信号按原文本同步。
+    panel.RemoveStagedPrompt(sId, 0);
+    QCOMPARE(panel.StagedCount(sId), 0);
+    QCOMPARE(aSpyRemove.size(), 1);
+    QCOMPARE(aSpyRemove.at(0).at(1).toString(), QStringLiteral("排队乙"));
+
+    // 越界/未知助手：零副作用。
+    panel.RemoveStagedPrompt(sId, 9);
+    panel.RemoveStagedPrompt(QStringLiteral("no-such"), 0);
+    QCOMPARE(aSpyRemove.size(), 1);
+
+    // UI 路径：再暂存一条，展开后 ✕ 按钮删除该条。
+    pInput->setPlainText(QStringLiteral("排队丙"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(panel.StagedCount(sId), 1);
+    auto* pExpand = pPage->findChild<QToolButton*>(QStringLiteral("queueExpandBtn"));
+    QVERIFY(pExpand != nullptr);
+    QTest::mouseClick(pExpand, Qt::LeftButton);
+    QTest::qWait(30);
+    auto aDelBtns = pPage->findChildren<QToolButton*>(QStringLiteral("queueDelBtn"));
+    QCOMPARE(aDelBtns.size(), 1);
+    QTest::mouseClick(aDelBtns.at(0), Qt::LeftButton);
+    QCOMPARE(panel.StagedCount(sId), 0);
+    QCOMPARE(aSpyRemove.size(), 2);
+    QCOMPARE(aSpyRemove.at(1).at(1).toString(), QStringLiteral("排队丙"));
+    panel.hide();
+}
+
+void TestExecPanel::recentDialogGeometryPersist() {
+    // 2026.09.20 最近打开对话框几何持久化：show→move/resize→hide 落
+    //   [Layout] RecentWin；新实例读回同几何；坏档回缺省；空 cfg 路径不写盘。
+    QTemporaryDir oTmp;
+    QVERIFY(oTmp.isValid());
+    const QString sCfg = oTmp.path() + QStringLiteral("/config.ini");
+    {
+        CRecentProjectsDialog stDlg({ QStringLiteral("C:/ProjA"), QStringLiteral("C:/ProjB") },
+                                     QList<int>() << 5 << 2, sCfg);
+        stDlg.show();
+        QTest::qWait(30);
+        // offscreen 虚拟桌面 800×600：取 600×400@（100,60）不出屏（760 宽会触发贴边收口）。
+        stDlg.move(100, 60);
+        stDlg.resize(600, 400);
+        QTest::qWait(30);
+        stDlg.hide();   // hideEvent → 落盘
+        QTest::qWait(30);
+        QFile fDbg(sCfg);
+        if (fDbg.open(QIODevice::ReadOnly)) {
+            qDebug() << "CFG:" << QString::fromUtf8(fDbg.readAll());
+            fDbg.close();
+        }
+    }
+    {
+        CRecentProjectsDialog stDlg({ QStringLiteral("C:/ProjA") }, QList<int>(), sCfg);
+        QCOMPARE(stDlg.geometry(), QRect(100, 60, 600, 400));
+        // 计数显示（同序快照）。
+        QVERIFY(stDlg.findChild<QListWidget*>() != nullptr);
+        QListWidget* pList = stDlg.findChild<QListWidget*>();
+        QCOMPARE(pList->count(), 1);
+        QVERIFY(pList->item(0)->text().contains(QStringLiteral("— 1 次")));
+    }
+    // 坏档（非数字/个数不符）→ 缺省 620×420 不炸（重写新档，非追加——追加时首个
+    //   同名键仍命中旧好值，profile 取首次出现）。
+    {
+        QFile fCfg(sCfg);
+        QVERIFY(fCfg.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        fCfg.write("\r\n[Layout]\r\nRecentWin=garbage,xx\r\n");
+        fCfg.close();
+        CRecentProjectsDialog stDlg({ QStringLiteral("C:/ProjA") }, QList<int>(), sCfg);
+        QCOMPARE(stDlg.size(), QSize(620, 420));
+    }
+    // 空 cfg 路径 = 禁用（不写盘；hide 无副作用）。
+    {
+        CRecentProjectsDialog stDlg({ QStringLiteral("C:/ProjA") });
+        stDlg.show();
+        QTest::qWait(20);
+        stDlg.hide();
+        QTest::qWait(20);
+        QVERIFY(!QFile::exists(oTmp.path() + QStringLiteral("/none.ini")));
+    }
+}
+
+void TestExecPanel::recentDialogGeometryNoDrift() {
+    // 窗口几何断言依赖真实窗口平台（offscreen 无原生窗口，漂移不发生，跳过）。
+    if (QGuiApplication::platformName() == QLatin1String("offscreen"))
+        QSKIP("window geometry drift requires a real window platform");
+    // 完整生命周期循环：构造（恢复几何）→ show → hide（落盘）→ 销毁，三轮。
+    //   修复前每轮 y 恒 -31（Qt6.8.3 setGeometry 客户区落点比请求高一个标题栏），
+    //   累漂到顶。修复后 move()+resize() 精确，三轮 y 必须逐轮相等。
+    QTemporaryDir oTmp;
+    QVERIFY(oTmp.isValid());
+    const QString sCfg = oTmp.path() + QStringLiteral("/config.ini");
+    int iPrevY = -1;
+    for (int i = 0; i < 3; ++i) {
+        CRecentProjectsDialog stDlg({ QStringLiteral("C:/ProjA") }, QList<int>(), sCfg);
+        stDlg.show();
+        QTest::qWait(80);
+        const int iY = stDlg.y();
+        stDlg.hide();   // hideEvent → 落盘
+        QTest::qWait(40);
+        if (iPrevY >= 0) {
+            QCOMPARE(iY, iPrevY);
+        }
+        iPrevY = iY;
+    }
+}
+
+void TestExecPanel::asstAutoNameOnFinish() {
+    // 2026.09.26 工作结束自动改名回归：①默认名（助手N）+有素材 → 收尾触发
+    //   sigAsstAutoRename（带提示词）；②命名轮收尾重入不再次触发（bAutoNameTried
+    //   防循环）；③非默认名不触发；④用户再发送 → 标志清零 → 下次收尾可重试。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手1"), 0));      // 默认名
+    aAssts.append(MakeAsst(QStringLiteral("装修达人"), 0));    // 非默认名
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    QSignalSpy spyRename(&panel, &CExecutionPanel::sigAsstAutoRename);
+
+    auto fnSwitchTo = [pTabs](const QString& sPrefix) -> QPlainTextEdit* {
+        for (int i = 0; i < pTabs->count(); ++i) {
+            if (pTabs->tabText(i).startsWith(sPrefix)) {
+                pTabs->setCurrentIndex(i);
+                return pTabs->widget(i)->findChild<QPlainTextEdit*>();
+            }
+        }
+        return nullptr;
+    };
+    auto fnFinish = [&panel](const QString& sId) {
+        panel.OnAdhocFinished(sId);
+    };
+
+    // ① 默认名：发送提示词（不触发）→ 收尾触发。
+    QPlainTextEdit* pIn = fnSwitchTo(QStringLiteral("助手1"));
+    QVERIFY(pIn != nullptr);
+    const QString sId1 = panel.ActiveAsstId();
+    pIn->setPlainText(QStringLiteral("帮我实现一个登录页面"));
+    panel.DoAdhocSend(sId1);
+    QCOMPARE(spyRename.count(), 0);   // 发送不触发（收尾才触发）
+    fnFinish(sId1);
+    QCOMPARE(spyRename.count(), 1);
+    QCOMPARE(spyRename.at(0).at(0).toString(), sId1);
+    QVERIFY(spyRename.at(0).at(1).toString().contains(QStringLiteral("登录页面")));
+
+    // ② 命名轮收尾重入（失败场景：名称未变）→ 不再触发，防死循环。
+    fnFinish(sId1);
+    QCOMPARE(spyRename.count(), 1);
+
+    // ③ 非默认名助手：发送+收尾 → 不触发。
+    pIn = fnSwitchTo(QStringLiteral("装修达人"));
+    QVERIFY(pIn != nullptr);
+    const QString sId2 = panel.ActiveAsstId();
+    QVERIFY(sId2 != sId1);
+    pIn->setPlainText(QStringLiteral("随便干点啥"));
+    panel.DoAdhocSend(sId2);
+    fnFinish(sId2);
+    QCOMPARE(spyRename.count(), 1);
+
+    // ④ 用户再发提示词 → 标志清零 → 收尾再次触发（失败重试语义）。
+    pIn = fnSwitchTo(QStringLiteral("助手1"));
+    QVERIFY(pIn != nullptr);
+    pIn->setPlainText(QStringLiteral("再加上注册功能"));
+    panel.DoAdhocSend(sId1);
+    QCOMPARE(spyRename.count(), 1);   // 发送本身仍不触发
+    fnFinish(sId1);
+    QCOMPARE(spyRename.count(), 2);
+    panel.hide();
+}
+
+void TestExecPanel::asstAutoNameDeferredWhileRunning() {
+    // 2026-10-03 运行中请求「自动重命名」→ 挂起到当前指令完成后执行（用户需求）：
+    //   ①运行中请求：不发射、置挂起位（流内留事件行）；
+    //   ②本轮收尾（OnAdhocFinished）：清挂起位 + 发射 sigAsstAutoRename（素材含
+    //     已完成轮的提示词）+ 运行态已归零；
+    //   ③挂起命名让位收尾自动命名（bAutoNameTried）：不双跑；再次收尾无残留；
+    //   ④空闲时请求：立即发射。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手1"), 0));   // 默认名
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    QSignalSpy spyRename(&panel, &CExecutionPanel::sigAsstAutoRename);
+    QPlainTextEdit* pIn = nullptr;
+    for (int i = 0; i < pTabs->count() && pIn == nullptr; ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手1"))) {
+            pTabs->setCurrentIndex(i);
+            pIn = pTabs->widget(i)->findChild<QPlainTextEdit*>();
+        }
+    }
+    QVERIFY(pIn != nullptr);
+    const QString sId = panel.ActiveAsstId();
+
+    // 发送提示词（素材入流）+ 置运行态（= 编排器 sigAdhocRunning 语义）
+    pIn->setPlainText(QStringLiteral("帮我实现一个登录页面"));
+    panel.DoAdhocSend(sId);
+    panel.SetAsstRunning(sId, true);
+    QVERIFY(panel.AsstRunning(sId));
+
+    // ① 运行中请求 → 挂起，不发射
+    QVERIFY(panel.TriggerAsstAutoRename(sId));
+    QCOMPARE(spyRename.count(), 0);
+    QVERIFY(panel.AsstRunning(sId));   // 挂起不打断当前轮
+
+    // ② 本轮收尾 → 执行挂起命名（发射 + 运行态清零后再起新命名轮前可见）
+    panel.OnAdhocFinished(sId);
+    QCOMPARE(spyRename.count(), 1);
+    QCOMPARE(spyRename.at(0).at(0).toString(), sId);
+    QVERIFY(spyRename.at(0).at(1).toString().contains(QStringLiteral("登录页面")));
+    QVERIFY(!panel.AsstRunning(sId));   // 测试环境无编排器回置运行态：收尾即空闲
+
+    // ③ 再次收尾：挂起位已清 + bAutoNameTried 拦截收尾自动命名 → 不再发射
+    panel.OnAdhocFinished(sId);
+    QCOMPARE(spyRename.count(), 1);
+
+    // ④ 空闲时请求 → 立即发射（原右键路径行为保持）
+    QVERIFY(panel.TriggerAsstAutoRename(sId));
+    QCOMPARE(spyRename.count(), 2);
+    panel.hide();
+}
+
+void TestExecPanel::recentChipsPanel() {
+    // 2026.09.26 v3.1.239 「最近打开」按钮面板回归（纯函数 + 面板交互）。
+    const QFontMetrics stFm{QFont{}};
+    constexpr int kiAvail = 400, kiSpacing = 6, kiHPad = 10;
+
+    // —— ① LayoutChips：等名列表 —— 行满占满整宽（无 cap 时误差≤1）、宽度≤半宽上限
+    {
+        QStringList aNames;
+        for (int i = 0; i < 20; ++i) { aNames << QStringLiteral("工程%1").arg(i); }
+        const auto aRows = CRecentChipsPanel::LayoutChips(aNames, stFm, kiAvail, kiSpacing, kiHPad);
+        QVERIFY(aRows.size() >= 2);
+        int iTotal = 0;
+        for (const auto& stRow : aRows) {
+            int iSum = -kiSpacing * (stRow.aBtnW.size() - 1) - kiSpacing;   // 先减全部间距
+            for (int w : stRow.aBtnW) {
+                iSum += w + kiSpacing;
+                QVERIFY(w <= kiAvail / 2);            // 用户规则 3：单按钮宽上限=半宽
+                QVERIFY(w >= 1);
+            }
+            iTotal += stRow.aBtnW.size();
+            // 行满：Σw+间距 = avail（整数化零头归最宽者，误差≤1）；单按钮行被 cap 钳位除外
+            if (stRow.aBtnW.size() > 1) {
+                const int iRowW = std::accumulate(stRow.aBtnW.begin(), stRow.aBtnW.end(), 0)
+                                  + kiSpacing * (stRow.aBtnW.size() - 1);
+                QVERIFY(qAbs(iRowW - kiAvail) <= 1);
+            }
+        }
+        QCOMPARE(iTotal, 20);   // 无丢失无重复
+    }
+
+    // —— ② LayoutChips：单按钮行被半宽上限钳位；独行超长同样封顶（省略号兑底）
+    {
+        const auto aRows = CRecentChipsPanel::LayoutChips(
+            { QStringLiteral("唯一工程") }, stFm, kiAvail, kiSpacing, kiHPad);
+        QCOMPARE(aRows.size(), 1);
+        QCOMPARE(aRows.at(0).aBtnW.at(0), kiAvail / 2);   // 钳到半宽（用户规则 3）
+    }
+
+    // —— ③ LayoutChips：长短名混排 —— 行内个数不同、多按钮行每按钮宽≥其最小宽（标题完整显示）
+    {
+        QStringList aNames = { QStringLiteral("a"), QStringLiteral("很长很长的工程名称测试用例"),
+                               QStringLiteral("b"), QStringLiteral("c"),
+                               QStringLiteral("另一个超长工程名称样例数据"), QStringLiteral("d") };
+        const auto aRows = CRecentChipsPanel::LayoutChips(aNames, stFm, kiAvail, kiSpacing, kiHPad);
+        QVERIFY(aRows.size() >= 2);   // 长名必然断行 → 每行个数不同
+        bool bSawDiff = false;
+        for (const auto& stRow : aRows) {
+            for (int k = 0; k < stRow.aBtnW.size(); ++k) {
+                const int iMinW = stFm.horizontalAdvance(aNames.at(stRow.iFirst + k))
+                                  + 2 * kiHPad + 2;
+                if (stRow.aBtnW.size() > 1) {
+                    QVERIFY(stRow.aBtnW.at(k) >= iMinW);   // 完整显示：宽≥最小宽
+                }
+            }
+            if (stRow.aBtnW.size() != aRows.at(0).aBtnW.size()) { bSawDiff = true; }
+        }
+        QVERIFY(bSawDiff);
+    }
+
+    // —— ④ ChipColorForCount：1~5 基色 → 100=(255,0,0) → 255=(100,0,0) → >255 恒定；
+    //      5→100 R 单调升 G/B 降；100→255 R 单调降
+    {
+        const QColor clBase = CRecentChipsPanel::ChipColorForCount(1);
+        QCOMPARE(CRecentChipsPanel::ChipColorForCount(5), clBase);
+        QCOMPARE(clBase, QColor(225, 230, 238));
+        QCOMPARE(CRecentChipsPanel::ChipColorForCount(100), QColor(255, 0, 0));
+        QCOMPARE(CRecentChipsPanel::ChipColorForCount(255), QColor(100, 0, 0));
+        QCOMPARE(CRecentChipsPanel::ChipColorForCount(300), QColor(100, 0, 0));
+        const QColor cl6 = CRecentChipsPanel::ChipColorForCount(6);
+        const QColor cl50 = CRecentChipsPanel::ChipColorForCount(50);
+        const QColor cl99 = CRecentChipsPanel::ChipColorForCount(99);
+        QVERIFY(cl50.red() > cl6.red() && cl99.red() > cl50.red() && cl99.red() < 255);
+        QVERIFY(cl50.green() < cl6.green() && cl50.blue() < cl6.blue());
+        const QColor cl150 = CRecentChipsPanel::ChipColorForCount(150);
+        QVERIFY(cl150.green() == 0 && cl150.blue() == 0);
+        QVERIFY(cl150.red() < 255 && cl150.red() > 100);
+    }
+
+    // —— ⑤ 面板交互：首个按钮=更多...；悬停状态栏显路径/离开回汇总；点击回调带路径
+    {
+        QStringList aOpened;
+        bool bMore = false;
+        CRecentChipsPanel stPanel(
+            [&aOpened](const QString& sP) { aOpened.append(sP); },
+            [&bMore]() { bMore = true; });
+        stPanel.Refresh({ QStringLiteral("C:/ProjA"), QStringLiteral("D:/x/ProjB") },
+                         { 3, 120 });
+        stPanel.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&stPanel));
+        QTest::qWait(50);
+        QCOMPARE(stPanel.Chips().size(), 3);   // 更多... + 2 工程
+
+        // 悬停工程按钮 → 状态栏显路径；离开 → 回汇总
+        QWidget* pChipB = stPanel.ChipAt(2);
+        QEnterEvent stEnter(QPointF(5, 5), QPointF(5, 5), QPointF(0, 0));
+        QApplication::sendEvent(pChipB, &stEnter);
+        QVERIFY(stPanel.StatusText().contains(QStringLiteral("ProjB")));
+        QEvent stLeave(QEvent::Leave);
+        QApplication::sendEvent(pChipB, &stLeave);
+        QVERIFY(stPanel.StatusText().contains(QStringLiteral("共 2 个工程")));
+
+        // 点击：工程按钮回调带路径；首个按钮=更多...
+        QTest::mouseClick(stPanel.ChipAt(1), Qt::LeftButton);
+        QCOMPARE(aOpened, QStringList({ QStringLiteral("C:/ProjA") }));
+        QTest::mouseClick(stPanel.ChipAt(0), Qt::LeftButton);
+        QVERIFY(bMore);
+        QCOMPARE(aOpened.size(), 1);   // 更多不进工程回调
+
+        // 面板渲染不崩溃（含悬停态假粗体 2x2 四次绘制路径）
+        QImage stImg(stPanel.size(), QImage::Format_ARGB32);
+        stPanel.render(&stImg);
+        QEnterEvent stEnter2(QPointF(3, 3), QPointF(3, 3), QPointF(0, 0));
+        QApplication::sendEvent(stPanel.ChipAt(1), &stEnter2);
+        stPanel.render(&stImg);
+        stPanel.hide();
+    }
+}
+
+void TestExecPanel::recentChipsPanelMenuEmbed() {
+    // 菜单内嵌（QWidgetAction）真实窗口验证：QMenu 打开期间面板按钮可点击/滚轮可滚。
+    //   offscreen 平台 QSKIP（口径同 recentDialogGeometryNoDrift）。
+    if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
+        QSKIP("menu embed interaction requires a real window platform");
+    }
+    QStringList aOpened;
+    bool bMore = false;
+    auto* pPanel = new CRecentChipsPanel(
+        [&aOpened](const QString& sP) { aOpened.append(sP); },
+        [&bMore]() { bMore = true; });
+    QStringList aPaths;
+    QList<int> aOpens;
+    for (int i = 0; i < 60; ++i) {
+        aPaths << QStringLiteral("C:/LongDir/ProjectLongName%1").arg(i);   // 长目录名 → 每行 3~4 个 → 必溢出 9 行封顶
+        aOpens << (i % 120);
+    }
+
+    QMenu stMenu;
+    auto* pWgtAct = new QWidgetAction(&stMenu);
+    pWgtAct->setDefaultWidget(pPanel);
+    stMenu.addAction(pWgtAct);
+    stMenu.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&stMenu));
+    QTest::qWait(50);
+    // 与生产同序：菜单已显示（aboutToShow 语义）后刷新——真实宽度下布局
+    pPanel->Refresh(aPaths, aOpens);
+    QTest::qWait(80);
+
+    // 点击第 3 个按钮（Proj2）——验证 QMenu 打开期间内嵌面板收到点击（关键决策：
+    //   独立弹窗收不到，QWidgetAction 内嵌可以）
+    QWidget* pChip = pPanel->ChipAt(3);
+    QTest::mouseClick(pChip, Qt::LeftButton);
+    QVERIFY(aOpened.contains(QStringLiteral("C:/LongDir/ProjectLongName2")));
+
+    // 滚轮滚动：60 项超出 9 行封顶 → 滚轮后垂直滚动值前移（明确取垂直条）
+    QScrollBar* pBar = nullptr;
+    for (QScrollBar* pB : pPanel->findChildren<QScrollBar*>()) {
+        if (pB->orientation() == Qt::Vertical) { pBar = pB; }
+    }
+    QVERIFY(pBar != nullptr);
+    QVERIFY(pBar->maximum() > 0);   // 60 项必超 9 行可视上限
+    const int iVal0 = pBar->value();
+        QWheelEvent stWheel(QPointF(10, 10), QPointF(10, 10), QPoint(0, -120), QPoint(0, -120),
+                            Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(pPanel->findChild<QAbstractScrollArea*>()->viewport(), &stWheel);
+        QTest::qWait(80);
+        QVERIFY(pBar->value() > iVal0);
+    stMenu.hide();
+}
+
+
+void TestExecPanel::foreignPhantomLifecycle() {
+    // 2026-10-02 跨档幽灵（任务助手不停跑跨档保留）核心逻辑：
+    //   ①视图 key 切换后 TakeRunningForReload 摘下全部运行者（含外档）；
+    //   ②AttachForeignAssistants 挂回；外档者粗体标记 + AssistantsJsonOf 分组过滤；
+    //   ③外档页输入禁用；④DropAsstEntries 按 id 去重；⑤轮次结束除名后不再外档。
+    CExecutionPanel panel;
+    panel.resize(1100, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+
+    // 视图 = 任务档 "taskA"：载两个助手（A1 运行中由 SetAsstRunning 模拟）
+    panel.SetViewKey(QStringLiteral("taskA"));
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("任务助手A1"), 3));
+    aAssts.append(MakeAsst(QStringLiteral("任务助手A2"), 1));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(80);
+    const QString sIdA1 = panel.AllAsstsSnapshot().at(0).sId;
+    panel.SetAsstRunning(sIdA1, true);
+    QCOMPARE(panel.RunningAsstIds().size(), 1);
+
+    // 切视图到工程档（""）：载工程助手 B1；运行中的 A1 应被摘下并可挂回
+    panel.SetViewKey(QString());
+    QList<CExecutionPanel::SAsst> aTaken = panel.TakeRunningForReload();
+    QCOMPARE(aTaken.size(), 1);                       // 只摘运行者（A1）
+    QCOMPARE(aTaken.at(0).sId, sIdA1);
+    QCOMPARE(aTaken.at(0).sOwnerKey, QStringLiteral("taskA"));
+    QJsonArray aProj;
+    aProj.append(MakeAsst(QStringLiteral("工程助手B1"), 0));
+    panel.LoadAssistantsFromJson(aProj, QString());
+    QTest::qWait(80);
+    panel.AttachForeignAssistants(aTaken, QStringLiteral("某任务"));
+    QTest::qWait(80);
+
+    // 外档判定 + 分组落盘过滤
+    QString sOwner;
+    QVERIFY(panel.AsstForeignById(sIdA1, &sOwner));
+    QCOMPARE(sOwner, QStringLiteral("taskA"));
+    const QList<CExecutionPanel::SAsst> aSnap = panel.AllAsstsSnapshot();
+    QCOMPARE(aSnap.size(), 2);                        // 工程助手B1 + 幽灵A1（文件版同 id 已被 Drop 语义避免）
+    QCOMPARE(panel.AssistantsToJson().size(), 1);     // 视图档只含工程助手B1
+    QCOMPARE(panel.AssistantsJsonOf(QStringLiteral("taskA")).size(), 1);   // 幽灵归 taskA 组
+
+    // 外档页输入禁用（防跨档误操作）——按 Tab 标题找页
+    QWidget* pForeignPage = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i) == QStringLiteral("任务助手A1")) {
+            pForeignPage = pTabs->widget(i);
+            break;
+        }
+    }
+    QVERIFY(pForeignPage != nullptr);
+    QPlainTextEdit* pForeignInput = pForeignPage->findChild<QPlainTextEdit*>();
+    QVERIFY(pForeignInput != nullptr);
+    QVERIFY(!pForeignInput->isEnabled());
+
+    // DropAsstEntries：载入同 id 文件版让位（不产生重复 Tab）
+    panel.LoadAssistantsFromJson(aProj, QString());   // 再载一次（模拟切回工程重复载）
+    panel.DropAsstEntries(QStringList{ sIdA1 });      // 若文件版含 A1 则移除
+    QCOMPARE(panel.AllAsstsSnapshot().size(), 1);     // 只有工程助手B1
+
+    // 幽灵结束除名
+    panel.AttachForeignAssistants(aTaken, QStringLiteral("某任务"));
+    panel.RemoveAsstEntry(sIdA1);
+    QCOMPARE(panel.AllAsstsSnapshot().size(), 1);
+    QVERIFY(!panel.AsstForeignById(sIdA1));
+}
+
+void TestExecPanel::adhocInputAutoGrowOnInject() {
+    // 2026.09.26 右键「添加到聊天框」注入长文本 → 输入框自动往上扩展高度：
+    //   ①注入无回车长文本后高度增长（软换行视觉行计高，旧版 blockCount 恒 1 行不涨）；
+    //   ②封顶 10 行；③清空回单行；④窗口变窄 → 软换行变多 → 高度重算更高。
+    CExecutionPanel panel;
+    panel.resize(1100, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手A"), 0));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    QPlainTextEdit* pInput = pTabs->currentWidget()->findChild<QPlainTextEdit*>();
+    QVERIFY(pInput != nullptr);
+    QTest::qWait(80);   // 首次布局安定
+
+    const int iH0 = pInput->height();
+    const QFontMetrics stFm = pInput->fontMetrics();
+    const int iLineH = stFm.lineSpacing();
+    QVERIFY(iH0 < iLineH * 2 + 40);   // 空输入=单行高度
+
+    // ① 无回车长文本（右键注入路径的典型形态）→ 高度按视觉行增长
+    panel.AppendToAdhocInput(QString(240, QLatin1Char('x')));   // 单块、无回车
+    QTest::qWait(80);
+    const int iH1 = pInput->height();
+    QVERIFY(iH1 > iH0 + iLineH);          // 至少多出 2 行（240 字符远超一行）
+    QVERIFY(iH1 <= iH0 + 9 * iLineH);     // 封顶 10 行
+
+    // ② 超长文本封顶后不再无限增长
+    panel.AppendToAdhocInput(QString(2000, QLatin1Char('y')));
+    QTest::qWait(80);
+    QVERIFY(pInput->height() <= iH0 + 9 * iLineH);
+
+    // ③ 清空（textChanged）回单行
+    pInput->clear();
+    QTest::qWait(80);
+    QCOMPARE(pInput->height(), iH0);
+
+    // ④ 宽度变窄 → 同样文本软换行变多 → 高度重算更高（Resize 重算链）
+    panel.AppendToAdhocInput(QString(160, QLatin1Char('z')));
+    QTest::qWait(80);
+    const int iWide = pInput->height();
+    panel.resize(520, 700);
+    QTest::qWait(120);
+    const int iNarrow = pInput->height();
+    QVERIFY(iNarrow > iWide);
+    panel.hide();
 }
 
 QTEST_MAIN(TestExecPanel)

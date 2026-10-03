@@ -17,8 +17,8 @@ const EStage g_aBugfix[] = {
     EStage::CodeReview, EStage::Verify, EStage::Test
 };
 
-constexpr int g_nFeature = int(sizeof(g_aFeature) / sizeof(EStage));
-constexpr int g_nBugfix  = int(sizeof(g_aBugfix) / sizeof(EStage));
+constexpr int g_nFeature = static_cast<int>(sizeof(g_aFeature) / sizeof(EStage));
+constexpr int g_nBugfix  = static_cast<int>(sizeof(g_aBugfix) / sizeof(EStage));
 }  // namespace
 
 bool CStageMachine::StageInFlow(ETaskType a_eType, EStage a_eStage) {

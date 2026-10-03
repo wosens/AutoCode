@@ -104,7 +104,7 @@ private slots:
     void slotOnErrorOccurred(QProcess::ProcessError a_eError);
 
 private:
-    void HandleLine(const QByteArray& a_sLine);
+    void HandleLine(const QByteArray& a_sLine, int a_iEpoch);   // a_iEpoch=所属进程代次（识破旧进程残留行）
     void EmitFailed(const QString& a_sMsg);
     void Reset();
     // 2026.08.17 停滞检测巡检（30s 一拍）：进程活着但距上次收到任何输出超过阈值 →
@@ -163,6 +163,13 @@ private:
     //   headless 失败常见）唯一可靠的信息源。
     QString MineTranscriptErrorTail();
     QStringList m_aStderrTail;            // 最近若干条 stderr 行（失败消息附带，防真因丢失）
+    // 2026.09.22 进程树整杀（2d9e4c0c 实证：cmd 被 kill 后 node 以孤儿进程继续运行，
+    //   任务判死后仍写出 design.md，编排器状态与磁盘事实脱节；旧注释见 BeginOrphanGrace）。
+    //   Windows Job Object（KILL_ON_JOB_CLOSE）：cmd+node 整树同生共死，
+    //   TerminateJobObject 一次杀干净，程序退出无残留。HANDLE 存 void* 避免头文件引 windows.h。
+    void* m_hJob = nullptr;              // Job 句柄（runner 生命周期内复用，析构时关闭）
+    bool  EnsureJobObject();             // 创建 Job（幂等）并把当前子进程 cmd 挂入（子孙全进树）
+    void  KillProcessTree();             // 整树终止（TerminateJobObject；无 Job 退回 m_pProc->kill）
     // 2026.08.17 停滞检测：m_actClock 在每次收到 stdout/stderr 字节时重启，30s 巡检一次，
     //   超阈值且进程仍活着 → 挂起判定（subtype="stall"）。挂载 ask_user 的调用
     //   （等待用户作答可静默很久）不启用。

@@ -50,6 +50,10 @@ private:
     void HandleMessage(const QJsonObject& a_oMsg);
     // tools/call(ask_user)：经 QLocalSocket 转发提问，同步等回答后回 tool_result。
     void HandleAskUser(const QJsonValue& a_vId, const QJsonObject& a_oArgs);
+    // 2026-09-26 tools/call(sandbox_*)：内置测试沙箱工具，经同一管道 {type:sbx}
+    //   转发主实例 CSandboxManager::Execute，回 tool_result。
+    void HandleSandboxCall(const QJsonValue& a_vId, const QString& a_sCmd,
+                           const QJsonObject& a_oArgs);
     void WriteJson(const QJsonObject& a_oMsg);     // 写一行 JSON 到 stdout（立即 flush）
 
     CStdInReaderThread* m_pReader = nullptr;

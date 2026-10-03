@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -31,6 +32,10 @@ static double s_dPiPriceInPerM        = 3.0;
 static double s_dPiPriceCacheReadPerM = 0.3;
 static double s_dPiPriceCacheWritePerM = 3.75;
 static double s_dPiPriceOutPerM       = 15.0;
+// 2026.09.22 RPC 形态能力缓存（进程内）：0=未探测，1=可用，-1=不可用；
+//   运行期早夭（未见会话即非零退出）另置 s_bRpcRuntimeBroken（探测命中也不再试）。
+static int  s_iRpcCapable = 0;
+static bool s_bRpcRuntimeBroken = false;
 
 void CPiAgentRunner::SetPiPriceInPerM(double a_d) {
     s_dPiPriceInPerM = qMax(0.0, a_d);
@@ -136,7 +141,7 @@ bool CPiAgentRunner::WritePiModelsJson() {
     const QString sPath = PiModelsJsonPath();
     QDir().mkpath(QFileInfo(sPath).absolutePath());
     QJsonObject oRoot;
-    QFile stFile(sPath);
+    CFrwDevice stFile(sPath);
     if (stFile.open(QIODevice::ReadOnly)) {
         QJsonParseError stErr;
         const QJsonDocument oDoc = QJsonDocument::fromJson(stFile.readAll(), &stErr);
@@ -178,7 +183,7 @@ bool CPiAgentRunner::WritePiModelsJson() {
     //   改 Hermes EnsureHermesHomeConfig 同款 .tmp→remove→rename 口径。
     const QByteArray aNew = QJsonDocument(oRoot).toJson(QJsonDocument::Indented);
     {
-        QFile stCur(sPath);
+        CFrwDevice stCur(sPath);
         if (stCur.open(QIODevice::ReadOnly)) {
             const QByteArray aCur = stCur.readAll();
             stCur.close();
@@ -230,7 +235,7 @@ bool CPiAgentRunner::EnsurePiRetrySettings() {
     QDir().mkpath(QFileInfo(sPath).absolutePath());
     QJsonObject oRoot;
     bool bParsed = false;
-    QFile stIn(sPath);
+    CFrwDevice stIn(sPath);
     if (stIn.open(QIODevice::ReadOnly)) {
         QJsonParseError stErr;
         const QJsonDocument oDoc = QJsonDocument::fromJson(stIn.readAll(), &stErr);
@@ -310,7 +315,7 @@ CPiAgentRunner::EPiForm CPiAgentRunner::DetectPiForm() {
 QString CPiAgentRunner::ResolvePiVersion(const QString& a_sRoot) {
     // 读指定 package.json 的 version（open 失败/解析错/无 version 字段→空串）。
     auto fnReadVer = [](const QString& a_sPkg) -> QString {
-        QFile stFile(a_sPkg);
+        CFrwDevice stFile(a_sPkg);
         if (!stFile.open(QIODevice::ReadOnly)) {
             return QString();
         }
@@ -342,6 +347,42 @@ QString CPiAgentRunner::ResolvePiVersion(const QString& a_sRoot) {
 QString CPiAgentRunner::ResolveNodePath() {
     // 留空走 PATH：QProcess 直起可执行名由系统搜路径（同 DSH 口径）。
     return s_sPiNodePath.isEmpty() ? QStringLiteral("node") : s_sPiNodePath;
+}
+
+bool CPiAgentRunner::RpcCapable() {
+    // 2026.09.22 RPC 形态探测（进程内缓存）：优先文件布局探测，退回 cli.js 内容
+    //   探测。两种 dist 形态：源码仓库/npm 包均为 tsc 树状 dist（cli.js 同级
+    //   modes/rpc/rpc-mode.js）；若未来改单文件 bundle，则协议字面量
+    //   "extension_ui_request" 必在 cli.js 文本内。运行期早夭记忆优先于探测结果。
+    if (s_bRpcRuntimeBroken) {
+        return false;
+    }
+    if (s_iRpcCapable != 0) {
+        return s_iRpcCapable > 0;
+    }
+    const QString sCli = ResolveCliJsPath();
+    if (sCli.isEmpty() || !QFile::exists(sCli)) {
+        s_iRpcCapable = -1;
+        return false;
+    }
+    const QString sDir = QFileInfo(sCli).absolutePath();
+    if (QFileInfo::exists(sDir + QStringLiteral("/modes/rpc/rpc-mode.js"))) {
+        s_iRpcCapable = 1;
+        return true;
+    }
+    QFile fCli(sCli);
+    if (fCli.open(QIODevice::ReadOnly)
+        && fCli.readAll().contains("extension_ui_request")) {
+        s_iRpcCapable = 1;
+        return true;
+    }
+    s_iRpcCapable = -1;
+    return false;
+}
+
+void CPiAgentRunner::ResetRpcCapCacheForTest() {
+    s_iRpcCapable = 0;
+    s_bRpcRuntimeBroken = false;
 }
 
 QString CPiAgentRunner::ResolveCliJsPath() {
@@ -453,6 +494,7 @@ void CPiAgentRunner::Reset() {
     m_bFinished = false;
     m_bAgentEnded = false;
     m_bSawSession = false;
+    m_bRpcSettled = false;   // 2026.09.22 RPC 轮收敛标记复位（m_bRpcMode 由 Impl 定）
     m_sTurnText.clear();
     m_sLastStopReason.clear();
     m_sLastApiError.clear();   // 2026.08.22 API 错误透传（见头文件注释）
@@ -481,8 +523,33 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
                                 bool a_bFork,
                                 int a_iAutocompactK,
                                 bool a_bEnableAskUser) {
+    // 2026.09.22 双形态入口：存回退参数（RPC 早夭时当轮重拉一次性形态，见
+    //   slotOnFinished），形态由能力探测决定。
+    m_stRetry.sWorkDir = a_sWorkDir;
+    m_stRetry.sPrompt = a_sPrompt;
+    m_stRetry.sDisallowed = a_sDisallowedTools;
+    m_stRetry.iMaxTurns = a_iMaxTurns;
+    m_stRetry.sResumeSid = a_sResumeSid;
+    m_stRetry.bFork = a_bFork;
+    m_stRetry.iAutocompactK = a_iAutocompactK;
+    m_stRetry.bEnableAskUser = a_bEnableAskUser;
+    StartStageImpl(a_sWorkDir, a_sPrompt, a_sDisallowedTools, a_iMaxTurns,
+                   a_sResumeSid, a_bFork, a_iAutocompactK, a_bEnableAskUser,
+                   RpcCapable());
+}
+
+void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
+                                    const QString& a_sPrompt,
+                                    const QString& a_sDisallowedTools,
+                                    int a_iMaxTurns,
+                                    const QString& a_sResumeSid,
+                                    bool a_bFork,
+                                    int a_iAutocompactK,
+                                    bool a_bEnableAskUser,
+                                    bool a_bRpc) {
     Q_UNUSED(a_bFork);
     Reset();
+    m_bRpcMode = a_bRpc;
 
     // claude 专属参数降级提示（仅非默认值出现时提示一次，默认路径零噪音）。
     if (a_iMaxTurns != 30 || a_iAutocompactK > 0 || a_bEnableAskUser) {
@@ -514,10 +581,15 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     //   默认发现 ~/.pi/agent/skills、<工程>/.pi/skills；同时经 --skill 依次挂载
     //   CAgentRunnerBase::SharedSkillDirs()：<exe>\skills（便携）与 ~/.claude/skills。
     QStringList aArgs;
-    aArgs << ResolveCliJsPath()
-          << QStringLiteral("-p")
-          << QStringLiteral("--mode") << QStringLiteral("json")
-          << QStringLiteral("--offline")
+    aArgs << ResolveCliJsPath();
+    if (m_bRpcMode) {
+        // 2026.09.22 RPC 形态（见类头注释）：JSONL 双向管道，prompt/steer 经命令帧。
+        aArgs << QStringLiteral("--mode") << QStringLiteral("rpc");
+    } else {
+        aArgs << QStringLiteral("-p")
+              << QStringLiteral("--mode") << QStringLiteral("json");
+    }
+    aArgs << QStringLiteral("--offline")
           << QStringLiteral("--no-extensions")
           << QStringLiteral("--no-themes")
           // 非交互全自动：忽略（而非信任）工程本地可执行内容，避免无头模式挂起。
@@ -607,9 +679,10 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
         emit sigInfo(QStringLiteral("[system/pi] 已挂载技能目录：%1")
             .arg(aSkillDirs.join(QStringLiteral("；"))));
     }
-    emit sigInfo(QStringLiteral("[system/pi] 启动：%1 %2").arg(
+    emit sigInfo(QStringLiteral("[system/pi] 启动：%1 %2%3").arg(
         QDir::toNativeSeparators(ResolveCliJsPath()),
-        QDir::toNativeSeparators(a_sWorkDir)));
+        QDir::toNativeSeparators(a_sWorkDir),
+        m_bRpcMode ? QStringLiteral("（RPC 形态，支持运行中追加指令）") : QString()));
     m_pProc->start(ResolveNodePath(), aArgs);
     if (!m_pProc->waitForStarted(10000)) {
         EmitFailed(QStringLiteral("无法启动 PIAgent 进程：%1 %2").arg(
@@ -622,9 +695,27 @@ void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
     if (m_pStallTimer != nullptr && !m_pStallTimer->isActive()) {
         m_pStallTimer->start();
     }
-    // prompt 经 stdin 投递后关闭写通道（实测可行，见 pi-json-sampling.md §5）。
-    m_pProc->write(sPrompt.toUtf8());
-    m_pProc->closeWriteChannel();
+    if (m_bRpcMode) {
+        // RPC：先回读会话 id（此形态无 session 头事件），再投 prompt 命令帧；
+        //   写通道保持打开——轮中 steer / 收尾优雅退出都依赖它。
+        SendRpcFrame(QJsonObject{{QStringLiteral("id"), QStringLiteral("sid")},
+                                 {QStringLiteral("type"), QStringLiteral("get_state")}});
+        SendRpcFrame(QJsonObject{{QStringLiteral("id"), QStringLiteral("go")},
+                                 {QStringLiteral("type"), QStringLiteral("prompt")},
+                                 {QStringLiteral("message"), sPrompt}});
+    } else {
+        // 一次性：prompt 经 stdin 投递后关闭写通道（实测可行，见 pi-json-sampling.md §5）。
+        m_pProc->write(sPrompt.toUtf8());
+        m_pProc->closeWriteChannel();
+    }
+}
+
+void CPiAgentRunner::SendRpcFrame(const QJsonObject& a_oCmd) {
+    // JSONL 命令帧：严格 LF 结尾（pi jsonl 读帧器只认 \n）。
+    if (m_pProc == nullptr || m_pProc->state() == QProcess::NotRunning) {
+        return;
+    }
+    m_pProc->write(QJsonDocument(a_oCmd).toJson(QJsonDocument::Compact) + '\n');
 }
 
 void CPiAgentRunner::Stop() {
@@ -648,8 +739,19 @@ bool CPiAgentRunner::IsRetryPending() const {
 }
 
 bool CPiAgentRunner::InjectUserTurn(const QString& a_sText) {
-    Q_UNUSED(a_sText);
-    return false;   // 一次性进程无轮次中插话（安全 no-op）
+    // 2026.09.22 RPC 形态轮中注入：运行中、轮未 settle（settle 后新帧只入 pi 待发
+    //   队列不再属于本轮——返回 false 交上层排队走下一轮，与 claude result 后口径
+    //   一致）。实测：工具执行中注入，下一模型迭代即收到（与 claude stream-json 同效）。
+    if (!m_bRpcMode || m_bFinished || m_bRpcSettled || a_sText.trimmed().isEmpty()) {
+        return false;
+    }
+    if (m_pProc == nullptr || m_pProc->state() == QProcess::NotRunning) {
+        return false;
+    }
+    SendRpcFrame(QJsonObject{{QStringLiteral("id"), QStringLiteral("steer1")},
+                             {QStringLiteral("type"), QStringLiteral("steer")},
+                             {QStringLiteral("message"), a_sText}});
+    return true;   // 乐观确认：帧已投递（pi steer 无同步失败语义；拒绝响应另行提示）
 }
 
 void CPiAgentRunner::slotOnStdOut() {
@@ -703,10 +805,59 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
     const QString sType = oRoot.value(QStringLiteral("type")).toString();
 
     if (sType == QStringLiteral("session")) {
-        // 会话头：回读真实 session id（供存档/续跑；resumeSid 生效时二者一致）。
+        // 会话头（一次性形态）：回读真实 session id（供存档/续跑；resumeSid 生效时二者一致）。
         m_sLastSessionId = oRoot.value(QStringLiteral("id")).toString();
         m_bSawSession = true;   // 本轮已确认 sid，失败收尾可安全携带
         return;
+    }
+    // —— 2026.09.22 RPC 形态专属帧（一次性形态不会出现这些 type）——
+    if (m_bRpcMode) {
+        if (sType == QStringLiteral("response")) {
+            // 命令响应：get_state 回读会话 id；prompt 提交失败即收尾；steer 拒绝仅提示。
+            const QString sCmd = oRoot.value(QStringLiteral("command")).toString();
+            const bool bOk = oRoot.value(QStringLiteral("success")).toBool();
+            if (sCmd == QStringLiteral("get_state")) {
+                const QString sSid = oRoot.value(QStringLiteral("data")).toObject()
+                    .value(QStringLiteral("sessionId")).toString();
+                if (bOk && !sSid.isEmpty()) {
+                    m_sLastSessionId = sSid;
+                    m_bSawSession = true;
+                }
+            } else if (sCmd == QStringLiteral("prompt") && !bOk) {
+                m_pProc->kill();
+                m_pProc->waitForFinished(3000);
+                EmitFailed(QStringLiteral("pi RPC prompt 提交失败：%1")
+                               .arg(oRoot.value(QStringLiteral("error")).toString()));
+            } else if (sCmd == QStringLiteral("steer") && !bOk) {
+                emit sigInfo(QStringLiteral("[system/pi] 追加指令未被 pi 接受：%1")
+                                 .arg(oRoot.value(QStringLiteral("error")).toString()));
+            }
+            return;
+        }
+        if (sType == QStringLiteral("agent_settled")) {
+            // 轮完整收敛（pi 源码 _runAgentPrompt 的 finally：含自动重试/压缩续跑后
+            //   仅发一次，不会在重试间隙提前触发）。优雅收尾：关写通道 → pi stdin
+            //   end 落盘退出(0) → slotOnFinished 既有成功路径发 sigFinished。
+            if (!m_bRpcSettled) {
+                m_bRpcSettled = true;
+                if (m_pProc != nullptr && m_pProc->state() != QProcess::NotRunning) {
+                    m_pProc->closeWriteChannel();
+                }
+            }
+            return;
+        }
+        if (sType == QStringLiteral("extension_ui_request")) {
+            // --no-extensions 下不应出现（防御）：自动取消，防 select/confirm/input
+            //   等待回复的 UI 请求挂起轮次。
+            SendRpcFrame(QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("extension_ui_response")},
+                {QStringLiteral("id"), oRoot.value(QStringLiteral("id")).toString()},
+                {QStringLiteral("cancelled"), true}});
+            return;
+        }
+        if (sType == QStringLiteral("queue_update")) {
+            return;   // steer 入队/投递可见性：不上屏（InjectUserTurn 侧已有反馈）
+        }
     }
     if (sType == QStringLiteral("message_update")) {
         // 流式文本增量（delta-only）：2026.08.20 起不再逐 Δ 上抛——AutoCode 的对话块
@@ -921,6 +1072,20 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
     }
     if (m_bFinished) {
         return;   // Stop/stall/已收尾：静默吞掉
+    }
+    // 2026.09.22 RPC 早夭自动回退：未见会话即非零退出 = pi 不认识 --mode rpc
+    //   （旧版 commander 报错早退 / 半安装态）。进程级记忆禁用 RPC，当轮用一次性
+    //   形态重拉同一 prompt（升级/安装异常自愈，用户无感）。已见会话的非零退出
+    //   （真配置错/中途崩溃）不回退——走下方既有失败路径带真因。
+    if (m_bRpcMode && !m_bSawSession && a_iExitCode != 0) {
+        s_bRpcRuntimeBroken = true;
+        emit sigInfo(QStringLiteral(
+            "[system/pi] RPC 模式不可用（pi 版本过旧或安装异常），自动回退一次性模式"));
+        const SRetryParams st = m_stRetry;
+        StartStageImpl(st.sWorkDir, st.sPrompt, st.sDisallowed, st.iMaxTurns,
+                       st.sResumeSid, st.bFork, st.iAutocompactK, st.bEnableAskUser,
+                       /*a_bRpc=*/false);
+        return;
     }
     if (a_iExitCode == 0 && m_bAgentEnded) {
         // 正常收敛：agent_end 已到、进程干净退出。stopReason=="length"（输出 token

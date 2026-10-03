@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <!-- CodexHarness：OpenAI 花结简化（三条旋转椭圆构成六瓣互锁），OpenAI 绿 #10A37F -->
+  <g stroke="#10A37F" stroke-width="2.0" fill="none" stroke-linecap="round">
+    <ellipse cx="16" cy="16" rx="3.8" ry="10.5"/>
+    <ellipse cx="16" cy="16" rx="3.8" ry="10.5" transform="rotate(60 16 16)"/>
+    <ellipse cx="16" cy="16" rx="3.8" ry="10.5" transform="rotate(120 16 16)"/>
+  </g>
+</svg>

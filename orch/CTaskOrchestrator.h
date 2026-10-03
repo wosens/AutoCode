@@ -19,6 +19,7 @@
 class CTaskInfo;
 class CAgentRunnerBase;
 class CProjectManager;
+class CReviewService;   // 2026-09-30 CodeReview 阶段 ReviewSdk 静态预审
 struct SStageDef;
 
 // 任务编排器：持有 ClaudeRunner，按状态机逐阶段驱动任务，
@@ -38,6 +39,10 @@ public:
     // 需求3：右键「再次执行」——仅重跑指定阶段，完成后停在该阶段（Paused），不推进后续、不判死。
     //   用于阶段表右键：重生成该阶段产物，不动后续已生成的产物、不自动往下跑。
     void RunSingleStage(CTaskInfo* a_pTask, EStage a_eStage);
+    // 2026.09.22 评审升级人工裁决回灌（UI 弹窗选完后调）：0=人工放行（视为评审通过，
+    //   从升级的评审阶段继续推进） 1=再迭代一轮（重置迭代计数后重跑回炉阶段）
+    //   2=保持暂停（不动作，任务维持 Paused 等用户稍后处理）。
+    void ResolveReviewEscalation(CTaskInfo* a_pTask, int a_iChoice);
 
     // FR-7 最低验收：停止当前任务 runner + 编译门并置空 m_pCurTask，
     // 使 OnRunnerFinished 早返回（不再回调到将被 delete 的任务），从而让
@@ -62,6 +67,41 @@ public:
     //   三态的备份快照/record.md/记忆沉淀/guide 同步均按「非只读」口径区分。
     enum EAdhocPerm { PermAuto = 0, PermManual = 1, PermReadOnly = 2 };
     // 向指定助手投递一条指令；a_iPerm 为权限三态（见 EAdhocPerm）。
+    // 2026.09.20 多条排队指令合并为一次投送的提示词封装（public static 供测试）：
+    //   逐条【指令 N】定界 + 按序全部执行完毕再收尾的要求；单条不封装（调用方直投原文）。
+    static QString MergeQueuedPrompts(const QStringList& a_aPrompts);
+    // 2026-09-30 ReviewSdk 预审：解析 changed_files.md（"+ 路径"/"M 路径"/"- 路径"）
+    //   → 去重后的存在文件绝对路径清单（删除行与不存在项剔除；公开静态供单测）。
+    static QStringList ParseChangedFilesList(const QString& a_sChangedMdAbs,
+                                             const QString& a_sProjectDir);
+    // 2026.09.23 v3.0.219 工作量评估（纯本地启发式，零 token 零额外往返）：按提示词自身的
+    //   编号子任务数/点名源文件数/重活关键词/文本长度估算轮次预算——只升不降
+    //   （a_iBaseTurns 为用户设的底线），封顶 200。公开静态供回归测试。
+    static int EstimateAdhocTurns(const QString& a_sUserText, int a_iBaseTurns);
+    // 2026.09.26 专家助手深度模式纯函数（公开静态供回归测试）：
+    //   ParseDeepVerdict 解析验证轮结论：1=PASS / 0=FAIL（a_pReasons 出失败原因，
+    //   仅当行） / -1=无判定行（FAIL 优先判定，防原因文本里出现 pass 字样误判）。
+    //   ExtractDeepCriteria 从规划产物提取「## 验收标准」段（到下一 ## 标题或文末；
+    //   段缺失回退整份计划；恒截 2000 字）。
+    static int  ParseDeepVerdict(const QString& a_sResult, QString* a_pReasons = nullptr);
+    static QString ExtractDeepCriteria(const QString& a_sPlan);
+    // 2026.10.02 查询意图启发式：查询/咨询类请求（无改码动词且有问句/查询信号）
+    //   跳过专家模式深度链——规划/验证是改码场景的质量保障，对查询纯属干扰。
+    //   只判用户原文，不判注入规则后的合成提示词。公开静态供回归测试。
+    static bool IsAdhocQueryPrompt(const QString& a_sText);
+    // 2026.10.02 深链辅助轮（规划/验证）assistant 输出压缩：≤360 字原样；超长保
+    //   首 300 字+尾注折叠说明（结论以事件判定行为准）。防验证长文刷屏淹没
+    //   执行结论（用户需求：结论一眼可见、验证日志不夹在中间）。
+    static QString CompressDeepAuxText(const QString& a_sText);
+    // 2026.09.26 深度模式运行期覆盖（测试桩，同 CHermesRunner::SetHermesRoot 先例）：
+    //   -1=按 config.ini [Adhoc] ExpertAssistant（缺省）；0/1=强制关/开。
+    //   tests 用它锁定纯对话/深度链行为，不依赖 exe 同级 config.ini 的机器状态。
+    static void SetAdhocDeepOverride(int a_iMode);
+    // 2026.09.20 未发送排队指令的删除/改写（面板暂存框编辑入口，按原文本匹配首个）：
+    //   返回是否命中（未入队/已被消费/新文本为空 → false，面板侧自行保持一致）。
+    bool RemoveQueuedAdhoc(const QString& a_sAsstId, const QString& a_sText);
+    bool EditQueuedAdhoc(const QString& a_sAsstId, const QString& a_sOldText,
+                         const QString& a_sNewText);
     //   a_sTaskId 非空 = 当前选中任务：仅一行可选指引（memory.md 由助手自行 Read 取用，
     //   非只读轮附一句条件性沉淀规则）——不注入任务信息全文，防稀释用户请求权重（v2.1.134）。
     //   2026.09.02 a_pTranscript 非空 = 外部提交（面板传入权威对话记录，整体重建回灌缓存；
@@ -79,6 +119,10 @@ public:
     bool IsAsstAdhocRunning(const QString& a_sAsstId) const;   // 指定助手是否在跑一轮
     bool IsAnyAdhocRunning() const;                            // 是否有任一助手在跑（旧 IsAdhocRunning 语义）
 
+    // 2026.09.18 退出确认提示用：当前流水线任务（IsRunnerBusy 时有效）与运行中助手 id 清单。
+    CTaskInfo* RunningTask() const { return m_pCurTask; }
+    QStringList RunningAdhocIds() const;
+
     // 2026.08.22 阶段后台备份线程（m_thBackup）是否运行中：CMainWindow::ExecuteRollback
     // 互斥守卫用（备份期间 IsRunnerBusy 可能为 false，需单独挡住，防回退与并发备份同写统一库）。
     bool IsBackupRunning() const { return m_bBackupRunning.load(); }
@@ -90,6 +134,12 @@ public:
     //   2026.09.03 多助手并发：命名借用 a_sAsstId 助手的会话链（fork 一次性分支，不动其
     //   撤销栈）；该助手忙则本地回退（其余助手照常并发，不受影响）。
     bool AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId = QString());
+
+    // 2026-09-22 助手自动重命名（右键菜单）：把该助手收到的全部用户提示词交 Agent 总结，
+    //   生成「≤10 汉字名称 + 一句说明」（说明进 Tab tooltip，随 assistant.json 持久化）。
+    //   借用该助手自己的会话（fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲
+    //   会话；全忙/无会话返回 false（调用方提示）。结果经 sigAsstAutoNameDone 回填。
+    bool AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts);
 
     // 设置评审阶段并行视角数（1=串行回退；>1=多视角并行 fan-out/fan-in）。
     void SetReviewParallel(int a_iN);
@@ -109,11 +159,14 @@ public:
     QJsonArray AsstAdhocStackToJson(const QString& a_sAsstId) const;
     // 助手组恢复（档载入/新建助手）时装入该助手的会话链（不发信号；首条提问前调用）。
     void LoadAsstAdhoc(const QString& a_sAsstId, const QString& a_sSid,
-                       const QJsonArray& a_aStack, const QString& a_sGuideHash = QString());
+                       const QJsonArray& a_aStack, const QString& a_sGuideHash = QString(),
+                       const QString& a_sBackend = QString());
     // 删除/丢弃助手时清理其会话（含在跑 runner；调用方 UI 已挡运行中删除，此处兜底停）。
     void RemoveAsstAdhoc(const QString& a_sAsstId);
     // 档切换/切工程：停全部助手并清空全部会话（新档经 LoadAsstAdhoc 重装）。
-    void ResetAdhocSessions();
+    void ResetAdhocSessions(const QSet<QString>& a_aKeep = QSet<QString>());
+    // 2026.09.20 该助手绑定的后端名（粘性；"" = 未绑定——首次提交时才绑当前全局）。
+    QString AsstAdhocBackend(const QString& a_sAsstId) const;
 
 signals:
     void sigTaskChanged(CTaskInfo* a_pTask);
@@ -130,6 +183,10 @@ signals:
     void sigToolResult(CTaskInfo* a_pTask, const QString& a_sResult,            // 工具结果(全文)
                        const QString& a_sViewId = QString());
     void sigTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
+    // 2026.09.22 评审驳回迭代熔断升级 → 人工介入弹窗（UI 据此询问用户：放行/再迭代/保持暂停；
+    //   用户选择经 ResolveReviewEscalation 回灌。[Policy] ReviewAskOnEscalate=0 时 UI 不弹、
+    //   行为退回旧版静默升级）。
+    void sigReviewEscalated(CTaskInfo* a_pTask);
 
     // —— 提示词 agent 专属信号（不经任务，路由到「助手」Tab）——
     void sigAdhocLog(const QString& a_sAsstId, const QString& a_sLine);           // 原始/系统日志
@@ -137,6 +194,11 @@ signals:
     void sigAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool, const QString& a_sInput);
     void sigAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult);
     void sigAdhocEvent(const QString& a_sAsstId, const QString& a_sKind, const QString& a_sText);  // 结构化事件徽章
+    // 2026.09.18 暂存提示词生命周期（用户需求：运行中发送的提示词先进右下角折叠框）：
+    //   started=排队指令被取出开始处理（面板此时才渲染正式用户块）；dropped=队列被
+    //   作废（撤销回退链/后端漂移会话链作废）——面板同步清空暂存框。
+    void sigAdhocPendingStarted(const QString& a_sAsstId, const QString& a_sText);
+    void sigAdhocPendingDropped(const QString& a_sAsstId);
     void sigAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 上下文占用（token）；-1=未知
     void sigAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 助手所用模型名（供面板查上下文窗口）
     // 2026.08.27 运行中实时计量（任务阶段/助手轮次通用）：本轮累计 输入/输出 token，
@@ -156,6 +218,11 @@ signals:
     // 2026.08.20 Agent 自动命名：一次自动命名调用完成（含失败）→ 主窗口做 DB 副本
     //   镜像 + 刷新两表。a_bOk=false 时 a_sName 为空。
     void sigAutoNameDone(CTaskInfo* a_pTask, bool a_bOk, const QString& a_sName);
+    // 2026-09-22 助手自动重命名完成（含失败）：a_sAsstId=被命名的助手（非借用的执行会话）。
+    //   a_bOk=false 时 a_sName 为空、a_sDesc 为失败原因；成功时 a_sName=≤10 字名称、
+    //   a_sDesc=一句说明（可为空，tooltip 只显示后端行）。
+    void sigAsstAutoNameDone(const QString& a_sAsstId, bool a_bOk,
+                             const QString& a_sName, const QString& a_sDesc);
 
 private slots:
     void OnRunnerInfo(const QString& a_sLine);
@@ -212,6 +279,10 @@ private:
     // 2026.08.15 策略参数配置化：原 static constexpr 常量改读 config.ini [Policy] 段
     //   （m_pPm 现读，设置对话框保存后即生效；m_pPm 为空时回退内置默认）。
     int MaxIter() const;          // 单阶段最大迭代（驳回重跑熔断阈值，默认 3）
+    int AdhocMaxTurns() const;    // 2026.09.23 助手单轮 --max-turns（[Adhoc] MaxTurns，默认 40，10..200）
+    // 2026.09.23 v3.0.219 工作量评估开关（[Adhoc] MaxTurnsAuto，缺省开）：开=按提示词难度
+    //   自动上调轮次预算；关=恒用基值（用户手动精确控制）。
+    bool AdhocMaxTurnsAuto() const;
     int MaxResume() const;        // 单阶段 --resume 续跑封顶（默认 3）
     int ReviewResume() const;     // (C) 轻量评审 max-turns 续跑封顶（默认 1，仅续跑 1 次即降级）
     void ReRunResume(CTaskInfo* a_pTask, const QString& a_sCont);      // --resume 续跑本阶段（带针对性 prompt）
@@ -232,8 +303,30 @@ private:
     void FanInReview(CTaskInfo* a_pTask);
     // 评审阶段推进：Pass→NextStage；Reject→IncStageIter/RejectTarget/熔断（抽自 ProceedToNext 评审分支）。
     void FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_eDec);
+    QHash<QString, EStage> m_hEscalatedReview;   // 2026.09.22 升级待裁决：taskId → 升级时的评审阶段
     // 终止所有评审 runner（Stop/StopAll 调用，防泄漏进程）。
     void StopReviewRunners();
+
+    // —— 2026-09-30 CodeReview 阶段 ReviewSdk 静态预审（用户需求：审查环节接入
+    //    CodeReview 的 ReviewSdk.dll）——
+    // 惰建审查服务（进程内常驻，析构统一回收）。
+    CReviewService* SdkReviewSvc();
+    // LaunchStage 入口：阶段=CodeReview 且配置开启时启动异步预审；返回 true=
+    // 已转后台（调用方立即 return，预审完成后带 stDef 重入 LaunchStage 注入结论）。
+    // 复用判定：同任务/同迭代/changed_files.md mtime 未变 → 直接用上次结论不重跑。
+    bool MaybeStartSdkPreReview(CTaskInfo* a_pTask, const SStageDef& a_stDef);
+    // 预审完成：落盘 sdk_review.md、构造注入块、续跑 CodeReview 阶段（守卫同备份线程：
+    // 任务已删/已停止/被抢跑时不推进）。
+    void OnSdkPreReviewDone(CTaskInfo* a_pTask, const SStageDef& a_stDef, bool bOk,
+                            bool bStopped, const QString& sJson, const QString& sMd,
+                            int iFiles, int iFindings);
+    CReviewService*     m_pSdkReview       = nullptr;
+    bool                m_bSdkReviewRunning = false;   // 预审进行中（StopTask 拦截用）
+    QString             m_sSdkReviewBlock;             // 完成后的 prompt 注入块（空=无/失败不注入）
+    QString             m_sSdkReviewTaskId;            // 预审归属任务（StopTask 匹配）
+    int                 m_iSdkReviewIter   = -1;       // 预审时的阶段迭代号（驳回重跑后重审）
+    QDateTime           m_dtSdkChangedMt;              // 预审时 changed_files.md 的 mtime
+    QMetaObject::Connection m_cSdkDone;                // 一次性完成连接（进入即断）
     void RunCompileGate(CTaskInfo* a_pTask);                           // 异步跑构建校验（不阻塞 UI）
     void OnBuildFinished(int a_iExitCode);                             // 构建结束续接流程
     QString ResolveBuildCommand(CTaskInfo* a_pTask) const;             // 解析构建命令（build.txt → CMakePresets → .sln）
@@ -244,10 +337,16 @@ private:
     QString ReadBuildVerdict(CTaskInfo* a_pTask) const;
     QString LocateMsBuild() const;                                     // 定位 msbuild（PATH → vswhere）
     int EstimateDevTurns(CTaskInfo* a_pTask) const;                    // 按 plan.md 任务数估算开发轮次
+    // 2026.09.22 (2d9e4c0c 教训) 文档生产阶段（Design/Plan）动态预算与产物判定：
+    //   大需求 30 轮连探索都做不完 → 按 requirements.md 规模动态给；假完成（回合结束
+    //   但产物未落盘）凭 StageOutputFresh 拦截，不再靠下一阶段 need_input 推倒重来。
+    int EstimateDocTurns(CTaskInfo* a_pTask) const;                    // 按 requirements.md 规模估算文档阶段轮次
+    bool StageOutputFresh(CTaskInfo* a_pTask, EStage a_eStage) const;  // 阶段产物本轮已写出（存在+非空+mtime>=阶段起点）
 
     static bool IsReviewStage(EStage a_eStage);
     static bool IsResumeEligible(EStage a_eStage);   // 该阶段命中 max-turns 时可 --resume 续跑
     static bool IsLightReviewStage(EStage a_eStage);  // (C) 轻量评审（不含 Test）—— max-turns 降级而非判死
+    static bool IsDocProduceStage(EStage a_eStage);   // 2026.09.22 文档生产阶段（Design/Plan）—— 产物增量落盘、下游有评审把关
     // 2026.08.15 (流程档位) 任务的生效阶段流：ResolveFlow(type, task.flowStages)——
     //   清单为空即完整规范流（旧任务兼容）。编排器内所有流转/输入过滤/意见携带统一走它。
     static QList<EStage> TaskFlow(const CTaskInfo* a_pTask);
@@ -265,8 +364,13 @@ private:
     // —— 提示词 agent 内部 ——
     // 提示词 agent 运行模式：Idle=空闲；Submitting=用户提问中；
     // CompactSummarize=压缩第一步（生成摘要）；CompactReseed=压缩第二步（摘要投新会话）；
-    // AutoNaming=自动命名（拼任务内容+guide.md 提示词交 Agent 起名，不动用户会话栈）。
-    enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming };
+    // AutoNaming=自动命名（拼任务内容+guide.md 提示词交 Agent 起名，不动用户会话栈）；
+    // AsstAutoNaming=助手自动重命名（2026-09-22：该助手全部用户提示词交 Agent 总结出
+    //   名称+说明，sAutoNameTargetAsst 记被命名助手——执行会话可能是借用的其他助手）；
+    // DeepPlan=专家模式规划轮（2026.09.26：分析请求产出计划+验收标准，fork 一次性分支）；
+    // DeepVerify=专家模式验证轮（独立验证者按验收标准编译/测试，fork 一次性分支）。
+    enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming,
+                      AsstAutoNaming, DeepPlan, DeepVerify };
 
     // —— 助手会话（2026.09.03 多助手并发）：每助手独立 runner 进程 + 会话链 + 状态机 ——
     //   会话常驻 m_aAdhoc（id→堆指针，QHash 重哈希不移动指向体）；档切换/切工程整体
@@ -275,17 +379,27 @@ private:
         QString               sId;             // 助手 id（索引键）
         CAgentRunnerBase*     pRunner = nullptr;   // 该助手的 runner（独立 QProcess，懒建）
         QString               sSid;            // 会话链基点 sid（首条前为空）
+        // 2026.09.20 助手粘性后端（v2.4.193）：会话绑定的后端名（"" = 未绑定，
+        //   首次提交时绑当前全局）。全局切换后已有助手继续用绑定后端（发送时忽略
+        //   全局设置），未使用过的新助手才跟随全局。
+        QString               sBackend;
+        QString               sLastSeenGlobal; // 上次提交时的全局后端名（粘性提示仅在其变化时发一次）
         QString               sGuideHash;      // 上次投喂 guide.md 的 SHA256（变更重投判定）
         QList<QPair<QString, QString>> aStack; // (prompt, sid) 撤销链；撤销=弹栈回基点
         QStringList           aTranscript;     // 跨轮上下文回灌缓存（DSH/Codex/Hermes 用）
         int                   iPerm = PermAuto; // 本轮权限三态（EAdhocPerm；原 bReadOnly 布尔三态化）
         EAdhocMode            eMode = Idle;    // 异步流程状态机（多助手各一份，互不干扰）
         CTaskInfo*            pAutoNameTask = nullptr;   // AutoNaming 模式待命名任务
+        QString               sAutoNameTargetAsst;       // AsstAutoNaming 模式：被命名的助手 id
         QString               sPendingPrompt;  // Submitting 模式当前 prompt（压栈用）
         QString               sSummary;        // CompactSummarize 产出、CompactReseed 投递
         QString               sLastTaskId;     // 最近一次 Submit 的任务档 id（续发记忆沿用）
         QDateTime             dtStart;         // 本轮起点（耗时归集）
         int                   iResume = 0;     // max-turns 自动续跑计数（上限 2，新提问清零）
+        // 2026.09.23 v3.0.219 工作量评估：本条提问的轮次预算（SubmitAdhoc 按提示词
+        //   启发式估算——编号子任务/点名文件/重活关键词/文本长度；0=未设回退全局基值）。
+        //   续跑/纠偏/压缩重发沿用同一预算（同一条提问的工作量不变）。
+        int                   iTurnsBudget = 0;
         QStringList           aPendingInjects; // 同助手运行中排队指令（本轮结束自动续发）
         qint64                iLiveIn  = 0;    // 2026.09.05 本轮实时计量（per-会话：并发助手各自累计，
         qint64                iLiveOut = 0;    //   收尾 0/0 回退归集 + 页内「本轮 ↑↓」显示）
@@ -301,11 +415,40 @@ private:
         bool                  bAutoCompactActive = false;   // 压缩完成后待自动重发
         bool                  bAutoCompactDone = false;     // 本条提问已自愈过（SubmitAdhoc 清零）
         QString              sCompactBaseSid;         // 超限自愈：压缩期间暂存的原会话 sid（摘要失败回退用）
+        // 2026.09.26 专家助手深度模式（[Adhoc] ExpertAssistant 开启时的非只读轮自动链：
+        //   规划Agent → 执行 → 验证Agent → 未过回炉 → 耗尽重启整链）：
+        //   bDeepActive=链在跑（Stop/链尾复位）；sDeepExecPrompt=SubmitAdhoc 组装好的原
+        //   执行提示词（规划失败回退直投 / 规划成功后附带计划投递）；sDeepPlan=规划产物
+        //   （含验收标准）；iDeepRetry=验证回炉计数（上限 MaxIter）；iDeepRestart=整链
+        //   重启计数（上限 [Adhoc] ExpertRestarts，0=不重启）；sDeepFailSummary=跨重启
+        //   累积的失败教训（重规划时注入规避，保尾部 2000 字）。
+        bool                  bDeepActive = false;
+        QString               sDeepExecPrompt;
+        QString               sDeepPlan;
+        QString               sDeepFailSummary;
+        int                   iDeepRetry = 0;
+        int                   iDeepRestart = 0;
     };
     SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
     void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
     void StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
-                         bool a_bDropLastUser = false);   // 按会话 sSid/权限三态组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）
+                         bool a_bDropLastUser = false, int a_iTurnsOverride = 0,
+                         const QString& a_sToolsDeny = QString());   // 按会话 sSid/权限三态组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）；2026.09.26 a_iTurnsOverride/a_sToolsDeny=专家模式规划/验证轮的轮次与工具覆盖（缺省 0/空串=沿用会话权限与预算口径）
+
+    // —— 2026.09.26 专家助手深度模式（规划→执行→验证闭环 + 回炉/重启）——
+    // 深度链第 1 步：规划轮（fork 一次性分支，不动撤销栈/sid 基点；产出计划+验收标准，
+    //   重启时携带历史失败教训重规划）。
+    void StartDeepPlan(SAdhocSession& a_S);
+    // 深度链第 3 步：验证轮（fork 一次性分支；独立验证者只核验不修复，结论 VERIFY:PASS/FAIL）。
+    void StartDeepVerify(SAdhocSession& a_S);
+    // 回炉耗尽/执行中断时的重启判定：累积教训 → 未超 [Adhoc] ExpertRestarts 则重置回炉
+    //   计数并重新「规划→执行→验证」；超限 → FinishAdhocFailure 保留断点收尾。
+    void DeepChainRestart(SAdhocSession& a_S, const QString& a_sWhy, const QString& a_sReasons);
+    // 助手轮成功收尾（原 Submitting 成功尾段提炼，深度链 PASS 也走这里）：压栈+推进链基点+
+    //   模型/上下文上报+guide 同步节流+排队指令续发。
+    void FinishAdhocSuccess(SAdhocSession& a_S, const QString& a_sFinalSid);
+    // 助手轮失败收尾（深度链最终失败）：保留断点（压栈保会话）+ 上下文 -1 + 交还输入栏。
+    void FinishAdhocFailure(SAdhocSession& a_S);
 
     CProjectManager* m_pPm;
     CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选

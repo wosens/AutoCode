@@ -17,7 +17,14 @@ class CRecentProjectsDialog : public QDialog {
     Q_OBJECT
 
 public:
+    // 2026.09.20 a_aOpens：与 a_aRecent 同序的打开次数（缺省空 = 旧调用兼容，显示「1 次」）。
+    // 2026.09.20 a_sCfgPath：几何持久化（[Layout] RecentWin=x,y,w,h；空 = 不持久化，
+    //   同 CRollbackDialog/a_sCfgPath 口径——测试传空不写盘）；hideEvent 保存。
     explicit CRecentProjectsDialog(const QStringList& a_aRecent, QWidget* a_pParent = nullptr);
+    CRecentProjectsDialog(const QStringList& a_aRecent, const QList<int>& a_aOpens,
+                          QWidget* a_pParent = nullptr);
+    CRecentProjectsDialog(const QStringList& a_aRecent, const QList<int>& a_aOpens,
+                          const QString& a_sCfgPath, QWidget* a_pParent = nullptr);
 
     // exec() 返回 Accepted 时取选中路径；Rejected / 空选择返回空串。
     // 多选时返回当前项（current item）路径；无当前项取第一个选中项。
@@ -32,13 +39,21 @@ private slots:
     void OnDeleteSelected();                 // 执行删除（列表内移除 + 记录）
     void OnSearchChanged(const QString& a_sText); // 搜索框内容变化 → 实时重筛列表
 
+protected:
+    // 2026.09.20 几何持久化：隐藏（含 accept/reject/done 关闭）时落 [Layout] RecentWin。
+    void hideEvent(QHideEvent* a_pEv) override;
+
 private:
     void ApplyPath(QListWidgetItem* a_pItem); // 记录确认路径（空安全）
     void RebuildList(const QString& a_sFilter); // 依据过滤词重建列表（排除已删条目）
+    void RestoreGeometryFromConfig();   // 2026.09.20 [Layout] RecentWin 恢复（限幅屏内）
+    void SaveGeometryToConfig();        // 2026.09.20 落盘 + profile 写缓存冲刷
 
     QListWidget*      m_pList = nullptr;
     QLineEdit*        m_pSearch = nullptr;   // 顶部搜索框（实时过滤）
     QStringList       m_aAll;                // 全量历史快照（构造入参，过滤/重建的数据源）
+    QList<int>        m_aOpens;              // 2026.09.20 打开次数（与 m_aAll 同序；旧档=1）
+    QString           m_sCfgPath;            // 2026.09.20 几何持久化路径（空=禁用）
     QDialogButtonBox* m_pBtns = nullptr;
     QString           m_sSelected;
     QStringList       m_aRemoved;             // 右键删除的路径集合

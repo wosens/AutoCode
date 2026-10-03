@@ -50,7 +50,25 @@ public:
     //   <ExpectedCodexVersion()>（v0.88+ 已移除 wire_api=chat，不提供升级）"；latest 空→"未查询"；
     //   可解析且 latest>local→"有新版本 <latest>"；其余不等→"与远端不同：
     //   <local> → <latest>"。
-    static QString Verdict(const QString& a_sLocal, const QString& a_sLatest, int a_iBackend);
+    // 2026.09.20 Hermes（backend=5）：git 部署无 npm 包，改用发布 tag 版本号比对
+    //   （同 DSH tag 口径；2026.09.20 旧结论「无语义化远端版本」实为误判——上游
+    //   有 34 个 v2026.M.D 日历发布 tag，之前只看到字母序在前面的 backup/ 杂项 tag）。
+    // 2026.09.21 改版：本地=git describe 最近可达发布 tag（日历版本核心），远端=
+    //   ls-remote --tags 最大版本 tag；比对/文案与其余 Harness 同为发布版本号语义，
+    //   HEAD sha 不再进结论（main tip 高频提交刷屏，发布 tag 语义下 verdict 稳定）。
+    //   a_sHermesSyncAt=本地仓上次 fetch 时刻文本（.git/FETCH_HEAD mtime），仅
+    //   「有新版本」时尾注；缺省参数保持旧签名兼容（既有单测三参调用不变）。
+    static QString Verdict(const QString& a_sLocal, const QString& a_sLatest, int a_iBackend,
+                           const QString& a_sHermesSyncAt = QString());
+    // Hermes 远端 tag 列表解析（T6 纯函数）：逐行 ls-remote --tags 输出，仅认
+    //   v<数字(.数字)+> 发布 tag（排除 backup/、premerge 等杂项），同版本名优先
+    //   剥离 ^{} 行的 commit sha（附注 tag 的实体）；取 QVersionNumber 最大者，
+    //   返回版本核心（去 v 前缀，如 "2026.9.14"），a_pShaOut 回写其 commit sha；
+    //   无有效 tag 返回空串。
+    static QString PickLatestHermesTag(const QStringList& a_aLines, QString* a_pShaOut);
+    // git describe 输出解析（T6 纯函数）："v2026.9.14" / "v2026.9.14-4881-gabc"
+    //   → "2026.9.14"（去 v 前缀，截断 -N-g 后缀）；无版本核心 → 空串。
+    static QString ParseHermesDescribe(const QString& a_sDescribe);
 
 private:
     // QProcess 池键（用途枚举，风险 #8：同键先杀旧再启新，结果只经 finished 信号写行）。
@@ -61,6 +79,7 @@ private:
         EProcQueryPi     = 11,   // npm view @earendil-works/pi-coding-agent version
         EProcQueryCodex  = 12,   // npm view @openai/codex version
         EProcQueryDsh    = 13,   // git ls-remote --tags（DSH 最新版查询）
+        EProcQueryHermes = 14,   // 2026.09.20 git ls-remote HEAD（Hermes 远端 sha 比对）
         EProcDshTag      = 20    // git ls-remote --tags（DSH 更新前 tag 解析）
     };
 
@@ -98,6 +117,10 @@ private:
     QString      m_asLocalVer[6];          // 会话内存本地版本（NFR-2 不落盘）
     QString      m_asLatestVer[6];         // 会话内存最新版（失败保留上次已知值）
     QDateTime    m_tQueryAt;               // 「查询时刻」时点语义（D2 手动触发）
+    QString      m_sHermesSyncAt;          // 2026.09.21 本地仓上次 fetch 时刻文本（同步
+                                           //   查询 .git/FETCH_HEAD mtime；读不出为空）
+    // 同步短命令捕获（本地 git 快调用 <1s；超时/失败 → 空串）。
+    static QString RunGitSync(const QStringList& a_aArgs, const QString& a_sWorkDir);
     QHash<int, QProcess*> m_aProc;         // 信号驱动异步子进程池（键=EProcKey）
     QHash<int, QTimer*>   m_aTimer;        // 硬超时 kill 表（析构统一停净）
     bool          m_bTearingDown = false; // 析构期标志：短路业务回调（防析构中

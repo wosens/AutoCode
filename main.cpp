@@ -8,6 +8,7 @@
 #include "ui/CMainWindow.h"
 #include "agent/CMcpAskServer.h"
 #include "core/CCrashDump.h"
+#include "sandbox/CSandboxCore.h"   // 2026-09-26 --sandbox 命令解析（sbx::ParseCli）
 #include <windows.h>   // v2.2.146 诊断模式 ExitProcess 直退（析构拆序段错误兑底）
 #include "ui/CSettingsDialog.h"
 #include "project/CProjectManager.h"
@@ -213,6 +214,83 @@ static int RunAskMode(int argc, char* argv[]) {
     return 0;
 }
 
+// 2026-09-26 --sandbox 沙箱命令模式（内置测试沙箱，全后端通用入口）。
+//   Agent 经 Bash 运行："<AutoCode.exe 全路径>" --sandbox <cmd> [参数...]，本进程经
+//   AUTOCODE_ASK_PIPE 连到所属主实例，转发 {type:sbx,cmd,args} 并同步等
+//   {type:sbxres,ok,text} 回行（200ms 轮询累计超时 180s）。结果文本写 stdout（UTF-8），
+//   退出码 0=成功 / 1=失败 / 4=服务不可用/用法错误。子命令与参数解析见
+//   sbx::ParseCli（windows/status/capture/click/drag/type/keys/command/button/
+//   tree/add/restore/restore-all/close/record_on/record_off）。
+static int RunSandboxMode(int argc, char* argv[]) {
+    QCoreApplication app(argc, argv);   // 仅 QLocalSocket，无控件（操作在主实例）
+    const QStringList aArgs = app.arguments();   // Qt 经 GetCommandLineW 解码，中文安全
+    QString sCmd;
+    QJsonObject oArgs;
+    if (!sbx::ParseCli(aArgs, &sCmd, &oArgs)) {
+        std::cout << "[沙箱不可用：用法 AutoCode.exe --sandbox <命令> [参数]，命令集 "
+                     "windows/status/capture/click/drag/type/keys/command/button/tree/"
+                     "add/restore/restore-all/close/record_on/record_off]\n";
+        return 4;
+    }
+    const QString sPipe = qEnvironmentVariable("AUTOCODE_ASK_PIPE");
+    if (sPipe.isEmpty()) {
+        std::cout << "[沙箱不可用：未配置 AUTOCODE_ASK_PIPE（须在 AutoCode 的助手进程链内运行）]\n";
+        return 4;
+    }
+    QLocalSocket sock;
+    sock.connectToServer(sPipe);
+    if (!sock.waitForConnected(3000)) {
+        std::cout << "[沙箱不可用：无法连接主窗口]\n";
+        return 4;
+    }
+    QJsonObject oReq;
+    oReq.insert(QStringLiteral("type"), QStringLiteral("sbx"));
+    oReq.insert(QStringLiteral("cmd"), sCmd);
+    oReq.insert(QStringLiteral("args"), oArgs);
+    sock.write(QJsonDocument(oReq).toJson(QJsonDocument::Compact) + "\n");
+    if (!sock.waitForBytesWritten(3000)) {
+        std::cout << "[沙箱不可用：发送命令失败]\n";
+        return 4;
+    }
+    QElapsedTimer t;
+    t.start();
+    bool bGot = false, bOk = false;
+    QString sText;
+    while (!bGot && t.elapsed() < 180000) {
+        if (sock.state() == QLocalSocket::UnconnectedState && sock.bytesAvailable() == 0) {
+            break;
+        }
+        while (sock.canReadLine()) {
+            const QByteArray aLine = sock.readLine().trimmed();
+            if (aLine.isEmpty()) {
+                continue;
+            }
+            const QJsonDocument stDoc = QJsonDocument::fromJson(aLine);
+            if (!stDoc.isObject()) {
+                continue;
+            }
+            const QJsonObject o = stDoc.object();
+            if (o.value(QStringLiteral("type")).toString() == QStringLiteral("sbxres")) {
+                bOk = o.value(QStringLiteral("ok")).toBool();
+                sText = o.value(QStringLiteral("text")).toString();
+                bGot = true;
+                break;
+            }
+        }
+        if (bGot) {
+            break;
+        }
+        sock.waitForReadyRead(200);
+    }
+    sock.disconnectFromServer();
+    if (!bGot) {
+        std::cout << "[沙箱命令超时未响应]\n";
+        return 4;
+    }
+    std::cout << sText.toUtf8().toStdString() << "\n";
+    return bOk ? 0 : 1;
+}
+
 int main(int argc, char* argv[]) {
     // 2026.08.22 崩溃转储：崩溃/abort/purecall/std::terminate 等异常退出时
     //   在 <exe 目录>\dump\ 落 MiniDump（最先装，覆盖后续所有路径，含 --mcp-ask-server 模式）。
@@ -235,18 +313,24 @@ int main(int argc, char* argv[]) {
         if (std::strcmp(argv[i], "--ask") == 0) {
             return RunAskMode(argc, argv);
         }
+        // 2026-09-26 --sandbox 沙箱命令模式（内置测试沙箱，全后端通用）：
+        //   "<AutoCode.exe>" --sandbox windows / capture <hwnd> / click <hwnd> <x> <y> /
+        //   type <hwnd> <文本> / tree <hwnd> / restore <hwnd> / restore-all ...
+        //   （环境 AUTOCODE_ASK_PIPE 由 runner InjectAskEnv 注入，同 --ask 通道）。
+        if (std::strcmp(argv[i], "--sandbox") == 0) {
+            return RunSandboxMode(argc, argv);
+        }
+        // 2026.09.09 v2.2.146 隐藏诊断模式（见 RunSettingsDiag 注释）。须在 QApplication
+        //   构造前分派：RunSettingsDiag 自建 QApplication，Qt 进程内仅允许一个实例，
+        //   后分派会二次构造（断言构建直接 abort / Release 覆盖 self）。
+        if (std::strcmp(argv[i], "--diag-settings") == 0) {
+            return RunSettingsDiag(argc, argv);
+        }
     }
 
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("AutoCode"));
     app.setOrganizationName(QStringLiteral("AutoCode"));
-
-    // 2026.09.09 v2.2.146 隐藏诊断模式（见 RunSettingsDiag 注释）。
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--diag-settings") == 0) {
-            return RunSettingsDiag(argc, argv);
-        }
-    }
 
     // FR-10：应用图标（任务栏 / 标题栏 / 自绘标题栏 / exe 资源 四入口）。
     app.setWindowIcon(QIcon(QStringLiteral(":/icons/app.ico")));
@@ -264,6 +348,9 @@ int main(int argc, char* argv[]) {
         "        border: 1px solid #d1d5db; padding: 4px 0; }"
         "QMenu::item { background-color: transparent; padding: 5px 26px 5px 22px;"
         "              border-radius: 3px; }"
+        // 2026.09.17 菜单图标列右移 8px（offscreen 实测：Qt 样式表下图标恒贴左 x≈3，
+        //   item 的 padding-left 只推文字不推图标，唯 QMenu::icon{left:N} 精确可控）。
+        "QMenu::icon { left: 8px; }"
         "QMenu::item:selected { background-color: #dbeafe; color: #1e40af; }"
         "QMenu::item:disabled { color: #9ca3af; }"
         "QMenu::separator { height: 1px; background: #e5e7eb; margin: 4px 8px; }"

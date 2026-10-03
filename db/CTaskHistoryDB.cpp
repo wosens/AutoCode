@@ -226,7 +226,7 @@ bool CTaskHistoryDB::Upsert(const CTaskInfo* a_pTask) {
         return false;
     }
 
-    // 14 列绑定（顺序与 VALUES 占位符一致）。
+    // 16 列绑定（顺序与 VALUES 占位符一致：id..run_ms）。
     BindText(pStmt, 1,  a_pTask->Id());
     BindText(pStmt, 2,  a_pTask->Name());
     BindText(pStmt, 3,  a_pTask->UserRequest());
@@ -268,7 +268,8 @@ QList<CTaskInfo*> CTaskHistoryDB::LoadAll() const {
         return aResult;
     }
 
-    while (sqlite3_step(pStmt) == SQLITE_ROW) {
+    int iStepRc = sqlite3_step(pStmt);
+    while (iStepRc == SQLITE_ROW) {
         auto* pTask = new CTaskInfo(); // 无父对象，调用方接管生命周期
         pTask->SetId(QString::fromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 0))));
         pTask->SetName(QString::fromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 1))));
@@ -290,6 +291,13 @@ QList<CTaskInfo*> CTaskHistoryDB::LoadAll() const {
         }
         pTask->SetRunElapsedMs(sqlite3_column_int64(pStmt, 15));   // 2026.08.15 历史表耗时列
         aResult.append(pTask);
+        iStepRc = sqlite3_step(pStmt);
+    }
+    // 读完≠成功：BUSY/损坏等错误同样退出循环，与「空表」无法区分（历史任务凭空消失
+    //   事故同形态）——非 SQLITE_DONE 时告警留痕，便于排查。
+    if (iStepRc != SQLITE_DONE) {
+        qWarning() << "[CTaskHistoryDB] LoadAll 读取中断：rc=" << iStepRc
+                   << "（已读" << aResult.size() << "行）";
     }
 
     sqlite3_finalize(pStmt);
@@ -348,31 +356,40 @@ int CTaskHistoryDB::MigrateLegacyToProjects(QString* a_pReport) {
     }
 
     int iMigrated = 0;
+    int iFailed = 0;   // 迁移失败行数（目标 Open 失败或 Upsert 失败）：非零则保留旧库供下次重试
     QStringList aProjects;
     for (auto it = mapGroups.constBegin(); it != mapGroups.constEnd(); ++it) {
         CTaskHistoryDB stTarget;
         if (!stTarget.Open(ProjectDbPath(it.key()))) {
+            iFailed += it.value().size();   // 整组失败：全组行待重试
             continue;
         }
         for (CTaskInfo* pTask : it.value()) {
             if (stTarget.Upsert(pTask)) {
                 ++iMigrated;
+            } else {
+                ++iFailed;
             }
         }
         stTarget.Close();
-        aProjects << it.key();
+        if (iFailed == 0) {
+            aProjects << it.key();
+        }
     }
     qDeleteAll(aRows);
 
-    // 全部可迁移行落位后收档旧库（改名保留现场，失败下次启动重试——目标侧 Upsert 幂等）。
+    // 全部可迁移行落位后才收档旧库；存在失败行时保留原路径旧库供下次启动重试
+    //   （目标侧 Upsert 幂等）——旧实现无条件改名，失败行的历史任务会静默消失。
     stLegacy.Close();
-    QFile::remove(sLegacy + QStringLiteral(".migrated"));
-    QFile::rename(sLegacy, sLegacy + QStringLiteral(".migrated"));
+    if (iFailed == 0) {
+        QFile::remove(sLegacy + QStringLiteral(".migrated"));
+        QFile::rename(sLegacy, sLegacy + QStringLiteral(".migrated"));
+    }
 
     if (a_pReport != nullptr) {
-        *a_pReport = QStringLiteral("%1 行 → %2 个工程（%3）")
+        *a_pReport = QStringLiteral("%1 行 → %2 个工程（%3）；失败 %4 行（旧库保留待重试）")
                          .arg(iMigrated).arg(aProjects.size())
-                         .arg(aProjects.join(QStringLiteral("; ")));
+                         .arg(aProjects.join(QStringLiteral("; "))).arg(iFailed);
     }
     return iMigrated;
 }

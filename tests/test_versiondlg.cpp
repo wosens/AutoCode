@@ -137,6 +137,58 @@ int main(int argc, char* argv[]) {
                                       QStringLiteral("0.1.0"), 2)
                   == QStringLiteral("已是最新"),
               QStringLiteral("DSH 本地==远端==基线仍应判已是最新"));
+        // 2026.09.21 Hermes 发布 tag 版本号比对（同其余 Harness 发布语义）：
+        //   local=git describe 日历版本核心，latest=远端最大发布 tag 核心；
+        //   HEAD sha 不再进结论。附：PickLatestHermesTag / ParseHermesDescribe 纯函数。
+        const QString sShaTag = QStringLiteral("29112bef099274229cadff79cdff7bf7b99c4b77");
+        const QStringList aTagLines = {
+            QStringLiteral("9d05f3721d69df570fde4c9378d5ed252f53ca88\trefs/tags/backup/opentui-prestrip-20260616-1950"),
+            QStringLiteral("a08725e52a17964b3c91b12fa434f4cba45c4521\trefs/tags/premerge-oh-god"),
+            QStringLiteral("9949d0d324a3a06ac238e01dd1c2103dbca09900\trefs/tags/v2026.9.7"),
+            QStringLiteral("c3f1b2d0e4a5968778695a4b3c2d1e0f9a8b7c6d\trefs/tags/v2026.9.14"),
+            QStringLiteral("%1\trefs/tags/v2026.9.14^{}").arg(sShaTag),
+            QStringLiteral("86960cdbb0148145890e2ee90b4e157fa899f6e1\trefs/tags/v2026.4.8^{}"),
+            QStringLiteral("not-a-sha\trefs/tags/v2026.99.99"),
+        };
+        QString sPickedSha;
+        Check(CVersionDialog::PickLatestHermesTag(aTagLines, &sPickedSha)
+                  == QStringLiteral("2026.9.14"),
+              QStringLiteral("Hermes tag 列表应取最大版本并排除杂项/坏行"));
+        Check(sPickedSha == sShaTag,
+              QStringLiteral("附注 tag 应取 ^{} 剥离行的 commit sha"));
+        Check(CVersionDialog::PickLatestHermesTag({QStringLiteral("垃圾行")}, nullptr).isEmpty(),
+              QStringLiteral("无有效 tag 应返回空"));
+        Check(CVersionDialog::ParseHermesDescribe(
+                  QStringLiteral("v2026.9.14-4881-gc4f5dd0dad"))
+                  == QStringLiteral("2026.9.14"),
+              QStringLiteral("describe 输出应截断 -N-g 后缀"));
+        Check(CVersionDialog::ParseHermesDescribe(QStringLiteral("v0.21.3"))
+                  == QStringLiteral("0.21.3"),
+              QStringLiteral("describe 纯 tag 名应去 v 前缀"));
+        Check(CVersionDialog::ParseHermesDescribe(QString()).isEmpty(),
+              QStringLiteral("describe 空输出应返回空"));
+        Check(CVersionDialog::Verdict(QStringLiteral("2026.9.14"),
+                  QStringLiteral("2026.9.14"), 5)
+                  == QStringLiteral("已是最新（v2026.9.14）"),
+              QStringLiteral("Hermes 本地==远端发布版应判已最新（纯版本号）"));
+        Check(CVersionDialog::Verdict(QStringLiteral("2026.9.7"),
+                  QStringLiteral("2026.9.14"), 5, QStringLiteral("10:28"))
+                  == QStringLiteral("有新版本 v2026.9.14（本地上次同步 10:28）"),
+              QStringLiteral("Hermes 落后应判有新版本并附同步时刻尾注"));
+        Check(CVersionDialog::Verdict(QStringLiteral("2026.9.7"),
+                  QStringLiteral("2026.9.14"), 5)
+                  == QStringLiteral("有新版本 v2026.9.14"),
+              QStringLiteral("Hermes 落后无同步时刻时应无尾注"));
+        Check(CVersionDialog::Verdict(QString(), QStringLiteral("2026.9.14"), 5)
+                  == QStringLiteral("远端最新发布 v2026.9.14（本地非 git 部署，无法比对）"),
+              QStringLiteral("Hermes 非 git 部署应明示无法比对（发布版口径）"));
+        Check(CVersionDialog::Verdict(QStringLiteral("2026.9.14"), QString(), 5)
+                  == QStringLiteral("未查询"),
+              QStringLiteral("Hermes latest 空仍判未查询"));
+        Check(CVersionDialog::Verdict(QStringLiteral("2026.10.1"),
+                  QStringLiteral("2026.9.14"), 5)
+                  == QStringLiteral("与远端不同：2026.10.1 → 2026.9.14"),
+              QStringLiteral("Hermes 本地>远端（查询竞态）应落通用与远端不同"));
     }
 
     // —— 4. ResolveDshVersion（QTemporaryDir 四态 + 静态根空参分派）——

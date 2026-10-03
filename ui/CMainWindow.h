@@ -5,6 +5,8 @@
 #include <QRect>
 #include <QPointer>
 #include <QMessageBox>
+#include <QLocalSocket>   // 2026-10-01 SSbxReq（沙箱异步回包）QPointer 成员需完整类型
+#include <QJsonObject>
 #include <memory>
 
 class CProjectManager;
@@ -16,6 +18,7 @@ class CTaskInfo;
 struct SBackupVersion;
 class CTitleBar;
 class CTitleBarMsgFilter;
+class CCodeReviewDialog;   // 2026-09-30 右键代码审查（ReviewSdk）
 class QMenuBar;
 class QSplitter;
 class QLabel;
@@ -46,8 +49,8 @@ protected:
     void paintEvent(QPaintEvent* a_pEvent) override;
 
 private slots:
-    // 工程菜单
-    void OnNewProject();
+    // 工程菜单（2026.09.22 删 OnNewProject：与 OnOpenProject 除标题外完全相同，
+    //   「打开工程目录...」对话框本就支持选空目录从零建工程）
     void OnOpenProject();
     void OnGenerateGuide();
     void OnGuideLog(const QString& a_sLine);
@@ -66,9 +69,12 @@ private slots:
     void OnHelp();
     void OnAbout();
 
-    // 最近打开
-    void OnRecentProject();        // 点子菜单内具体历史项
-    void OnOpenAllRecent();        // 点「...」→ 开全量对话框
+    // 最近打开（2026.09.26 v3.1.239 按钮面板化：子菜单内嵌 QWidgetAction 面板，
+    //   旧 20 条 QAction 列表退役；详见 CRecentChipsPanel 头注）
+    void OnRecentChipOpen(const QString& a_sPath);   // 面板按钮：先收菜单链再打开工程
+    void OnRecentChipMore();                         // 面板「更多...」：先收菜单链再开全量对话框
+    void CloseRecentMenus();                         // 收起子菜单与父级工程菜单
+    void OnOpenAllRecent();                          // 全量对话框（搜索/多选删除/计数）
 
     // 任务列表
     void OnNewTask();
@@ -102,9 +108,14 @@ private slots:
     void OnStageEvent(CTaskInfo* a_pTask, const QString& a_sKind, const QString& a_sText);
     void OnTaskChanged(CTaskInfo* a_pTask);
     void OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk);
+    // 2026.09.22 评审驳回迭代熔断升级 → 人工介入弹窗（放行/再迭代/保持暂停）。
+    void OnReviewEscalated(CTaskInfo* a_pTask);
 
     // 提示词 agent（面板 ↔ 编排器转发）
     void OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, int a_iPerm);
+    // 2026-09-22 助手右键「自动重命名」：面板收集的提示词 → 编排器 AutoNameAsstNow；
+    //   同步失败（全忙/无会话）也走面板 ApplyAsstAutoName 留事件行。
+    void OnAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts);
     void OnAdhocUndo(const QString& a_sAsstId);
     void OnAdhocCompact(const QString& a_sAsstId);
     // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
@@ -116,6 +127,8 @@ private slots:
     // ask_user MCP：本地管道提问服务（孙进程 MCP server → 本窗口弹窗）
     void OnAskConnection();
     void OnAskReadyRead();
+    // 2026-09-26 功能菜单「测试沙箱...」：打开非模态管理对话框。
+    void OnSandboxDialog();
 
     // 标题栏图标按下/标题栏右键 → 弹 Win32 系统菜单（还原/移动/大小/最小化/最大化/关闭）。
     // a_stAt=菜单锚点（屏幕坐标）；传空点 → 自动取图标左下角。
@@ -134,9 +147,19 @@ private:
     QString CurrentAdhocOwner() const;
     void StartAskServer();
     void ActivateAskClient(QLocalSocket* a_pSock);   // 2026-09-12 接管一条提问连接（当前位空时）
+
+    // 2026-10-01 沙箱命令异步化：入队投线程池（MTA COM）→ 结果/超时回 UI 写回管道。
+    void EnqueueSbx(QLocalSocket* a_pSock, const QString& a_sCmd, const QJsonObject& a_oArgs);
+    void DispatchSbx();                              // 无在飞且队非空 → 投池执行队首
+    void OnSbxDone(qint64 a_iSeq, bool a_bOk, const QString& a_sText);   // 池线程完成（queued 回 UI）
+    void FinishSbx(qint64 a_iSeq, bool a_bOk, const QString& a_sText);   // 写回+断连+出队
+    void OnSbxWatchdog();                           // 5s 检查：150s 未回包 → 错误包出队
     // 2026.08.20 多实例配置同步：config.ini（exe 同级全局）回填运行期静态配置。
     //   a_bStartup=true 仅启动调用（含 DSH/Pi 不可用警告弹窗）；热重载 false 静默。
     void ApplyAgentConfigToRuntime(bool a_bStartup);
+    // 2026.09.19 后端切换清会话链（设置保存/热重载/任务档重应用三路统一）：编排器+面板
+    //   两侧同步清 sid/撤销栈（后端私有），对话历史/统计保留，状态栏提示。
+    void ClearAssistantSessionsOnBackendSwitch();
     // 2026.09.10 公共模型配置：四张模型表（当前设置参数源范围）合并为一份共享表
     //   （列表+当前项，规则见 CModelEntry.h MergeSharedModelTables）后统一应用到
     //   四个 runner——切换后端即用同一份列表/当前项，无需重配。
@@ -172,7 +195,8 @@ private:
     //   所有改变 m_pCur 的路径必须经此函数，禁止裸赋值（防旧档丢失 / 串档）。
     void SwitchAssistantArchive(CTaskInfo* a_pNewTask);
 
-    // 依据 RecentProjects() 重建 m_pMenuRecent 的 QAction。
+    // 依据 RecentProjects() 刷新「最近打开」入口态（2026.09.26 面板化：条目内容
+    //   由面板在菜单 aboutToShow 时自取，此处只管空历史置灰）。
     void RebuildRecentMenu();
     // OpenProjectDir 成功后调用：记录历史并刷新子菜单。
     void RecordRecent(const QString& a_sDir);
@@ -195,6 +219,11 @@ private:
     CTaskOrchestrator* m_pOrch      = nullptr;
     CTaskListPanel*    m_pTaskPanel = nullptr;
     CExecutionPanel*   m_pExecPanel = nullptr;
+    // 2026-09-30 手动代码审查对话框（非模态单例，右键资源管理器触发；关闭自动销毁）。
+    QPointer<CCodeReviewDialog> m_pReviewDlg;
+    // 挂起的助手档切换（原 v2.3.174 挂起的取消选中切档；2026.09.23 v3.0.220 推广口径：
+    //   助手运行中点任何目标——空白/任意任务/启动任务——档切换均挂起不停跑助手，
+    //   全部助手结束后 OnAdhocRunFinished 自动完成；目标任务经 QPointer 防删悬垂）。
     CTitleBar*         m_pTitleBar  = nullptr;   // FR-3 自绘标题栏
     // 应用级原生消息过滤器（图标/标题栏右键弹系统菜单；比 nativeEvent 更底层，Qt 吞不掉消息）
     CTitleBarMsgFilter* m_pMsgFilter = nullptr;
@@ -212,16 +241,48 @@ private:
     QPointer<CTaskInfo> m_pTaskPendingGuide;
 
     QMenu*             m_pMenuRecent = nullptr;
-    // 子菜单显示上限（可调常量，FR-4.1）。
-    static constexpr int s_kiMaxRecentMenu = 20;   // 2026.08.20 菜单展示上限 10→20
+    class CRecentChipsPanel* m_pRecentPanel = nullptr;   // 2026.09.26 按钮面板（内嵌子菜单）
 
     // ask_user 提问服务：孙进程 MCP server 经此管道发来提问，弹窗作答后回包。
     QLocalServer*      m_pAskServer = nullptr;
     QLocalSocket*      m_pAskClient = nullptr;   // 当前提问连接（一次只弹一个对话框）
     QList<QLocalSocket*> m_aAskQueue;            // 2026-09-12 排队提问连接（多助手并发手工审批；对端断连自动离队）
     QByteArray         m_bufAsk;                 // 提问连接行缓冲
+    bool               m_bAskDialogOpen = false; // 2026.09.28 ask 弹窗重入门禁：模态 exec 期间
+                                                 //   m_pAskClient 已置空，新连接须排队防嵌套弹窗
+
+    // 2026-09-26 内置测试沙箱：Agent 后代 GUI 窗口自动幽灵化收纳 + MP4 录像 +
+    //   sandbox_* 命令通道（MCP 工具与 --sandbox CLI 同桥转发到这里）。
+    class CSandboxManager* m_pSbx = nullptr;
+    class CSandboxDialog*  m_pSbxDlg = nullptr;   // 非模态管理对话框（功能菜单入口）
+
+    // 2026-10-01 沙箱命令异步化（修「MeloTTS 实例 UI+助手全卡死」）：sbx 命令的
+    //   叶子操作（UIA 控件树/PrintWindow/同步点击）可能无限阻塞（hung 窗口、
+    //   输入法钩子），旧实现在 UI 线程同步执行 Execute——一旦阻塞 UI 死锁（UIA
+    //   的 STA 回调又需 UI 泵消息，循环等待）。改为投线程池（MTA COM，无 STA
+    //   泵依赖），结果回 UI 线程写回管道；150s 看门狗保证对端（MCP/CLI 均有
+    //   180s 上限）总能得到回包；卡死的池线程泄漏退出（仅极端 hung 场景）。
+    struct SSbxReq {
+        qint64                iSeq = 0;
+        QPointer<QLocalSocket> pSock;      // 结果写回后断连（一连接一命令）
+        qint64                iT0Ms = 0;   // 入队时刻（看门狗计时基点）
+        QString               sCmd;
+        QJsonObject           oArgs;
+    };
+    QList<SSbxReq>     m_qSbx;             // FIFO：队首=在飞（线程池执行中）
+    qint64             m_iSbxSeq = 0;
+    QTimer*            m_pSbxWd = nullptr; // 看门狗（5s 检查，150s 超时回错误包）
     // 2026.08.20 多实例配置同步：盯 config.ini（其他实例保存 → 热重载）。
     QFileSystemWatcher* m_pCfgWatcher  = nullptr;
     QTimer*             m_pCfgReloadTm = nullptr;   // 防抖合并（1s 窗口多次触发一次生效）
+
+    // 2026-10-02 助手运行态孤儿看门狗（修「busy 永卡」：结束信号丢失时面板 bRunning
+    //   无限残留——图标转不停/输入栏锁「追加指令」）：周期交叉核对面板运行中助手
+    //   与编排器 IsAsstAdhocRunning，连续两次不健康即自动恢复并记事件。
+    QTimer*             m_pAdhocHealthTm = nullptr;
+    QSet<QString>       m_aAdhocSuspect;             // 首次不健康待复确认（防同轮瞬态空档）
+    void OnAdhocHealthCheck();
+    void OnAsstForeignActivated(const QString& a_sOwnerKey);   // 2026-10-02 幽灵 Tab 点击 → 切回归属
+    void OnAsstForeignFinished(const QString& a_sAsstId);      // 2026-10-02 幽灵轮次结束 → 落盘除名
     qint64              m_iCfgSelfSaveMs = 0;       // 自身最近一次保存时刻（ms；<2s 内的变更跳过）
 };

@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -34,6 +35,47 @@ static const SDshModelEntry* CodexActiveEntry() {
     return (s_iCodexActiveModel >= 0 && s_iCodexActiveModel < s_aCodexModels.size())
         ? &s_aCodexModels.at(s_iCodexActiveModel) : nullptr;
 }
+// 2026.09.24 v3.1.231 搬机端点兑底（用户实测：四后端共享表把 Pi 风味条目 glm-5.3
+//   @.../claude anthropic-messages 设为当前 → Codex 发 /chat/completions 到该基址
+//   必 404「Route /claude/chat/completions not found」）：Codex 只能说 chat
+//   completions（chat/openai-completions/空；responses 是 codex 自有协议另行直连），
+//   激活条目为非 chat 端点时在同表内找「同名模型 + chat 兼容」条目兑底（同
+//   scheme+host+port 优先，其次表序）。找不到由 CodexConfigError/StartStage 前置拦截。
+static bool CodexApiChatCompat(const QString& a_sApi) {
+    const QString s = a_sApi.trimmed().toLower();
+    return s.isEmpty() || s == QLatin1String("chat")
+        || s == QLatin1String("openai-completions");
+}
+static const SDshModelEntry* CodexChatCompatEntry() {
+    const SDshModelEntry* pAct = CodexActiveEntry();
+    if (pAct == nullptr || CodexApiChatCompat(pAct->sApi)) {
+        return pAct;
+    }
+    const QUrl urlAct(pAct->sBaseURL.trimmed());
+    const SDshModelEntry* pBest = nullptr;
+    bool bBestSameHost = false;
+    for (const SDshModelEntry& st : s_aCodexModels) {
+        if (&st == pAct || !CodexApiChatCompat(st.sApi)
+                || st.sModelId.trimmed().isEmpty()
+                || st.sModelId.compare(pAct->sModelId, Qt::CaseInsensitive) != 0
+                || st.sBaseURL.trimmed().isEmpty()) {
+            continue;
+        }
+        const QUrl url(st.sBaseURL.trimmed());
+        const bool bSameHost = url.scheme() == urlAct.scheme()
+            && url.host() == urlAct.host()
+            && url.port(url.scheme() == QLatin1String("https") ? 443 : 80)
+                == urlAct.port(urlAct.scheme() == QLatin1String("https") ? 443 : 80);
+        if (pBest == nullptr || (bSameHost && !bBestSameHost)) {
+            pBest = &st;
+            bBestSameHost = bSameHost;
+            if (bSameHost) {
+                break;   // 同主机即最优，提前收敛
+            }
+        }
+    }
+    return pBest;
+}
 static QString CodexEffProvider() {
     return CodexActiveEntry() != nullptr ? CCodexRunner::CodexActiveProvider()
                                          : CCodexRunner::CodexProvider();
@@ -42,11 +84,23 @@ static QString CodexEffModel() {
     return CodexActiveEntry() != nullptr ? CodexActiveEntry()->sModelId
                                          : CCodexRunner::CodexModel();
 }static QString CodexEffBaseUrl() {
-    return CodexActiveEntry() != nullptr ? CodexActiveEntry()->sBaseURL
-                                         : CCodexRunner::CodexBaseUrl();
+    if (CodexActiveEntry() != nullptr) {
+        // 2026.09.24 v3.1.231 激活条目为 anthropic-messages 等非 chat 端点时落
+        //   同名 chat 兼容兑底条目；无兑底返回原 URL（StartStage/CodexConfigError
+        //   前置拦截给出中文指引，不再让 codex CLI 深处 404）。
+        const SDshModelEntry* p = CodexChatCompatEntry();
+        return p != nullptr ? p->sBaseURL : CodexActiveEntry()->sBaseURL;
+    }
+    return CCodexRunner::CodexBaseUrl();
 }
 static QString CodexEffWireApi() {
     if (CodexActiveEntry() != nullptr) {
+        // 2026.09.24 v3.1.231 兑底条目是 chat 兼容 → wire 一并落 chat（防激活条目
+        //   responses 语义被误套到 chat 端点）；激活条目本身兼容时维持原判据。
+        const SDshModelEntry* p = CodexChatCompatEntry();
+        if (p != nullptr && p != CodexActiveEntry()) {
+            return QStringLiteral("chat");
+        }
         const QString sApi = CodexActiveEntry()->sApi.trimmed().toLower();
         if (sApi == QLatin1String("responses")) {
             return QStringLiteral("responses");
@@ -57,8 +111,16 @@ static QString CodexEffWireApi() {
     return s.isEmpty() ? QStringLiteral("chat") : s;
 }
 static QString CodexEffApiKey() {
-    if (CodexActiveEntry() != nullptr && !CodexActiveEntry()->sApiKey.isEmpty()) {
-        return CodexActiveEntry()->sApiKey;
+    if (CodexActiveEntry() != nullptr) {
+        // 2026.09.24 v3.1.231 兑底条目带 key 优先（同网关路由一致），空则回退激活
+        //   条目 key，再回退固定键（原三级口径不变）。
+        const SDshModelEntry* p = CodexChatCompatEntry();
+        if (p != nullptr && !p->sApiKey.isEmpty()) {
+            return p->sApiKey;
+        }
+        if (!CodexActiveEntry()->sApiKey.isEmpty()) {
+            return CodexActiveEntry()->sApiKey;
+        }
     }
     return CCodexRunner::CodexApiKey();
 }
@@ -187,7 +249,7 @@ QString CCodexRunner::ResolveCodexVersion() {
     if (s_sCodexRoot.isEmpty()) {
         return QString();
     }
-    QFile stFile(s_sCodexRoot + QString::fromLatin1(kSzCodexPkgRel));
+    CFrwDevice stFile(s_sCodexRoot + QString::fromLatin1(kSzCodexPkgRel));
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }
@@ -285,6 +347,18 @@ QString CCodexRunner::CodexConfigError() {
             "处理：「设置 → CodexHarness 参数」自定义大模型列表条目里填接入点"
             "（如 http://192.168.x.x:9000/v1）并「设为当前」。");
     }
+    // 2026.09.24 v3.1.231 激活条目为 anthropic-messages 等 Codex 无法使用的端点形态，
+    //   且共享表内无同名 chat 兼容兑底 → 前置拦截（否则 codex 发 /chat/completions
+    //   到该基址必 404，真因深藏在 CLI stderr）。有兑底时不报警（运行期自动切换）。
+    if (CodexActiveEntry() != nullptr && !CodexApiChatCompat(CodexActiveEntry()->sApi)
+            && CodexChatCompatEntry() == nullptr) {
+        return QStringLiteral(
+            "激活模型条目「%1」的接入点 API 形态为 anthropic-messages（Anthropic 原生端点），"
+            "CodexHarness 只能连 chat completions 兼容端点。\n"
+            "处理：在自定义大模型列表里另选一条 API 形态为 chat/openai-completions 的"
+            "同名或可用条目「设为当前」，或为该网关补一条 chat 形态条目。")
+            .arg(CodexActiveEntry()->sDisp);
+    }
     return QString();
 }
 
@@ -318,7 +392,7 @@ static bool WriteCodexToml(const QString& a_sHome, QString* a_pErr) {
     // 读全文（不存在=空文件；CRLF/LF 均按行保留原样逐字拼回）。
     QString sAll;
     {
-        QFile stFile(sPath);
+        CFrwDevice stFile(sPath);
         if (stFile.open(QIODevice::ReadOnly)) {
             sAll = QString::fromUtf8(stFile.readAll());
             stFile.close();
@@ -441,7 +515,7 @@ static bool WriteCodexAuthJson(const QString& a_sHome, QString* a_pErr) {
     QJsonObject oRoot;
     bool bParsedOk = !QFile::exists(sPath);
     {
-        QFile stFile(sPath);
+        CFrwDevice stFile(sPath);
         if (stFile.open(QIODevice::ReadOnly)) {
             QJsonParseError stErr;
             const QJsonDocument oDoc = QJsonDocument::fromJson(stFile.readAll(), &stErr);
@@ -604,6 +678,15 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     //   仅 http + chat 生效（代理为明文管道；https/responses 保持原路由）。
     //   base_url 以命令行覆盖级注入，~/.codex/config.toml 仍存真实网关地址
     //   （代理随进程起停，不落盘）。
+    // 2026.09.24 v3.1.231 激活条目为 anthropic-messages（Codex 不可用）且已自动
+    //   切到同名 chat 兑底端点 → 留显式痕迹（四后端共享列表「设为当前」的条目
+    //   可能是 Pi 风味，用户需要知道 Codex 实际连的是哪条）。
+    if (CodexActiveEntry() != nullptr && !CodexApiChatCompat(CodexActiveEntry()->sApi)
+            && CodexChatCompatEntry() != nullptr) {
+        emit sigInfo(QStringLiteral("[system/codex] 激活条目「%1」接入点为 anthropic-messages"
+                                    "（Codex 不可用），已自动改用同模型 chat 端点：%2")
+                         .arg(CodexActiveEntry()->sDisp, CodexEffBaseUrl()));
+    }
     const QUrl urlBase(CodexEffBaseUrl());
     if (urlBase.scheme().compare(QStringLiteral("http"), Qt::CaseInsensitive) == 0
         && CodexEffWireApi() == QLatin1String("chat")) {

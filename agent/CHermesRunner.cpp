@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QMap>
@@ -24,6 +25,9 @@ static QString s_sHermesNodePath;
 static QString s_sHermesModel;
 static QString s_sHermesApiKey;
 static QString s_sHermesBaseUrl;
+// 激活模型条目的 API 协议（anthropic-messages / openai-completions，2026.09.21）：
+//   空/未知 = OpenAI wire（历史行为）；anthropic* 时 config.yaml 补写 api_mode。
+static QString s_sHermesApi;
 // 计费单价（$/百万 token，口径同 DSH/Pi）：Hermes 只报 token 分量，客户端折算。
 static double s_dHermesPriceInPerM        = 3.0;
 static double s_dHermesPriceCacheReadPerM = 0.3;
@@ -35,6 +39,29 @@ static int    s_iHermesMaxTok = 32768;
 
 void CHermesRunner::SetHermesRoot(const QString& a_sRoot) { s_sHermesRoot = a_sRoot.trimmed(); }
 QString CHermesRunner::HermesRoot() { return s_sHermesRoot; }
+
+QString CHermesRunner::HermesGitRepoDir() {
+    // 2026.09.20 版本管理 Hermes 最新版比对：定位部署根下真正含 .git 的仓目录
+    //   （探测序同 ResolveHermesVersion 的形态判定）。
+    const QString sCli = ResolveHermesCli();
+    if (sCli.isEmpty()) {
+        return QString();
+    }
+    QStringList aCandidates;
+    if (sCli.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive)) {
+        const QDir dirCli = QFileInfo(sCli).dir();                    // .../venv/Scripts
+        aCandidates << dirCli.filePath(QStringLiteral("../.."))       // venv 上级（平铺）
+                    << dirCli.filePath(QStringLiteral("../../../..")); // root/hermes-agent
+    } else {
+        aCandidates << QFileInfo(sCli).dir().filePath(QStringLiteral(".."));  // dist 上级=根
+    }
+    for (const QString& sDir : aCandidates) {
+        if (QFileInfo::exists(QDir(sDir).filePath(QStringLiteral(".git")))) {
+            return QDir::cleanPath(sDir);
+        }
+    }
+    return QString();
+}
 void CHermesRunner::SetHermesNodePath(const QString& a_sPath) { s_sHermesNodePath = a_sPath.trimmed(); }
 QString CHermesRunner::HermesNodePath() { return s_sHermesNodePath; }
 void CHermesRunner::SetHermesModel(const QString& a_sModel) { s_sHermesModel = a_sModel.trimmed(); }
@@ -43,6 +70,17 @@ void CHermesRunner::SetHermesApiKey(const QString& a_sKey) { s_sHermesApiKey = a
 QString CHermesRunner::HermesApiKey() { return s_sHermesApiKey; }
 void CHermesRunner::SetHermesBaseUrl(const QString& a_sUrl) { s_sHermesBaseUrl = a_sUrl.trimmed(); }
 QString CHermesRunner::HermesBaseUrl() { return s_sHermesBaseUrl; }
+
+// 2026.09.21 协议回填：CMainWindow 启动/设置保存两路径传激活条目 sApi。
+void CHermesRunner::SetHermesApi(const QString& a_sApi) { s_sHermesApi = a_sApi.trimmed(); }
+QString CHermesRunner::HermesApi() { return s_sHermesApi; }
+
+// anthropic 协议端点判定（兼容 anthropic-messages / anthropic / anthropic_messages）。
+static bool HermesApiIsAnthropic(const QString& a_sApi) {
+    return a_sApi.compare(QStringLiteral("anthropic-messages"), Qt::CaseInsensitive) == 0
+        || a_sApi.compare(QStringLiteral("anthropic_messages"), Qt::CaseInsensitive) == 0
+        || a_sApi.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) == 0;
+}
 
 void CHermesRunner::SetHermesPriceInPerM(double a_d) { s_dHermesPriceInPerM = qMax(0.0, a_d); }
 void CHermesRunner::SetHermesPriceCacheReadPerM(double a_d) { s_dHermesPriceCacheReadPerM = qMax(0.0, a_d); }
@@ -98,7 +136,7 @@ bool CHermesRunner::EnsureRuntimeConfig(const QString& a_sHermesHome) {
     const QJsonDocument oDoc(BuildRuntimeConfigJson());
     const QByteArray aTarget = oDoc.toJson(QJsonDocument::Indented);
 
-    QFile fOld(sCfgPath);
+    CFrwDevice fOld(sCfgPath);
     if (fOld.open(QIODevice::ReadOnly)) {
         if (fOld.readAll() == aTarget) {
             return true;   // 读-比-短路：内容一致，无需写
@@ -157,7 +195,8 @@ QString CHermesRunner::ResolveHermesHomeForExe(const QString& a_sCli) {
 namespace {
 // model 段内我们接管的四个键（default 是 hermes 的模型键；model 别名键不接管，
 //   hermes 侧 default 优先，两键并存时我们的 default 生效）。
-const char* const kHermesModelKeys[] = { "default", "provider", "base_url", "api_key" };
+const char* const kHermesModelKeys[] = { "default", "provider", "base_url", "api_key",
+                                         "api_mode" };
 
 // 顶级键行（无缩进 ident:...）判定；注释/空行/列表项不算。
 bool IsTopLevelKeyLine(const QString& a_sLine) {
@@ -169,7 +208,7 @@ bool IsTopLevelKeyLine(const QString& a_sLine) {
 // 缩进键行匹配（注释行 # 开头不命中——正则要求空白后紧跟键名）。
 QRegularExpressionMatch MatchModelKey(const QString& a_sLine) {
     static const QRegularExpression re(
-        QStringLiteral("^(\\s*)(default|provider|base_url|api_key)\\s*:\\s*(.*)$"));
+        QStringLiteral("^(\\s*)(default|provider|base_url|api_key|api_mode)\\s*:\\s*(.*)$"));
     return re.match(a_sLine);
 }
 
@@ -309,6 +348,21 @@ QString LocalizeHermesCapText(const QString& a_sText) {
             "⚠ Hermes 已达轮次上限，未能生成收尾总结（模型返回空）。\n"
             "此前已完成的工作均已保存；重发指令即可继续。");
     }
+    // 2026.09.21 端点协议失配 404（他机 GLM-5.3 实录：模型表选中 anthropic-
+    //   messages 端点 http://gw:9000/claude，旧版 Hermes runner 恒按 OpenAI wire
+    //   发 <base>/chat/completions → 网关 404 Route not found）。命中即附中文
+    //   排障指引（现版已自动写 api_mode，此提示留给旧端点/手填 URL 场景）。
+    if (sTrim.contains(QStringLiteral("HTTP 404"))
+        && sTrim.contains(QStringLiteral("not found"), Qt::CaseInsensitive)) {
+        return QStringLiteral(
+                   "✗ 模型端点返回 404（路由不存在）：%1\n"
+                   "常见原因：接入点与 API 协议不匹配——anthropic-messages 端点"
+                   "（如 .../claude）只收 Anthropic Messages 请求，OpenAI 协议端点"
+                   "（如 .../api/v1）只收 chat/completions 请求。\n"
+                   "处理：到设置页模型列表换用与当前后端协议一致的条目（或改接入点"
+                   "路径）。升级 AutoCode 后 Hermes 后端会按条目协议自动适配。")
+            .arg(sTrim);
+    }
     return a_sText;
 }
 }   // namespace
@@ -318,7 +372,7 @@ bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath) {
     if (s_sHermesModel.isEmpty() || s_sHermesBaseUrl.isEmpty() || s_sHermesApiKey.isEmpty()) {
         return false;
     }
-    QFile fYaml(a_sYamlPath);
+    CFrwDevice fYaml(a_sYamlPath);
     QString sTxt;
     if (fYaml.open(QIODevice::ReadOnly)) {
         sTxt = QString::fromUtf8(fYaml.readAll());
@@ -329,6 +383,14 @@ bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath) {
     oTargets.insert(QStringLiteral("provider"), QStringLiteral("custom"));
     oTargets.insert(QStringLiteral("base_url"), s_sHermesBaseUrl);
     oTargets.insert(QStringLiteral("api_key"), s_sHermesApiKey);
+    // 2026.09.21 协议感知：anthropic 端点写 api_mode（hermes 主运行时
+    //   _resolve_plain_custom_api_mode 读该键切 Anthropic 传输，请求
+    //   <base>/v1/messages——与 Claude Code 同链路）；OpenAI 端点写显式
+    //   chat_completions（网关 /claude 路由 404 实录后双保险，语义同缺省）。
+    oTargets.insert(QStringLiteral("api_mode"),
+                    HermesApiIsAnthropic(s_sHermesApi)
+                        ? QStringLiteral("anthropic_messages")
+                        : QStringLiteral("chat_completions"));
     // 读-比-短路：model 段四键已是目标值 → 不写（保 mtime，AC6 幂等口径）。
     if (ReadHermesModelKeys(sTxt.split(QLatin1Char('\n'))) == oTargets) {
         return true;
@@ -370,7 +432,7 @@ namespace {
 // v2.0.109 PreviewSuffix 已随 v2.0.111 工具卡化退役（preview 直传 sigToolUse）。
 
 bool OneshotHasEventPatch(const QString& a_sPyPath) {
-    QFile fPy(a_sPyPath);
+    CFrwDevice fPy(a_sPyPath);
     if (!fPy.open(QIODevice::ReadOnly)) {
         return false;
     }
@@ -487,7 +549,7 @@ QString CHermesRunner::ResolveHermesCli() {
     //    绝对路径）；解析不出可用绝对路径则返回空串走失败提示，绝不回退 .cmd 本身。
     const QString sCmd = QStandardPaths::findExecutable(QStringLiteral("hermes.cmd"));
     if (!sCmd.isEmpty()) {
-        QFile fCmd(sCmd);
+        CFrwDevice fCmd(sCmd);
         if (fCmd.open(QIODevice::ReadOnly)) {
             const QString sTxt = QString::fromLocal8Bit(fCmd.readAll());
             const QRegularExpression reJsPath(QStringLiteral("\"([^\"]+\\.js)\""));
@@ -533,7 +595,7 @@ QString CHermesRunner::ResolveHermesVersion() {
         static const QRegularExpression reVer(
             QStringLiteral("^\\s*version\\s*=\\s*\"([^\"]+)\""));
         for (const QString& sDir : aPkgDirs) {
-            QFile stPy(QDir(sDir).filePath(QStringLiteral("pyproject.toml")));
+            CFrwDevice stPy(QDir(sDir).filePath(QStringLiteral("pyproject.toml")));
             if (!stPy.open(QIODevice::ReadOnly)) {
                 continue;
             }
@@ -551,7 +613,7 @@ QString CHermesRunner::ResolveHermesVersion() {
     }
     const QString sPkg = QFileInfo(sCli).dir()
         .filePath(QStringLiteral("../package.json"));
-    QFile stFile(sPkg);
+    CFrwDevice stFile(sPkg);
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }

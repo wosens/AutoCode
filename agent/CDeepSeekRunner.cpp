@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -14,6 +15,15 @@
 #include <QUuid>
 
 #include "CClaudeRunner.h"   // ContextWindowForModel：DSH 侧窗口兜底探测复用同一实现
+
+// 2026.09.27 额外可写目录（pwsh 沙箱 DACL 放行）：SID 派生 + ACE 授/撤。
+#include <QCryptographicHash>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <aclapi.h>   // GetNamedSecurityInfo / SetEntriesInAcl / SetNamedSecurityInfo
+#include <sddl.h>     // ConvertStringSidToSid
 
 // —— 进程级全局配置（static：所有 DSH runner 实例共享，主窗口启动/设置变更时写）——
 static QString s_sDshRootPath;    // DSH 仓库根（deepseek-harness 目录；空=未配置/未探测到）
@@ -52,6 +62,186 @@ void CDeepSeekRunner::SetDshRootPath(const QString& a_sRoot) {
 
 QString CDeepSeekRunner::DshRootPath() {
     return s_sDshRootPath;
+}
+
+// —— 2026.09.27 DSH 额外可写目录（pwsh 沙箱 DACL 放行）——————————————
+// DSH windows-acl 沙箱：workspace-write 的强制是纯 NTFS DACL——受限令牌的 restricting
+//   组里带工作区写 SID（S-1-4-x-y，sha256(规范化工作区根) 派生，见 harness
+//   sandbox-windows-acl/src/workspace-sid.ts）；目录可写 ⟺ 其 DACL 授了该 SID
+//   （Allow，OI|CI，FILE_GENERIC_WRITE|DELETE|FILE_DELETE_CHILD & ~STANDARD_RIGHTS_WRITE，
+//   见 win32-abi.ts GRANT_MASK / acl.ts buildExplicitAccess）。拒绝标记是 stderr 特征
+//   分类（无路径预检）→ 对工程根之外的关联目录授同一 SID 的同形 ACE 即放行，
+//   零 harness 改动、对已部署副本全部生效。ACE 是 standing（留在 DACL 里跨会话复用，
+//   与 harness 自身的 workspace 复用缓存同语义）。
+static QStringList s_aDshExtraWriteDirs;   // [Dsh] ExtraWriteDirs（';' 分隔）
+
+void CDeepSeekRunner::SetDshExtraWriteDirs(const QStringList& a_aDirs) {
+    QStringList aNorm;
+    for (const QString& s : a_aDirs) {
+        const QString sT = QDir::fromNativeSeparators(s.trimmed());
+        if (!sT.isEmpty() && !aNorm.contains(sT)) {
+            aNorm.append(sT);
+        }
+    }
+    s_aDshExtraWriteDirs = aNorm;
+}
+
+QStringList CDeepSeekRunner::DshExtraWriteDirs() {
+    return s_aDshExtraWriteDirs;
+}
+
+// node realpathSync.native 等价（GetFinalPathNameByHandleW，剥 \?\ 前缀，真实大小写）：
+//   SID 输入必须与 harness 侧 canonicalPath 完全一致。
+static QString DshCanonicalWinPath(const QString& a_sDir) {
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    HANDLE h = CreateFileW(reinterpret_cast<const wchar_t*>(sNative.utf16()),
+                           FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE
+                               | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);   // 目录句柄
+    if (h == INVALID_HANDLE_VALUE) {
+        return QString();
+    }
+    wchar_t wsBuf[1024] = {};
+    const DWORD dwN = GetFinalPathNameByHandleW(h, wsBuf, 1024, FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (dwN == 0 || dwN >= 1024) {
+        return QString();
+    }
+    QString s = QString::fromWCharArray(wsBuf, static_cast<int>(dwN));
+    if (s.startsWith(QLatin1String("\\\\?\\"))) {   // \\?\ 前缀（源码级双反斜杠×4+?+2）
+        s = s.mid(4);
+    }
+    return s;
+}
+
+// 工作区写 SID：sha256(utf8(规范化根)) 前两个 LE u32 mod (2^30-1) + 1（对齐
+//   sandbox-windows-acl/src/workspace-sid.ts workspaceWriteSid）。
+static QString DshWorkspaceWriteSidOf(const QString& a_sCanonicalRoot) {
+    const QByteArray aDig = QCryptographicHash::hash(
+        a_sCanonicalRoot.toUtf8(), QCryptographicHash::Sha256);
+    if (aDig.size() < 8) {
+        return QString();
+    }
+    const quint32 uOne = qFromLittleEndian<quint32>(
+        reinterpret_cast<const uchar*>(aDig.constData()));
+    const quint32 uTwo = qFromLittleEndian<quint32>(
+        reinterpret_cast<const uchar*>(aDig.constData()) + 4);
+    const quint64 uMax = (Q_UINT64_C(1) << 30) - 1;
+    return QStringLiteral("S-1-4-%1-%2")
+        .arg(QString::number(uOne % uMax + 1), QString::number(uTwo % uMax + 1));
+}
+
+// 授/撤一个 (目录, SID) 的 ACE。a_bGrant=false 撤销（REVOKE_ACCESS 删该 trustee 全部
+//   ACE）。幂等：已存在精确 ACE（Allow+OI|CI+GRANT_MASK+同 SID）跳过。跨进程命名
+//   互斥串行化（多 AutoCode 实例/多助手并发授同目录防 DACL 读-合-写竞态，对齐 harness
+//   的 dsh-acl-locks 思路）。返回是否成功（目录不存在不算失败，返回 true 跳过）。
+static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_bGrant) {
+    static const DWORD kDshGrantMask =
+        (FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD) & ~STANDARD_RIGHTS_WRITE;
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    if (!QFileInfo::exists(sNative) || !QFileInfo(sNative).isDir()) {
+        return true;   // 目录不在场：无可授（后续会话也不需要；不算失败）
+    }
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"AutoCode_DshAclGrant_Mutex");
+    if (hMutex != nullptr) {
+        WaitForSingleObject(hMutex, 8000);   // 已被创建并持有→等；二次持有也无妨
+    }
+    struct CMutexGuard {
+        HANDLE h;
+        ~CMutexGuard() { if (h != nullptr) { ReleaseMutex(h); CloseHandle(h); } }
+    } stGuard{ hMutex };
+
+    PSID pSid = nullptr;
+    if (!ConvertStringSidToSidW(
+            reinterpret_cast<const wchar_t*>(a_sSid.utf16()), &pSid) || pSid == nullptr) {
+        return false;
+    }
+    struct CSidGuard {
+        PSID p;
+        ~CSidGuard() { if (p != nullptr) { LocalFree(p); } }
+    } stSidGuard{ pSid };
+
+    // 已有精确 ACE？读 DACL 逐条比对（幂等防叠加）。
+    PACL pOld = nullptr;
+    PSECURITY_DESCRIPTOR pSd = nullptr;
+    if (GetNamedSecurityInfoW(reinterpret_cast<const wchar_t*>(sNative.utf16()),
+                              SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, &pOld, nullptr, &pSd) != ERROR_SUCCESS
+        || pOld == nullptr) {
+        if (pSd != nullptr) { LocalFree(pSd); }
+        return false;
+    }
+    struct CSdGuard {
+        PSECURITY_DESCRIPTOR p;
+        ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
+    } stSdGuard{ pSd };
+    if (a_bGrant) {
+        BOOL bFound = FALSE;
+        for (DWORD i = 0; i < pOld->AceCount && !bFound; ++i) {
+            void* pAce = nullptr;
+            if (!GetAce(pOld, i, &pAce) || pAce == nullptr) { continue; }
+            const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+            if (pHdr->AceType != ACCESS_ALLOWED_ACE_TYPE) { continue; }
+            auto* pAllow = const_cast<ACCESS_ALLOWED_ACE*>(
+                static_cast<const ACCESS_ALLOWED_ACE*>(pAce));
+            if (pAllow->Mask != kDshGrantMask) { continue; }
+            if ((pHdr->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))
+                    != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) {
+                continue;
+            }
+            if (EqualSid(reinterpret_cast<PSID>(&pAllow->SidStart), pSid)) {
+                bFound = TRUE;
+            }
+        }
+        if (bFound) {
+            return true;
+        }
+    }
+
+    EXPLICIT_ACCESS_W stEa = {};
+    stEa.grfAccessPermissions = kDshGrantMask;
+    stEa.grfAccessMode = a_bGrant ? GRANT_ACCESS : REVOKE_ACCESS;
+    stEa.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    stEa.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    stEa.Trustee.ptstrName = reinterpret_cast<LPWSTR>(pSid);
+    PACL pNew = nullptr;
+    if (SetEntriesInAclW(1, &stEa, pOld, &pNew) != ERROR_SUCCESS || pNew == nullptr) {
+        return false;
+    }
+    const DWORD dwR = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(const_cast<ushort*>(sNative.utf16())),
+        SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, pNew, nullptr);
+    LocalFree(pNew);
+    return dwR == ERROR_SUCCESS;
+}
+
+int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
+                                         const QStringList& a_aGrant,
+                                         const QStringList& a_aRevoke) {
+    // 工程根规范化 → 工作区写 SID（与 harness 派生一致）→ 逐目录授/撤。
+    if ((a_aGrant.isEmpty() && a_aRevoke.isEmpty()) || a_sWorkDir.trimmed().isEmpty()) {
+        return 0;
+    }
+    const QString sCanonicalRoot = DshCanonicalWinPath(a_sWorkDir);
+    if (sCanonicalRoot.isEmpty()) {
+        return a_aGrant.size();   // 工程根拿不到规范名：全部按失败计（不阻断，日志可见）
+    }
+    const QString sSid = DshWorkspaceWriteSidOf(sCanonicalRoot);
+    if (sSid.isEmpty()) {
+        return a_aGrant.size();
+    }
+    int iFailed = 0;
+    for (const QString& sDir : a_aRevoke) {
+        if (!a_aGrant.contains(sDir) && !DshApplyDirAce(sDir, sSid, false)) {
+            ++iFailed;
+        }
+    }
+    for (const QString& sDir : a_aGrant) {
+        if (!DshApplyDirAce(sDir, sSid, true)) {
+            ++iFailed;
+        }
+    }
+    return iFailed;
 }
 
 QString CDeepSeekRunner::ResolveNodePath() {
@@ -164,7 +354,7 @@ QString CDeepSeekRunner::DshConfigError() {
                 "或重跑「安装 DeepSeekHarness…」后重试。").arg(
                     QDir::toNativeSeparators(sPatch));
         }
-        QFile oPatch(sPatch);
+        CFrwDevice oPatch(sPatch);
         if (oPatch.open(QIODevice::ReadOnly)) {
             const QString sPatchText = QString::fromUtf8(oPatch.readAll());
             oPatch.close();
@@ -207,7 +397,7 @@ QString CDeepSeekRunner::DshConfigError() {
     //   EnsureProcess 才跑）。
     for (const QString& sYml : QStringList{ sCordis, QCoreApplication::applicationDirPath()
                                                 + QStringLiteral("/dsh/cordis.autocode.yml") }) {
-        QFile oYml(sYml);
+        CFrwDevice oYml(sYml);
         if (!oYml.exists() || !oYml.open(QIODevice::ReadOnly)) {
             continue;
         }
@@ -239,7 +429,7 @@ QString CDeepSeekRunner::DshConfigError() {
     //   模型而 exe 侧 dsh\cordis.autocode.yml 不带槽位 = 部署目录未随主程序更新，前置拦截并给
     //   更新指引（不再等任务握手才炸）。
     if (CustomActiveValid()) {
-        QFile oMasterYml(QCoreApplication::applicationDirPath()
+        CFrwDevice oMasterYml(QCoreApplication::applicationDirPath()
                           + QStringLiteral("/dsh/cordis.autocode.yml"));
         if (oMasterYml.exists() && oMasterYml.open(QIODevice::ReadOnly)) {
             const bool bHasSlot = oMasterYml.readAll().contains("autocode-active");
@@ -359,7 +549,7 @@ QString CDeepSeekRunner::ResolveDshVersion(const QString& a_sRoot) {
     if (sRoot.isEmpty()) {
         return QString();
     }
-    QFile stFile(sRoot + QStringLiteral("/package.json"));
+    CFrwDevice stFile(sRoot + QStringLiteral("/package.json"));
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }
@@ -522,7 +712,7 @@ int CDeepSeekRunner::HealCredentialsFile(QString* a_pOutWhy) {
     //   会生成/或走 env 阶梯）；平铺或解析不出的格式→0（不动）；已知坏格式→备份
     //   .autosave（覆盖旧备份）+ 改写平铺 →1。凭据值逐对原样迁移，不重排不丢失。
     const QString sPath = QDir::home().filePath(QStringLiteral(".dsh/.credentials.yaml"));
-    QFile stFile(sPath);
+    CFrwDevice stFile(sPath);
     if (!stFile.exists()) {
         if (a_pOutWhy != nullptr) {
             *a_pOutWhy = QStringLiteral("文件不存在");
@@ -1260,6 +1450,9 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     }
     // initialize 握手：cwd/provider/model（maxTokens 不传——组合 maxTokensAsSuccess=false，
     //   token 封顶以 turn/end reason=max-tokens 上报，续跑语义靠它）。
+    //   2026.09.27 额外可写目录自愈授 ACE（幂等；见 ApplyExtraWriteDirs）——pwsh 沙箱
+    //   的写强制是纯 NTFS DACL，会话 cwd（=工程根）派生的写 SID 被授到额外目录即放行。
+    ApplyExtraWriteDirs(a_sWorkDir, DshExtraWriteDirs());
     m_iInitId = m_iNextRpcId++;
     QJsonObject oParams;
     oParams.insert(QStringLiteral("cwd"), a_sWorkDir);
@@ -1308,16 +1501,18 @@ void CDeepSeekRunner::SyncCordisFromMaster() {
     if (sMaster.isEmpty() || sDeployed.isEmpty() || !QFile::exists(sMaster)) {
         return;
     }
-    QFile oMaster(sMaster);
+    CFrwDevice oMaster(sMaster);
     if (!oMaster.open(QIODevice::ReadOnly)) {
         return;
     }
     const QByteArray aMaster = oMaster.readAll();
     oMaster.close();
-    QFile oDeployed(sDeployed);
-    if (oDeployed.open(QIODevice::ReadOnly)) {
-        const QByteArray aOld = oDeployed.readAll();
-        oDeployed.close();
+    // 2026.09.13 文件读取统一走 CFrwDevice（fileread.dll）；该对象随后还要写开，
+    //   读/写拆两个对象（CFrwDevice 只读组件，拒绝写标志）。
+    CFrwDevice oDeployedRd(sDeployed);
+    if (oDeployedRd.open(QIODevice::ReadOnly)) {
+        const QByteArray aOld = oDeployedRd.readAll();
+        oDeployedRd.close();
         if (aOld == aMaster) {
             return;   // 已同步
         }
@@ -1333,9 +1528,10 @@ void CDeepSeekRunner::SyncCordisFromMaster() {
             return;
         }
     }
-    if (oDeployed.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        oDeployed.write(aMaster);
-        oDeployed.close();
+    QFile oDeployedWr(sDeployed);
+    if (oDeployedWr.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        oDeployedWr.write(aMaster);
+        oDeployedWr.close();
         emit sigInfo(QStringLiteral("[system/dsh] 组合文件已从程序目录模板刷新：%1")
                          .arg(QDir::toNativeSeparators(sDeployed)));
     } else {

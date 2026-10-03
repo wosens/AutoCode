@@ -1,6 +1,7 @@
 #include "CTaskInfo.h"
 
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -106,7 +107,14 @@ bool CTaskInfo::SaveToFile(const QString& a_sFilePath) const {
     if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return false;
     }
-    stFile.write(stDoc.toJson(QJsonDocument::Indented));
+    // 写入校验：磁盘满/配额/句柄异常时 write 可能短写或失败，忽略返回值会把截断档
+    //   当成功落盘，任务进度静默丢失。
+    const QByteArray aJson = stDoc.toJson(QJsonDocument::Indented);
+    if (stFile.write(aJson) != aJson.size() || stFile.error() != QFile::NoError) {
+        stFile.close();
+        return false;
+    }
+    stFile.close();
     return true;
 }
 
@@ -133,7 +141,7 @@ void CTaskInfo::ResetForRevive() {
 }
 
 bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
-    QFile stFile(a_sFilePath);
+    CFrwDevice stFile(a_sFilePath);
     if (!stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return false;
     }
@@ -202,6 +210,24 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
 //   退路：最长行往往是编号细节条款而非主旨，79 字压线入选第 7 条抠出「资源管理器
 //   右键菜单增加」的实害勿回退）。行内清洗：剥行首编号/条目号 → 剥引导语（剥后 <4
 //   字回退剥前）→ 取首子句边界（首子句不足 10 字顺延，同编排器旧口径）→ 截 24 字。
+QString CTaskInfo::TrimNamePunct(const QString& a_s) {
+    // 两侧装饰字符集：首=引号/书名号/Markdown 标记；尾=同左 + 句尾标点（冒号分号
+    //   逗号句号顿号叹号问号省略号破折号波浪线）。循环剥处理嵌套（「X」：→X）。
+    static const QRegularExpression reEdge(
+        QStringLiteral("^[\\s\"'“”‘’「」『』《》<>#*`]+"
+                       "|[\\s\"'“”‘’「」『』《》<>#*`：:，,。;；、!！?？.\\-—…~]+$"));
+    QString s = a_s.simplified();
+    for (int i = 0; i < 4; ++i) {
+        const QString sPrev = s;
+        s.remove(reEdge);
+        s = s.trimmed();
+        if (s == sPrev) {
+            break;
+        }
+    }
+    return s;
+}
+
 QString CTaskInfo::ExtractNameFromRequest(const QString& a_sReq) {
     QStringList aLines;
     for (const QString& sLine : a_sReq.split(QLatin1Char('\n'))) {
@@ -216,11 +242,14 @@ QString CTaskInfo::ExtractNameFromRequest(const QString& a_sReq) {
     static const QRegularExpression reNum(
         QStringLiteral("^\\s*(?:(?:FR|NFR|AC|Q)\\d+\\.?|\\d+[.、])\\s*"),
         QRegularExpression::CaseInsensitiveOption);
-    // 引导语（一层，不循环剥）：「请帮我开发一个X」→「X」。剥后 <4 字回退剥前原文
-    //   （防短句被剥到太短/意外全剥）。
+    // 引导语（一层，不循环剥）：礼貌前缀（我想/请帮我…）恒剥；动词（开发/创建…）
+    //   仅在「动词+一个/一款/个」时剥（“做一个X”→X）；裸动词开头保留——「开发大模型
+    //   Harness网关插件」是天然标题，2026.09.21 实害：旧版把「开发」剥掉＋尾冒号
+    //   不清，产出「大模型 Harness网关插件:」而用户期望名就是「开发大模型Harness网关
+    //   插件」。剥后 <4 字回退剥前原文（防短句被剥到太短/意外全剥）。
     static const QRegularExpression reLeadIn(
         QStringLiteral("^(?:我想|我想要|想要|请帮我|帮我|请你|请|我需要|需要)?\\s*"
-                       "(?:开发|创建|实现|做一个|写一个|搭一个|搭建|制作|设计)?\\s*"
+                       "(?:(?:开发|创建|实现|做|写|搭|搭建|制作|设计)(?:一个|一款|个))?\\s*"
                        "(?:一个|一款|个)?\\s*"));
     // 首子句截断（同编排器 MaybeAutoNameTask 旧口径）：边界为全/半角逗号句号分号冒号；
     //   首子句不足 10 字顺延到下一边界；截 24 字。
@@ -286,5 +315,7 @@ QString CTaskInfo::ExtractNameFromRequest(const QString& a_sReq) {
             }
         }
     }
-    return sCandidate;
+    // 尾标点剥离（「开发大模型 Harness网关插件:」→「开发大模型 Harness网关插件」；
+    //   2026.09.21 实害：fnClause 对行尾冒号不截断，冒号留在任务名尾部）。
+    return TrimNamePunct(sCandidate);
 }

@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QTextStream>
 #include <QDateTime>
@@ -14,6 +15,7 @@
 #include <QThread>   // 2026.08.22 blob 临时名防并发碰撞（线程 id 掺入）
 #include <thread>     // 2026.08.26 指纹同步后台线程（大工程扫描不阻塞 UI）
 #include <QSet>
+#include <QMap>   // 2026.09.21 TruncateBefore：seq→meta 内存快照
 #include <vector>    // 2026.09.09 v2.1.143 任务级配置覆盖（MergeFillTaskConfig 节枚举缓冲）
 
 #include <zstd.h>       // 备份压缩（#2）：第三方静态库 libzstd_static，逐文件 zstd 压缩/解压
@@ -105,7 +107,7 @@ bool CProjectManager::HasGuide() const {
 }
 
 QString CProjectManager::ReadGuide() const {
-    QFile stFile(AutoDevDir() + QStringLiteral("/guide.md"));
+    CFrwDevice stFile(AutoDevDir() + QStringLiteral("/guide.md"));
     if (!stFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return QString();
     }
@@ -164,7 +166,7 @@ bool CProjectManager::WriteAssistantState(const QByteArray& a_sData) const {
 }
 
 QByteArray CProjectManager::ReadAssistantState() const {
-    QFile stFile(AssistantStateFile());
+    CFrwDevice stFile(AssistantStateFile());
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QByteArray();   // 不存在/无权限：返回空，调用方判空跳过恢复
     }
@@ -189,7 +191,7 @@ bool CProjectManager::WriteTaskChat(const QString& a_sTaskId, const QByteArray& 
 }
 
 QByteArray CProjectManager::ReadTaskChat(const QString& a_sTaskId) const {
-    QFile stFile(TaskChatFile(a_sTaskId));
+    CFrwDevice stFile(TaskChatFile(a_sTaskId));
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QByteArray();
     }
@@ -214,7 +216,7 @@ bool CProjectManager::WriteTaskAssistantState(const QString& a_sTaskId, const QB
 }
 
 QByteArray CProjectManager::ReadTaskAssistantState(const QString& a_sTaskId) const {
-    QFile stFile(TaskAssistantFile(a_sTaskId));
+    CFrwDevice stFile(TaskAssistantFile(a_sTaskId));
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QByteArray();   // 该任务还没用过助手：返回空，调用方判空走清空分支
     }
@@ -226,7 +228,7 @@ QString CProjectManager::TaskMemoryFile(const QString& a_sTaskId) const {
 }
 
 QString CProjectManager::ReadTaskMemory(const QString& a_sTaskId) const {
-    QFile stFile(TaskMemoryFile(a_sTaskId));
+    CFrwDevice stFile(TaskMemoryFile(a_sTaskId));
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();   // 不存在（任务还没沉淀过经验）→ 空，调用方跳过注入
     }
@@ -338,7 +340,7 @@ void CProjectManager::OnGuideRunnerFinished(bool a_bOk, const QString& a_sResult
         // 协调2：全量重生成 guide.md 后，历史 record 不必再同步进 guide——水位线推进到当前
         //   record 行数（含本条生成日志），避免首次触发把全部历史 record 喂进同步 agent。
         {
-            QFile stRec(AutoDevDir() + QStringLiteral("/record.md"));
+            CFrwDevice stRec(AutoDevDir() + QStringLiteral("/record.md"));
             int iLines = 0;
             if (stRec.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 iLines = QTextStream(&stRec).readAll()
@@ -374,7 +376,7 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
     }
 
     // 读 record.md 全文，取水位线之后的新增行作为本次增量输入（行数水位线，无时间戳歧义）。
-    QFile stRec(AutoDevDir() + QStringLiteral("/record.md"));
+    CFrwDevice stRec(AutoDevDir() + QStringLiteral("/record.md"));
     QString sRecord;
     if (stRec.open(QIODevice::ReadOnly | QIODevice::Text)) {
         sRecord = QTextStream(&stRec).readAll();
@@ -450,7 +452,7 @@ void CProjectManager::OnGuideSyncRunnerFinished(bool a_bOk, const QString& a_sRe
         AppendRecord(QStringLiteral("[%1] 按 record 新增记录同步 .autodev/guide.md")
                          .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm"))));
         // 推进水位线到含本条同步日志的当前 record 行数，下次仅对新改动触发。
-        QFile stRec(AutoDevDir() + QStringLiteral("/record.md"));
+        CFrwDevice stRec(AutoDevDir() + QStringLiteral("/record.md"));
         int iLines = 0;
         if (stRec.open(QIODevice::ReadOnly | QIODevice::Text)) {
             iLines = QTextStream(&stRec).readAll()
@@ -499,7 +501,7 @@ QString CProjectManager::GuideSyncFile() const {
 
 int CProjectManager::LoadGuideSyncLines() const {
     // 读取已同步到的 record.md 行数；无文件/缺键/非法值返回 0（视为从未同步）。
-    QFile stFile(GuideSyncFile());
+    CFrwDevice stFile(GuideSyncFile());
     if (!stFile.open(QIODevice::ReadOnly)) {
         return 0;
     }
@@ -557,7 +559,7 @@ void CProjectManager::SyncGuideIncremental() {
             // 读 guide.md 全文（后台线程直接读文件，不走 ReadGuide 的成员访问）。
             QString sGuide;
             {
-                QFile stGuide(sGuidePath);
+                CFrwDevice stGuide(sGuidePath);
                 if (stGuide.open(QIODevice::ReadOnly | QIODevice::Text)) {
                     sGuide = QTextStream(&stGuide).readAll();
                 }
@@ -615,14 +617,33 @@ void CProjectManager::AddRecent(const QString& a_sDir) {
     // 2026.09.09 v2.1.139 改移除【全部】匹配：旧版 removeAt 后 break 只删首个——
     //   历史上 LoadRecent 叠加 bug（见 LoadRecent 注释）在列表里留下过同名重复项，
     //   只删首个会残留副本继续被落盘。
+    // 2026.09.20 打开次数：命中时取旧计数（重复条目取最大——叠加 bug 的副本是同一批
+    //   打开事件的重复落盘，取最大最接近真实），本次再 +1；新条目 = 1。
+    int iOldOpens = 0;
     for (int i = 0; i < m_aRecentProjects.size(); ) {
         if (NormalizePath(m_aRecentProjects.at(i)) == sCmp) {
+            if (i < m_aiRecentOpens.size()) {
+                iOldOpens = qMax(iOldOpens, m_aiRecentOpens.at(i));
+            } else {
+                iOldOpens = qMax(iOldOpens, 1);
+            }
             m_aRecentProjects.removeAt(i);
+            if (i < m_aiRecentOpens.size()) {
+                m_aiRecentOpens.removeAt(i);
+            }
         } else {
             ++i;
         }
     }
     m_aRecentProjects.prepend(sStored);
+    m_aiRecentOpens.prepend(iOldOpens > 0 ? iOldOpens + 1 : 1);
+    // 计数表与路径表长度对齐（防御：异常态下截齐）。
+    while (m_aiRecentOpens.size() > m_aRecentProjects.size()) {
+        m_aiRecentOpens.removeLast();
+    }
+    while (m_aiRecentOpens.size() < m_aRecentProjects.size()) {
+        m_aiRecentOpens.append(1);
+    }
 
     SaveRecent();
 }
@@ -634,6 +655,7 @@ QStringList CProjectManager::RecentProjects() const {
 void CProjectManager::RemoveRecent(const QString& a_sDir) {
     // 2026.08.20 与 AddRecent 同口径：按规范化路径比较，命中即删；不存在 no-op。
     //   2026.09.09 v2.1.139 同 AddRecent 改删全部匹配（防叠加 bug 残留重复项）。
+    //   2026.09.20 计数随条目同删（计数表与路径表同序对齐）。
     if (a_sDir.isEmpty()) {
         return;
     }
@@ -641,6 +663,9 @@ void CProjectManager::RemoveRecent(const QString& a_sDir) {
     for (int i = 0; i < m_aRecentProjects.size(); ) {
         if (NormalizePath(m_aRecentProjects.at(i)) == sCmp) {
             m_aRecentProjects.removeAt(i);
+            if (i < m_aiRecentOpens.size()) {
+                m_aiRecentOpens.removeAt(i);
+            }
         } else {
             ++i;
         }
@@ -650,6 +675,7 @@ void CProjectManager::RemoveRecent(const QString& a_sDir) {
 
 void CProjectManager::ClearRecent() {
     m_aRecentProjects.clear();
+    m_aiRecentOpens.clear();   // 2026.09.20 计数随历史同清
 }
 
 // —— 多实例工程锁（2026.09.07 v2.1.123；说明见 CProjectManager.h 同名节）——
@@ -665,7 +691,7 @@ bool CProjectManager::ReadProjectLock(const QString& a_sProjectDir, SProjectLock
     if (sLock.isEmpty()) {
         return false;
     }
-    QFile fLock(sLock);
+    CFrwDevice fLock(sLock);
     if (!fLock.open(QIODevice::ReadOnly)) {
         return false;   // 无锁/不可读（无 .autodev 时同此）
     }
@@ -1033,11 +1059,15 @@ void CProjectManager::SaveRecent() {
     //   profile 每次读都要扫全段）；整节替换会把未出现在新缓冲里的键全部删除（MSDN），
     //   一次调用收敛文件——旧实例投毒后的高位键在本实例下一次保存时即被清干净。
     //   缓冲格式："k=v\0k=v\0...\0\0"（wstring 自带尾部终止符补出双 null）。
-    // ini 中 1 = 最近（MRU），索引 0 → key "1"。
+    // ini 中 1 = 最近（MRU），索引 0 → key "1"；打开次数 → 附加键 "C<i>"（2026.09.20，
+    //   用于统计各工程使用/修改频率；整节替换会同步清掉高位残留的旧 C 键）。
     QString sBody = QStringLiteral("Count=%1").arg(m_aRecentProjects.size());
     for (int i = 0; i < m_aRecentProjects.size(); ++i) {
         sBody += QChar(u'\0');
         sBody += QStringLiteral("%1=%2").arg(i + 1).arg(m_aRecentProjects.at(i));
+        sBody += QChar(u'\0');
+        sBody += QStringLiteral("C%1=%2").arg(i + 1)
+                     .arg(i < m_aiRecentOpens.size() ? m_aiRecentOpens.at(i) : 1);
     }
     const std::wstring wsBody = sBody.toStdWString();
     WritePrivateProfileSectionW(wsSect.c_str(), wsBody.c_str(), wsPath.c_str());
@@ -1061,8 +1091,10 @@ void CProjectManager::LoadRecent() {
 
     const int iCountCfg = GetPrivateProfileIntW(wsSect.c_str(), L"Count", 0, wsPath.c_str());
     m_aRecentProjects.clear();
+    m_aiRecentOpens.clear();   // 2026.09.20 计数随列表同清（热同步重入安全）
 
     QStringList aLoaded;
+    QList<int> aLoadedOpens;
     QSet<QString> aSeen;
     auto fnReadKey = [&wsSect, &wsPath](int a_iIdx) -> QString {
         wchar_t szBuf[MAX_PATH] = {0};
@@ -1074,7 +1106,16 @@ void CProjectManager::LoadRecent() {
         return dwCopied == 0 ? QString()
                               : QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
     };
-    // ini 中 1 = 最近（MRU）；顺序读入保序，重复路径（规范化后相同）只留首个。
+    // 2026.09.20 打开次数键 "C<i>"（旧档无此键 → 1：能在列表里即被打开过至少一次）。
+    auto fnReadOpens = [&wsSect, &wsPath](int a_iIdx) -> int {
+        const int iVal = GetPrivateProfileIntW(
+            wsSect.c_str(),
+            QStringLiteral("C%1").arg(a_iIdx).toStdWString().c_str(),
+            1, wsPath.c_str());
+        return iVal > 0 ? iVal : 1;
+    };
+    // ini 中 1 = 最近（MRU）；顺序读入保序，重复路径（规范化后相同）只留首个
+    //   （计数取重复项最大——叠加 bug 副本同源，取最大最接近真实）。
     if (iCountCfg > 0) {
         for (int i = 1; i <= iCountCfg; ++i) {
             const QString sVal = fnReadKey(i);
@@ -1082,9 +1123,14 @@ void CProjectManager::LoadRecent() {
                 continue;
             }
             const QString sKey = NormalizePath(sVal);
+            const int iOpens = fnReadOpens(i);
+            const int iDupIdx = aLoaded.isEmpty() ? -1 : aLoaded.indexOf(sVal);
             if (!aSeen.contains(sKey)) {
                 aSeen.insert(sKey);
                 aLoaded.append(sVal);
+                aLoadedOpens.append(iOpens);
+            } else if (iDupIdx >= 0 && iOpens > aLoadedOpens.at(iDupIdx)) {
+                aLoadedOpens[iDupIdx] = iOpens;
             }
         }
     } else {
@@ -1098,13 +1144,26 @@ void CProjectManager::LoadRecent() {
                 break;
             }
             const QString sKey = NormalizePath(sVal);
+            const int iOpens = fnReadOpens(i);
+            const int iDupIdx = aLoaded.isEmpty() ? -1 : aLoaded.indexOf(sVal);
             if (!aSeen.contains(sKey)) {
                 aSeen.insert(sKey);
                 aLoaded.append(sVal);
+                aLoadedOpens.append(iOpens);
+            } else if (iDupIdx >= 0 && iOpens > aLoadedOpens.at(iDupIdx)) {
+                aLoadedOpens[iDupIdx] = iOpens;
             }
         }
     }
     m_aRecentProjects = aLoaded;
+    m_aiRecentOpens = aLoadedOpens;
+    // 计数表与路径表长度对齐（防御：历史档/异常态）。
+    while (m_aiRecentOpens.size() > m_aRecentProjects.size()) {
+        m_aiRecentOpens.removeLast();
+    }
+    while (m_aiRecentOpens.size() < m_aRecentProjects.size()) {
+        m_aiRecentOpens.append(1);
+    }
 }
 
 bool CProjectManager::SaveWindowGeometry(const QRect& a_stGeometry, bool a_bMaximized) {
@@ -1340,6 +1399,50 @@ int CProjectManager::LoadMaxIter() {
     return (iN >= 1 && iN <= 9) ? iN : 3;
 }
 
+bool CProjectManager::LoadReviewAskOnEscalate() {
+    // 2026.09.22 [Policy] ReviewAskOnEscalate：评审驳回迭代熔断升级时是否弹人工介入窗
+    //   （放行/再迭代/保持暂停）。缺省开；置 0 退回旧版静默升级（无人值守跑批可关）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Policy", L"ReviewAskOnEscalate", 1, wsPath.c_str()) != 0;
+}
+
+bool CProjectManager::LoadReviewSdkOnStage() {
+    // 2026-09-30 [Review] SdkOnStage：任务 CodeReview 阶段 ReviewSdk 静态预审开关。
+    //   缺省开（用户需求：审查环节接入该模块）；置 0 回纯 agent 评审。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Review", L"SdkOnStage", 1, wsPath.c_str()) != 0;
+}
+
+int CProjectManager::LoadReviewSdkMaxFiles() {
+    // [Review] SdkMaxFiles：单轮送审文件上限（缺省 12；合法 1..50 兑底回 12）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 12;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iN = GetPrivateProfileIntW(L"Review", L"SdkMaxFiles", 12, wsPath.c_str());
+    return (iN >= 1 && iN <= 50) ? iN : 12;
+}
+
+int CProjectManager::LoadReviewSdkTimeoutSec() {
+    // [Review] SdkTimeoutSec：单文件 LLM 调用超时秒（缺省 600；合法 60..3600）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 600;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iN = GetPrivateProfileIntW(L"Review", L"SdkTimeoutSec", 600, wsPath.c_str());
+    return (iN >= 60 && iN <= 3600) ? iN : 600;
+}
+
 bool CProjectManager::SaveMaxResume(int a_iN) {
     // 落 [Policy] MaxResume（驳回后单阶段最大续跑次数）；失败不抛。
     const QString sPath = SettingsCfgPath();
@@ -1450,6 +1553,23 @@ bool CProjectManager::SaveDshRoot(const QString& a_sRoot) {
 
 QString CProjectManager::LoadDshRoot() {
     return LoadDshStrKey(SettingsCfgPath(), L"DshRoot", QString());
+}
+
+bool CProjectManager::SaveDshExtraWriteDirs(const QStringList& a_aDirs) {
+    // 2026.09.27 额外可写目录（[Dsh] ExtraWriteDirs；';' 分隔原样落盘，运行期规范化）。
+    return SaveDshStrKey(SettingsCfgPath(), L"ExtraWriteDirs", a_aDirs.join(QLatin1Char(';')));
+}
+
+QStringList CProjectManager::LoadDshExtraWriteDirs() {
+    const QString sRaw = LoadDshStrKey(SettingsCfgPath(), L"ExtraWriteDirs", QString());
+    QStringList aDirs;
+    for (const QString& s : sRaw.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+        const QString sT = s.trimmed();
+        if (!sT.isEmpty() && !aDirs.contains(sT)) {
+            aDirs.append(sT);
+        }
+    }
+    return aDirs;
 }
 
 bool CProjectManager::SaveDshNodePath(const QString& a_sPath) {
@@ -1983,13 +2103,73 @@ bool CProjectManager::SaveExpertAssistant(bool a_bOn) {
 }
 
 bool CProjectManager::LoadExpertAssistant() const {
-    // 无 config.ini/缺键 → 默认启用（1）；0=手工禁用。
+    // 无 config.ini/缺键 → 默认关闭（0，2026.09.26 用户定稿：深度链耗 token，须显式启用）；
+    //   1=手工启用。已有 config.ini 存了 1 的老用户不受影响（显式记录优先）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Adhoc", L"ExpertAssistant", 0, wsPath.c_str()) != 0;
+}
+
+int CProjectManager::LoadExpertRestarts() const {
+    // 2026.09.26 专家助手深度链重启上限：无 config.ini/缺键 → 默认 1（重启一次）；
+    //   韩位 0..5（0=不自动重启）。读即时生效，无需重启。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 1;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return qBound(0, static_cast<int>(GetPrivateProfileIntW(
+        L"Adhoc", L"ExpertRestarts", 1, wsPath.c_str())), 5);
+}
+
+bool CProjectManager::SaveAdhocMaxTurns(int a_iN) {
+    // 2026.09.23 落 [Adhoc] MaxTurns（助手单轮执行 --max-turns；默认 40，合法 10..200）。
+    //   助手做大型多文件重构时 40 轮常打满（LayoutDesign 实测 12 问 11 次触顶），
+    //   允许用户按工程工作量放大；每条提问仍受自动续跑 2 次兜底，不会无限跑。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Adhoc", L"MaxTurns",
+        QString::number(qBound(10, a_iN, 200)).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadAdhocMaxTurns() const {
+    // 无 config.ini/缺键 → 默认 40；非法值（<10 或 >200）兜底回 40。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 40;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iN = GetPrivateProfileIntW(L"Adhoc", L"MaxTurns", 40, wsPath.c_str());
+    return (iN >= 10 && iN <= 200) ? iN : 40;
+}
+
+bool CProjectManager::SaveAdhocMaxTurnsAuto(bool a_bOn) {
+    // 2026.09.23 v3.0.219 落 [Adhoc] MaxTurnsAuto（1=按提示词难度自动上调轮次，0=恒用基值）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Adhoc", L"MaxTurnsAuto",
+        QString::number(a_bOn ? 1 : 0).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadAdhocMaxTurnsAuto() const {
+    // 无 config.ini/缺键 → 默认开（难度评估是零成本纯启发式，缺省受益）；0=恒用基值。
     const QString sPath = SettingsCfgPath();
     if (sPath.isEmpty()) {
         return true;
     }
     const std::wstring wsPath = sPath.toStdWString();
-    return GetPrivateProfileIntW(L"Adhoc", L"ExpertAssistant", 1, wsPath.c_str()) != 0;
+    return GetPrivateProfileIntW(L"Adhoc", L"MaxTurnsAuto", 1, wsPath.c_str()) != 0;
 }
 
 bool CProjectManager::SaveAdhocContextLimit(qint64 a_iLimit) {
@@ -2042,7 +2222,9 @@ bool MirrorTree(const QString& a_sSrc, const QString& a_sDst, const QStringList&
         return false;
     }
     // 子目录：跳过排除清单（仅顶层一级生效——排除 .autodev 即整树跳过，防递归）。
-    const QStringList aDirs = stSrc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    //   NoSymLinks：防 junction/symlink 环无限递归（CAS 扫描器同款防护）。
+    const QStringList aDirs = stSrc.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
     for (const QString& sSub : aDirs) {
         if (a_aExclude.contains(sSub, Qt::CaseInsensitive)) {
             continue;
@@ -2052,7 +2234,7 @@ bool MirrorTree(const QString& a_sSrc, const QString& a_sDst, const QStringList&
         }
     }
     // 文件拷贝
-    const QStringList aFiles = stSrc.entryList(QDir::Files);
+    const QStringList aFiles = stSrc.entryList(QDir::Files | QDir::NoSymLinks);
     for (const QString& sFile : aFiles) {
         const QString sSrcPath = stSrc.filePath(sFile);
         const QString sDstPath = QDir(a_sDst).filePath(sFile);
@@ -2079,7 +2261,7 @@ bool RemoveTree(const QString& a_sPath) {
 // —— zstd 逐文件压缩 / 解压（#2，备份体积优化）——
 // 读源文件全部字节 → ZSTD 压缩/解压 → 写目标。任一 IO 或 zstd 错误返回 false。
 bool ZstdCompressFile(const QString& a_sSrc, const QString& a_sDst) {
-    QFile stSrc(a_sSrc);
+    CFrwDevice stSrc(a_sSrc);
     if (!stSrc.open(QIODevice::ReadOnly)) {
         return false;
     }
@@ -2110,7 +2292,7 @@ bool ZstdCompressFile(const QString& a_sSrc, const QString& a_sDst) {
 }
 
 bool ZstdDecompressFile(const QString& a_sSrc, const QString& a_sDst) {
-    QFile stSrc(a_sSrc);
+    CFrwDevice stSrc(a_sSrc);
     if (!stSrc.open(QIODevice::ReadOnly)) {
         return false;
     }
@@ -2168,7 +2350,8 @@ bool CompressTree(const QString& a_sSrc, const QString& a_sDst, const QStringLis
     if (!QDir().mkpath(a_sDst)) {
         return false;
     }
-    const QStringList aDirs = stSrc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    const QStringList aDirs = stSrc.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
     for (const QString& sSub : aDirs) {
         if (a_aExclude.contains(sSub, Qt::CaseInsensitive)) {
             continue;
@@ -2177,7 +2360,7 @@ bool CompressTree(const QString& a_sSrc, const QString& a_sDst, const QStringLis
             return false;
         }
     }
-    const QStringList aFiles = stSrc.entryList(QDir::Files);
+    const QStringList aFiles = stSrc.entryList(QDir::Files | QDir::NoSymLinks);
     for (const QString& sFile : aFiles) {
         const QString sSrcPath = stSrc.filePath(sFile);
         const QString sDstPath = QDir(a_sDst).filePath(sFile + QStringLiteral(".zst"));
@@ -2198,14 +2381,15 @@ bool RestoreTreeLegacy(const QString& a_sSrc, const QString& a_sDst) {
     if (!QDir().mkpath(a_sDst)) {
         return false;
     }
-    const QStringList aDirs = stSrc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    const QStringList aDirs = stSrc.entryList(
+        QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
     for (const QString& sSub : aDirs) {
         if (!RestoreTreeLegacy(stSrc.filePath(sSub), QDir(a_sDst).filePath(sSub))) {
             return false;
         }
     }
     const QString sZst = QStringLiteral(".zst");
-    const QStringList aFiles = stSrc.entryList(QDir::Files);
+    const QStringList aFiles = stSrc.entryList(QDir::Files | QDir::NoSymLinks);
     for (const QString& sFile : aFiles) {
         const QString sSrcPath = stSrc.filePath(sFile);
         const bool bCompressed = sFile.endsWith(sZst, Qt::CaseInsensitive);
@@ -2249,6 +2433,45 @@ bool CProjectManager::SaveBackupExcludeDirs(const QString& a_sDirs) {
     WritePrivateProfileStringW(L"Backup", L"ExcludeDirs",
         a_sDirs.toStdWString().c_str(), wsPath.c_str());
     return true;
+}
+
+// —— 2026.09.23 资源管理器显示隐藏目录（[Explorer] HiddenDirs）——
+
+QString CProjectManager::DefaultExplorerHiddenDirs() {
+    // 内置默认：常见生成目录不进树（单点维护；面板构造/设置页预填同源）。
+    return QStringLiteral("build,.git,.vs,node_modules");
+}
+
+bool CProjectManager::SaveExplorerHiddenDirs(const QString& a_sDirs) {
+    // 落 [Explorer] HiddenDirs（保存的是全量清单——设置页预填生效清单后整写；
+    //   空串=写空值→全可见。与缺键（回退内置默认）区分）。失败不抛。
+    //   注意用全局 ConfigFilePath 而非 SettingsCfgPath——显示偏好属界面态，
+    //   不参与任务级覆盖（同 Recent/UI/Layout 口径）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Explorer", L"HiddenDirs",
+        a_sDirs.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadExplorerHiddenDirs() const {
+    // 读 [Explorer] HiddenDirs：缺键 → 内置默认（GetPrivateProfileStringW 缺键返回
+    //   lpDefault、键存在值为空返回空串——两种情形天然区分）；有值 → 显式清单原文
+    //   （设置页预填它，用户删哪项哪项可见）。无 config.ini 同缺键。
+    //   读全局 ConfigFilePath（界面态不随任务覆盖，见 Save 注）。
+    const QString sPath = ConfigFilePath();
+    const std::wstring wsDefault = DefaultExplorerHiddenDirs().toStdWString();
+    if (sPath.isEmpty()) {
+        return DefaultExplorerHiddenDirs();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[1024] = { 0 };
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"Explorer", L"HiddenDirs", wsDefault.c_str(), szBuf, 1024, wsPath.c_str());
+    return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
 }
 
 QStringList CProjectManager::BackupExcludeDirs() const {
@@ -2343,7 +2566,7 @@ bool CProjectManager::SetBackupSummary(const QString& a_sTaskId, int a_iSeq,
     }
     const QString sMetaPath = QDir(BackupsDir(a_sTaskId))
         .filePath(FormatSeq(a_iSeq) + QStringLiteral(".meta.json"));
-    QFile stRead(sMetaPath);
+    CFrwDevice stRead(sMetaPath);
     if (!stRead.open(QIODevice::ReadOnly)) {
         return false;
     }
@@ -2383,7 +2606,7 @@ QList<SBackupVersion> CProjectManager::ListBackups(const QString& a_sTaskId) con
     // 扫所有 NNNN.meta.json，解析为 SBackupVersion，按序号倒序（最新在前）。
     const QStringList aMetas = stBackups.entryList({QStringLiteral("*.meta.json")}, QDir::Files);
     for (const QString& sMeta : aMetas) {
-        QFile stFile(stBackups.filePath(sMeta));
+        CFrwDevice stFile(stBackups.filePath(sMeta));
         if (!stFile.open(QIODevice::ReadOnly)) {
             continue;
         }
@@ -2483,7 +2706,7 @@ namespace {
 
 // 读 JSON 文件（自动跳 UTF-8 BOM）；失败返回空文档。
 QJsonDocument ReadJsonFile(const QString& a_sPath) {
-    QFile stFile(a_sPath);
+    CFrwDevice stFile(a_sPath);
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QJsonDocument();
     }
@@ -2502,10 +2725,14 @@ bool WriteJsonFile(const QString& a_sPath, const QJsonDocument& a_stDoc, bool a_
     if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return false;
     }
-    if (a_bBom) {
-        stFile.write("\xEF\xBB\xBF");
+    // 2026.09.28 写入校验：磁盘满/短写时残缺 JSON 会被调用方 rename 成正式档，
+    //   「tmp+rename 原子提交」形同虚设（ZstdCompressFile 已有同款校验）。
+    const QByteArray aBody = a_stDoc.toJson();
+    const QByteArray aOut = a_bBom ? QByteArray("\xEF\xBB\xBF") + aBody : aBody;
+    if (stFile.write(aOut) != aOut.size() || stFile.error() != QFile::NoError) {
+        stFile.close();
+        return false;
     }
-    stFile.write(a_stDoc.toJson());
     stFile.close();
     return true;
 }
@@ -2628,7 +2855,7 @@ int CBackupStore::Backup(const QString& a_sKind, const QString& a_sOwner,
             sHash = oHit.value(QStringLiteral("h")).toString();
         } else {
             bAnyChanged = true;
-            QFile stF(sAbs);
+            CFrwDevice stF(sAbs);
             if (!stF.open(QIODevice::ReadOnly)) {
                 return 0;
             }
@@ -2865,6 +3092,12 @@ bool CBackupStore::Restore(int a_iSeq, QString& a_sErr) {
             RemoveTree(stRoot.filePath(sSub));
         }
         for (const QString& sFile : stRoot.entryList(QDir::Files)) {
+            // 2026.09.28 补文件级谓词（与步骤①同口径）：非代码根级文件（.sln/.vcxproj/
+            //   图片等）从未入 tmp 也从不在备份 manifest 里，旧实现回滚时无差别删光，
+            //   造成不可逆数据丢失；它们留在原地不动即可（与①的「不迁移」对称）。
+            if (m_pfFileFilter && !m_pfFileFilter(sFile)) {
+                continue;
+            }
             QFile::remove(stRoot.filePath(sFile));
         }
         MirrorTree(sTmp, sRoot, QStringList());
@@ -2890,7 +3123,7 @@ bool CBackupStore::Restore(int a_iSeq, QString& a_sErr) {
                 .arg(sHash.left(12)).arg(a_iSeq);
             return false;
         }
-        QFile stCheck(sDst);
+        CFrwDevice stCheck(sDst);
         if (!stCheck.open(QIODevice::ReadOnly)) {
             fnRollback();
             a_sErr = QStringLiteral("恢复后校验读取失败：%1（工程已还原）").arg(sRel);
@@ -3062,7 +3295,7 @@ bool CBackupStore::ReadFile(int a_iSeq, const QString& a_sRelPath,
         .value(QStringLiteral("h")).toString();
     const QString sBlob = QDir(BsStoreDir(m_sBackupsRoot))
         .filePath(sHash + QStringLiteral(".zst"));
-    QFile stBlob(sBlob);
+    CFrwDevice stBlob(sBlob);
     if (!stBlob.open(QIODevice::ReadOnly)) {
         a_sErr = QStringLiteral("blob 丢失或无法读取（%1）").arg(sHash.left(12));
         return false;
@@ -3117,7 +3350,15 @@ int CBackupStore::GcOrphanBlobs() {
             QFile::remove(stStore.filePath(sTmpF));
         }
         const QStringList aBlobs = stStore.entryList({QStringLiteral("*.zst")}, QDir::Files);
+        // 2026.09.28 在途保护（与 TruncateBefore 同口径）：并发备份是 blob 先落盘、meta 后
+        //   提交，无新鲜度判定的 GC 会误删在途 blob 导致该版本 manifest 指向缺失内容。
+        //   跳过 10 分钟内落盘的 .zst，留待下轮回收。
+        const QDateTime tFreshCut = QDateTime::currentDateTime().addSecs(-600);
         for (const QString& sBlob : aBlobs) {
+            const QFileInfo stBlobFi(stStore.filePath(sBlob));
+            if (stBlobFi.lastModified() > tFreshCut) {
+                continue;   // 新鲜 blob：可能在途，本轮不回收
+            }
             if (!setUsed.contains(sBlob.left(sBlob.size() - 4))
                 && QFile::remove(stStore.filePath(sBlob))) {
                 ++iRemoved;
@@ -3125,6 +3366,165 @@ int CBackupStore::GcOrphanBlobs() {
         }
     }
     return iRemoved;
+}
+
+// 2026.09.21 基准截断（用户需求：回退历史太多时选指定记录为基准、删更早的全部记录）。
+//   架构依据：每版 manifest 全量自包含，删旧版不伤存活版可恢复性；唯一例外是同源
+//   引用版（v1.4.85，meta 无 files 仅 base 指针）——base 落在删除区间的先物化（基版
+//   files 拷入该 meta、摘除 base 键），物化失败则整体拒绝不动盘（保持库一致）。
+bool CBackupStore::TruncateBefore(int a_iBaseSeq, bool a_bDryRun,
+                                  int& a_iDeletedVersions, int& a_iDeletedBlobs,
+                                  qint64& a_iFreedBytes, QString& a_sErr) {
+    a_iDeletedVersions = 0;
+    a_iDeletedBlobs = 0;
+    a_iFreedBytes = 0;
+    a_sErr.clear();
+    if (a_iBaseSeq <= 0) {
+        a_sErr = QStringLiteral("基准版本号无效");
+        return false;
+    }
+    const QDir stRoot(m_sBackupsRoot);
+    if (!stRoot.exists()) {
+        a_sErr = QStringLiteral("备份库不存在");
+        return false;
+    }
+    if (!QFile::exists(BsMetaPath(m_sBackupsRoot, a_iBaseSeq))) {
+        a_sErr = QStringLiteral("基准版本 #%1 不存在（可能已被清理）").arg(a_iBaseSeq);
+        return false;
+    }
+    // 安全阀：待恢复现场（notice pending）时禁止截断——还原流程可能正要按老 seq 读内容。
+    {
+        int iDummySeq = 0;
+        QString sDummyOwner;
+        if (LoadPendingNotice(iDummySeq, sDummyOwner)) {
+            a_sErr = QStringLiteral("有待恢复的回退现场（notice），请先完成或放弃还原再截断");
+            return false;
+        }
+    }
+    // 1) 全量扫描 meta → 内存快照（删除前解析引用链——磁盘版 BsResolveFiles 删后就断）。
+    const QStringList aMetaNames = stRoot.entryList({QStringLiteral("*.meta.json")}, QDir::Files);
+    QMap<int, QString> mapFiles;      // seq → 文件名
+    QMap<int, QJsonObject> mapMetas;  // seq → meta 对象
+    for (const QString& sName : aMetaNames) {
+        const int iDot = sName.indexOf(QLatin1Char('.'));
+        bool bOk = false;
+        const int iSeq = (iDot > 0 ? sName.left(iDot) : sName).toInt(&bOk);
+        if (!bOk || iSeq <= 0) {
+            continue;
+        }
+        mapFiles.insert(iSeq, sName);
+        mapMetas.insert(iSeq, ReadJsonFile(stRoot.filePath(sName)).object());
+    }
+    // 内存版 files 解析（同 BsResolveFiles 语义：base 链 ≤8 跳）。
+    std::function<QJsonObject(int)> fnResolve = [&](int a_iSeq) -> QJsonObject {
+        QJsonObject o = mapMetas.value(a_iSeq);
+        for (int iHop = 0; iHop < 8 && o.contains(QStringLiteral("base")); ++iHop) {
+            o = mapMetas.value(o.value(QStringLiteral("base")).toInt());
+        }
+        return o.value(QStringLiteral("files")).toObject();
+    };
+    // 2) 存活引用版物化判定：base 在删除区间（seq < 基准）→ 需物化为自包含实版。
+    QList<int> aMaterialize;
+    for (auto it = mapMetas.constBegin(); it != mapMetas.constEnd(); ++it) {
+        const int iSeq = it.key();
+        if (iSeq >= a_iBaseSeq && it.value().contains(QStringLiteral("base"))
+            && !it.value().contains(QStringLiteral("files"))) {
+            if (it.value().value(QStringLiteral("base")).toInt() < a_iBaseSeq) {
+                aMaterialize.append(iSeq);
+            }
+        }
+    }
+    // 3) 删除区间统计（meta 字节数先量后删）。
+    qint64 iMetaBytes = 0;
+    int iDelCount = 0;
+    for (auto it = mapMetas.constBegin(); it != mapMetas.constEnd(); ++it) {
+        if (it.key() < a_iBaseSeq) {
+            iMetaBytes += QFileInfo(stRoot.filePath(mapFiles.value(it.key()))).size();
+            ++iDelCount;
+        }
+    }
+    if (iDelCount == 0) {
+        a_sErr = QStringLiteral("没有比 #%1 更早的记录").arg(a_iBaseSeq);
+        return false;   // 无事可做（UI 侧本就不该出菜单）
+    }
+    // 4) 孤儿 blob 统计：存活区间（物化后）引用并集之外的 blob。新鲜 blob（10 分钟内
+    //    写入）跳过——并发备份是 blob 先落盘、meta 后提交，GC 会误删在途内容。
+    QSet<QString> setUsed;
+    for (auto it = mapMetas.constBegin(); it != mapMetas.constEnd(); ++it) {
+        if (it.key() >= a_iBaseSeq) {
+            const QJsonObject oFiles = fnResolve(it.key());
+            for (auto itF = oFiles.begin(); itF != oFiles.end(); ++itF) {
+                setUsed.insert(itF.value().toObject().value(QStringLiteral("h")).toString());
+            }
+        }
+    }
+    qint64 iBlobBytes = 0;
+    QList<QString> aRemoveBlobs;
+    const QDir stStore(BsStoreDir(m_sBackupsRoot));
+    if (stStore.exists()) {
+        const QDateTime tFreshCut = QDateTime::currentDateTime().addSecs(-600);
+        const QStringList aBlobs = stStore.entryList({QStringLiteral("*.zst")}, QDir::Files);
+        for (const QString& sBlob : aBlobs) {
+            if (setUsed.contains(sBlob.left(sBlob.size() - 4))) {
+                continue;
+            }
+            const QFileInfo stFi(stStore.filePath(sBlob));
+            if (stFi.lastModified() > tFreshCut) {
+                continue;   // 在途保护：本轮不动，下次截断/GC 再收
+            }
+            iBlobBytes += stFi.size();
+            aRemoveBlobs.append(sBlob);
+        }
+    }
+    a_iDeletedVersions = iDelCount;
+    a_iDeletedBlobs = aRemoveBlobs.size();
+    a_iFreedBytes = iMetaBytes + iBlobBytes;
+    if (a_bDryRun) {
+        return true;   // 预估模式：不动盘（引用版物化留给正式执行）
+    }
+    // 5) 物化存活引用版（删除前置；任一失败 → 整体拒绝，库保持原状）。
+    for (const int iSeq : aMaterialize) {
+        const QJsonObject oResolved = fnResolve(iSeq);
+        if (oResolved.isEmpty()) {
+            a_sErr = QStringLiteral("引用版 #%1 的基版内容解析失败，已中止（此前已物化的引用版内容等价，不影响库一致性）")
+                         .arg(iSeq);
+            return false;
+        }
+        QJsonObject o = mapMetas.value(iSeq);
+        o.remove(QStringLiteral("base"));
+        o[QStringLiteral("files")] = oResolved;
+        const QString sFinal = BsMetaPath(m_sBackupsRoot, iSeq);
+        const QString sTmpF = sFinal + QStringLiteral(".tmp");
+        if (!WriteJsonFile(sTmpF, QJsonDocument(o), m_bBom)
+            || !QFile::remove(sFinal)          // 引用版 meta 已存在：先删后 rename（同 SetMetaField）
+            || !QFile::rename(sTmpF, sFinal)) {
+            QFile::remove(sTmpF);
+            a_sErr = QStringLiteral("引用版 #%1 物化失败，已中止（此前已物化的引用版内容等价，不影响库一致性）")
+                         .arg(iSeq);
+            return false;
+        }
+    }
+    // 6) 删除旧 meta + 孤儿 blob（统计实际删除数——完成提示「删了多少文件」用）。
+    int iDeleted = 0;
+    for (auto it = mapMetas.constBegin(); it != mapMetas.constEnd(); ++it) {
+        if (it.key() < a_iBaseSeq
+            && QFile::remove(stRoot.filePath(mapFiles.value(it.key())))) {
+            ++iDeleted;
+        }
+    }
+    int iBlobsRemoved = 0;
+    for (const QString& sBlob : aRemoveBlobs) {
+        if (QFile::remove(stStore.filePath(sBlob))) {
+            ++iBlobsRemoved;
+        }
+    }
+    a_iDeletedBlobs = iBlobsRemoved;
+    if (iDeleted < iDelCount) {
+        a_sErr = QStringLiteral("部分旧记录删除失败（%1/%2），可重试")
+                     .arg(iDeleted).arg(iDelCount);
+        return false;
+    }
+    return true;
 }
 
 bool CBackupStore::HasRestoreTmp() const {
@@ -3217,6 +3617,12 @@ bool IsCodeRelatedFile(const QString& a_sRel) {
         QStringLiteral("h++"), QStringLiteral("inl"), QStringLiteral("ipp"),
         QStringLiteral("tpp"), QStringLiteral("qml"), QStringLiteral("ui"),
         QStringLiteral("qrc"), QStringLiteral("pro"), QStringLiteral("pri"),
+        // 2026.09.28 VS 工程文件（qmake 的 pro/pri 在列而 sln/vcxproj 缺席——本程序管
+        //   理的正是 VS/Qt 工程，缺了它们回退时工程文件与源码版本错配）。二进制缓存
+        //   （suo/ncb/aps 等）不入列。
+        QStringLiteral("sln"), QStringLiteral("vcxproj"),
+        QStringLiteral("filters"), QStringLiteral("props"),
+        QStringLiteral("vcproj"), QStringLiteral("vsproj"),
         // 脚本与其他语言
         QStringLiteral("cs"), QStringLiteral("java"), QStringLiteral("kt"),
         QStringLiteral("kts"), QStringLiteral("scala"), QStringLiteral("swift"),
@@ -3368,6 +3774,16 @@ int CProjectManager::GcOrphanBlobs() {
     return BackupStore()->GcOrphanBlobs();
 }
 
+// 2026.09.21 基准截断（转发 PortableCore）。
+bool CProjectManager::TruncateUnifiedBefore(int a_iBaseSeq, bool a_bDryRun,
+                                            int& a_iDeletedVersions,
+                                            int& a_iDeletedBlobs,
+                                            qint64& a_iFreedBytes, QString& a_sErr) {
+    return BackupStore()->TruncateBefore(a_iBaseSeq, a_bDryRun,
+                                         a_iDeletedVersions, a_iDeletedBlobs,
+                                         a_iFreedBytes, a_sErr);
+}
+
 bool CProjectManager::HasRestoreTmp() const {
     return BackupStore()->HasRestoreTmp();
 }
@@ -3390,4 +3806,111 @@ void CProjectManager::ClearPendingNotice() {
 
 bool CProjectManager::SetUnifiedSummary(int a_iSeq, const QString& a_sSummary) {
     return BackupStore()->SetMetaField(a_iSeq, QStringLiteral("summary"), a_sSummary.left(300));
+}
+
+// —— 内置测试沙箱（2026-09-26，[Sandbox] 全局键：界面态/能力开关，不随任务覆盖）——
+// 统一口径：Save 写 ConfigFilePath（全局）；Load 读同一路径，缺键/非法值回默认。
+bool CProjectManager::SaveSandboxEnable(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"Enable",
+        a_bOn ? L"1" : L"0", wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxEnable() const {
+    // 无 config.ini / 缺键 → 默认开（1）；仅认 0 为关。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    return GetPrivateProfileIntW(L"Sandbox", L"Enable", 1,
+                                 sPath.toStdWString().c_str()) != 0;
+}
+
+bool CProjectManager::SaveSandboxAutoGhost(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"AutoGhost",
+        a_bOn ? L"1" : L"0", wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxAutoGhost() const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    return GetPrivateProfileIntW(L"Sandbox", L"AutoGhost", 1,
+                                 sPath.toStdWString().c_str()) != 0;
+}
+
+bool CProjectManager::SaveSandboxRecord(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"Record",
+        a_bOn ? L"1" : L"0", wsPath.c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxRecord() const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    return GetPrivateProfileIntW(L"Sandbox", L"Record", 0,
+                                 sPath.toStdWString().c_str()) != 0;
+}
+
+bool CProjectManager::SaveSandboxFps(int a_iFps) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"Fps",
+        QString::number(qBound(1, a_iFps, 15)).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadSandboxFps() const {
+    // 无 config.ini / 缺键 → 默认 5；非法值（<1 或 >15）兜底回 5。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return 5;
+    }
+    const int iFps = GetPrivateProfileIntW(L"Sandbox", L"Fps", 5,
+                                           sPath.toStdWString().c_str());
+    return (iFps >= 1 && iFps <= 15) ? iFps : 5;
+}
+
+bool CProjectManager::SaveSandboxRetainDays(int a_iDays) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"RetainDays",
+        QString::number(qBound(1, a_iDays, 365)).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadSandboxRetainDays() const {
+    // 无 config.ini / 缺键 → 默认 7；非法值（<1 或 >365）兜底回 7。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return 7;
+    }
+    const int iDays = GetPrivateProfileIntW(L"Sandbox", L"RetainDays", 7,
+                                            sPath.toStdWString().c_str());
+    return (iDays >= 1 && iDays <= 365) ? iDays : 7;
 }

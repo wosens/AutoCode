@@ -7,7 +7,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
-#include <new>
+#include <exception>   // std::set_terminate（<new> 未用且非权威头）
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -40,39 +40,44 @@ bool MakeDumpPath(char a_szOut[MAX_PATH]) {
 
 // dump 只保最新 30 份：按名字（含时间戳，字典序=时间序）降序清多余的。
 void PruneOldDumps(const char* a_pszDir) {
-    WIN32_FIND_DATAA fd;
-    char pattern[MAX_PATH];
-    std::snprintf(pattern, MAX_PATH, "%s\\AutoCode_*.dmp", a_pszDir);
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) {
+    WIN32_FIND_DATAA fdFind;
+    char szPattern[MAX_PATH];
+    std::snprintf(szPattern, MAX_PATH, "%s\\AutoCode_*.dmp", a_pszDir);
+    HANDLE hFind = FindFirstFileA(szPattern, &fdFind);
+    if (hFind == INVALID_HANDLE_VALUE) {
         return;
     }
-    char names[30][64];   // 排序前先收集，再统一删（不能边枚举边删）
-    int n = 0;
+    // 收集上限须大于保留数（kDumpKeep），否则下方 i>=kDumpKeep 的删除段不可达（历史缺陷：
+    //   names[30]+n<30 封顶致清理永不执行，dump 目录无限增长）。
+    constexpr int kDumpKeep = 30;      // 保留份数
+    constexpr int kScanMax  = 128;     // 单轮收集上限（防超长目录一次占爆栈）
+    static_assert(kScanMax > kDumpKeep, "collect cap must exceed keep count");
+    char aszNames[kScanMax][64];   // 排序前先收集，再统一删（不能边枚举边删）
+    int iCount = 0;
     do {
-        if (n < 30) {
-            std::strncpy(names[n], fd.cFileName, 63);
-            names[n][63] = '\0';
-            ++n;
+        if (iCount < kScanMax) {
+            std::strncpy(aszNames[iCount], fdFind.cFileName, 63);
+            aszNames[iCount][63] = '\0';
+            ++iCount;
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    } while (FindNextFileA(hFind, &fdFind));
+    FindClose(hFind);
 
     // 简单降序（名字含时间戳，字典序即时间序）。
-    for (int i = 0; i < n; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            if (std::strcmp(names[j], names[i]) > 0) {
-                char tmp[64];
-                std::strcpy(tmp, names[i]);
-                std::strcpy(names[i], names[j]);
-                std::strcpy(names[j], tmp);
+    for (int i = 0; i < iCount; ++i) {
+        for (int j = i + 1; j < iCount; ++j) {
+            if (std::strcmp(aszNames[j], aszNames[i]) > 0) {
+                char szTmp[64];
+                std::strcpy(szTmp, aszNames[i]);
+                std::strcpy(aszNames[i], aszNames[j]);
+                std::strcpy(aszNames[j], szTmp);
             }
         }
     }
-    for (int i = 30; i < n; ++i) {   // 越界的（更旧）删除
-        char full[MAX_PATH];
-        std::snprintf(full, MAX_PATH, "%s\\%s", a_pszDir, names[i]);
-        DeleteFileA(full);
+    for (int i = kDumpKeep; i < iCount; ++i) {   // 越界的（更旧）删除
+        char szFull[MAX_PATH];
+        std::snprintf(szFull, MAX_PATH, "%s\\%s", a_pszDir, aszNames[i]);
+        DeleteFileA(szFull);
     }
 }
 

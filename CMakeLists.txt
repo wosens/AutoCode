@@ -77,6 +77,8 @@ qt_add_executable(AutoCode WIN32
     ui/CTaskListPanel.cpp
     ui/CExecutionPanel.h
     ui/CExecutionPanel.cpp
+    ui/CAsstTabBar.h
+    ui/CAsstTabBar.cpp
     ui/CTitleBar.h
     ui/CTitleBar.cpp
     ui/CArtifactView.h
@@ -93,6 +95,8 @@ qt_add_executable(AutoCode WIN32
     ui/CMessageBlock.cpp
     ui/CRecentProjectsDialog.h
     ui/CRecentProjectsDialog.cpp
+    ui/CRecentChipsPanel.h
+    ui/CRecentChipsPanel.cpp
     ui/CAskUserDialog.h
     ui/CAskUserDialog.cpp
     ui/CNewTaskDialog.h
@@ -118,6 +122,23 @@ qt_add_executable(AutoCode WIN32
     db/CTaskHistoryDB.cpp
     sqlite3.h
     sqlite3.c
+    # 内置测试沙箱（2026-09-26）：Agent 后代窗口自动幽灵化收纳 + 消息级操控 +
+    # MP4 录像（MF H264）+ 管理对话框；MCP 工具/CLI 统一入口见 CSandboxManager
+    sandbox/CSandboxCore.h
+    sandbox/CSandboxCore.cpp
+    sandbox/CSandboxManager.h
+    sandbox/CSandboxManager.cpp
+    sandbox/CSandboxRecorder.h
+    sandbox/CSandboxRecorder.cpp
+    sandbox/CSandboxDialog.h
+    sandbox/CSandboxDialog.cpp
+    # 2026-09-30 代码审查接入（ReviewSdk.dll 动态加载 + 异步审查服务 + 右键审查对话框）
+    review/CReviewSdkClient.h
+    review/CReviewSdkClient.cpp
+    review/CReviewService.h
+    review/CReviewService.cpp
+    ui/CCodeReviewDialog.h
+    ui/CCodeReviewDialog.cpp
     # FR-10 应用图标资源：.qrc（经 AUTORCC 编入，运行期 QIcon(":/icons/app.ico")）
     # 与 .rc（Windows exe 资源图标，资源管理器显示）。
     resources/app.qrc
@@ -147,11 +168,27 @@ target_include_directories(AutoCode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/project
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${CMAKE_CURRENT_SOURCE_DIR}/db
+    ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
+    ${CMAKE_CURRENT_SOURCE_DIR}/review   # 2026-09-30 ReviewSdk 接入
     ${ZSTD_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/gen   # AutoCodeVersion.h（PRE_BUILD 生成，见下方版本号段）
 )
 
-target_link_libraries(AutoCode PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network dwmapi ${ZSTD_LIB})
+target_link_libraries(AutoCode PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network dwmapi Shell32 mfplat mfreadwrite mfuuid ole32 ${ZSTD_LIB} frwdevice)
+
+# ---- fileread.dll 适配层（2026.09.13 文件读取统一走 fileread.dll，用户指令）----
+# CFrwDevice（QIODevice 适配器）：open→FRW_OpenW / readData→FRW_Read / close→FRW_Close，
+# 三件套 fileread.dll+code.exe+filereadwrite.h 位于 third_party/fileread（动态加载免 .lib）。
+# 缺失/失效时兜底 QFile 直读；无 Q_OBJECT 无需 moc。所有编译生产 .cpp（含已改读点）的
+# 目标均需链接本库（静态库自带 include 目录，frwreadwrite.h 仅被库自身包含）。
+add_library(frwdevice STATIC
+    core/CFrwDevice.h
+    core/CFrwDevice.cpp
+)
+target_include_directories(frwdevice PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/include
+)
+target_link_libraries(frwdevice PUBLIC Qt6::Core)
 
 # ---- 三段式版本号 v主.次.编译号（如 v1.1.38）----
 # 2026.08.24 起按 %USERPROFILE%\.claude\CLAUDE.md「Version Number」规则：
@@ -269,7 +306,7 @@ target_include_directories(test_projectmanager PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_projectmanager PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_projectmanager PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
 set_target_properties(test_projectmanager PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -280,8 +317,14 @@ add_test(NAME test_projectmanager COMMAND test_projectmanager)
 # 「+」占位页的 currentChanged 再入。GUI 测试（QWidget）。
 qt_add_executable(test_execpanel
     tests/test_execpanel.cpp
+    ui/CRecentProjectsDialog.h
+    ui/CRecentProjectsDialog.cpp
+    ui/CRecentChipsPanel.h
+    ui/CRecentChipsPanel.cpp
     ui/CExecutionPanel.h
     ui/CExecutionPanel.cpp
+    ui/CAsstTabBar.h
+    ui/CAsstTabBar.cpp
     ui/CAskUserDialog.h
     ui/CAskUserDialog.cpp
     ui/CMessageView.h
@@ -314,7 +357,7 @@ target_include_directories(test_execpanel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
 )
-target_link_libraries(test_execpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_execpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
 set_target_properties(test_execpanel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -330,6 +373,12 @@ qt_add_executable(test_tasklistpanel
     ui/CTaskListPanel.cpp
     ui/CProjectExplorerPanel.h
     ui/CProjectExplorerPanel.cpp
+    sandbox/CSandboxCore.h
+    sandbox/CSandboxCore.cpp
+    sandbox/CSandboxManager.h
+    sandbox/CSandboxManager.cpp
+    sandbox/CSandboxRecorder.h
+    sandbox/CSandboxRecorder.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/TaskTypes.h
@@ -340,8 +389,9 @@ target_include_directories(test_tasklistpanel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
 )
-target_link_libraries(test_tasklistpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test)
+target_link_libraries(test_tasklistpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test Shell32 dwmapi mfplat mfreadwrite mfuuid ole32 frwdevice)
 set_target_properties(test_tasklistpanel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -368,7 +418,7 @@ target_include_directories(test_historydb PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/db
 )
-target_link_libraries(test_historydb PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(test_historydb PRIVATE Qt6::Core Qt6::Test frwdevice)
 set_target_properties(test_historydb PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -383,15 +433,68 @@ qt_add_executable(test_verify_flow
     core/CStageMachine.h
     core/CStageMachine.cpp
     core/TaskTypes.h
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+    core/CModelEntry.h
     project/CGuideFingerprintScanner.h
     project/CGuideFingerprintScanner.cpp
+    # 2026.09.19 后端切换清会话链回归（testBackendSwitchClearsSessions）需要完整编排器：
+    #   CTaskOrchestrator + CProjectManager + 五 Runner + db（同 test_orchpi 依赖面，
+    #   但本目标挂 ctest 自动跑——纯离线构造，不碰真机 pi/spark）。
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CMcpAskServer.h
+    agent/CMcpAskServer.cpp
+    orch/CTaskOrchestrator.h
+    orch/CTaskOrchestrator.cpp
+    # 2026-09-30 编排器新增 ReviewSdk 预审依赖（同 AutoCode 目标；无 dll 时预审自动跳过）
+    review/CReviewSdkClient.h
+    review/CReviewSdkClient.cpp
+    review/CReviewService.h
+    review/CReviewService.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    db/CTaskHistoryDB.h
+    db/CTaskHistoryDB.cpp
+    sqlite3.h
+    sqlite3.c
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
 )
 target_include_directories(test_verify_flow PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/orch
+    ${CMAKE_CURRENT_SOURCE_DIR}/review
+    ${CMAKE_CURRENT_SOURCE_DIR}/db
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_verify_flow PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(test_verify_flow PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Widgets Qt6::Test ${ZSTD_LIB} frwdevice)
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES LANGUAGE C COMPILE_FLAGS "/W0")
+endif()
 set_target_properties(test_verify_flow PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -413,7 +516,7 @@ target_include_directories(test_record_verify PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/core
 )
-target_link_libraries(test_record_verify PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(test_record_verify PRIVATE Qt6::Core Qt6::Test frwdevice)
 set_target_properties(test_record_verify PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -462,7 +565,7 @@ target_include_directories(test_rollback PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_rollback PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_rollback PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
 set_target_properties(test_rollback PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -490,7 +593,7 @@ target_include_directories(import_tasks PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/db
 )
-target_link_libraries(import_tasks PRIVATE Qt6::Core)
+target_link_libraries(import_tasks PRIVATE Qt6::Core frwdevice)
 set_target_properties(import_tasks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -528,6 +631,11 @@ qt_add_executable(test_orchpi
     agent/CMcpAskServer.cpp
     orch/CTaskOrchestrator.h
     orch/CTaskOrchestrator.cpp
+    # 2026-09-30 编排器新增 ReviewSdk 预审依赖（同 AutoCode 目标；无 dll 时预审自动跳过）
+    review/CReviewSdkClient.h
+    review/CReviewSdkClient.cpp
+    review/CReviewService.h
+    review/CReviewService.cpp
     project/CProjectManager.h
     project/CProjectManager.cpp
     project/CGuideFingerprintScanner.h
@@ -551,17 +659,19 @@ target_include_directories(test_orchpi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
     ${CMAKE_CURRENT_SOURCE_DIR}/orch
     ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${CMAKE_CURRENT_SOURCE_DIR}/review
     ${CMAKE_CURRENT_SOURCE_DIR}/db
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_orchpi PRIVATE Qt6::Core Qt6::Network Qt6::Widgets ${ZSTD_LIB})
+target_link_libraries(test_orchpi PRIVATE Qt6::Core Qt6::Network Qt6::Widgets ${ZSTD_LIB} frwdevice)
 if(MSVC)
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/sqlite3.c PROPERTIES LANGUAGE C COMPILE_FLAGS "/W0")
 endif()
 set_target_properties(test_orchpi PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
+
 qt_add_executable(test_dshrunner
     tests/test_dshrunner.cpp
     agent/CClaudeRunner.h
@@ -575,7 +685,7 @@ target_include_directories(test_dshrunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
 )
-target_link_libraries(test_dshrunner PRIVATE Qt6::Core Qt6::Network)
+target_link_libraries(test_dshrunner PRIVATE Qt6::Core Qt6::Network frwdevice)
 set_target_properties(test_dshrunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -591,6 +701,26 @@ add_custom_command(TARGET test_dshrunner POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/cordis.autocode.yml"
         "$<TARGET_FILE_DIR:test_dshrunner>/dsh/cordis.autocode.yml"
     COMMENT "Sync DSH overlays to test_dshrunner dir"
+)
+
+# ---- 集成测试（CClaudeRunner：联网真实调用本机 claude CLI + 配置网关，不挂 ctest）----
+# 手动跑: Execute/test_clauderunner.exe（2026.09.23 v3.1.225 修复回归锚：GLM 网关
+#   assistant 帧 usage 全 0，上下文占用只能来自 message_delta 兜底——断言运行中
+#   sigContextFill(>0) 必达 + 收尾 LastContextFill/LastModel 非空）。
+qt_add_executable(test_clauderunner
+    tests/test_clauderunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+)
+target_include_directories(test_clauderunner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+)
+target_link_libraries(test_clauderunner PRIVATE Qt6::Core Qt6::Network frwdevice)
+set_target_properties(test_clauderunner PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 
 # ---- Pi 后端离线单元测试（不联网，挂 ctest）----
@@ -616,7 +746,7 @@ target_include_directories(test_pirunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
 )
-target_link_libraries(test_pirunner PRIVATE Qt6::Core Qt6::Network)
+target_link_libraries(test_pirunner PRIVATE Qt6::Core Qt6::Network frwdevice)
 add_test(NAME test_pirunner COMMAND test_pirunner)
 
 # ---- 后端版本管理纯函数离线单元测试（不联网不弹窗，挂 ctest；任务 23183ccb）----
@@ -645,7 +775,7 @@ target_include_directories(test_versiondlg PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
 )
-target_link_libraries(test_versiondlg PRIVATE Qt6::Core Qt6::Network Qt6::Widgets)
+target_link_libraries(test_versiondlg PRIVATE Qt6::Core Qt6::Network Qt6::Widgets frwdevice)
 add_test(NAME test_versiondlg COMMAND test_versiondlg)
 
 # ---- CodexHarness 后端离线单元测试（不联网，挂 ctest）----
@@ -671,7 +801,7 @@ target_include_directories(test_codexrunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
 )
-target_link_libraries(test_codexrunner PRIVATE Qt6::Core Qt6::Network)
+target_link_libraries(test_codexrunner PRIVATE Qt6::Core Qt6::Network frwdevice)
 add_test(NAME test_codexrunner COMMAND test_codexrunner)
 
 # ---- Hermes 第五后端离线单元测试（不联网，挂 ctest；任务 3213cdbf）----
@@ -710,16 +840,91 @@ target_include_directories(test_hermesrunner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${ZSTD_INCLUDE_DIR}
 )
-target_link_libraries(test_hermesrunner PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB})
+target_link_libraries(test_hermesrunner PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
 set_target_properties(test_hermesrunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_hermesrunner COMMAND test_hermesrunner)
+
+# ---- CFrwDevice（fileread.dll 适配器）离线单元测试（2026.09.13，不联网，挂 ctest）----
+qt_add_executable(test_frwdevice
+    tests/test_frwdevice.cpp
+)
+target_include_directories(test_frwdevice PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+target_link_libraries(test_frwdevice PRIVATE Qt6::Core Qt6::Test frwdevice)
+set_target_properties(test_frwdevice PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_frwdevice COMMAND test_frwdevice)
+
+# ---- 2026-09-30 ReviewSdk 接入回归：动态加载/元信息/mock-LLM 全链/错误码/相对路径。
+#      纯离线（canned 模型应答）；exe 同目录无 ReviewSdk.dll 时全部 QSKIP（0 通过）。
+qt_add_executable(test_reviewsdk
+    tests/test_reviewsdk.cpp
+    review/CReviewSdkClient.h
+    review/CReviewSdkClient.cpp
+)
+target_include_directories(test_reviewsdk PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/review
+)
+# 注：exe 输出到 Execute/（与 ReviewSdk.dll 同目录，运行期动态加载）。
+target_link_libraries(test_reviewsdk PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(test_reviewsdk PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+# 运行依赖：exe 同目录需 ReviewSdk.dll（多配置生成器落在 Release/ 子目录，从
+#   Execute/ 根镜像；Qt6Core.dll 依赖不镜像——与测试 exe 自身的 Qt 一并经 PATH
+#   解析，混入另一份副本会与 PATH 里的 Qt 组件版本冲突致 0xc0000409）。
+#   源不存在时静默跳过——测试制全部 QSKIP，不红。
+add_custom_command(TARGET test_reviewsdk POST_BUILD
+    COMMAND cmd /c "if exist \"${CMAKE_CURRENT_SOURCE_DIR}\\Execute\\ReviewSdk.dll\" copy /y \"${CMAKE_CURRENT_SOURCE_DIR}\\Execute\\ReviewSdk.dll\" \"$<TARGET_FILE_DIR:test_reviewsdk>\\ReviewSdk.dll\" >nul"
+    COMMENT "Mirror ReviewSdk.dll for test_reviewsdk"
+)
+add_test(NAME test_reviewsdk COMMAND test_reviewsdk)
+
+# ---- 内置沙箱测试（2026-09-26）：需要真实 Win32 窗口（幽灵化/截图/投递消息/MP4 录像），
+#      刻意不进 offscreen 清单；无窗口环境（无桌面会话）自动 QSKIP ----
+qt_add_executable(test_sandbox
+    tests/test_sandbox.cpp
+    sandbox/CSandboxCore.h
+    sandbox/CSandboxCore.cpp
+    sandbox/CSandboxManager.h
+    sandbox/CSandboxManager.cpp
+    sandbox/CSandboxRecorder.h
+    sandbox/CSandboxRecorder.cpp
+)
+target_include_directories(test_sandbox PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
+)
+target_link_libraries(test_sandbox PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test dwmapi Shell32 mfplat mfreadwrite mfuuid ole32)
+set_target_properties(test_sandbox PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_sandbox COMMAND test_sandbox)
 
 # ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
 # 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
 set_tests_properties(
     test_projectmanager test_execpanel test_tasklistpanel test_historydb test_verify_flow
     test_record_verify test_rollback test_pirunner test_versiondlg test_codexrunner
-    test_hermesrunner
+    test_hermesrunner test_frwdevice
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# ---- fileread 三件套随所有输出目录（exe 与全部测试）——CFrwDevice 运行时依赖
+#（2026.09.13 文件读取统一走 fileread.dll；dll 缺失时兜底 QFile 直读不瘫）----
+foreach(tgt AutoCode test_projectmanager test_execpanel test_tasklistpanel test_historydb
+            test_verify_flow test_record_verify test_rollback import_tasks test_orchpi
+            test_dshrunner test_pirunner test_versiondlg test_codexrunner test_hermesrunner
+            test_frwdevice test_sandbox)
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/fileread.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/code.exe"
+            "$<TARGET_FILE_DIR:${tgt}>"
+        COMMENT "Copy fileread.dll/code.exe next to ${tgt}")
+endforeach()

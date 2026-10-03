@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <!-- DeepSeekHarness：鲸（躬身鲸体 + 尾鳍 + 喷水），DeepSeek 蓝 #4D6BFE -->
+  <path d="M4 21 Q6 13 14 12 Q21 11.4 24 15 Q27 18 26 21.5 Q20 24.5 13 23.5 Q7 22.8 4 21 Z"
+        stroke="#4D6BFE" stroke-width="2.2" stroke-linejoin="round"/>
+  <path d="M24 21.5 Q27.5 20.5 29 17.5 M24 21.5 Q27.5 22.5 29 25"
+        stroke="#4D6BFE" stroke-width="2.0" stroke-linecap="round" fill="none"/>
+  <path d="M13 11.5 V8.5 M15.5 11 V7 M18 11.5 V8.5"
+        stroke="#4D6BFE" stroke-width="1.7" stroke-linecap="round"/>
+  <circle cx="9.5" cy="18" r="1.2" fill="#4D6BFE"/>
+  <path d="M3 26.5 H29" stroke="#4D6BFE" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

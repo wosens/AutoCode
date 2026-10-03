@@ -5,12 +5,19 @@
 #include <QJsonArray>
 #include <QJsonParseError>
 #include <QFile>
+#include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 CClaudeRunner::CClaudeRunner(QObject* a_pParent)
     : CAgentRunnerBase(a_pParent) {
@@ -33,6 +40,60 @@ CClaudeRunner::CClaudeRunner(QObject* a_pParent)
 
 CClaudeRunner::~CClaudeRunner() {
     Stop();
+#ifdef Q_OS_WIN
+    // 2026.09.22 KILL_ON_JOB_CLOSE 兑底：关闭 Job 句柄 → 树内仍存活的孤儿（cmd 已死
+    //   而 node 未收尾的场景）一并终结，程序退出无残留。
+    if (m_hJob != nullptr) {
+        CloseHandle(static_cast<HANDLE>(m_hJob));
+        m_hJob = nullptr;
+    }
+#endif
+}
+
+// —— 进程树整杀（2026.09.22，2d9e4c0c 教训）——
+bool CClaudeRunner::EnsureJobObject() {
+#ifdef Q_OS_WIN
+    if (m_hJob == nullptr) {
+        HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+        if (hJob == nullptr) {
+            return false;
+        }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION stInfo = {};
+        stInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                     &stInfo, sizeof(stInfo))) {
+            CloseHandle(hJob);
+            return false;
+        }
+        m_hJob = hJob;
+    }
+    // 把当前子进程（cmd.exe）挂入 Job：其子孙（node 等）全部进树，随 Job 同生共死。
+    if (m_pProc == nullptr || m_pProc->processId() == 0) {
+        return false;
+    }
+    HANDLE hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
+                               static_cast<DWORD>(m_pProc->processId()));
+    if (hProc == nullptr) {
+        return false;
+    }
+    const BOOL bOk = AssignProcessToJobObject(static_cast<HANDLE>(m_hJob), hProc);
+    CloseHandle(hProc);
+    return bOk != FALSE;
+#else
+    return false;
+#endif
+}
+
+void CClaudeRunner::KillProcessTree() {
+    // 优先整树终止（cmd+node 一锅端）；Job 不可用（创建失败/非 Windows）退回单点 kill（旧行为）。
+#ifdef Q_OS_WIN
+    if (m_hJob != nullptr && TerminateJobObject(static_cast<HANDLE>(m_hJob), 0)) {
+        return;
+    }
+#endif
+    if (m_pProc != nullptr) {
+        m_pProc->kill();
+    }
 }
 
 // —— 进程级全局配置（static：所有 runner 实例共享，主窗口启动/设置变更时写）——
@@ -188,7 +249,7 @@ QString CClaudeRunner::ResolveClaudeVersion() {
     if (sPkg.isEmpty()) {
         return QString();
     }
-    QFile stFile(sPkg);
+    CFrwDevice stFile(sPkg);
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }
@@ -257,7 +318,7 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
     //   被正常吞掉，状态机干净地属于新进程。
     if (m_pProc != nullptr && m_pProc->state() != QProcess::NotRunning) {
         if (!m_pProc->waitForFinished(5000)) {
-            m_pProc->kill();
+            KillProcessTree();   // 2026.09.22 整树终止：只杀 cmd 会泄漏 node 孤儿（2d9e4c0c）
             m_pProc->waitForFinished(3000);
         }
     }
@@ -353,10 +414,17 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
     }
     if (bMcpReady) {
         // 挂载 ask_user MCP server：claude 需向用户提问时调 mcp__autocode__ask_user。
+        // 2026-09-26 追加内置沙箱工具说明（sandbox_* 与 ask_user 同一 mcp-config 挂载，
+        //   工具常驻可见；此处点名确保 GUI 测试场景模型直接联想，不靠技能清单）。
         aArgs << QStringLiteral("--mcp-config") << m_sMcpConfigPath
               << QStringLiteral("--append-system-prompt")
               << QStringLiteral("当你需要向用户确认选择、澄清需求或在多方案间做决定时，"
-                                "调用 mcp__autocode__ask_user 工具向用户提问，不要自行假设用户意图。");
+                                "调用 mcp__autocode__ask_user 工具向用户提问，不要自行假设用户意图。"
+                                "GUI/界面测试一律用内置沙箱工具 mcp__autocode__sandbox_*："
+                                "先 sandbox_windows 列窗口，sandbox_capture 截图（PNG 路径，"
+                                "用读图工具查看），sandbox_click/type/keys 消息级操控"
+                                "（后台点击不抢焦点，不打扰用户），sandbox_tree 取控件树；"
+                                "禁止物理操控鼠标键盘。测试过程已自动录像，无需额外操作。");
     }
 
     m_pProc->setWorkingDirectory(a_sWorkDir);
@@ -380,6 +448,7 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
         return;
     }
     m_uptime.restart();
+    EnsureJobObject();   // 2026.09.22 cmd 挂入 Job（KILL_ON_JOB_CLOSE）：子孙全进树，可整杀、退出无孤儿
     // 2026.08.17 停滞检测武装：非 ask_user 调用才启用（ask_user 等用户作答可静默很久，
     //   误杀会把提问中的会话拦腰截断）。收到任何输出即重置计时（见 slotOnStdOut/StdErr）。
     m_bStallWatch = !a_bEnableAskUser;
@@ -428,6 +497,8 @@ void CClaudeRunner::RelaunchStage() {
         emit sigInfo(QStringLiteral("↻ 自动重试 claude 调用（第 %1/2 次）…").arg(m_iFastRetry));
     }
     m_buf.clear();
+    m_aStderrTail.clear();   // 2026.09.19 重拉清旧进程 stderr 尾：防下一轮失败消息拼上已死进程的
+                             //   过期报错（PixelPorter 实害：新会话进程的失败带旧 sid 的 No conversation found）
     m_sLastSubtype.clear();
     m_pProc->setWorkingDirectory(m_sLastWorkDir);
     m_pProc->start(QStringLiteral("cmd.exe"), m_aLastArgs);
@@ -459,7 +530,7 @@ void CClaudeRunner::Stop() {
     }
     m_bGraceActive = false;
     if (m_pProc && m_pProc->state() != QProcess::NotRunning) {
-        m_pProc->kill();
+        KillProcessTree();   // 2026.09.22 整树终止：cmd+node 一并终结，停止无孤儿
         m_pProc->waitForFinished(3000);
     }
 }
@@ -485,6 +556,10 @@ bool CClaudeRunner::InjectUserTurn(const QString& a_sText) {
 
 void CClaudeRunner::slotOnStdOut() {
     m_actClock.restart();   // 2026.08.17 收到输出 = 进程活着，停滞计时清零
+    // 2026.09.23 代次快照（双 result 守卫配套）：本批字节全部属于快照时刻的进程代次。
+    //   批内 result#1 可能同步触发上层续跑（StartStage→Reset 代次+1），批内残留的旧
+    //   进程 result 行凭此识破（逐行传入 HandleLine 比对）。
+    const int iEpoch = m_iProcEpoch;
     m_buf += m_pProc->readAllStandardOutput();
 
     int iIdx = 0;
@@ -493,7 +568,7 @@ void CClaudeRunner::slotOnStdOut() {
         m_buf = m_buf.mid(iIdx + 1);
         sLine = sLine.trimmed();
         if (!sLine.isEmpty()) {
-            HandleLine(sLine);
+            HandleLine(sLine, iEpoch);
         }
     }
 }
@@ -515,6 +590,14 @@ void CClaudeRunner::slotOnStdErr() {
         if (sLine.isEmpty()) {
             continue;
         }
+        // 2026.09.20 良性诊断过滤（MPlatform_QT 实害：GLM 网关别名下每轮必报
+        //   「[claude-code:unrecognized_model] {"model":"glm-5.3[1m]",...}」——
+        //   claude CLI 对非 Anthropic 名册的模型别名恒打此提示，请求照常成功；
+        //   已实测去掉 [1M] 后缀/换任意别名均同样提示，属网关接入的正常噪声。
+        //   过滤后不入 stderr 尾（防污染失败消息）也不上屏。其余 stderr 照旧全量透传。
+        if (sLine.startsWith(QStringLiteral("[claude-code:unrecognized_model]"))) {
+            continue;
+        }
         m_aStderrTail.append(sLine);
         if (m_aStderrTail.size() > 15) {
             m_aStderrTail.removeFirst();
@@ -523,7 +606,7 @@ void CClaudeRunner::slotOnStdErr() {
     }
 }
 
-void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
+void CClaudeRunner::HandleLine(const QByteArray& a_sLine, int a_iEpoch) {
     QJsonParseError stErr;
     const QJsonDocument stDoc = QJsonDocument::fromJson(a_sLine, &stErr);
     if (stErr.error != QJsonParseError::NoError || !stDoc.isObject()) {
@@ -548,6 +631,14 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         if (!sSid.isEmpty() && m_sLastSessionId.isEmpty()) {
             m_sLastSessionId = sSid;
         }
+        // 2026.09.23 model 运行中即捕获（init 行携带，CLI 2.1.278 实测）：result 已无顶层
+        //   model 字段，不在此补取则整个运行期的窗口口径（ContextWindowForModel，供
+        //   message_delta/assistant 帧脏值守卫）只能走空模型 200K 兜底——GLM（128K）
+        //   等小窗口模型下脏值上限被放宽到 2×200K。
+        const QString sInitModel = oRoot.value(QStringLiteral("model")).toString();
+        if (!sInitModel.isEmpty()) {
+            m_sLastModel = sInitModel;
+        }
         emit sigInfo(QStringLiteral("[system/%1] session=%2").arg(sSub, sSid));
         return;
     }
@@ -565,9 +656,23 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
                 + oU.value(QStringLiteral("cache_creation_input_tokens")).toInteger()
                 + oU.value(QStringLiteral("cache_read_input_tokens")).toInteger();
         } else if (sEv == QStringLiteral("message_delta")) {
-            const qint64 iOut = oEv.value(QStringLiteral("usage")).toObject()
-                                   .value(QStringLiteral("output_tokens")).toInteger();
+            const QJsonObject oU = oEv.value(QStringLiteral("usage")).toObject();
+            const qint64 iOut = oU.value(QStringLiteral("output_tokens")).toInteger();
             m_iStreamOut = iOut;
+            // 2026.09.23 GLM 网关上下文兜底：内网 GLM 中转（Anthropic 兼容层）实测
+            //   message_start/assistant 帧的 usage 恒全 0，真实 input/cache 三项只在末条
+            //   message_delta 携带——只认 assistant 帧则上下文占用全程 0。此处一并读取三项
+            //   刷新占用，守卫与 assistant 帧完全一致（>0、值变化、≤2×窗口）：真 Anthropic
+            //   下 message_delta 无 input 字段（三项和 0 被拦）或与 assistant 帧同值
+            //   （变化守卫拦下），均无副作用；旧 CLI 无流式事件时退化为原行为。
+            const qint64 iFill = oU.value(QStringLiteral("input_tokens")).toInteger()
+                + oU.value(QStringLiteral("cache_creation_input_tokens")).toInteger()
+                + oU.value(QStringLiteral("cache_read_input_tokens")).toInteger();
+            const qint64 iWinCap = 2 * ContextWindowForModel(m_sLastModel);
+            if (iFill > 0 && iFill != m_iLastContextFill && iFill <= iWinCap) {
+                m_iLastContextFill = iFill;
+                emit sigContextFill(iFill);
+            }
             emit sigLivePartial(m_iLiveEmitIn + m_iStreamIn, m_iLiveEmitOut + m_iStreamOut);
         } else if (sEv == QStringLiteral("message_stop")) {
             // 本消息收口：交给 assistant 完整帧的 sigUsageDelta 入账，流式部分归零。
@@ -649,12 +754,39 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
     }
 
     if (sType == QStringLiteral("result")) {
+        // 2026.09.23 双 result 守卫（LayoutDesign「UI 已停、实仍在跑」实测根因）：claude 打满
+        //   收尾会连发两条 result——先 error_max_turns，随后把 "Continue from where you left
+        //   off." / "No response requested." 秒答包装成第二条 success result。两条可能同批到达，
+        //   而第 1 条的收尾处理可能已同步触发上层续跑（StartStage→Reset 代次+1、m_bFinished 清零），
+        //   残留的 success result 就会被误判成新轮「秒回成功」→ 整轮被错判「已完成」（压栈+done+
+        //   面板停），而真正的新进程还在后续长跑（实测又干了 11 分钟）。两道闸：
+        //   ① 代次不符 = 行属已被替换的旧进程，丢弃；
+        //   ② 本轮已收尾（m_bFinished）后同代次再到的 result（如预算耗尽不续跑时），丢弃。
+        if (m_iProcEpoch != a_iEpoch) {
+            emit sigInfo(QStringLiteral("◌ 忽略旧进程残留 result 行（subtype=%1，进程已被续跑重启）")
+                             .arg(oRoot.value(QStringLiteral("subtype")).toString()));
+            return;
+        }
+        if (m_bFinished) {
+            emit sigInfo(QStringLiteral("◌ 忽略本轮收尾后的残留 result 行（subtype=%1，已按先前收尾结果处理）")
+                             .arg(oRoot.value(QStringLiteral("subtype")).toString()));
+            return;
+        }
         const bool bErr = oRoot.value(QStringLiteral("is_error")).toBool();
         const QString sSub = oRoot.value(QStringLiteral("subtype")).toString();
         const QString sResult = oRoot.value(QStringLiteral("result")).toString();
         const double dCost = oRoot.value(QStringLiteral("total_cost_usd")).toDouble();
         const QString sSid = oRoot.value(QStringLiteral("session_id")).toString();
         m_sLastModel = oRoot.value(QStringLiteral("model")).toString();   // 供上层查上下文窗口口径
+        if (m_sLastModel.isEmpty()) {
+            // 2026.09.23 result 顶层 model 字段已取消（CLI 2.1.278 实测，仅剩按模型名
+            //   分组的 modelUsage）：回退取其首个键（即本次模型；多模型 fan-out 取任一
+            //   仍优于空串兜底）。
+            const QJsonObject oMU = oRoot.value(QStringLiteral("modelUsage")).toObject();
+            if (!oMU.isEmpty()) {
+                m_sLastModel = oMU.keys().constFirst();
+            }
+        }
 
         const QJsonObject oUsage = oRoot.value(QStringLiteral("usage")).toObject();
         const qint64 iInRaw  = oUsage.value(QStringLiteral("input_tokens")).toInteger();
@@ -678,6 +810,24 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         }
 
         const bool bOk = !bErr && (sSub == QStringLiteral("success"));
+        // 2026.09.23 空转秒回抑制（HotNews「UI 已停、实仍在跑」实测根因）：对 max-turns
+        //   打满的会话 --resume+fork 续跑时，claude CLI 实测会在启动后 1~2s 先回一条
+        //   result(success) 空结果——全程无 assistant 消息/工具调用/token 产出、费用 0，
+        //   续跑 prompt 还压在其内部输入队列未消费，随后才真正开始干活（实测续跑进程
+        //   又持续工作了 10 分钟以上）。若照常收尾，上层会把整轮判成「已完成」（面板
+        //   状态图标/Tab 闪点停止、输入栏解禁），而进程还在跑并持续吐日志 →「UI 已停、
+        //   实仍在跑」假象。此处识别该退化结果：不置收尾态、不关 stdin、继续等真正的
+        //   收尾；若进程随后直接退出，slotOnFinished 的 exit-0 兜底语义不变（照常收尾），
+        //   只增强不回退。判定条件取「零产出交集」，真实秒答必有 assistant 消息/输出
+        //   token，不会误伤。
+        if (bOk && sResult.trimmed().isEmpty() && dCost <= 0.0
+                && m_uptime.isValid() && m_uptime.elapsed() < 5000
+                && m_iLastReqCount == 0 && m_iStreamOut == 0 && m_iLiveEmitOut == 0) {
+            m_sLastSessionId = sSid;   // 记录 fork 出的会话：进程早夭时上层仍可凭此续跑
+            emit sigInfo(QStringLiteral("◌ 进程启动 %1s 即回空 result（无任何产出），判定为退化收尾信号，继续等待实际工作完成…")
+                             .arg(m_uptime.elapsed() / 1000.0, 0, 'f', 1));
+            return;
+        }
         // 2026.08.27 实时计量已逐消息上抛（sigUsageDelta）时，收尾 token 报 0 防与
         //   编排器实时累计双计（同 Codex 口径）；费用/会话 id 照报。未发过（无 assistant
         //   消息的极端流）仍报 result 累计。
@@ -686,6 +836,13 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
         m_sLastSubtype   = sSub;     // 供编排器区分 max-turns / 真错误
         m_sLastSessionId = sSid;     // 供编排器 --resume 续跑
         m_bFinished = true;
+        // 2026.09.26 零 usage 诊断（放空 result 抑制之后，避免退化收尾误报）：
+        //   assistant 帧/message_delta/result 兑底全没拿到时上下文将显示「—」——
+        //   日志写明原因指向（网关/中转未回传 usage），用户不再对着 0/— 猜。
+        if (m_iLastContextFill <= 0) {
+            emit sigInfo(QStringLiteral("[claude] 本轮未收到任何 usage 数据，上下文占用不可知（显示 —）；"
+                                       "常见原因：网关/中转层未回传 usage 字段"));
+        }
         // 2026.08.27 悬空 resume sid 自愈：--resume 的会话在本机不存在（claude 报
         //   「No conversation found with session ID」，工程自其他电脑拷贝时必现——
         //   助手档 sid 随工程走、会话数据在 ~/.claude 不随工程走）→ 不发失败，从参数
@@ -715,7 +872,7 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine) {
             emit sigInfo(QStringLiteral("↻ 会话在本机不存在（工程可能自其他电脑拷贝，"
                                         "会话数据不随工程走），自动新建会话重发本轮…"));
             if (m_pProc != nullptr && m_pProc->state() != QProcess::NotRunning) {
-                m_pProc->kill();   // 收尾信号走 slotOnFinished 的 QuietRestart 分支重拉
+                KillProcessTree();   // 收尾信号走 slotOnFinished 的 QuietRestart 分支重拉（整树终止防新旧双跑）
             }
             return;
         }
@@ -836,7 +993,14 @@ void CClaudeRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStat
 }
 
 void CClaudeRunner::slotOnErrorOccurred(QProcess::ProcessError a_eError) {
-    if (m_bFinished || m_bGraceActive) {
+    // 2026.09.19 勿回退（PixelPorter 实害：pi 切 claude 后首轮「会话在本机不存在」自愈必失败）：
+    //   Qt 的 kill()（TerminateProcess）在 Windows 上先发 errorOccurred(Crashed)、后发
+    //   finished(CrashExit)——自愈路径在 HandleLine 里已置 m_bFinished=false 并 kill()，本槽的
+    //   (m_bFinished||m_bGraceActive) 守卫双双放行 → BeginOrphanGrace（sid 已被自愈清空）→
+    //   EmitFailed("claude 进程崩溃"+旧进程 stderr 尾) 抢在 QuietRestart 重拉之前宣告失败。
+    //   m_bQuietRestart 在 kill() 前置位、slotOnFinished 的重拉分支才复位——此处一并
+    //   拦截即消除竞态（Stop() 走 m_bFinished=true 前置，同口径）。
+    if (m_bQuietRestart || m_bFinished || m_bGraceActive) {
         return;
     }
     QString sMsg;
@@ -888,7 +1052,7 @@ void CClaudeRunner::PollOrphanTranscript() {
     ++m_iGraceTicks;
     const QString sPath = FindTranscriptPath();
     if (!sPath.isEmpty()) {
-        QFile stFile(sPath);
+        CFrwDevice stFile(sPath);
         if (stFile.open(QIODevice::ReadOnly)) {
             const qint64 iSize = stFile.size();
             if (iSize > m_iTranscriptSeen) {
@@ -933,7 +1097,7 @@ QString CClaudeRunner::MineTranscriptErrorTail() {
     if (sPath.isEmpty()) {
         return QString();
     }
-    QFile stFile(sPath);
+    CFrwDevice stFile(sPath);
     if (!stFile.open(QIODevice::ReadOnly)) {
         return QString();
     }
@@ -1043,7 +1207,7 @@ void CClaudeRunner::CheckStall() {
     // 先置终态再 kill：kill 触发的 Crashed/finished 信号一律吞掉（同 Stop 静默模式），
     //   避免误入孤儿宽限期（node 已随挂起失去意义，无需等待 transcript）。
     m_bFinished = true;
-    m_pProc->kill();
+    KillProcessTree();   // 2026.09.22 整树终止：挂起的 cmd+node 一并终结，无孤儿残留
     m_pProc->waitForFinished(3000);
     emit sigFinished(false,
                      QStringLiteral("停滞检测：%1 分钟无任何输出（疑似网络/中继挂起），进程已终止")
