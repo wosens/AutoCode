@@ -149,6 +149,9 @@ public:
 
     static void SetDshNodePath(const QString& a_sPath);
     static QString DshNodePath();
+    // 2026-10-08 思考强度（initialize reasoningEffort；off/low/high/max；空=默认）。
+    static void SetDshEffort(const QString& a_sLevel);
+    static QString DshEffort();
     static void SetDshBinJsPath(const QString& a_sPath);
     static QString DshBinJsPath();
     static void SetDshCordisPath(const QString& a_sPath);
@@ -230,6 +233,7 @@ private:
     int  m_iCfgDirtyGen = -1;  // 挂脏标时的进程代次（收尾杀进程只杀旧代，防误杀新配置进程）
     int  m_iProcGen = 0;       // 进程代次（EnsureProcess 冷启动 +1；区分新旧进程）
     QString m_sProcWorkDir;    // 2026.08.20 当前 DSH 进程 cwd（工程切换检测：不一致须杀旧冷启）
+    QString m_sProcModelKey;   // 2026-10-07 当前进程 env 烘焙的模型条目身份（对话级覆盖/全局切换后不一致须杀旧冷启；"fixed"=固定路由）
 
     // 进程态（长驻生命周期）：NotCreated → Booting（握手中）→ Ready ⇄ Dead（退出/被杀）。
     enum EProcState { ProcNotCreated, ProcBooting, ProcReady, ProcDead };

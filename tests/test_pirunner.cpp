@@ -1,4 +1,4 @@
-// CPiAgentRunner 离线单元测试（不联网、不依赖真实 PIAgent 安装，挂 ctest）。
+﻿// CPiAgentRunner 离线单元测试（不联网、不依赖真实 PIAgent 安装，挂 ctest）。
 //
 // 覆盖（针对 2026.08.19 第三后端接入）：
 //   1. 工厂三元后端：BackendName/BackendDisplayName/IsPi 分派 + Create 返回 CPiAgentRunner。
@@ -414,6 +414,7 @@ int main(int argc, char* argv[]) {
             const QString sStubJs = QStringLiteral(R"PISTUB(#!/usr/bin/env node
 const fs = require('fs');
 const args = process.argv.slice(2);
+fs.writeFileSync(__dirname + '/rpc_argv.txt', args.join('\n'));
 const out = o => process.stdout.write(JSON.stringify(o) + '\n');
 let buf = '';
 if (args.includes('rpc')) {
@@ -606,6 +607,68 @@ if (args.includes('rpc')) {
                 Check(bPromptSeen,
                       QStringLiteral("回退重拉应投递原 prompt（stdin 原文）"));
                 QFile::remove(sDist + QStringLiteral("/break_rpc.flag"));
+            }
+
+            // D. 2026-10-07 对话级模型覆盖：会话覆盖下标优先于全局激活——表两条
+            //   (active=0)，实例槽设 1 → stub argv 应含 autocode-2；且全局激活静态
+            //   不被翻动（第二 runner 不带覆盖跑一轮应回 autocode-1）。
+            {
+                CPiAgentRunner::SetModelsJsonPathOverrideForTest(
+                    oTmp.path() + QStringLiteral("/models_ov.json"));
+                QList<SDshModelEntry> aTbl;
+                SDshModelEntry stM1;
+                stM1.sDisp = QStringLiteral("覆盖表A");
+                stM1.sBaseURL = QStringLiteral("http://127.0.0.1:9/a");
+                stM1.sModelId = QStringLiteral("ov-a");
+                SDshModelEntry stM2;
+                stM2.sDisp = QStringLiteral("覆盖表B");
+                stM2.sBaseURL = QStringLiteral("http://127.0.0.1:9/b");
+                stM2.sModelId = QStringLiteral("ov-b");
+                aTbl << stM1 << stM2;
+                CPiAgentRunner::SetPiModels(aTbl, /*active=*/0);
+                auto fnArgv = [&sDist](const QString& a_sWant) {
+                    QFile f(sDist + QStringLiteral("/rpc_argv.txt"));
+                    return f.open(QIODevice::ReadOnly)
+                        && QString::fromUtf8(f.readAll()).split(QLatin1Char('\n'))
+                               .contains(a_sWant);
+                };
+                {
+                    CPiAgentRunner runner;
+                    runner.SetStageModelOverride(/*a_iIdx=*/1, stM2);
+                    int iFin = 0;
+                    QObject::connect(&runner, &CAgentRunnerBase::sigFinished,
+                                     [&](bool, const QString&, qint64, qint64,
+                                        double, const QString&) {
+                        ++iFin;
+                        QCoreApplication::exit(0);
+                    });
+                    QTimer::singleShot(60000, []() { QCoreApplication::exit(2); });
+                    runner.StartStage(oTmp.path(), QStringLiteral("覆盖路由测试"),
+                                      QString(), 30, QString(), false, 0, false);
+                    QCoreApplication::exec();
+                    Check(iFin == 1, QStringLiteral("覆盖轮应成功收尾"));
+                    Check(fnArgv(QStringLiteral("autocode-2")),
+                          QStringLiteral("覆盖下标 1 应路由 --provider autocode-2"));
+                }
+                {
+                    CPiAgentRunner runner;   // 不带覆盖：全局激活静态未被翻动
+                    int iFin = 0;
+                    QObject::connect(&runner, &CAgentRunnerBase::sigFinished,
+                                     [&](bool, const QString&, qint64, qint64,
+                                        double, const QString&) {
+                        ++iFin;
+                        QCoreApplication::exit(0);
+                    });
+                    QTimer::singleShot(60000, []() { QCoreApplication::exit(2); });
+                    runner.StartStage(oTmp.path(), QStringLiteral("全局路由测试"),
+                                      QString(), 30, QString(), false, 0, false);
+                    QCoreApplication::exec();
+                    Check(iFin == 1, QStringLiteral("全局路由轮应成功收尾"));
+                    Check(fnArgv(QStringLiteral("autocode-1")),
+                          QStringLiteral("无覆盖应仍路由全局激活 autocode-1"));
+                }
+                CPiAgentRunner::SetModelsJsonPathOverrideForTest(QString());
+                CPiAgentRunner::SetPiModels({}, -1);
             }
 
             // 复位全局静态（后续用例/真实进程不受沙箱影响）。

@@ -21,9 +21,18 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QList>
 #include <atomic>
 
 class QThread;
+
+// —— 2026-10-08 手动审查 Tab 改造：单文件送审项 ——
+// bIncremental=true 且基线仓可用 → 只审自上次审查后的修改段（库内
+// BuildIncrementalScope + ReviewContentEx 增量契约）；否则全量审。
+struct SReviewItem {
+    QString sAbs;
+    bool    bIncremental = false;
+};
 
 class CReviewService : public QObject {
     Q_OBJECT
@@ -35,7 +44,14 @@ public:
     // 启动一轮审查：a_sRootDir 为工程根（相对路径换算基），a_aAbsFiles 为待审
     // 文件绝对路径清单（调用方已过滤/限量）。a_iTimeoutSec 为单文件 LLM 调用
     // 超时。返回 false=正在跑（本实例一轮未完不接新单）或参数空/引擎不可用。
+    // （任务阶段预审路径：全量审、不建基线——保持 2026-09-30 原行为。）
     bool Start(const QString& a_sRootDir, const QStringList& a_aAbsFiles, int a_iTimeoutSec);
+
+    // 2026-10-08 手动审查路径：逐文件可增量 + 基线仓（a_sBaselineDir 为
+    // review_cache/<目标哈希>.bl；空串=不启用基线）。审查成功的文件基线前移
+    // （内容入 blob 仓 + meta 更新），下次「仅审修改」由此判定。
+    bool StartEx(const QString& a_sRootDir, const QList<SReviewItem>& a_aFiles,
+                 const QString& a_sBaselineDir, int a_iTimeoutSec);
 
     // 停止当前轮（当前文件的 LLM 调用一并终止；已完成的文件结果保留并照常收尾）。
     void Stop();

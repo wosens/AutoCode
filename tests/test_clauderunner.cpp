@@ -16,6 +16,7 @@
 #include <QEventLoop>
 #include <QTimer>
 #include <QTextStream>
+#include <QFile>
 
 #include "agent/CClaudeRunner.h"
 
@@ -32,7 +33,101 @@ static void Fail(const QString& a_sWhy) {
     g_out << "  [FAIL] " << a_sWhy << Qt::endl;
 }
 
+namespace {
+void Check2(bool a_b, const QString& a_sWhy) {
+    if (!a_b) { Fail(a_sWhy); } else { g_out << "  [ok] " << a_sWhy << Qt::endl; }
+}
+
+// 2026-10-08 stub 模式（-stub，挂 ctest 不联网）：claude 命令指向批处理桩——
+//   落盘进程 env 后回一条合法 result 行收尾。验证共享大模型表 env 注入：
+//   实例槽覆盖优先（ANTHROPIC_BASE_URL/MODEL 按覆盖条目），覆盖无效时按
+//   「跟随开关 + 共享表当前条目」，开关关则完全不注入（走系统 env）。
+int RunStubMode(int a_iArgc, char* a_pArgv[]) {
+    QCoreApplication app(a_iArgc, a_pArgv);
+    const QString sDir = QDir::tempPath() + QStringLiteral("/autocode-claude-stub");
+    QDir(sDir).removeRecursively();
+    QDir().mkpath(sDir);
+    const QString sStub = sDir + QStringLiteral("/claude_stub.cmd");
+    const QString sEnvTxt = sDir + QStringLiteral("/env.txt");
+    {
+        QFile f(sStub);
+        f.open(QIODevice::WriteOnly | QIODevice::Text);
+        f.write(QStringLiteral("set ANTHROPIC > \"%1\"\n")
+                    .arg(sEnvTxt).toUtf8());
+        f.write(QStringLiteral("echo {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"stub-sid-env\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n").toUtf8());
+        f.close();
+    }
+    CClaudeRunner::SetClaudeCmd(sStub);
+    SDshModelEntry stOv;
+    stOv.sDisp = QStringLiteral("覆盖模型");
+    stOv.sBaseURL = QStringLiteral("http://127.0.0.1:9/ov");
+    stOv.sApiKey = QStringLiteral("ov-key");
+    stOv.sApi = QStringLiteral("anthropic-messages");
+    stOv.sModelId = QStringLiteral("ov-claude");
+    SDshModelEntry stG;
+    stG.sBaseURL = QStringLiteral("http://127.0.0.1:9/g");
+    stG.sApiKey = QStringLiteral("g-key");
+    stG.sApi = QStringLiteral("anthropic-messages");
+    stG.sModelId = QStringLiteral("g-claude");
+    QList<SDshModelEntry> aTbl = { stG, stOv };
+    CClaudeRunner::SetSharedModelTable(aTbl, /*active=*/0);
+    CClaudeRunner::SetFollowSharedModels(true);
+    auto fnEnvOf = [&sEnvTxt](const QString& a_sKey) {
+        QFile f(sEnvTxt);
+        if (!f.open(QIODevice::ReadOnly)) { return QString(); }
+        const QString sAll = QString::fromUtf8(f.readAll());
+        f.close();
+        const QStringList aLines = sAll.split(QLatin1Char('\n'));
+        for (const QString& sLine : aLines) {
+            if (sLine.startsWith(a_sKey + QLatin1Char('='))) {
+                return sLine.mid(a_sKey.size() + 1).trimmed();
+            }
+        }
+        return QString();
+    };
+    auto fnRun = [&app, &sDir](CClaudeRunner& a_Runner, const QString& a_sTag) {
+        int iFin = 0;
+        QObject::connect(&a_Runner, &CAgentRunnerBase::sigFinished,
+                         &a_Runner, [&](bool, const QString&, qint64, qint64, double,
+                                        const QString&) { ++iFin; QCoreApplication::exit(0); });
+        QTimer::singleShot(30000, []() { QCoreApplication::exit(2); });
+        a_Runner.StartStage(sDir, QStringLiteral("env测试"), QString(), 40,
+                            QString(), false, 0, false);
+        QCoreApplication::exec();
+        if (iFin != 1) { Fail(a_sTag + QStringLiteral("：未正常收尾")); }
+    };
+    {   // A. 实例槽覆盖优先
+        CClaudeRunner runner;
+        runner.SetStageModelOverride(1, stOv);
+        fnRun(runner, QStringLiteral("覆盖轮"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_MODEL")) == QStringLiteral("ov-claude"),
+               QStringLiteral("覆盖条目应注入 ANTHROPIC_MODEL=ov-claude"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_BASE_URL")).contains(QStringLiteral("127.0.0.1:9/ov")),
+               QStringLiteral("覆盖条目应注入 BASE_URL"));
+    }
+    {   // B. 无覆盖 + 跟随开 → 共享表当前条目
+        CClaudeRunner runner;
+        fnRun(runner, QStringLiteral("跟随轮"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_MODEL")) == QStringLiteral("g-claude"),
+               QStringLiteral("跟随开应注入当前条目 g-claude"));
+    }
+    {   // C. 跟随关 → 不注入（系统 env 无这些键）
+        CClaudeRunner::SetFollowSharedModels(false);
+        CClaudeRunner runner;
+        fnRun(runner, QStringLiteral("关闭轮"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_MODEL")).isEmpty(),
+               QStringLiteral("跟随关不应注入 ANTHROPIC_MODEL"));
+    }
+    return g_iFail == 0 ? 0 : 1;
+}
+}   // namespace
+
 int main(int a_iArgc, char* a_pArgv[]) {
+    for (int i = 1; i < a_iArgc; ++i) {
+        if (QLatin1String(a_pArgv[i]) == QLatin1String("-stub")) {
+            return RunStubMode(a_iArgc, a_pArgv);
+        }
+    }
     QCoreApplication app(a_iArgc, a_pArgv);
 
     // 干净工作目录

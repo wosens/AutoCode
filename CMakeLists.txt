@@ -672,6 +672,46 @@ set_target_properties(test_orchpi PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 
+# —— 临时探针（验证后删除）：审查窗口 Tab 改造全链验证 ——
+qt_add_executable(probe_reviewtabs
+    tests/probe_reviewtabs.cpp
+    review/CReviewSdkClient.h
+    review/CReviewSdkClient.cpp
+    review/CReviewService.h
+    review/CReviewService.cpp
+    ui/CCodeReviewDialog.h
+    ui/CCodeReviewDialog.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CMcpAskServer.h
+    agent/CMcpAskServer.cpp
+)
+target_include_directories(probe_reviewtabs PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/review
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+)
+target_link_libraries(probe_reviewtabs PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_reviewtabs PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
 qt_add_executable(test_dshrunner
     tests/test_dshrunner.cpp
     agent/CClaudeRunner.h
@@ -722,6 +762,9 @@ target_link_libraries(test_clauderunner PRIVATE Qt6::Core Qt6::Network frwdevice
 set_target_properties(test_clauderunner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
+# 2026-10-08 stub 模式挂 ctest（不联网）：claude 命令指向批处理桩，验证共享大模型表
+#   env 注入三态（实例槽覆盖优先 / 跟随开关+当前条目 / 关=不注入）。无参仍为联网手动模式。
+add_test(NAME test_clauderunner_stub COMMAND test_clauderunner -stub)
 
 # ---- Pi 后端离线单元测试（不联网，挂 ctest）----
 qt_add_executable(test_pirunner

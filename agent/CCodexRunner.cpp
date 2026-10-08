@@ -19,6 +19,7 @@
 // —— 进程级全局配置（static：所有 Codex runner 实例共享，主窗口启动/设置变更时写）——
 static QString s_sCodexRoot;      // npm 工程根（Execute\CodexHarness；空=未配置）
 static QString s_sCodexNodePath;  // node.exe 路径（空=走 PATH 的 "node"）
+static QString s_sCodexEffort;    // 2026-10-08 思考强度（-c model_reasoning_effort；空=默认）
 static QString s_sCodexProvider;  // provider id（空="autocode"，~/.codex 固有槽位）
 static QString s_sCodexModel;     // 模型 id（必填，缺项时 CodexConfigError 报指引）
 static QString s_sCodexApiKey;    // API key（明文存 config.ini；仅写入 auth.json）
@@ -46,8 +47,7 @@ static bool CodexApiChatCompat(const QString& a_sApi) {
     return s.isEmpty() || s == QLatin1String("chat")
         || s == QLatin1String("openai-completions");
 }
-static const SDshModelEntry* CodexChatCompatEntry() {
-    const SDshModelEntry* pAct = CodexActiveEntry();
+static const SDshModelEntry* CodexChatCompatFor(const SDshModelEntry* pAct) {
     if (pAct == nullptr || CodexApiChatCompat(pAct->sApi)) {
         return pAct;
     }
@@ -76,72 +76,91 @@ static const SDshModelEntry* CodexChatCompatEntry() {
     }
     return pBest;
 }
-static QString CodexEffProvider() {
-    return CodexActiveEntry() != nullptr ? CCodexRunner::CodexActiveProvider()
-                                         : CCodexRunner::CodexProvider();
+static const SDshModelEntry* CodexChatCompatEntry() {
+    return CodexChatCompatFor(CodexActiveEntry());
 }
-static QString CodexEffModel() {
-    return CodexActiveEntry() != nullptr ? CodexActiveEntry()->sModelId
-                                         : CCodexRunner::CodexModel();
-}static QString CodexEffBaseUrl() {
-    if (CodexActiveEntry() != nullptr) {
-        // 2026.09.24 v3.1.231 激活条目为 anthropic-messages 等非 chat 端点时落
-        //   同名 chat 兼容兑底条目；无兑底返回原 URL（StartStage/CodexConfigError
-        //   前置拦截给出中文指引，不再让 codex CLI 深处 404）。
-        const SDshModelEntry* p = CodexChatCompatEntry();
-        return p != nullptr ? p->sBaseURL : CodexActiveEntry()->sBaseURL;
+// 2026-10-07 对话级模型覆盖：*_For 版按传入起步条目（覆盖优先，缺省全局激活）解析
+//   生效值，兑底链与无参版逐字同构；无参版保持全局口径（WriteCodexUserConfig/
+//   CodexConfigError/设置页路径）。StartStage 用 For 版——覆盖仅改本进程命令行级
+//   配置（-c 覆盖级优先于 config.toml），config.toml/auth.json 恒写全局内容 →
+//   并发不同模型的助手间无共享文件竞态。
+static QString CodexEffProviderFor(const SDshModelEntry* pAct, int iUse) {
+    return pAct != nullptr ? QStringLiteral("autocode-%1").arg(iUse + 1)
+                           : CCodexRunner::CodexProvider();
+}
+static QString CodexEffModelFor(const SDshModelEntry* pAct) {
+    return pAct != nullptr ? pAct->sModelId : CCodexRunner::CodexModel();
+}
+static QString CodexEffBaseUrlFor(const SDshModelEntry* pAct) {
+    if (pAct != nullptr) {
+        const SDshModelEntry* p = CodexChatCompatFor(pAct);
+        return p != nullptr ? p->sBaseURL : pAct->sBaseURL;
     }
     return CCodexRunner::CodexBaseUrl();
 }
-static QString CodexEffWireApi() {
-    if (CodexActiveEntry() != nullptr) {
-        // 2026.09.24 v3.1.231 兑底条目是 chat 兼容 → wire 一并落 chat（防激活条目
-        //   responses 语义被误套到 chat 端点）；激活条目本身兼容时维持原判据。
-        const SDshModelEntry* p = CodexChatCompatEntry();
-        if (p != nullptr && p != CodexActiveEntry()) {
+static QString CodexEffWireApiFor(const SDshModelEntry* pAct) {
+    if (pAct != nullptr) {
+        const SDshModelEntry* p = CodexChatCompatFor(pAct);
+        if (p != nullptr && p != pAct) {
             return QStringLiteral("chat");
         }
-        const QString sApi = CodexActiveEntry()->sApi.trimmed().toLower();
-        if (sApi == QLatin1String("responses")) {
-            return QStringLiteral("responses");
-        }
-        return QStringLiteral("chat");
+        const QString sApi = pAct->sApi.trimmed().toLower();
+        return (sApi == QLatin1String("responses")) ? QStringLiteral("responses")
+                                                     : QStringLiteral("chat");
     }
     const QString s = CCodexRunner::CodexWireApi();
     return s.isEmpty() ? QStringLiteral("chat") : s;
 }
-static QString CodexEffApiKey() {
-    if (CodexActiveEntry() != nullptr) {
-        // 2026.09.24 v3.1.231 兑底条目带 key 优先（同网关路由一致），空则回退激活
-        //   条目 key，再回退固定键（原三级口径不变）。
-        const SDshModelEntry* p = CodexChatCompatEntry();
+static QString CodexEffApiKeyFor(const SDshModelEntry* pAct) {
+    if (pAct != nullptr) {
+        const SDshModelEntry* p = CodexChatCompatFor(pAct);
         if (p != nullptr && !p->sApiKey.isEmpty()) {
             return p->sApiKey;
         }
-        if (!CodexActiveEntry()->sApiKey.isEmpty()) {
-            return CodexActiveEntry()->sApiKey;
+        if (!pAct->sApiKey.isEmpty()) {
+            return pAct->sApiKey;
         }
     }
     return CCodexRunner::CodexApiKey();
+}
+static qint64 CodexEffContextWindowFor(const SDshModelEntry* pAct) {
+    const qint64 iCtx = pAct != nullptr ? pAct->iCtx : 200000;
+    return iCtx > 8000 ? iCtx : 200000;
+}
+static int CodexEffMaxTokensFor(const SDshModelEntry* pAct) {
+    int iTok = pAct != nullptr ? pAct->iMaxTok : 0;
+    if (iTok <= 0) {
+        iTok = 32768;
+    }
+    return iTok < 1024 ? 1024 : (iTok > 131072 ? 131072 : iTok);
+}
+static QString CodexEffProvider() {
+    return CodexEffProviderFor(CodexActiveEntry(), s_iCodexActiveModel);
+}
+static QString CodexEffModel() {
+    return CodexEffModelFor(CodexActiveEntry());
+}static QString CodexEffBaseUrl() {
+    return CodexEffBaseUrlFor(CodexActiveEntry());
+}
+static QString CodexEffWireApi() {
+    return CodexEffWireApiFor(CodexActiveEntry());
+}
+static QString CodexEffApiKey() {
+    return CodexEffApiKeyFor(CodexActiveEntry());
 }
 // 2026.08.21 生效上下文窗口（token）：激活条目 iCtx（下限钳 8000 防误填 0）；
 //   固定路由无对应键，取条目默认量级 200000。写入 config.toml 顶层
 //   model_context_window——codex 对自定义模型不知道真实窗口时，估算超限即报
 //   「ran out of room in the model's context window」提前终止。
 static qint64 CodexEffContextWindow() {
-    const qint64 iCtx = CodexActiveEntry() != nullptr ? CodexActiveEntry()->iCtx : 200000;
-    return iCtx > 8000 ? iCtx : 200000;
+    return CodexEffContextWindowFor(CodexActiveEntry());
 }
 // 2026.08.21 生效单次最大输出（token）：条目「最大输出」iMaxTok，钳
 //   [1024, 131072]（0/误填兜底 32768）。codex 0.87 chat 请求体不带 max_tokens，
 //   网关默认输出上限 4096——长输出轮被截断（finish_reason=length）且 codex 误报
 //   「ran out of room in the model's context window」；经 CCodexProxy 本地注入。
 static int CodexEffMaxTokens() {
-    int iTok = CodexActiveEntry() != nullptr ? CodexActiveEntry()->iMaxTok : 0;
-    if (iTok <= 0) {
-        iTok = 32768;
-    }
-    return iTok < 1024 ? 1024 : (iTok > 131072 ? 131072 : iTok);
+    return CodexEffMaxTokensFor(CodexActiveEntry());
 }
 
 // 根目录内固定相对布局（npm 本地工程安装：node_modules\@openai\codex）。
@@ -157,6 +176,10 @@ void CCodexRunner::SetCodexRoot(const QString& a_sRoot) {
 
 QString CCodexRunner::CodexRoot() {
     return s_sCodexRoot;
+}
+
+void CCodexRunner::SetCodexEffort(const QString& a_sLevel) {
+    s_sCodexEffort = a_sLevel.trimmed().toLower();
 }
 
 void CCodexRunner::SetCodexNodePath(const QString& a_sPath) {
@@ -660,6 +683,25 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
         WriteCodexUserConfig();
     }
 
+    // 2026-10-07 对话级模型覆盖：起步条目 = 会话覆盖下标（per-runner 实例槽，右键
+    //   「选择模型」仅本助手生效）优先，缺省全局激活。后续路由/兑底/窗口/输出上限
+    //   全部按起步条目解析，且只落在命令行级（-c 覆盖级优先于 config.toml）——
+    //   config.toml/auth.json 恒为全局内容，并发不同模型的助手间无共享文件竞态。
+    const int iOvUse = ModelOvIdxIn(s_aCodexModels.size());
+    const int iUse = (iOvUse >= 0) ? iOvUse : s_iCodexActiveModel;
+    const SDshModelEntry* pAct = (iUse >= 0 && iUse < s_aCodexModels.size())
+        ? &s_aCodexModels.at(iUse) : nullptr;
+    if (pAct != nullptr && !CodexApiChatCompat(pAct->sApi)
+            && CodexChatCompatFor(pAct) == nullptr) {
+        // 覆盖条目 anthropic 且无兑底：CodexConfigError 拦不到（它只看全局激活），
+        //   此处前置拦截（文案同源，主体换成覆盖条目名）。
+        EmitFailed(QStringLiteral(
+            "模型条目「%1」的接入点 API 形态为 anthropic-messages（Anthropic 原生端点），"
+            "CodexHarness 只能连 chat completions 兼容端点（右键「选择模型」另选一条，"
+            "或「跟随全局设置」）。").arg(pAct->sDisp));
+        return;
+    }
+
     // —— 组装命令行（node 直起；prompt 走 stdin 的 "-" 模式）——
     QStringList aArgs;
     aArgs << ResolveCodexJsPath()
@@ -671,8 +713,17 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
           // 覆盖级配置：provider 槽位 + 模型（生效路由 = 激活自定义条目或固定键；
           // key 不进命令行）。2026.08.21 自定义路由激活时先自愈重写 ~/.codex
           // （config.toml 槽位 + auth.json），防多实例竞态写空后 provider 失配。
-          << QStringLiteral("-c") << QStringLiteral("model_provider=%1").arg(CodexEffProvider())
-          << QStringLiteral("-c") << QStringLiteral("model=%1").arg(CodexEffModel());
+          // 2026-10-07 起按起步条目（覆盖优先）解析；model_context_window 一并
+          //   命令行化（覆盖轮窗口随条目，且不依赖共享 config.toml 内容）。
+          << QStringLiteral("-c") << QStringLiteral("model_provider=%1").arg(CodexEffProviderFor(pAct, iUse))
+          << QStringLiteral("-c") << QStringLiteral("model=%1").arg(CodexEffModelFor(pAct))
+          << QStringLiteral("-c") << QStringLiteral("model_context_window=%1")
+                                     .arg(QString::number(CodexEffContextWindowFor(pAct)));
+    // 2026-10-08 思考强度（官方键 model_reasoning_effort；minimal/low/medium/high/xhigh；
+    //   空=不注入走模型默认。responses/chat 两 wire 均接受该覆盖键）。
+    if (!s_sCodexEffort.isEmpty()) {
+        aArgs << "-c" << QStringLiteral("model_reasoning_effort=%1").arg(s_sCodexEffort);
+    }
     // 2026.08.21 本地代理注入 max_tokens：codex chat 请求体不带 max_tokens，
     //   网关默认输出 4096 截断（长输出轮必挂且被 codex 误报为上下文耗尽）。
     //   仅 http + chat 生效（代理为明文管道；https/responses 保持原路由）。
@@ -680,16 +731,18 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     //   （代理随进程起停，不落盘）。
     // 2026.09.24 v3.1.231 激活条目为 anthropic-messages（Codex 不可用）且已自动
     //   切到同名 chat 兑底端点 → 留显式痕迹（四后端共享列表「设为当前」的条目
-    //   可能是 Pi 风味，用户需要知道 Codex 实际连的是哪条）。
-    if (CodexActiveEntry() != nullptr && !CodexApiChatCompat(CodexActiveEntry()->sApi)
-            && CodexChatCompatEntry() != nullptr) {
-        emit sigInfo(QStringLiteral("[system/codex] 激活条目「%1」接入点为 anthropic-messages"
-                                    "（Codex 不可用），已自动改用同模型 chat 端点：%2")
-                         .arg(CodexActiveEntry()->sDisp, CodexEffBaseUrl()));
+    //   可能是 Pi 风味，用户需要知道 Codex 实际连的是哪条）。2026-10-07 起按
+    //   起步条目（覆盖优先）判定。
+    if (pAct != nullptr && !CodexApiChatCompat(pAct->sApi)
+            && CodexChatCompatFor(pAct) != nullptr) {
+        emit sigInfo(QStringLiteral("[system/codex] %1条目「%2」接入点为 anthropic-messages"
+                                    "（Codex 不可用），已自动改用同模型 chat 端点：%3")
+                         .arg(HasStageModelOverride() ? QStringLiteral("覆盖") : QStringLiteral("激活"),
+                              pAct->sDisp, CodexEffBaseUrlFor(pAct)));
     }
-    const QUrl urlBase(CodexEffBaseUrl());
+    const QUrl urlBase(CodexEffBaseUrlFor(pAct));
     if (urlBase.scheme().compare(QStringLiteral("http"), Qt::CaseInsensitive) == 0
-        && CodexEffWireApi() == QLatin1String("chat")) {
+        && CodexEffWireApiFor(pAct) == QLatin1String("chat")) {
         if (m_pProxy == nullptr) {
             m_pProxy = new CCodexProxy(this);
             // 2026.08.21 真实计量：代理从网关响应解析 usage（含 stream_options
@@ -706,13 +759,13 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
                         emit sigUsageDelta(a_iIn, a_iOut);
                     });
         }
-        if (m_pProxy->Start(urlBase, CodexEffMaxTokens())) {
+        if (m_pProxy->Start(urlBase, CodexEffMaxTokensFor(pAct))) {
             aArgs << "-c" << QStringLiteral("model_providers.%1.base_url=%2")
-                         .arg(CodexEffProvider(), m_pProxy->ProxyBaseUrl());
+                         .arg(CodexEffProviderFor(pAct, iUse), m_pProxy->ProxyBaseUrl());
             emit sigInfo(QStringLiteral("[system/codex] 本地输出上限代理：127.0.0.1:%1 → %2"
                                         "（注入 max_tokens=%3，防网关默认 4096 截断）")
                              .arg(QString::number(m_pProxy->Port()), urlBase.toString(),
-                                  QString::number(CodexEffMaxTokens())));
+                                  QString::number(CodexEffMaxTokensFor(pAct))));
         } else {
             emit sigInfo(QStringLiteral("[system/codex] ⚠ 本地代理监听失败，走直连路由"
                                         "（长输出可能被网关按默认上限截断）"));
@@ -731,6 +784,12 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
     // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
     InjectAskEnv(oEnv);
+    // 2026-10-07 对话级模型覆盖：生效 key 按起步条目经进程 env 注入（per-进程，
+    //   不再依赖共享 auth.json 的最后写入值——并发不同模型的助手各自带各自的 key）。
+    const QString sEffKey = CodexEffApiKeyFor(pAct);
+    if (!sEffKey.isEmpty()) {
+        oEnv.insert(QStringLiteral("OPENAI_API_KEY"), sEffKey);
+    }
     oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
     oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));

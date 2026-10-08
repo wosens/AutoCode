@@ -600,10 +600,18 @@ void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
     }
     // 2026.08.20 自定义大模型激活条目覆盖固定路由：provider=autocode-<n>、model=条目
     //   模型 id（apiKey 走 models.json，不走 env 注入）；无激活 → Provider/模型 键。
-    const bool bCustomActive = !PiActiveProvider().isEmpty();
+    // 2026-10-07 对话级模型覆盖：会话级下标优先于全局激活（per-runner 实例槽，不动
+    //   静态表/全局配置——右键「选择模型」仅本助手生效的链路终点）。RPC 形态每轮
+    //   起新进程、一次性形态同理，覆盖下一轮即生效。
+    const int iOvProv = ModelOvIdxIn(s_aPiModels.size());
+    const int iUseProv = (iOvProv >= 0) ? iOvProv : s_iPiActiveModel;
+    const bool bCustomActive = (iUseProv >= 0 && iUseProv < s_aPiModels.size());
+    const QString sCustomProvider = bCustomActive
+        ? QStringLiteral("autocode-%1").arg(iUseProv + 1) : QString();
     // 2026.08.21 自愈：多实例/热重载竞态可能把 models.json 的 autocode-* 槽位清掉
     //   （磁盘正本与内存表失配 → pi 报 Unknown provider "autocode-n"）。每次启动前
     //   幂等重写一遍（保留用户手写 provider，代价极低），保证槽位与激活路由一致。
+    //   （models.json 写全槽位、内容与激活/覆盖下标无关 → 并发不同模型的助手间无竞态）
     if (bCustomActive) {
         WritePiModelsJson();
     }
@@ -611,8 +619,9 @@ void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
     //   的 retry 段（已有段不动；详见 EnsurePiRetrySettings 注释）。
     EnsurePiRetrySettings();
     aArgs << QStringLiteral("--provider")
-          << (bCustomActive ? PiActiveProvider() : PiProvider());
-    const QString sModelArg = bCustomActive ? PiActiveModelId() : PiModel();
+          << (bCustomActive ? sCustomProvider : PiProvider());
+    const QString sModelArg = bCustomActive
+        ? s_aPiModels.at(iUseProv).sModelId : PiModel();
     if (!sModelArg.isEmpty()) {
         aArgs << QStringLiteral("--model") << sModelArg;
     }
@@ -644,7 +653,7 @@ void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
     //   过期——用户每步间隔常超 5 分钟，过期后网关全量重算整个上下文（慢 prefill 网关上
     //   几十秒/步）；长保留把窗口拉到 1 小时（网关不认 ttl 也无害，实测请求正常）。
     oEnv.insert(QStringLiteral("PI_CACHE_RETENTION"), QStringLiteral("long"));
-    if (!PiApiKey().isEmpty() && PiActiveProvider().isEmpty()) {
+    if (!PiApiKey().isEmpty() && !bCustomActive) {
         QString sEnvName;
         const QString sP = PiProvider().toLower();
         if (sP == QLatin1String("anthropic"))        { sEnvName = QStringLiteral("ANTHROPIC_API_KEY"); }

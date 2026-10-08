@@ -307,6 +307,63 @@ void CMainWindow::ApplySharedModelsToRunners() {
         CHermesRunner::SetHermesApi(stE.sApi);   // 2026.09.21 协议感知：anthropic 端点 → config.yaml api_mode
         CHermesRunner::SetHermesRuntimeLimits(stE.iCtx, stE.iMaxTok);
     }
+    // 2026-10-05 共享表同步推给面板：右键「选择模型」菜单列条目 + 上下文进度条模型名
+    //   兜底/即时刷新（启动/热重载/设置保存/右键切换四路都会走到这里；面板可能尚未
+    //   创建——早期单实例挂接路径会先跑一次，判空即可）。
+    // 2026-10-08 Claude 后端：共享表快照 + 跟随开关（StartStage per-进程 env 注入；
+    //   助手实例槽覆盖优先，跟随开关仅在无覆盖时生效）。
+    CClaudeRunner::SetSharedModelTable(stM.aModels, stM.iActive);
+    CClaudeRunner::SetFollowSharedModels(
+        m_pPm != nullptr && m_pPm->LoadClaudeFollowShared());
+    if (m_pExecPanel != nullptr) {
+        m_pExecPanel->SetSharedModels(stM.aModels, stM.iActive);
+    }
+}
+
+// 2026-10-05 上下文进度条右键「选择模型」：共享当前项换 a_iIndex（下标口径 = 面板
+//   SetSharedModels 收到的同一份合并表）→ 四张节同写 + ApplySharedModelsToRunners
+//   重应用（DSH env 槽位/Pi models.json/Codex 内存+~/.codex/Hermes 固定路由，
+//   下一轮即用新模型，无需重启 AutoCode/进设置页）。任务级覆盖激活时写入任务档
+//   （Save*Models 走 TableCfgPath，口径同设置页保存）。
+void CMainWindow::OnSwitchSharedModel(int a_iIndex) {
+    if (m_pPm == nullptr) {
+        return;
+    }
+    int iDshAct = -1;
+    int iPiAct = -1;
+    int iCodexAct = -1;
+    int iHermesAct = -1;
+    const QList<SDshModelEntry> aDsh = m_pPm->LoadDshModels(&iDshAct);
+    const QList<SDshModelEntry> aPi = m_pPm->LoadPiModels(&iPiAct);
+    const QList<SDshModelEntry> aCodex = m_pPm->LoadCodexModels(&iCodexAct);
+    const QList<SDshModelEntry> aHermes = m_pPm->LoadHermesModels(&iHermesAct);
+    int iPrefTable = -1;
+    if (CAgentRunnerFactory::IsPi()) {
+        iPrefTable = 0;
+    } else if (CAgentRunnerFactory::IsDsh()) {
+        iPrefTable = 1;
+    } else if (CAgentRunnerFactory::IsHermes()) {
+        iPrefTable = 2;
+    } else if (CAgentRunnerFactory::IsCodex()) {
+        iPrefTable = 3;
+    }
+    const SSharedModels stM = MergeSharedModelTables(
+        { aPi, aDsh, aHermes, aCodex },
+        { iPiAct, iDshAct, iHermesAct, iCodexAct }, iPrefTable);
+    if (a_iIndex < 0 || a_iIndex >= stM.aModels.size()) {
+        return;
+    }
+    const bool bOk = m_pPm->SaveDshModels(stM.aModels, a_iIndex)
+                  && m_pPm->SavePiModels(stM.aModels, a_iIndex)
+                  && m_pPm->SaveHermesModels(stM.aModels, a_iIndex)
+                  && m_pPm->SaveCodexModels(stM.aModels, a_iIndex);
+    if (!bOk) {
+        ExecMsgBox(QMessageBox::Warning, QStringLiteral("切换模型"),
+            QStringLiteral("模型配置写入 config.ini 失败，切换可能未持久化（重启后失效）。"), this);
+    }
+    ApplySharedModelsToRunners();   // 重应用 runner + 回推面板（进度条模型名/菜单勾选即时刷新）
+    SetStatus(QStringLiteral("已切换模型：%1（下一轮生效）")
+                  .arg(stM.aModels.at(a_iIndex).sModelId));
 }
 
 // 2026.08.20 抽取自 ctor 启动回填块（多实例配置热重载复用）：config.ini → 运行期
@@ -659,10 +716,20 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             m_pPm->SaveAdhocContextLimit(a_iLimit);
         }
     });
+    // 2026-10-05 上下文条右键「选择模型」：面板菜单选择 → 四张节落盘 + 重应用 runner
+    //   （下一轮即用新模型）+ 回推面板刷新进度条模型名/菜单勾选。
+    connect(m_pExecPanel, &CExecutionPanel::sigSwitchSharedModel,
+            this, &CMainWindow::OnSwitchSharedModel);
+    // 2026-10-07 对话级模型覆盖（右键「选择模型」仅本助手）：面板 → 编排器会话快照
+    //   （StartAdhocStage 每轮按身份解析注入该会话 runner；全局四张节/静态激活不动）。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstModelOverride, m_pOrch,
+            &CTaskOrchestrator::SetAsstModelOverride);
 
     // #1/#6 对话流持久化：助手流/sid 变化 → 写 assistant.json；任务流变化 → 写 chat.json。
+    //   2026-10-04 lambda 包一层：SaveAssistantState 带 a_bForce 参数后，带默认参的
+    //   成员函数指针不能直接连参更少的信号（Qt 指针连接不用默认参）。
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocBlocksChanged,
-            this, &CMainWindow::SaveAssistantState);
+            this, [this]() { SaveAssistantState(); });
     // 2026.08.22 多助手事件：切助手换载编排器会话；增删/改名/排序 → 落盘。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstSwitched,
             this, &CMainWindow::OnAsstSwitched);
@@ -671,9 +738,9 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     connect(m_pExecPanel, &CExecutionPanel::sigAsstRemoved,
             this, &CMainWindow::OnAsstRemoved);
     connect(m_pExecPanel, &CExecutionPanel::sigAsstLayoutChanged,
-            this, &CMainWindow::SaveAssistantState);
+            this, [this]() { SaveAssistantState(); });
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocStateChanged,
-            this, &CMainWindow::SaveAssistantState);
+            this, [this](const QString&) { SaveAssistantState(); });
     connect(m_pExecPanel, &CExecutionPanel::sigTaskChatChanged,
             this, [this](const QString& a_sTaskId) {
         if (m_pPm == nullptr || a_sTaskId.isEmpty()) {
@@ -1273,21 +1340,32 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
         }
     }
     const QString sPrevProject = m_pPm->ProjectDir();   // 切走后摘旧工程的锁
+    // 2026-10-04 切工程隔离窗开启：自此至 LoadAssistantState 收尾，一切信号驱动的
+    //   assistant.json 落盘与自动命名轮全部旁路（成员注释详见 CMainWindow.h）。
+    //   实害：旧工程助手停链中会同步触发命名子轮（收尾自动命名/挂起命名执行），
+    //   ClearTasks 兑底 StopAllAdhoc 的 ⏹/落盘链会把整版旧工程助手写进【新工程】档。
+    m_bProjectSwitching = true;
     // #1/#6 切工程前：先停在跑的助手（⏹ 停止事件此刻仍写【旧】工程的档——之后 m_pPm 将指向
     //   新工程，若等 ClearTasks 再停，旧对话的尾块会被写进新工程的全局 assistant.json），
     //   再把当前工程的助手对话流落盘（Open 后 m_pPm 指向新工程就丢了上下文）。
     if (m_pOrch != nullptr && m_pOrch->IsAnyAdhocRunning()) {
         m_pOrch->StopAllAdhoc();   // 2026.09.03 多助手并发：整组停（各 ⏹ 痕迹落旧档）
     }
-    SaveAssistantState();
+    SaveAssistantState(/*a_bForce=*/true);   // 隔离窗内唯一放行：旧工程终快照
 
     // FR-7 最低验收：切工程前停止在跑的任务 runner + 编译门，并置空编排器 m_pCurTask，
     // 使后续 ClearTasks 的 delete pTask 不触发 runner 异步 finished 回调的悬垂访问（崩溃根因）。
     if (m_pOrch != nullptr) {
         m_pOrch->StopAll();
+        // 2026-10-04 会话先死、后切目标：m_pPm->Open 指向新工程之前整组释放助手会话
+        //   （含停链中可能新起的命名子轮、3s 自动命名重试定时器的会话依赖）——此后
+        //   不存在任何能发射助手落盘信号的源头，ClearTasks 内的 StopAllAdhoc/
+        //   ResetAdhocSessions 成为真空操作，跨工程串档窗口彻底关闭。
+        m_pOrch->ResetAdhocSessions();
     }
 
     if (!m_pPm->Open(a_sDir)) {
+        m_bProjectSwitching = false;   // 失败路径关闭隔离窗（旧面板未动，恢复正常落盘）
         ExecMsgBox(QMessageBox::Warning, QStringLiteral("错误"),
                    QStringLiteral("无法打开目录：%1").arg(a_sDir), this);
         return;
@@ -1390,10 +1468,14 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
     }
 
     // #1 恢复该工程的助手会话链与对话流（sid/撤销栈/助手块）。
-    LoadAssistantState();
+    //   2026-10-04 a_bProjectSwitch：切工程不搞跨档幽灵——外工程助手的 ownerKey 在
+    //   新工程无意义（空串撞全局档 key，会被当本地助手落盘串档），一律丢弃。
+    LoadAssistantState(/*a_bProjectSwitch=*/true);
+    m_bProjectSwitching = false;   // 隔离窗关闭：新工程档已恢复，恢复正常落盘
 
     // 统一备份（方案 §4.4）：打开工程时探测回退中断残留——还原现场（幂等安全），
-    // 用户确认目标后可重新发起回退。孤儿 blob 已在 CProjectManager::Open 尾静默 GC。
+    // 用户确认目标后可重新发起回退。孤儿 blob 已在 CProjectManager::Open 尾后台节流
+    //   GC（2026-10-08：巨型工程同步全量解析卡 UI 改异步 24h 节流，详见函数注释）。
     if (m_pPm->HasRestoreTmp()) {
         QString sErr;
         if (m_pPm->RestoreFromTmp(sErr)) {
@@ -1654,6 +1736,8 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveDshModels(stDlg.DshModels(), stDlg.DshActiveModel());
     m_pPm->SaveWebSearch(stDlg.WebSearch());
     m_pPm->SaveExpertAssistant(stDlg.ExpertAssistant());
+    // 2026-10-08 claude 跟随共享表开关（大模型页）：落盘即重应用（含 runner 静态槽）。
+    m_pPm->SaveClaudeFollowShared(stDlg.ClaudeFollowShared());
     m_pPm->SaveAutoCompactPct(stDlg.AutoCompactPct());
     // 2026.09.27 「上下文窗口上限」设置项已删：[Adhoc] ContextLimit 不再由设置页读写，
     //   入口收敛到上下文进度条右键「设置上下文大小…」（已存值继续生效，未设按模型探测）。
@@ -2788,6 +2872,10 @@ void CMainWindow::OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText
 void CMainWindow::OnAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts) {
     // 2026-09-22 助手自动重命名：面板已收集好提示词，转编排器借会话交 Agent 总结名称+说明；
     //   同步失败（工程未开/无会话/全部助手忙）也走面板 ApplyAsstAutoName 留失败事件行。
+    if (m_bProjectSwitching) {
+        return;   // 2026-10-04 切工程隔离窗：停链收尾触发的自动命名不起新轮
+                  //   （命名子轮会在旧工程面板尚在时启动，轮块/尾块落盘串新工程档）。
+    }
     if (m_pOrch == nullptr || !m_pOrch->AutoNameAsstNow(a_sAsstId, a_sPrompts)) {
         if (m_pExecPanel != nullptr) {
             m_pExecPanel->ApplyAsstAutoName(a_sAsstId, false, QString(),
@@ -3282,7 +3370,12 @@ void CMainWindow::ReloadHistory() {
 }
 
 // —— 助手会话状态持久化（#1）：多助手 v2 档 ↔ .autodev/assistant.json（或 tasks/<id>/）——
-void CMainWindow::SaveAssistantState() {
+void CMainWindow::SaveAssistantState(bool a_bForce) {
+    if (m_bProjectSwitching && !a_bForce) {
+        return;   // 2026-10-04 切工程隔离窗：m_pPm 已指向新工程而面板可能仍持旧工程
+                  //   助手，此刻任何落盘都会把旧工程助手整版写进新工程 assistant.json
+                  //   （BigModel 实害）。唯一放行 = OpenProjectDir 的显式终快照。
+    }
     if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty() ||
         m_pOrch == nullptr || m_pExecPanel == nullptr) {
         return;
@@ -3365,7 +3458,7 @@ void CMainWindow::SaveAssistantState() {
     }
 }
 
-void CMainWindow::LoadAssistantState() {
+void CMainWindow::LoadAssistantState(bool a_bProjectSwitch) {
     if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty() ||
         m_pOrch == nullptr || m_pExecPanel == nullptr) {
         return;
@@ -3373,9 +3466,14 @@ void CMainWindow::LoadAssistantState() {
     // 2026-10-02 跨档幽灵：视图 key 跟 m_pCur（载入档）；档重建前摘下全部运行中助手
     //   （跨档幽灵 + 本档运行者——切回归属档也不能杀在跑轮次，v3.2.259 E2E 实测误杀），
     //   载完挂回：外档者粗体 Tab 继续跨档可见，本档者转正常。
+    //   2026-10-04 a_bProjectSwitch（切工程）：不摘不挂——外工程助手跟到新工程只会以
+    //   空 ownerKey 冒充本地助手落盘串档；会话已由 OpenProjectDir 提前整组释放，
+    //   面板随后整体重建，无需保留任何运行中 Tab。
     m_pExecPanel->SetViewKey(m_pCur != nullptr ? m_pCur->Id() : QString());
     const QString sOldTaskName = (m_pCur != nullptr) ? m_pCur->Name() : QString();
-    const QList<CExecutionPanel::SAsst> aPhantoms = m_pExecPanel->TakeRunningForReload();
+    const QList<CExecutionPanel::SAsst> aPhantoms = a_bProjectSwitch
+        ? QList<CExecutionPanel::SAsst>()
+        : m_pExecPanel->TakeRunningForReload();
     QSet<QString> aKeepIds;
     for (const CExecutionPanel::SAsst& st : aPhantoms) {
         aKeepIds.insert(st.sId);
@@ -3490,6 +3588,9 @@ void CMainWindow::LoadOrchFromPanel(const QString& a_sAsstId) {
                            m_pExecPanel->AsstStack(a_sAsstId),
                            m_pExecPanel->AsstGuideHash(a_sAsstId),
                            m_pExecPanel->AsstBackend(a_sAsstId));   // 2026.09.20 粘性后端
+    // 2026-10-07 对话级模型覆盖随档恢复（面板是持久化正本，会话侧存快照）。
+    const QPair<SDshModelEntry, bool> stOv = m_pExecPanel->AsstModelOverride(a_sAsstId);
+    m_pOrch->SetAsstModelOverride(a_sAsstId, stOv.first, stOv.second);
 }
 
 void CMainWindow::OnAsstSwitched(const QString& a_sOldId, const QString& a_sNewId) {

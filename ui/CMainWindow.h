@@ -164,6 +164,9 @@ private:
     //   （列表+当前项，规则见 CModelEntry.h MergeSharedModelTables）后统一应用到
     //   四个 runner——切换后端即用同一份列表/当前项，无需重配。
     void ApplySharedModelsToRunners();
+    // 2026-10-05 上下文进度条右键「选择模型」：面板上抛切换下标 → 四张节同写 +
+    //   重应用 runner（下一轮即用新模型）+ 回推面板（模型名/勾选即时刷新）。
+    void OnSwitchSharedModel(int a_iIndex);
     // 2026.09.09 v2.1.143 任务级配置覆盖：随有效选中任务切换设置参数源（任务档优先/
     //   未选回全局），重应用运行期配置。选中变化、删除/移除任务、切工程时调用。
     void ApplyTaskConfigOverlay(CTaskInfo* a_pTask);
@@ -181,8 +184,11 @@ private:
     void SaveTask(CTaskInfo* a_pTask);   // 持久化任务到 .autodev/tasks/<id>/task.json
     void ClearTasks();                   // 清理内存任务对象（切工程时调用）
     void ReloadHistory();                // 从全局 SQLite 库重载历史任务并刷新历史页
-    void SaveAssistantState();           // 序列化助手档 → 选中任务存 tasks/<id>/assistant.json，否则工程级（#1）
-    void LoadAssistantState();           // 读对应档 → 恢复助手会话链与对话流；无档显式清空（#1）
+    // a_bForce=true 仅限切工程序列内部使用（m_bProjectSwitching 置位期间的最终落盘）。
+    void SaveAssistantState(bool a_bForce = false);   // 序列化助手档 → 选中任务存 tasks/<id>/assistant.json，否则工程级（#1）
+    // a_bProjectSwitch=true：切工程专用——不做跨档幽灵摘挂（外工程助手绝不跟进新工程，
+    //   防 ownerKey 同为空串被当作本档本地助手落盘 → 跨工程污染 assistant.json）。
+    void LoadAssistantState(bool a_bProjectSwitch = false);   // 读对应档 → 恢复助手会话链与对话流；无档显式清空（#1）
     // 2026.08.22 多助手会话换载：编排器单会话 ↔ 面板各助手会话态互转。
     void SyncOrchToPanel(const QString& a_sAsstId);   // 编排器 sid/栈/guideHash → 回填该助手
     void LoadOrchFromPanel(const QString& a_sAsstId); // 该助手会话态 → 换载进编排器
@@ -235,6 +241,12 @@ private:
     QList<CTaskInfo*>  m_aHistoryTasks;             // 历史页数据源（DB 加载副本，本窗口拥有）
     QList<CTaskInfo*>  m_aTasks;
     CTaskInfo*         m_pCur          = nullptr;
+    // 2026-10-04 切工程隔离窗：OpenProjectDir 自停旧工程助手起置位、LoadAssistantState
+    //   收尾清除。置位期间一切信号驱动的 SaveAssistantState/自动命名轮全部旁路——
+    //   m_pPm->Open 已指向新工程后面板仍持旧工程助手的窗口内，任何落盘都会把整版
+    //   旧工程助手写进新工程 .autodev/assistant.json（BigModel 实害：HarnessAgent 的
+    //   4 个助手整体串档）。仅 OpenProjectDir 内部显式 SaveAssistantState(true) 放行。
+    bool               m_bProjectSwitching = false;
     bool               m_bGuideBuilding = false;
     // 启动任务时 guide.md 缺失：登记该任务，待 guide 生成完成后自动续跑（初始任务）。
     // QPointer：任务对象销毁时自动置空，避免悬垂。

@@ -29,6 +29,18 @@ public:
     static void SetClaudeCmd(const QString& a_sCmd);
     static QString ClaudeCmd();
 
+    // 2026-10-08 共享大模型表消费（设置→大模型「Claude Code 后端跟随本表」，任务/
+    //   助手全覆盖）：跟随开关开时，无实例槽覆盖的 claude 轮次按共享表当前条目
+    //   注入 ANTHROPIC_BASE_URL/API_KEY/MODEL（仅 anthropic-messages 兼容条目；
+    //   开关关/条目非兼容 = 完全走 claude 自身配置，行为与旧版一致）。
+    static void SetSharedModelTable(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    static void SetFollowSharedModels(bool a_bOn);
+    // 2026-10-08 Claude 专属参数（设置→Claude Code 页；与共享表无关，设了就注入）：
+    //   思考预算 MAX_THINKING_TOKENS（<=0=不注入）+ 小模型 ANTHROPIC_SMALL_FAST_MODEL
+    //   （空=不注入；claude 后台小任务的中转映射，网关需同时提供该模型名）。
+    static void SetMaxThinkingTokens(int a_iTok);
+    static void SetSmallFastModel(const QString& a_sModel);
+
     // 2026.08.15 [Agent] AskTimeoutSec：ask_user 等用户作答的超时（秒，默认 600）。
     //   MCP ask 服务跑在独立子进程（--mcp-ask-server），经环境变量 AUTOCODE_ASK_TIMEOUT_SEC
     //   传递（挂载 ask_user 的 StartStage 启动时注入）；非正数回退默认。
@@ -104,6 +116,14 @@ private slots:
     void slotOnErrorOccurred(QProcess::ProcessError a_eError);
 
 private:
+    // 2026-10-08 共享大模型表快照 + 跟随开关（CMainWindow 重应用时刷新；见公共段注释）。
+    static QList<SDshModelEntry> s_aSharedModels;
+    static int  s_iSharedActive;
+    static bool s_bFollowSharedModels;
+    // 2026-10-08 Claude 专属参数（见公共段 SetMaxThinkingTokens/SetSmallFastModel）。
+    static int     s_iMaxThinkTok;
+    static QString s_sSmallFastModel;
+
     void HandleLine(const QByteArray& a_sLine, int a_iEpoch);   // a_iEpoch=所属进程代次（识破旧进程残留行）
     void EmitFailed(const QString& a_sMsg);
     void Reset();

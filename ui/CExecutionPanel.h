@@ -12,6 +12,7 @@
 #include "ui/CMessageBlock.h"   // 块控件（SBlockData 现居 CStreamPresenter.h）
 #include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 亦在此）
 #include "ui/CStageBar.h"          // 2026.09.04 阶段横向图标条
+#include "core/CModelEntry.h"      // 2026-10-05 SDshModelEntry（右键「选择模型」共享表数据源）
 
 class QLabel;
 class QTabWidget;
@@ -64,6 +65,7 @@ public:
     //   测试直调本层验证删除效果）。与 CloseAsst（软关闭可恢复）对应。
     void DeleteAsstCore(const QString& a_sId);
     void ShowTaskLogPage();
+    void SetTaskTabsVisible(bool a_bShow);  // 2026-10-03 任务侧 Tab（日志/产物）显隐统一入口
     // 2026.08.29 上下文进度条菜单（右键/左键共用）：立即压缩 + 设置上下文大小。
     //   2026.09.05 per-助手控件：目标助手 id 显式传入（该助手自己的进度条/会话）。
     void ShowContextMenu(const QString& a_sAsstId, const QPoint& a_stGlobalPos);
@@ -125,6 +127,18 @@ public:
     void SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 更新该助手上下文快照+进度条（<0 视为未知）
     void OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 该助手收到模型名 → 查表更新窗口分母
     void SetUserContextLimit(qint64 a_iLimit);    // 右键设窗口上限（>0 覆盖探测；0/负回退自动）
+    // 2026-10-05 右键「选择模型」数据源：主窗口推送共享模型表（列表+当前项）——菜单列
+    //   全部可用模型、进度条本体显示当前模型名也以此兜底；切换经 sigSwitchSharedModel
+    //   上抛主窗口（四张节落盘 + 重应用 runner，下一轮立刻用新模型，无需重启/进设置页）。
+    void SetSharedModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    // 2026-10-07 对话级模型覆盖：右键「选择模型」改为仅本助手生效（不动全局四张节/
+    //   静态激活）。a_iIdx = 共享表下标（SetSharedModels 推送的同一份表）；<0/越界 =
+    //   清除（跟随全局）。更新 SAsst + 进度条显示 + 落盘信号，并经 sigAsstModelOverride
+    //   上抛主窗口转编排器（会话快照，StartAdhocStage 每轮按身份解析注入 runner）。
+    //   claude 粘性助手不参与共享表（模型自报）→ no-op 返回 false。
+    bool ApplyAsstModelOverride(const QString& a_sAsstId, int a_iIdx);
+    // 该助手覆盖快照（LoadOrchFromPanel 档恢复拉取用；second=false=未设）。
+    QPair<SDshModelEntry, bool> AsstModelOverride(const QString& a_sAsstId) const;
     void SetAdhocEnabled(bool a_bEnabled);  // 工程未打开时禁用输入栏
     // FR-3：资源管理器「添加到聊天框」→ 把文本追加到 adhoc 助手输入框末尾。
     void AppendToAdhocInput(const QString& a_sText);
@@ -171,6 +185,14 @@ public:
     // 2026.09.23 v3.1.227 阶段条显隐观察口（测试/诊断）：无任务选中时阶段条自隐藏、
     //   日志 Tab 区顶上移到原任务进度位置（SetCurrentTask/RefreshTask 驱动）。
     bool StageBarVisible() const { return m_pStageBar != nullptr && m_pStageBar->isVisible(); }
+    // 2026-10-03 任务侧底栏显隐观察口（测试/诊断）：无任务隐藏介入栏与费用栏容器。
+    bool TaskBarsVisible() const {
+        return (m_pTaskBarWidget != nullptr && m_pTaskBarWidget->isVisibleTo(parentWidget()))
+            || (m_pCostBarWidget != nullptr && m_pCostBarWidget->isVisibleTo(parentWidget()));
+    }
+    // 2026-10-03 任务侧 Tab 显隐观察口：日志页在 Tab 栏可见与否（无任务隐藏，选任务
+    //   恢复；卖现在 .cpp——头文件仅前置声明 CAsstTabWidget/QTabBar）。
+    bool TaskLogTabVisible() const;
     static bool BusyIndicatorSpinning(const QWidget* a_pW);
     QString ActiveAsstId() const { return m_sActiveAsst; }  // 当前激活（显示中）的助手 id
     // 2026.09.02 跨轮上下文回灌：提取指定助手最近对话记录（"用户：…"/"助手：…"
@@ -233,6 +255,14 @@ signals:
     void sigTaskChatChanged(const QString& a_sTaskId);    // 任务流变化（#6 去抖存盘）
     // 右键「设置上下文大小」→ 上抛用户设的上下文窗口上限（token；0=回退自动探测）。
     void sigAdhocContextLimitChanged(qint64 a_iLimit);
+    // 2026-10-05 右键「选择模型」切换共享当前模型（下标按 SetSharedModels 推送的表）：
+    //   主窗口存四张节（Dsh/Pi/Codex/Hermes）+ ApplySharedModelsToRunners 重应用 +
+    //   回推面板（进度条模型名/菜单勾选即时刷新）；下一轮即用新模型。
+    void sigSwitchSharedModel(int a_iIndex);
+    // 2026-10-07 对话级模型覆盖变化（右键菜单设置/清除）：主窗口转编排器
+    //   SetAsstModelOverride 存会话快照（生效在 StartAdhocStage 每轮解析）。
+    void sigAsstModelOverride(const QString& a_sAsstId, const SDshModelEntry& a_stE,
+                              bool a_bOn);
     // FR-3：任务对话流介入输入栏 → 主窗口 → 编排器 InjectTaskMessage。
     void sigTaskInject(const QString& a_sTaskId, const QString& a_sText);
     // 需求3：阶段表右键「再次执行」→ 主窗口 → 编排器 RunSingleStage（仅该阶段，不推进后续）。
@@ -291,6 +321,7 @@ private:
     void CreateAsstWidgets(SAsst& a_stAsst);   // 建助手页容器（日志视图+输入栏+统计栏）并接信号
     void SyncRunTimer();            // 2026.09.05 耗时定时器统一开关（任务或任一助手在跑即跑）
     void UpdateTaskInjectState();   // FR-3 按当前任务 Running 态刷新介入输入栏可用性
+    void UpdateTaskBarsVisibility(); // 2026-10-03 无任务隐藏任务侧底栏（介入栏+费用栏）
     void UpdateCostLabel();         // 2026.08.15 刷新底部费用/状态栏（2026.09.05 起仅任务侧；助手统计在各自页内）
     void OnRunTimer();              // 2026.08.15 运行中每秒刷新耗时显示
     static qint64 ContextLimitForModel(const QString& a_sModel);  // 模型名 → 上下文窗口 token 上限
@@ -311,6 +342,8 @@ private:
     CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志
     QPlainTextEdit* m_pTaskInput = nullptr; // FR-3 任务对话流下方的介入输入栏
     QPushButton*    m_pBtnInject = nullptr; // FR-3 介入发送按钮
+    QWidget*        m_pTaskBarWidget = nullptr; // 2026-10-03 介入栏容器（无任务整体隐藏）
+    QWidget*        m_pCostBarWidget = nullptr; // 2026-10-03 任务侧费用栏容器（同上）
     QListWidget*    m_pOutputs = nullptr;   // Tab2 左：阶段产物清单
     CArtifactView* m_pArtifactView = nullptr;  // Tab2 右：选中产物的 Markdown 渲染
     QLabel*         m_pLblCost = nullptr;
@@ -347,7 +380,16 @@ public:
         QString               sDesc;          // 2026-09-22 助手说明（自动重命名生成，Tab tooltip 首行）
         bool                  bAutoNameTried = false;  // 2026.09.26 本轮已自动改名尝试过（防收尾重入循环；用户再发提示词时清零）
         bool                  bAutoNameQueued = false;  // 2026-10-03 运行中请求的自动重命名挂起位（本轮收尾 OnAdhocFinished 执行）
+        // 2026-10-08 首条提示词「先改名后执行」：命名轮期间挂起的待执行提示词——首条
+        //   提交时若助手名仍是缺省名（助手N）且从未收到过提示词，先触发自动命名，
+        //   提示词只入暂存框；命名轮收尾（OnAdhocFinished）统一转正补发。期间新提交
+        //   同样只暂存不提交（防 InjectUserTurn 污染命名轮）。
+        bool                  bSendAfterAutoName = false;
+        int                   iSendAfterPerm = 0;     // 挂起首条提交时拍的权限快照（补发携带）
         QString               sBackend;       // 2026.09.20 粘性后端名（"" = 未绑定；档持久化）
+        // 2026-10-07 对话级模型覆盖（右键「选择模型」仅本助手，不动全局；档持久化 modelOv 键）
+        SDshModelEntry        stModelOv;
+        bool                  bModelOv = false;
         QString               sSid;           // 会话 sid（编排器会话换载时回填）
         QString               sGuideHash;     // guide.md 投喂哈希基线
         QJsonArray            aStack;         // 撤销栈 JSON（prompt,sid 链）
@@ -463,6 +505,10 @@ private:
     CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起；仅当前助手页可见，锚定其按钮）
     QTimer*                m_pFlyoutHideTimer = nullptr;   // 2026.09.13 浮层收起定时器：鼠标离开区域 500ms 后才收（位置判定，见 IsCursorInsideFlyoutRegion）
     QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
+    // 2026-10-05 共享模型表镜像（主窗口 SetSharedModels 推送；启动/热重载/设置保存/
+    //   右键切换后同步）：右键「选择模型」菜单列条目、上下文进度条模型名兜底。
+    QList<SDshModelEntry>  m_aSharedModels;
+    int                    m_iSharedActiveModel = -1;   // 共享当前条目下标（-1=无激活/未配置）
     QString                m_sViewKey;                 // 2026-10-02 当前视图存档 key（任务 id/空=工程档）：SAsst::sOwnerKey 与之不等即外档幽灵
     QString                m_sActiveAsst;              // 当前激活助手 id
     // （m_sRunningAsst 已删：运行态 per-助手存 SAsst::bRunning。）

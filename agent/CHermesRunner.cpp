@@ -22,12 +22,19 @@
 // —— 进程级静态配置（纯内存；CMainWindow 启动/设置保存路径回填）——
 static QString s_sHermesRoot;
 static QString s_sHermesNodePath;
+// 2026-10-08 思考强度（agent.reasoning_effort；空=不托管）——类静态成员
+//   （CHermesRunner.h 声明），此处定义（旧文件级 static 与成员重名致链接缺定义）。
+QString CHermesRunner::s_sHermesEffort;
 static QString s_sHermesModel;
 static QString s_sHermesApiKey;
 static QString s_sHermesBaseUrl;
 // 激活模型条目的 API 协议（anthropic-messages / openai-completions，2026.09.21）：
 //   空/未知 = OpenAI wire（历史行为）；anthropic* 时 config.yaml 补写 api_mode。
 static QString s_sHermesApi;
+// 2026-10-07 对话级模型覆盖的并发守卫记录：最近一次 Hermes 启动写入共享配置的
+//   模型身份 + 时刻（UI 线程串行维护；紧邻的不同身份启动延迟重入，见 StartStage）。
+static qint64 s_llHermesCfgMs = 0;
+static QString s_sHermesCfgIdent;
 // 计费单价（$/百万 token，口径同 DSH/Pi）：Hermes 只报 token 分量，客户端折算。
 static double s_dHermesPriceInPerM        = 3.0;
 static double s_dHermesPriceCacheReadPerM = 0.3;
@@ -39,6 +46,10 @@ static int    s_iHermesMaxTok = 32768;
 
 void CHermesRunner::SetHermesRoot(const QString& a_sRoot) { s_sHermesRoot = a_sRoot.trimmed(); }
 QString CHermesRunner::HermesRoot() { return s_sHermesRoot; }
+void CHermesRunner::SetHermesEffort(const QString& a_sLevel) {
+    s_sHermesEffort = a_sLevel.trimmed().toLower();
+}
+
 
 QString CHermesRunner::HermesGitRepoDir() {
     // 2026.09.20 版本管理 Hermes 最新版比对：定位部署根下真正含 .git 的仓目录
@@ -111,19 +122,25 @@ static QString HermesHomeDir(const QString& a_sHermesHome) {
     return QDir::homePath() + QStringLiteral("/.hermes");
 }
 
-QJsonObject CHermesRunner::BuildRuntimeConfigJson() {
+QJsonObject CHermesRunner::BuildRuntimeConfigJson(const SDshModelEntry* a_pOv) {
     // 写入内容是 config 静态键的确定性纯函数（多实例后写者不产生损坏内容的前提）。
+    // 2026-10-07 对话级模型覆盖：a_pOv 非空时 model/baseUrl/apiKey 取覆盖条目
+    //   （窗口/输出上限仍走全局钳位静态——覆盖条目与共享表同源，值本就一致）。
     QJsonObject oCfg;
-    oCfg.insert(QStringLiteral("model"), s_sHermesModel);
-    oCfg.insert(QStringLiteral("baseUrl"), s_sHermesBaseUrl);
-    oCfg.insert(QStringLiteral("apiKey"), s_sHermesApiKey);
+    oCfg.insert(QStringLiteral("model"),
+                (a_pOv != nullptr && !a_pOv->sModelId.isEmpty()) ? a_pOv->sModelId : s_sHermesModel);
+    oCfg.insert(QStringLiteral("baseUrl"),
+                (a_pOv != nullptr && !a_pOv->sBaseURL.isEmpty()) ? a_pOv->sBaseURL : s_sHermesBaseUrl);
+    oCfg.insert(QStringLiteral("apiKey"),
+                (a_pOv != nullptr && !a_pOv->sApiKey.isEmpty()) ? a_pOv->sApiKey : s_sHermesApiKey);
     oCfg.insert(QStringLiteral("contextWindow"), static_cast<double>(s_iHermesCtx));
     // maxTokens 钳位（AC3 口径=钳位 131072，与设置页保存双侧收口）。
     oCfg.insert(QStringLiteral("maxTokens"), static_cast<double>(s_iHermesMaxTok));
     return oCfg;
 }
 
-bool CHermesRunner::EnsureRuntimeConfig(const QString& a_sHermesHome) {
+bool CHermesRunner::EnsureRuntimeConfig(const QString& a_sHermesHome,
+                                        const SDshModelEntry* a_pOv) {
     // 幂等自愈写 ~/.hermes/agent/config.json：
     //   1) 读旧值——内容与目标一致则短路返回（AC6 幂等；不重写 mtime）；
     //   2) 不一致——写同目录临时文件 + QFile::rename 原子替换。多实例首写竞态下
@@ -133,7 +150,7 @@ bool CHermesRunner::EnsureRuntimeConfig(const QString& a_sHermesHome) {
     const QString sAgentDir = sHome + QStringLiteral("/agent");
     const QString sCfgPath = sAgentDir + QStringLiteral("/config.json");
 
-    const QJsonDocument oDoc(BuildRuntimeConfigJson());
+    const QJsonDocument oDoc(BuildRuntimeConfigJson(a_pOv));
     const QByteArray aTarget = oDoc.toJson(QJsonDocument::Indented);
 
     CFrwDevice fOld(sCfgPath);
@@ -228,6 +245,81 @@ QString YamlScalar(QString a_sVal) {
         sV.truncate(iHash);
     }
     return sV.trimmed();
+}
+
+// agent: 段 reasoning_effort 读取/写管理（2026-10-08 思考强度）。
+//   读 = agent: 段内首个 reasoning_effort: 行的标量（段缺/键缺 = 空）。
+QString ReadHermesAgentEffort(const QStringList& a_aLines) {
+    bool bInAgent = false;
+    for (const QString& sLine : a_aLines) {
+        if (IsTopLevelKeyLine(sLine)) {
+            bInAgent = sLine.startsWith(QStringLiteral("agent"));
+            continue;
+        }
+        if (!bInAgent) {
+            continue;
+        }
+        const QString sT = sLine.trimmed();
+        if (sT.startsWith(QStringLiteral("reasoning_effort"))) {
+            return sT.mid(17).split(QLatin1Char('#')).first().trimmed();
+        }
+    }
+    return QString();
+}
+
+// 写：agent: 段内 reasoning_effort 键 upsert（a_sEffort 空 = 删键回 hermes 默认；
+//   false/minimal..ultra 原词写入）。段缺 = 文末追加 agent: + 缩进键；段在 = 沿用
+//   段内首个保留行缩进插入/替换，多余同名键删除（同 model 段防后位覆盖口径）。
+QString BuildHermesAgentEffortText(const QStringList& a_aLines, const QString& a_sEffort) {
+    int iAgent = -1;
+    for (int i = 0; i < a_aLines.size(); ++i) {
+        if (a_aLines.at(i).startsWith(QStringLiteral("agent"))
+            && IsTopLevelKeyLine(a_aLines.at(i))) {
+            iAgent = i;
+            break;
+        }
+    }
+    int iSegEnd = a_aLines.size();
+    QString sIndent = QStringLiteral("  ");
+    if (iAgent >= 0) {
+        for (int i = iAgent + 1; i < a_aLines.size(); ++i) {
+            if (IsTopLevelKeyLine(a_aLines.at(i))) {
+                iSegEnd = i;
+                break;
+            }
+        }
+        for (int i = iAgent + 1; i < iSegEnd; ++i) {
+            const QString sT = a_aLines.at(i).trimmed();
+            if (!sT.isEmpty() && !sT.startsWith(QLatin1Char('#'))) {
+                sIndent = a_aLines.at(i).left(a_aLines.at(i).size() - sT.size());
+                break;
+            }
+        }
+    }
+    QStringList aOut;
+    bool bDone = false;
+    for (int i = 0; i < a_aLines.size(); ++i) {
+        const bool bInSeg = (iAgent >= 0 && i > iAgent && i < iSegEnd);
+        const QString sT = a_aLines.at(i).trimmed();
+        if (bInSeg && sT.startsWith(QStringLiteral("reasoning_effort"))) {
+            if (!bDone && !a_sEffort.isEmpty()) {
+                aOut << sIndent + QStringLiteral("reasoning_effort: ") + a_sEffort;
+                bDone = true;
+            }
+            continue;
+        }
+        aOut << a_aLines.at(i);
+    }
+    if (!bDone && !a_sEffort.isEmpty()) {
+        if (iAgent < 0) {
+            if (!aOut.isEmpty() && !aOut.last().trimmed().isEmpty()) {
+                aOut << QString();
+            }
+            aOut << QStringLiteral("agent:");
+        }
+        aOut << sIndent + QStringLiteral("reasoning_effort: ") + a_sEffort;
+    }
+    return aOut.join(QLatin1Char('\n'));
 }
 
 // 提取 model: 段四键当前值（后位同名键覆盖——YAML 语义；段外/缺键 → 空值）。
@@ -367,9 +459,16 @@ QString LocalizeHermesCapText(const QString& a_sText) {
 }
 }   // namespace
 
-bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath) {
+bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath,
+                                           const SDshModelEntry* a_pOv) {
     // 静态配置三值不全（模型条目未回填）→ 不注入（更早的 HermesConfigError 拦截）。
-    if (s_sHermesModel.isEmpty() || s_sHermesBaseUrl.isEmpty() || s_sHermesApiKey.isEmpty()) {
+    // 2026-10-07 对话级模型覆盖：a_pOv 非空时三值/协议取覆盖条目（与全局同表同源，
+    //   覆盖只改本进程读取窗口的内容——StartStage 的延迟重入守卫保证读不串台）。
+    const QString sM = (a_pOv != nullptr && !a_pOv->sModelId.isEmpty()) ? a_pOv->sModelId : s_sHermesModel;
+    const QString sU = (a_pOv != nullptr && !a_pOv->sBaseURL.isEmpty()) ? a_pOv->sBaseURL : s_sHermesBaseUrl;
+    const QString sK = (a_pOv != nullptr && !a_pOv->sApiKey.isEmpty()) ? a_pOv->sApiKey : s_sHermesApiKey;
+    const QString sA = (a_pOv != nullptr && !a_pOv->sApi.isEmpty()) ? a_pOv->sApi : s_sHermesApi;
+    if (sM.isEmpty() || sU.isEmpty() || sK.isEmpty()) {
         return false;
     }
     CFrwDevice fYaml(a_sYamlPath);
@@ -379,23 +478,29 @@ bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath) {
         fYaml.close();
     }
     QMap<QString, QString> oTargets;
-    oTargets.insert(QStringLiteral("default"), s_sHermesModel);
+    oTargets.insert(QStringLiteral("default"), sM);
     oTargets.insert(QStringLiteral("provider"), QStringLiteral("custom"));
-    oTargets.insert(QStringLiteral("base_url"), s_sHermesBaseUrl);
-    oTargets.insert(QStringLiteral("api_key"), s_sHermesApiKey);
+    oTargets.insert(QStringLiteral("base_url"), sU);
+    oTargets.insert(QStringLiteral("api_key"), sK);
     // 2026.09.21 协议感知：anthropic 端点写 api_mode（hermes 主运行时
     //   _resolve_plain_custom_api_mode 读该键切 Anthropic 传输，请求
     //   <base>/v1/messages——与 Claude Code 同链路）；OpenAI 端点写显式
     //   chat_completions（网关 /claude 路由 404 实录后双保险，语义同缺省）。
     oTargets.insert(QStringLiteral("api_mode"),
-                    HermesApiIsAnthropic(s_sHermesApi)
+                    HermesApiIsAnthropic(sA)
                         ? QStringLiteral("anthropic_messages")
                         : QStringLiteral("chat_completions"));
-    // 读-比-短路：model 段四键已是目标值 → 不写（保 mtime，AC6 幂等口径）。
-    if (ReadHermesModelKeys(sTxt.split(QLatin1Char('\n'))) == oTargets) {
+    // 读-比-短路：model 段四键已是目标值且思考强度键同步 → 不写（保 mtime）。
+    //   2026-10-08 思考强度：agent.reasoning_effort 与 model 段同一次写管；
+    //   空值 = 删键（回 hermes 默认），false = 显式禁用，minimal..ultra 原词。
+    const QString sEffort = s_sHermesEffort;
+    const QStringList aLines = sTxt.split(QLatin1Char('\n'));
+    if (ReadHermesModelKeys(aLines) == oTargets
+        && ReadHermesAgentEffort(aLines) == sEffort) {
         return true;
     }
-    const QString sNew = BuildHermesYamlText(sTxt.split(QLatin1Char('\n')), oTargets);
+    const QString sNew = BuildHermesAgentEffortText(
+        BuildHermesYamlText(aLines, oTargets).split(QLatin1Char('\n')), sEffort);
     // 临时文件 + rename 原子替换（口径同 EnsureRuntimeConfig；写入内容是静态
     //   配置键的确定性纯函数，多实例首写竞态下 rename 失败时兜底删临时文件）。
     const QString sTmp = a_sYamlPath + QStringLiteral(".tmp");
@@ -693,6 +798,7 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
                                int a_iAutocompactK,
                                bool a_bEnableAskUser) {
     Reset();   // a_sWorkDir：工程根（exe 形态注入 TERMINAL_CWD 锚定工具路径，见下）
+    ++m_uStageSeq;   // 2026-10-07 代序（延迟重入守卫：迟发回调发现代序已变/已被 Stop 即放弃）
     emit sigInfo(QStringLiteral("[hermes] 启动阶段（prompt %1 字符）")
                      .arg(a_sPrompt.size()));
     // 2026.09.14 技能清单前置（hermes 技能只发现 HERMES_HOME/skills，不认 ~/.claude/skills；
@@ -741,7 +847,39 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
     //   形态 B（exe）不再写 ~/.hermes——hermes-agent 只认部署根 config.yaml
     //   （EnsureHermesHomeConfig，见下 env 段），写用户主目录属纯垃圾，违反
     //   「AutoCode 自身配置随程序目录/部署根走，不落用户主目录」的便携约定。
-    if (!bExeForm && !EnsureRuntimeConfig()) {
+    // 2026-10-07 对话级模型覆盖（右键「选择模型」仅本助手生效，不动全局静态）：
+    //   覆盖条目快照在实例槽（编排器每轮现读共享表按身份解析注入）；本进程的
+    //   env 与 config 写入均按覆盖值。hermes 的模型通道是共享配置文件
+    //   （形态 A=~/.hermes/agent/config.json、形态 B=部署根 config.yaml）且进程
+    //   在 spawn 后异步读取 → 并发不同模型的 Hermes 助手在彼此「写→读」窗口内
+    //   互相串台。守卫：记录最近一次写入的模型身份，紧邻的不同身份启动延迟 4s
+    //   重入（python 启动读取窗口远小于该值；同身份不延迟——全局并发行为不变）。
+    const SDshModelEntry* pOv = HasStageModelOverride() ? &m_stModelOv : nullptr;
+    const QString sWantIdent = (pOv != nullptr)
+        ? ModelEntryIdentity(*pOv)
+        : (s_sHermesModel.trimmed().toLower() + QChar(1) + s_sHermesBaseUrl.trimmed().toLower());
+    const qint64 llNow = QDateTime::currentMSecsSinceEpoch();
+    if (!s_sHermesCfgIdent.isEmpty() && s_sHermesCfgIdent != sWantIdent
+        && llNow - s_llHermesCfgMs < 4000) {
+        const quint32 uSeq = m_uStageSeq;
+        const int iWait = int(4200 - (llNow - s_llHermesCfgMs));
+        emit sigInfo(QStringLiteral("[hermes] 另一 Hermes 会话刚写入不同模型配置，"
+                                    "延迟 %1ms 启动以避开其读取窗口。").arg(iWait));
+        const QString sW = a_sWorkDir, sP = a_sPrompt, sT = a_sDisallowedTools,
+                      sR = a_sResumeSid;
+        const int iT = a_iMaxTurns, iK = a_iAutocompactK;
+        const bool bF = a_bFork, bA = a_bEnableAskUser;
+        QTimer::singleShot(iWait, this, [this, uSeq, sW, sP, sT, iT, sR, bF, iK, bA]() {
+            if (uSeq != m_uStageSeq || m_bFinished) {
+                return;   // 延迟期间有新 StartStage（代序已变）或已被 Stop
+            }
+            StartStage(sW, sP, sT, iT, sR, bF, iK, bA);
+        });
+        return;
+    }
+    s_sHermesCfgIdent = sWantIdent;
+    s_llHermesCfgMs = llNow;
+    if (!bExeForm && !EnsureRuntimeConfig(QString(), pOv)) {
         emit sigInfo(QStringLiteral("[hermes] ~/.hermes 运行时配置写入失败"
                                     "（继续启动，走 HERMES_* 环境变量兜底）。"));
     }
@@ -779,9 +917,13 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
     env.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
     env.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
     env.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
-    env.insert(QStringLiteral("HERMES_BASE_URL"), s_sHermesBaseUrl);
-    env.insert(QStringLiteral("HERMES_API_KEY"), s_sHermesApiKey);
-    env.insert(QStringLiteral("HERMES_MODEL"), s_sHermesModel);
+    // 2026-10-07 对话级覆盖优先（per-进程 env，形态 A 的双保险通道不受共享文件影响）。
+    env.insert(QStringLiteral("HERMES_BASE_URL"),
+               (pOv != nullptr && !pOv->sBaseURL.isEmpty()) ? pOv->sBaseURL : s_sHermesBaseUrl);
+    env.insert(QStringLiteral("HERMES_API_KEY"),
+               (pOv != nullptr && !pOv->sApiKey.isEmpty()) ? pOv->sApiKey : s_sHermesApiKey);
+    env.insert(QStringLiteral("HERMES_MODEL"),
+               (pOv != nullptr && !pOv->sModelId.isEmpty()) ? pOv->sModelId : s_sHermesModel);
     // 形态 B（exe 直起）：注入 HERMES_HOME（venv 内的 exe 可能定位不到部署根）
     //   并幂等注入部署根 config.yaml model 段；
     //   -z 一次性模式吃掉 prompt，输出纯文本回复（HandleLine 积累、收尾整段上抛
@@ -800,7 +942,7 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
         if (!sHome.isEmpty()) {
             env.insert(QStringLiteral("HERMES_HOME"), sHome);
             // 幂等注入失败提示不阻断：config.yaml 可能已手工配好或介质只读。
-            if (!EnsureHermesHomeConfig(sHome + QStringLiteral("/config.yaml"))) {
+            if (!EnsureHermesHomeConfig(sHome + QStringLiteral("/config.yaml"), pOv)) {
                 emit sigInfo(QStringLiteral("[hermes] 部署根 config.yaml model 段注入"
                                             "未完成（若已手工配置可忽略）。"));
             }

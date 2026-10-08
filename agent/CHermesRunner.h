@@ -60,6 +60,9 @@ public:
     //   Node 形态 = cli.js 所在根；robocopy 拷贝部署（无 .git）→ 空串（无法比对）。
     static QString HermesGitRepoDir();
     static void    SetHermesNodePath(const QString& a_sPath);
+    // 2026-10-08 思考强度（config.yaml agent.reasoning_effort；false=显式禁用，
+    //   minimal/low/medium/high/xhigh/max/ultra 原词透传；空=不托管走 hermes 默认）。
+    static void    SetHermesEffort(const QString& a_sLevel);
     static QString HermesNodePath();
     static void    SetHermesModel(const QString& a_sModel);
     static QString HermesModel();
@@ -86,7 +89,8 @@ public:
     // StartStage 幂等自愈写 ~/.hermes/agent/config.json（model/baseUrl/apiKey/
     //   contextWindow/maxTokens，写前 qMin 钳位）。a_sHermesHome 空 = ~/.hermes
     //   （注入参数供单测离线验证，不写真实主目录）。
-    static bool EnsureRuntimeConfig(const QString& a_sHermesHome = QString());
+    static bool EnsureRuntimeConfig(const QString& a_sHermesHome = QString(),
+                                    const SDshModelEntry* a_pOv = nullptr);   // 2026-10-07 对话级覆盖条目（空=全局静态）
     // exe 形态部署根探测：venv/Scripts 上溯候选根中含 config.yaml 者（即
     //   hermes-agent 的 HERMES_HOME）；找不到/非 exe 形态返回空串。
     static QString ResolveHermesHomeForExe(const QString& a_sCli);
@@ -99,7 +103,8 @@ public:
     //   rename 原子替换；段内旧同名键行全部移除后在段首插一组——防 YAML 同键
     //   后位覆盖前位失效）。返回 false = 静态配置不全或写入失败（调用方提示
     //   不阻断启动）。a_sYamlPath 显式传入（单测离线/StartStage 共用）。
-    static bool EnsureHermesHomeConfig(const QString& a_sYamlPath);
+    static bool EnsureHermesHomeConfig(const QString& a_sYamlPath,
+                                       const SDshModelEntry* a_pOv = nullptr);   // 2026-10-07 对话级覆盖条目（空=全局静态）
     // 2026.09.03 v2.0.105 软编码事件补丁敷设（参数=部署根 home）：oneshot.py 已含
     //   "AutoCode events patch v1" 标记→true；缺则同步调 exe 同级 install_env.bat
     //   /hermes-patch <home>（补丁正本=exe 同级 hermes_oneshot_patch.py，venv python
@@ -110,7 +115,7 @@ public:
     // 离线单测注入：覆盖默认 ~/.hermes（传空串还原生产默认）。
     static void SetHermesHomeOverride(const QString& a_sDir);
     // 生成的运行时配置 JSON 内容（钳位后；EnsureRuntimeConfig 的纯函数面，单测用）。
-    static QJsonObject BuildRuntimeConfigJson();
+    static QJsonObject BuildRuntimeConfigJson(const SDshModelEntry* a_pOv = nullptr);   // 2026-10-07 覆盖条目（空=全局静态）
     // 钳位单点（供测试与设置页共用口径）：maxTok>131072 → 131072；ctx>200000 → 200000。
     static int ClampMaxTok(int a_iMaxTok) { return qMin(a_iMaxTok, 131072); }
     static qint64 ClampCtx(qint64 a_iCtx) { return qMin(a_iCtx, 200000); }
@@ -151,6 +156,7 @@ private slots:
     void CheckStall();
 
 private:
+    static QString s_sHermesEffort;   // 2026-10-08 思考强度（agent.reasoning_effort；空=不托管）
     void Reset();
     void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
     void ApplyUsage(const QJsonObject& oUsage);
@@ -190,4 +196,5 @@ private:
     QStringList m_aStderrTail;            // stderr 尾部（失败消息附带）
     QElapsedTimer m_actClock;             // 距上次收到输出（stall 巡检）
     QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
+    quint32     m_uStageSeq = 0;   // 2026-10-07 StartStage 代序（并发模型配置写入的延迟重入守卫：迟发回调发现代序已变/已被 Stop 即放弃）
 };

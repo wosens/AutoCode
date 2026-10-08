@@ -49,6 +49,8 @@ public:
     static void    SetCodexRoot(const QString& a_sRoot);
     static QString CodexRoot();
     static void    SetCodexNodePath(const QString& a_sPath);
+    // 2026-10-08 思考强度（-c model_reasoning_effort；minimal/low/medium/high/xhigh；空=默认）。
+    static void    SetCodexEffort(const QString& a_sLevel);
     static QString CodexNodePath();
     static void    SetCodexProvider(const QString& a_sProvider);
     static QString CodexProvider();

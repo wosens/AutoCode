@@ -46,6 +46,15 @@ public:
     QString ClaudeCmd() const;
     int     AskTimeoutSec() const;
     bool    WebSearch() const;
+    // 2026-10-08 Claude Code 后端跟随共享大模型表（[Agent] ClaudeFollowShared）。
+    bool    ClaudeFollowShared() const;
+    // 2026-10-08 Claude 专属参数（设置→Claude Code 页）。
+    int     ClaudeMaxThinkTok() const;
+    QString ClaudeSmallModel() const;
+    // 2026-10-08 思考强度（DSH/Codex/Hermes 参数页下拉；Pi 已有 PiThinking）。
+    QString DshEffort() const;
+    QString CodexEffort() const;
+    QString HermesEffort() const;
     // 2026.08.26 专家助手开关（[Adhoc] ExpertAssistant）：缺省启用，可手工禁用。
     bool    ExpertAssistant() const;
     // 2026.08.18 Agent 后端与 DSH 参数（全局单选；1=claude，2=dsh）。
@@ -150,13 +159,6 @@ private:
     void OnInstallPi();
     void OnInstallPiNpm();       // 2026.08.20 联网安装：npm install -g pi-coding-agent
     // 2026.08.20 PiAgent 自定义大模型列表维护（口径同 DSH 页同名四方法）。
-    void RefreshPiModelList();
-    int  CurPiModelRow() const;
-    void OnPiModelAdd();
-    void OnPiModelEdit();
-    void OnPiModelCopy();   // 2026.08.27 复制选中条目（口径同 DSH 页）
-    void OnPiModelDel();
-    void OnPiModelSetActive();
     // CodexHarness 安装探测/单装（口径同 Pi：DetectCodexInstalled 静默/手动两态；
     //   OnInstallCodex 提权运行 install_env.bat /codex，npm 本地安装到 exe 同级
     //   Execute\CodexHarness）。
@@ -165,13 +167,6 @@ private:
     void OnInstallCodex();
     void OnInstallCodexLocal();   // 2026.08.21 本机源离线安装（robocopy，无需管理员）
     // 2026.08.21 Codex 自定义大模型列表维护（口径同 Pi 页同名四方法）。
-    void RefreshCodexModelList();
-    int  CurCodexModelRow() const;
-    void OnCodexModelAdd();
-    void OnCodexModelEdit();
-    void OnCodexModelCopy();   // 2026.08.27 复制选中条目（口径同 DSH 页）
-    void OnCodexModelDel();
-    void OnCodexModelSetActive();
     // Hermes 第五后端（任务 3213cdbf）：安装探测（口径同 Pi；自动安装待澄清 3
     //   落地，安装按钮不设——只检测）+ 模型列表维护（口径同 Pi 页）。
     void UpdateHermesEnabled();
@@ -182,13 +177,6 @@ private:
     // 2026.09 Hermes 联网安装（git）：提权运行 install_env.bat /hermes <仓库地址>
     //   （口径同 DSH 安装——git 浅克隆 + pnpm 依赖构建；已装时 fetch+reset 更新）。
     void OnInstallHermesNet();
-    void RefreshHermesModelList();
-    int  CurHermesModelRow() const;
-    void OnHermesModelAdd();
-    void OnHermesModelEdit();
-    void OnHermesModelCopy();
-    void OnHermesModelDel();
-    void OnHermesModelSetActive();
 
     QSpinBox*   m_pSpinMaxIter      = nullptr;
     QSpinBox*   m_pSpinMaxResume    = nullptr;
@@ -220,6 +208,13 @@ private:
     QPushButton* m_pBtnModelActive = nullptr;
     QCheckBox*  m_pChkWebSearch     = nullptr;
     QCheckBox*  m_pChkExpertAssistant = nullptr;   // 2026.08.26 专家助手开关
+    QCheckBox*  m_pChkClaudeFollow = nullptr;      // 2026-10-08 claude 跟随共享表开关（Claude Code 页）
+    QSpinBox*   m_pSpinClaudeThinkTok = nullptr;   // 2026-10-08 思考预算 MAX_THINKING_TOKENS（0=默认）
+    QLineEdit*  m_pEditClaudeSmallModel = nullptr; // 2026-10-08 小模型 ANTHROPIC_SMALL_FAST_MODEL
+    QLineEdit*  m_pEditNodePath = nullptr;         // 2026-10-08 全后端共用 node 路径（常用页）
+    QComboBox*  m_pComboDshEffort = nullptr;       // 2026-10-08 思考强度下拉（DSH 页）
+    QComboBox*  m_pComboCodexEffort = nullptr;     // 2026-10-08 思考强度下拉（Codex 页）
+    QComboBox*  m_pComboHermesEffort = nullptr;    // 2026-10-08 思考强度下拉（Hermes 页）
     // 2026.08.19 PIAgent Tab 控件（仿 DSH Tab：安装状态行 + node/root/provider/model/
     //   apiKey/thinking 编辑组；thinking 为下拉，空项=默认）。
     QLabel*     m_pLblPiState       = nullptr;
@@ -239,12 +234,6 @@ private:
     //   ~/.pi/agent/models.json 的 autocode-<n> provider 槽位生效）。
     QList<SDshModelEntry> m_aPiModels;
     int         m_iPiActiveModel = -1;    // -1=未启用（走 Provider/模型固定路由）
-    QTreeWidget* m_pTreePiModels = nullptr;
-    QPushButton* m_pBtnPiModelAdd    = nullptr;
-    QPushButton* m_pBtnPiModelCopy   = nullptr;   // 2026.08.27 复制选中条目
-    QPushButton* m_pBtnPiModelEdit   = nullptr;
-    QPushButton* m_pBtnPiModelDel    = nullptr;
-    QPushButton* m_pBtnPiModelActive = nullptr;
     // CodexHarness 第四后端（[Agent] Codex*）：安装状态行 + 表单七项（Root/Node/
     //   Provider/Model/ApiKey/BaseUrl/WireApi 下拉）。
     QLabel*     m_pLblCodexState   = nullptr;
@@ -262,12 +251,6 @@ private:
     //   autocode-<n> provider 槽位，CCodexRunner 合成写）+ 本机源离线安装按钮。
     QList<SDshModelEntry> m_aCodexModels;
     int         m_iCodexActiveModel = -1;    // -1=未启用（走固定路由）
-    QTreeWidget* m_pTreeCodexModels = nullptr;
-    QPushButton* m_pBtnCodexModelAdd    = nullptr;
-    QPushButton* m_pBtnCodexModelCopy   = nullptr;   // 2026.08.27 复制选中条目
-    QPushButton* m_pBtnCodexModelEdit   = nullptr;
-    QPushButton* m_pBtnCodexModelDel    = nullptr;
-    QPushButton* m_pBtnCodexModelActive = nullptr;
     QPushButton* m_pBtnInstallCodexLocal = nullptr;
     // Hermes 第五后端（[Agent] Hermes*）：安装状态行 + 表单五项（Root/Node/Model/
     // ApiKey/BaseUrl）+ 计费单价四项 + 模型树（[HermesModels]）。
@@ -284,12 +267,6 @@ private:
     QDoubleSpinBox* m_pSpinHermesPriceOut       = nullptr;
     QList<SDshModelEntry> m_aHermesModels;
     int         m_iHermesActiveModel = -1;   // -1=未启用（走 HermesModel 固定路由）
-    QTreeWidget* m_pTreeHermesModels = nullptr;
-    QPushButton* m_pBtnHermesModelAdd    = nullptr;
-    QPushButton* m_pBtnHermesModelCopy   = nullptr;
-    QPushButton* m_pBtnHermesModelEdit   = nullptr;
-    QPushButton* m_pBtnHermesModelDel    = nullptr;
-    QPushButton* m_pBtnHermesModelActive = nullptr;
     QSpinBox*   m_pSpinCompactPct   = nullptr;
     QSpinBox*   m_pSpinMaxTurns     = nullptr;   // 2026.09.23 助手轮次上限（[Adhoc] MaxTurns）
     QCheckBox*  m_pChkMaxTurnsAuto = nullptr;   // 2026.09.23 工作量评估开关（[Adhoc] MaxTurnsAuto）

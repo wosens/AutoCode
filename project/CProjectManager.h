@@ -90,6 +90,10 @@ public:
     bool ReadFile(int a_iSeq, const QString& a_sRelPath, QByteArray& a_bufOut, QString& a_sErr) const;
     int  PurgeOwner(const QString& a_sOwner);           // 删 owner 全部版本+GC，返回释放 blob 数
     int  GcOrphanBlobs();                               // 无引用 blob 清理，返回删除数
+    // 2026-10-08 GC 本体抽为静态路径版：Open 时后台节流 GC 只捕获备份根路径执行，
+    //   不持 store/宿主指针（切工程销毁 store 不悬垂）。tmp 清理带 10 分钟新鲜度
+    //   守卫（后台化后可能与在途备份并发，防误删正在写的 blob.tmp*）。
+    static int GcOrphanBlobsAtPath(const QString& a_sRoot);
     // 2026.09.21 基准截断（用户需求：回退历史太多时选指定记录为基准、删更早的全部记录）：
     //   删除所有 seq < a_iBaseSeq 的 meta（基准本身保留=最老可回退点）+ 孤儿 blob GC。
     //   安全性依据：每版 manifest 全量自包含（path→hash 完整清单），删旧版不影响存活版
@@ -298,6 +302,22 @@ public:
     // 离线/内网环境改 0 即可，每个阶段启动时读取生效。
     bool SaveWebSearch(bool a_bOn);
     bool LoadWebSearch();
+    // 2026-10-08 Claude Code 后端跟随共享大模型表（[Agent] ClaudeFollowShared，默认 0）：
+    //   1 = claude 任务/助手全走共享表当前条目（env 注入，需 anthropic 兼容端点）。
+    bool LoadClaudeFollowShared() const;
+    bool SaveClaudeFollowShared(bool a_bOn);
+    // 2026-10-08 Claude 专属参数（[Agent] Claude*，设置→Claude Code 页）：
+    //   MaxThinkTok=思考预算 MAX_THINKING_TOKENS（0=不注入走默认）；
+    //   SmallModel=小模型映射 ANTHROPIC_SMALL_FAST_MODEL（空=不注入，后台小任务
+    //   走 claude 自身配置——中转网关需同时提供该小模型名，可在此映射为条目名）。
+    bool SaveClaudeMaxThinkTok(int a_iTok);
+    int LoadClaudeMaxThinkTok() const;
+    bool SaveClaudeSmallModel(const QString& a_sModel);
+    QString LoadClaudeSmallModel() const;
+    // 2026-10-08 全后端共用 node 路径（[Agent] NodePath；空=走 PATH；兼容读取旧
+    //   DshNode/PiNode/CodexNode/HermesNode 专用键——缺共享键时取首个非空旧键并回写）。
+    bool SaveNodePath(const QString& a_sPath);
+    QString LoadNodePathShared();
 
     // ---- 运行策略（config.ini 的 [Policy] 段，设置对话框可改）----
     // 单阶段最大迭代次数（驳回重跑熔断阈值，默认 3；合法 1..9）。
@@ -397,6 +417,16 @@ public:
     // thinking 级别（off/minimal/low/medium/high/xhigh/max；空=默认）。
     bool    SavePiThinking(const QString& a_sLevel);
     QString LoadPiThinking();
+    // 2026-10-08 思考强度（各 harness 参数页）：空=默认不注入。
+    //   DshEffort=DSH initialize reasoningEffort（off/low/high/max）；
+    //   CodexEffort=-c model_reasoning_effort（minimal/low/medium/high/xhigh）；
+    //   HermesEffort=config.yaml agent.reasoning_effort（false/minimal..ultra）。
+    bool    SaveDshEffort(const QString& a_sLevel);
+    QString LoadDshEffort();
+    bool    SaveCodexEffort(const QString& a_sLevel);
+    QString LoadCodexEffort();
+    bool    SaveHermesEffort(const QString& a_sLevel);
+    QString LoadHermesEffort();
     // 2026.08.20 PiAgent 自定义大模型表（[PiModels] Count/Active/M<i>*，口径同
     //   [DshModels]）：激活条目经 ~/.pi/agent/models.json 生效（CPiAgentRunner 合成写）。
     QList<SDshModelEntry> LoadPiModels(int* a_pActive = nullptr);
@@ -555,6 +585,11 @@ signals:
     void sigGuideSyncFinished(bool a_bOk, const QString& a_sMsg);   // 需求4 guide.md 增量同步结果
 
 private:
+    // 2026-10-08 打开卡顿修复（.claude 巨型工程实害）：Open 尾的孤儿 blob GC 改后台节流
+    //   ——旧版同步全量解析所有 meta.json（.claude/skills 12 万代码文件 → 每版 34MB ×
+    //   44 版 = 1.5GB，实测 10-20s）卡 UI 线程。24h 节流（gc.stamp 打点）+ 线程池异步，
+    //   仅捕获备份根路径（不持 this/store，切工程不悬垂）；进程级单飞标志防同根并发。
+    void MaybeStartBackgroundGc();
     void OnGuideRunnerFinished(bool a_bOk, const QString& a_sResult,
                                qint64 a_iIn, qint64 a_iOut, double a_dCost, const QString& a_sSid);
     void OnGuideSyncRunnerFinished(bool a_bOk, const QString& a_sResult,

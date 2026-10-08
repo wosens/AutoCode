@@ -8,6 +8,7 @@
 #include <QList>
 #include <QPair>
 #include <QSet>
+#include "core/CModelEntry.h"   // 2026-10-07 SDshModelEntry（会话级模型覆盖快照）
 #include <QHash>
 #include <QJsonArray>
 #include <QTimer>   // 2026.08.27 m_tGuideSyncIdle（助手 guide 同步空闲节流）
@@ -167,6 +168,9 @@ public:
     void ResetAdhocSessions(const QSet<QString>& a_aKeep = QSet<QString>());
     // 2026.09.20 该助手绑定的后端名（粘性；"" = 未绑定——首次提交时才绑当前全局）。
     QString AsstAdhocBackend(const QString& a_sAsstId) const;
+    // 2026-10-07 对话级模型覆盖：面板右键「选择模型」/档恢复时设置（a_bOn=false 清除
+    //   = 跟随全局）。存条目快照；生效在 StartAdhocStage 每轮解析（见 ApplySessionModelOverride）。
+    void SetAsstModelOverride(const QString& a_sAsstId, const SDshModelEntry& a_stE, bool a_bOn);
 
 signals:
     void sigTaskChanged(CTaskInfo* a_pTask);
@@ -384,6 +388,11 @@ private:
         //   全局设置），未使用过的新助手才跟随全局。
         QString               sBackend;
         QString               sLastSeenGlobal; // 上次提交时的全局后端名（粘性提示仅在其变化时发一次）
+        // 2026-10-07 对话级模型覆盖（右键「选择模型」仅本助手生效，不动全局四张节）：
+        //   条目快照随面板档持久化（assistant.json modelOv 键）；StartAdhocStage 每轮
+        //   现读共享表按身份解析下标注入该会话 runner（实例槽，互不影响其他会话/任务侧）。
+        SDshModelEntry        stModelOv;
+        bool                  bModelOv = false;
         QString               sGuideHash;      // 上次投喂 guide.md 的 SHA256（变更重投判定）
         QList<QPair<QString, QString>> aStack; // (prompt, sid) 撤销链；撤销=弹栈回基点
         QStringList           aTranscript;     // 跨轮上下文回灌缓存（DSH/Codex/Hermes 用）
@@ -391,6 +400,16 @@ private:
         EAdhocMode            eMode = Idle;    // 异步流程状态机（多助手各一份，互不干扰）
         CTaskInfo*            pAutoNameTask = nullptr;   // AutoNaming 模式待命名任务
         QString               sAutoNameTargetAsst;       // AsstAutoNaming 模式：被命名的助手 id
+        // 2026-10-03 自动命名忙等待（HarnessGatewayPlugin 实害：claude result 到达即
+        //   emit sigFinished、进程退净前 IsRunning()=true——收尾自动命名/挂起收尾执行
+        //   在 sigAdhocFinished 同步链里跑必撞该窗口判「忙」；工程只有一个助手时也无
+        //   空闲会话可借，旧版直接失败打「✗ 无可用的空闲助手会话」）。目标忙且无可借
+        //   会话时置 bAutoNameWait 排队，3s 周期重查，空闲后以快照素材启动命名轮；
+        //   StopAdhoc 显式取消（用户主动停后不再冒命名轮）；会话删除/工程关闭由回调
+        //   守卫静默放弃。等待不设上限（专家模式链可达十余分钟，与面板挂起「本轮
+        //   完成后进行」同语义）。
+        bool                  bAutoNameWait = false;
+        QString               sAutoNameWaitPrompts;      // 排队时刻的命名素材快照
         QString               sPendingPrompt;  // Submitting 模式当前 prompt（压栈用）
         QString               sSummary;        // CompactSummarize 产出、CompactReseed 投递
         QString               sLastTaskId;     // 最近一次 Submit 的任务档 id（续发记忆沿用）
@@ -431,6 +450,10 @@ private:
     };
     SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
     void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
+    // 2026-10-07 对话级模型覆盖：StartAdhocStage 每轮调用——现读四张节合并共享表，
+    //   会话有覆盖且后端为四自定义表后端时按身份解析下标注入该会话 runner 实例
+    //   （claude/覆盖失效回退跟随全局）。每轮显式设/清，静态激活永不被动。
+    void ApplySessionModelOverride(SAdhocSession& a_S);
     void StartAdhocStage(SAdhocSession& a_S, const QString& a_sPrompt,
                          bool a_bDropLastUser = false, int a_iTurnsOverride = 0,
                          const QString& a_sToolsDeny = QString());   // 按会话 sSid/权限三态组装 argv 起一次；2026.09.02 a_bDropLastUser=回灌时剔除末尾本轮提问行（prompt 尾部已含原文，防重复）；2026.09.26 a_iTurnsOverride/a_sToolsDeny=专家模式规划/验证轮的轮次与工具覆盖（缺省 0/空串=沿用会话权限与预算口径）

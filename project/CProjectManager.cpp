@@ -13,6 +13,8 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QThread>   // 2026.08.22 blob 临时名防并发碰撞（线程 id 掺入）
+#include <QThreadPool>   // 2026-10-08 Open 尾孤儿 blob GC 后台节流（大库解析不卡 UI）
+#include <QAtomicInteger>   // 同上：进程级 GC 单飞标志
 #include <thread>     // 2026.08.26 指纹同步后台线程（大工程扫描不阻塞 UI）
 #include <QSet>
 #include <QMap>   // 2026.09.21 TruncateBefore：seq→meta 内存快照
@@ -45,10 +47,47 @@ bool CProjectManager::Open(const QString& a_sDir) {
         m_pBackupStore = nullptr;
     }
     // 静默孤儿 GC（方案 §4.4：备份中断留下的无引用 blob）。
-    if (QDir(UnifiedBackupsDir()).exists()) {
-        BackupStore()->GcOrphanBlobs();
-    }
+    // 2026-10-08 改后台节流（.claude 巨型工程实害）：旧版每次打开同步全量解析
+    //   所有 meta.json（skills 12 万代码文件 → 每版 34MB × 44 版 = 1.5GB，
+    //   实测 10-20s）卡 UI 线程；现在 24h 节流 + 线程池异步（详见函数体注释）。
+    MaybeStartBackgroundGc();
     return true;
+}
+
+// 2026-10-08 打开卡顿修复：孤儿 blob GC 后台节流启动器（旧版 Open 尾同步调
+//   BackupStore()->GcOrphanBlobs()）。实害：C:\Users\Administrator\.claude 作为
+//   工程打开时极慢——skills/skills_disabled 共 12 万+代码类文件命中备份白名单，
+//   每版 manifest 34MB/12 万条目，44 版全量读+解析+引用集构建 ≈ 10-20s，且
+//   43,223 个 blob 逐一 stat，全部落在 UI 线程。节流：gc.stamp（上次 GC 完成
+//   时间）24h 内跳过；执行：QThreadPool 异步，lambda 仅捕获备份根路径字符串，
+//   不持 this/store 指针（切工程销毁 store 不悬垂；GC 只操作磁盘文件，与
+//   并发备份的安全窗口见 GcOrphanBlobsAtPath 的在途保护注释）；进程级单飞
+//   标志防同根/异根叠加并发（重复 GC 无害但白费 IO）。
+void CProjectManager::MaybeStartBackgroundGc() {
+    const QString sRoot = UnifiedBackupsDir();
+    if (!QDir(sRoot).exists()) {
+        return;
+    }
+    const QString sStamp = QDir(sRoot).filePath(QStringLiteral("gc.stamp"));
+    const QFileInfo stStampFi(sStamp);
+    if (stStampFi.exists()
+        && stStampFi.lastModified().msecsTo(QDateTime::currentDateTime())
+               < qint64(24) * 3600 * 1000) {
+        return;   // 24h 内已跑过：孤儿量极小，不值得再扫 1.5GB
+    }
+    static QAtomicInteger<int> s_iGcInFlight{0};
+    if (!s_iGcInFlight.testAndSetAcquire(0, 1)) {
+        return;   // 已有一轮 GC 在跑：不叠加
+    }
+    QThreadPool::globalInstance()->start([sRoot, sStamp]() {
+        CBackupStore::GcOrphanBlobsAtPath(sRoot);
+        // 完成打点（写失败不影响正确性，下轮重扫）；先写内容再靠 mtime 生效。
+        QFile stStampF(sStamp);
+        if (stStampF.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            stStampF.write(QByteArray::number(QDateTime::currentMSecsSinceEpoch()));
+        }
+        s_iGcInFlight.storeRelease(0);
+    });
 }
 
 CProjectManager::~CProjectManager() {
@@ -2080,6 +2119,186 @@ bool CProjectManager::SaveWebSearch(bool a_bOn) {
     return true;
 }
 
+bool CProjectManager::SaveClaudeMaxThinkTok(int a_iTok) {
+    // 落 [Agent] ClaudeMaxThinkTok（claude MAX_THINKING_TOKENS；0=不注入走默认）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"ClaudeMaxThinkTok",
+        QString::number(a_iTok).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadClaudeMaxThinkTok() const {
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 0;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Agent", L"ClaudeMaxThinkTok", 0, wsPath.c_str());
+}
+
+bool CProjectManager::SaveClaudeSmallModel(const QString& a_sModel) {
+    // 落 [Agent] ClaudeSmallModel（ANTHROPIC_SMALL_FAST_MODEL；空=不注入）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"ClaudeSmallModel",
+        a_sModel.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadClaudeSmallModel() const {
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[256] = { 0 };
+    GetPrivateProfileStringW(L"Agent", L"ClaudeSmallModel", L"", szBuf, 256, wsPath.c_str());
+    return QString::fromWCharArray(szBuf).trimmed();
+}
+
+bool CProjectManager::SaveNodePath(const QString& a_sPath) {
+    // 落 [Agent] NodePath（全后端共用 node.exe；空=走 PATH）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"NodePath",
+        a_sPath.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadNodePathShared() {
+    // 共享 node 路径：[Agent] NodePath 优先；缺省时兼容读取旧四专用键
+    // （DshNode/PiNode/CodexNode/HermesNode）首个非空并一次性回写共享键
+    // （2026-10-08 node 路径收敛到「常用」页，老配置无感迁移）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[512] = { 0 };
+    GetPrivateProfileStringW(L"Agent", L"NodePath", L"", szBuf, 512, wsPath.c_str());
+    QString sVal = QString::fromWCharArray(szBuf).trimmed();
+    if (!sVal.isEmpty()) {
+        return sVal;
+    }
+    const wchar_t* aOldKeys[] = { L"DshNode", L"PiNode", L"CodexNode", L"HermesNode" };
+    for (const wchar_t* pKey : aOldKeys) {
+        GetPrivateProfileStringW(L"Agent", pKey, L"", szBuf, 512, wsPath.c_str());
+        sVal = QString::fromWCharArray(szBuf).trimmed();
+        if (!sVal.isEmpty()) {
+            WritePrivateProfileStringW(L"Agent", L"NodePath",
+                sVal.toStdWString().c_str(), wsPath.c_str());
+            return sVal;
+        }
+    }
+    return QString();
+}
+
+bool CProjectManager::SaveDshEffort(const QString& a_sLevel) {
+    // 落 [Agent] DshEffort（DSH initialize reasoningEffort；空=默认）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"DshEffort",
+        a_sLevel.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadDshEffort() {
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"Agent", L"DshEffort", L"", szBuf, 64, wsPath.c_str());
+    return QString::fromWCharArray(szBuf).trimmed().toLower();
+}
+
+bool CProjectManager::SaveCodexEffort(const QString& a_sLevel) {
+    // 落 [Agent] CodexEffort（-c model_reasoning_effort；空=默认）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"CodexEffort",
+        a_sLevel.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadCodexEffort() {
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"Agent", L"CodexEffort", L"", szBuf, 64, wsPath.c_str());
+    return QString::fromWCharArray(szBuf).trimmed().toLower();
+}
+
+bool CProjectManager::SaveHermesEffort(const QString& a_sLevel) {
+    // 落 [Agent] HermesEffort（config.yaml agent.reasoning_effort；空=默认；
+    //   off=写 false 显式禁用；minimal..ultra 原词透传）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    QString sVal = a_sLevel.trimmed().toLower();
+    if (sVal == QStringLiteral("off")) {
+        sVal = QStringLiteral("false");
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"HermesEffort",
+        sVal.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadHermesEffort() {
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return QString();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[64] = { 0 };
+    GetPrivateProfileStringW(L"Agent", L"HermesEffort", L"", szBuf, 64, wsPath.c_str());
+    return QString::fromWCharArray(szBuf).trimmed().toLower();
+}
+
+bool CProjectManager::LoadClaudeFollowShared() const {
+    // 2026-10-08 默认关（0）：claude 订阅/网关既有用法不受升级影响；显式开 1 才跟随。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    return GetPrivateProfileIntW(L"Agent", L"ClaudeFollowShared", 0, wsPath.c_str()) != 0;
+}
+
+bool CProjectManager::SaveClaudeFollowShared(bool a_bOn) {
+    // 落 [Agent] ClaudeFollowShared（1=claude 任务/助手跟随共享表当前条目）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Agent", L"ClaudeFollowShared",
+        QString::number(a_bOn ? 1 : 0).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
 bool CProjectManager::LoadWebSearch() {
     // 2026.08.15 无 config.ini/缺键 → 默认开（1）；0=全阶段禁用联网检索。
     const QString sPath = SettingsCfgPath();
@@ -3328,7 +3547,15 @@ int CBackupStore::PurgeOwner(const QString& a_sOwner) {
 }
 
 int CBackupStore::GcOrphanBlobs() {
-    const QDir stRoot(m_sBackupsRoot);
+    return GcOrphanBlobsAtPath(m_sBackupsRoot);
+}
+
+// 2026-10-08 GC 本体（静态路径版）：语义同旧版，供 Open 后台节流 GC 只携路径调用
+//   （不持 store/宿主指针）。tmp 清理新增 10 分钟新鲜度守卫——GC 后台化后可能与
+//   在途备份并发（blob 先落 .tmpNNN 再 rename），无条件删 tmp 会把正在写的临时块
+//   删掉导致 rename 失败、整版备份作废；与 .zst 的新鲜度保护同口径。
+int CBackupStore::GcOrphanBlobsAtPath(const QString& a_sRoot) {
+    const QDir stRoot(a_sRoot);
     if (!stRoot.exists()) {
         return 0;
     }
@@ -3342,18 +3569,22 @@ int CBackupStore::GcOrphanBlobs() {
         }
     }
     int iRemoved = 0;
-    const QDir stStore(BsStoreDir(m_sBackupsRoot));
+    const QDir stStore(BsStoreDir(a_sRoot));
     if (stStore.exists()) {
         // 2026.08.22 顺手清理并发备份留下的残缺 tmp（不匹配 *.zst，不会被误判为孤儿 blob）。
         const QStringList aTmps = stStore.entryList({QStringLiteral("*.tmp*")}, QDir::Files);
+        const QDateTime tFreshCut = QDateTime::currentDateTime().addSecs(-600);
         for (const QString& sTmpF : aTmps) {
+            // 新鲜 tmp：可能在途备份正在写，本轮不删（同 .zst 在途保护口径）。
+            if (QFileInfo(stStore.filePath(sTmpF)).lastModified() > tFreshCut) {
+                continue;
+            }
             QFile::remove(stStore.filePath(sTmpF));
         }
         const QStringList aBlobs = stStore.entryList({QStringLiteral("*.zst")}, QDir::Files);
         // 2026.09.28 在途保护（与 TruncateBefore 同口径）：并发备份是 blob 先落盘、meta 后
         //   提交，无新鲜度判定的 GC 会误删在途 blob 导致该版本 manifest 指向缺失内容。
         //   跳过 10 分钟内落盘的 .zst，留待下轮回收。
-        const QDateTime tFreshCut = QDateTime::currentDateTime().addSecs(-600);
         for (const QString& sBlob : aBlobs) {
             const QFileInfo stBlobFi(stStore.filePath(sBlob));
             if (stBlobFi.lastModified() > tFreshCut) {

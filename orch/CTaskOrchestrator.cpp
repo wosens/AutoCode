@@ -2181,9 +2181,10 @@ bool CTaskOrchestrator::AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId
 }
 
 bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts) {
-    // 2026-09-22 助手自动重命名：右键菜单「自动重命名」→ 面板收集该助手全部用户提示词
-    //   经 sigAsstAutoRename → CMainWindow 转到这里。优先借用该助手自己的会话（fork
-    //   一次性只读分支，不动撤销栈）；其忙则借用任一空闲会话；全忙/无会话返回 false。
+    // 2026-09-22 助手自动重命名：右键菜单「自动重命名」/收尾自动命名/挂起收尾执行 →
+    //   面板收集该助手全部用户提示词经 sigAsstAutoRename → CMainWindow 转到这里。优先
+    //   借用该助手自己的会话（fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲
+    //   会话；全忙则排队忙等待（2026-10-03：3s 周期重查至空闲，取代旧版直接 false）。
     //   结果在 OnAdhocFinished 的 AsstAutoNaming 分支解析两行（名称+说明）后发
     //   sigAsstAutoNameDone → 面板回填 sName/sDesc 并落盘。
     if (a_sAsstId.isEmpty() || a_sPrompts.trimmed().isEmpty()) {
@@ -2204,13 +2205,37 @@ bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString&
         pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
     }
     if (fnBusy(pS)) {
-        // 目标会话被占用（用户提问/压缩中）：借用任一空闲会话（命名无会话语义，一次性分支）。
+        // 目标会话被占用（用户提问/压缩中/收尾链进程退净窗口）：借用任一空闲会话（命名无会话语义，一次性分支）。
         SAdhocSession* pIdle = nullptr;
         for (SAdhocSession* pCand : m_aAdhoc) {
             if (pCand != pS && !fnBusy(pCand)) { pIdle = pCand; break; }
         }
         if (pIdle == nullptr) {
-            return false;   // 全忙：调用方提示稍后再试
+            // 2026-10-03 忙等待取代直接失败（实害：HarnessGatewayPlugin 14:48 收尾自动
+            //   命名必败——claude 后端 result 事件到达即 emit sigFinished，同步链一路到
+            //   面板 MaybeAutoNameOnFinish 时进程尚未退净，IsRunning()=true 被误判「忙」；
+            //   工程仅一个助手时无空闲会话可借 → 旧版打「✗ 无可用的空闲助手会话」，
+            //   用户 15 分钟后手动右键重试才成功。v3.3.264 挂起收尾执行同链同窗口）。
+            //   改为会话内排队：3s 周期重查，空闲后以排队素材快照启动命名轮。
+            if (!pS->bAutoNameWait) {
+                pS->bAutoNameWait = true;
+                pS->sAutoNameWaitPrompts = a_sPrompts;
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("auto_name_wait"),
+                    QStringLiteral("⏳ 助手会话忙，自动命名将在其空闲后自动进行…"));
+            }
+            QTimer::singleShot(3000, this, [this, a_sAsstId]() {
+                SAdhocSession* pWait = m_aAdhoc.value(a_sAsstId, nullptr);
+                if (pWait == nullptr || !pWait->bAutoNameWait) {
+                    return;   // 会话已删（助手删除/切工程）或等待已被取消
+                }
+                if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+                    pWait->bAutoNameWait = false;   // 工程已关：放弃
+                    pWait->sAutoNameWaitPrompts.clear();
+                    return;
+                }
+                AutoNameAsstNow(a_sAsstId, pWait->sAutoNameWaitPrompts);
+            });
+            return true;   // 已受理（延迟到空闲执行），调用方不打失败
         }
         pS = pIdle;
     }
@@ -2226,6 +2251,12 @@ bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString&
         "4. 严格只输出这两行：第一行名称、第二行说明；不要任何解释、引号、编号、\n"
         "   Markdown 标记或多余文字。")
         .arg(a_sPrompts);
+    // 2026-10-03 命名轮实际启动前清目标会话的忙等待位（含借会话执行的场景：目标此刻
+    //   已空闲，残留等待位会让后续重试回调误以为仍在排队）。
+    if (SAdhocSession* pTgt = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        pTgt->bAutoNameWait = false;
+        pTgt->sAutoNameWaitPrompts.clear();
+    }
     pS->sAutoNameTargetAsst = a_sAsstId;
     pS->iPerm = PermReadOnly;    // 纯命名：禁 Bash/Edit/Write（用户下次提交时由面板回写）
     pS->sPendingPrompt.clear();
@@ -2590,6 +2621,64 @@ bool CTaskOrchestrator::EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a
 //   - 撤销：每次提问 --fork-session 产生新 sid 分支（实测不污染旧 sid），栈存 (prompt,sid)，撤销=弹栈。
 //   - 压缩：/compact 在 headless 无效 → 「摘要→开新会话重播种」两步 + --autocompact 150k 自动兜底。
 // ---------------------------------------------------------------------------
+void CTaskOrchestrator::SetAsstModelOverride(const QString& a_sAsstId,
+                                            const SDshModelEntry& a_stE, bool a_bOn) {
+    // 2026-10-07 对话级模型覆盖（面板右键「选择模型」/档恢复入口）：只存快照，
+    //   生效在 StartAdhocStage 每轮解析——共享表内容可能已变，快照按身份重定位。
+    SAdhocSession* pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
+    if (pS == nullptr) {
+        return;
+    }
+    pS->bModelOv = a_bOn;
+    pS->stModelOv = a_bOn ? a_stE : SDshModelEntry();
+}
+
+void CTaskOrchestrator::ApplySessionModelOverride(SAdhocSession& a_S) {
+    // 2026-10-07 对话级模型覆盖 → 会话 runner 实例槽：DSH/Pi/Codex/Hermes 生效；
+    //   2026-10-08 起 claude 同样生效（runner 侧 per-进程 env 注入，仅 anthropic 兼容
+    //   条目实际路由，见 CClaudeRunner::StartStage）。下标口径 = 该后端 runner 静态表
+    //   （ApplySharedModelsToRunners 已把四表收敛为同一份共享表，与 CMainWindow 同源
+    //   同序）；覆盖条目按身份在现读共享表中重定位（表变更后失效即回退全局，打留痕）。
+    if (a_S.pRunner == nullptr) {
+        return;
+    }
+    if (!a_S.bModelOv) {
+        a_S.pRunner->ClearStageModelOverride();
+        return;
+    }
+    int iDshAct = -1, iPiAct = -1, iCodexAct = -1, iHermesAct = -1;
+    QList<SDshModelEntry> aDsh, aPi, aCodex, aHermes;
+    if (m_pPm != nullptr) {
+        aDsh    = m_pPm->LoadDshModels(&iDshAct);
+        aPi     = m_pPm->LoadPiModels(&iPiAct);
+        aCodex  = m_pPm->LoadCodexModels(&iCodexAct);
+        aHermes = m_pPm->LoadHermesModels(&iHermesAct);
+    }
+    int iPrefTable = -1;
+    if (CAgentRunnerFactory::IsPi()) {
+        iPrefTable = 0;
+    } else if (CAgentRunnerFactory::IsDsh()) {
+        iPrefTable = 1;
+    } else if (CAgentRunnerFactory::IsHermes()) {
+        iPrefTable = 2;
+    } else if (CAgentRunnerFactory::IsCodex()) {
+        iPrefTable = 3;
+    }
+    // 表序/pref 与 CMainWindow::ApplySharedModelsToRunners 完全一致（Pi,Dsh,Hermes,
+    //   Codex）——面板菜单下标、runner 静态表、此处解析三方向同一份合并表对齐。
+    const SSharedModels stM = MergeSharedModelTables(
+        { aPi, aDsh, aHermes, aCodex }, { iPiAct, iDshAct, iHermesAct, iCodexAct }, iPrefTable);
+    const int iIdx = SharedModelIndexByIdentity(stM.aModels, a_S.stModelOv);
+    if (iIdx < 0) {
+        OnAdhocInfo(a_S.sId, QStringLiteral(
+            "⚠ 本助手设置的覆盖模型已不在共享模型列表中（列表被编辑），本轮暂时"
+            "跟随全局当前模型；如需继续使用请在上下文条右键重新选择。"));
+        a_S.pRunner->ClearStageModelOverride();
+        return;
+    }
+    a_S.pRunner->SetStageModelOverride(iIdx, stM.aModels.at(iIdx));
+}
+
 void CTaskOrchestrator::EnsureAdhocRunner(SAdhocSession& a_S) {
     // 2026.09.03 多助手并发：runner per-助手（独立 QProcess，各起各的进程）。
     // 2026.09.20 助手粘性后端（v2.4.193，用户需求：助手不支持中途换 Harness → 发送时
@@ -2667,6 +2756,9 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
                                         bool a_bDropLastUser, int a_iTurnsOverride,
                                         const QString& a_sToolsDeny) {
     EnsureAdhocRunner(a_S);
+    // 2026-10-07 对话级模型覆盖：每轮显式设/清该会话 runner 的实例槽（覆盖仅本
+    //   助手生效；claude/表已变更回退跟随全局——静态激活与其他会话/任务侧不受影响）。
+    ApplySessionModelOverride(a_S);
     // 新轮次开始：该会话本轮实时计量清零（2026.09.05 per-助手，带 id 收起其页内标签；
     //   不再碰全局 m_iLive*——那是任务阶段专用）。
     a_S.iLiveIn  = 0;
@@ -3150,6 +3242,8 @@ void CTaskOrchestrator::StopAdhoc(const QString& a_sAsstId) {
         pS->eMode = Idle;
         pS->sPendingPrompt.clear();
         pS->bDeepActive = false;   // 2026.09.26 深度链中断：停止后不再回炉/重启
+        pS->bAutoNameWait = false;   // 2026-10-03 停止取消排队的自动命名（用户主动停后不再冒命名轮）
+        pS->sAutoNameWaitPrompts.clear();
     }
     emit sigAdhocFinished(a_sAsstId);
 }

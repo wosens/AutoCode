@@ -28,6 +28,7 @@
 // —— 进程级全局配置（static：所有 DSH runner 实例共享，主窗口启动/设置变更时写）——
 static QString s_sDshRootPath;    // DSH 仓库根（deepseek-harness 目录；空=未配置/未探测到）
 static QString s_sDshNodePath;    // node.exe 绝对路径（空=走 PATH 的 "node"）
+static QString s_sDshEffort;      // 2026-10-08 思考强度（initialize reasoningEffort；空=默认）
 static QString s_sDshBinJsPath;   // bin.js 绝对路径（空=按根目录推导；显式键优先，旧档回退）
 static QString s_sDshCordisPath;  // cordis.yml 绝对路径（空=按根目录推导；显式键优先，旧档回退）
 static QString s_sDshProvider;    // provider 名（空回退 glm-custom）
@@ -868,6 +869,14 @@ QString CDeepSeekRunner::DshNodePath() {
     return s_sDshNodePath;
 }
 
+void CDeepSeekRunner::SetDshEffort(const QString& a_sLevel) {
+    s_sDshEffort = a_sLevel.trimmed().toLower();
+}
+
+QString CDeepSeekRunner::DshEffort() {
+    return s_sDshEffort;
+}
+
 void CDeepSeekRunner::SetDshBinJsPath(const QString& a_sPath) {
     s_sDshBinJsPath = a_sPath.trimmed();
 }
@@ -1344,12 +1353,30 @@ void CDeepSeekRunner::FinishHeal(bool a_bOk, const QString& a_sMsg) {
 }
 
 bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
+    // 2026-10-07 对话级模型覆盖：起步条目 = 会话覆盖下标（per-runner 实例槽，右键
+    //   「选择模型」仅本助手生效）优先，缺省全局激活。env 槽位按起步条目烘焙；
+    //   保活进程的 env 是启动时快照 → 起步条目身份变化须杀旧冷启（同 cwd 守卫先例）。
+    const int iOvM = ModelOvIdxIn(s_aCustomModels.size());
+    const int iUseM = (iOvM >= 0) ? iOvM : s_iCustomActive;
+    const bool bUseCustom = (iUseM >= 0 && iUseM < s_aCustomModels.size());
+    QString sWantModelKey = QStringLiteral("fixed");
+    if (bUseCustom) {
+        const SCustomModel& stW = s_aCustomModels.at(iUseM);
+        SDshModelEntry stId;
+        stId.sBaseURL = stW.sBaseURL;
+        stId.sApi     = stW.sApi;
+        stId.sModelId = stW.sModelId;
+        sWantModelKey = ModelEntryIdentity(stId);
+    }
     if (m_eProcState == ProcBooting || m_eProcState == ProcReady) {
         // 2026.08.20 cwd 热切换守卫：进程是旧工程 cwd 时不可复用——agent 的相对路径写
         //   （.autodev/tasks/<id>/intake.md 等）会落进旧工程，新工程校验产物永远缺失，
         //   造成「多次回退仍未生成 intake.md」级联暂停（实例：扑克任务产物写进扫雷）。
-        if (m_sProcWorkDir.isEmpty() ||
-            QDir::cleanPath(m_sProcWorkDir) == QDir::cleanPath(a_sWorkDir)) {
+        // 2026-10-07 模型热切换守卫：env 槽位随起步条目变（覆盖设置/清除、全局激活
+        //   变化）时同样不可复用——旧进程仍连旧模型，与本轮目标不一致。
+        if ((m_sProcWorkDir.isEmpty() ||
+             QDir::cleanPath(m_sProcWorkDir) == QDir::cleanPath(a_sWorkDir))
+            && m_sProcModelKey == sWantModelKey) {
             return true;
         }
         if (m_pProc->state() != QProcess::NotRunning) {
@@ -1388,8 +1415,8 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     // 2026.08.18 自定义大模型：激活条目注入 llm-pi-ai 的 env 槽位（组合 cordis.yml 的
     //   autocode-active provider 逐字段读这些变量；密钥值走 credentials-local 的 env
     //   阶梯最优先级）。未启用（表空/Active 无效）时不设——组合回落 ?? 兜底默认值。
-    if (CustomActiveValid()) {
-        const SCustomModel& stM = s_aCustomModels.at(s_iCustomActive);
+    if (bUseCustom) {   // 2026-10-07 起按起步条目（覆盖优先）；冷启后记入 m_sProcModelKey（保活守卫用）
+        const SCustomModel& stM = s_aCustomModels.at(iUseM);
         oEnv.insert(QStringLiteral("DSH_LLM_NAME"),
                     stM.sDisp.isEmpty() ? QStringLiteral("AutoCode Active Model") : stM.sDisp);
         oEnv.insert(QStringLiteral("DSH_LLM_BASE_URL"), stM.sBaseURL);
@@ -1429,6 +1456,7 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     m_pProc->setProcessEnvironment(oEnv);
     m_pProc->setWorkingDirectory(a_sWorkDir);
     m_sProcWorkDir = a_sWorkDir;   // 2026.08.20 记录进程 cwd（EnsureProcess 工程切换检测用）
+    m_sProcModelKey = sWantModelKey;   // 2026-10-07 记录 env 烘焙的模型身份（覆盖/全局切换检测用）
     ++m_iProcGen;   // 2026.08.19 进程代次 +1（热生效守卫：脏标只杀配置变更前的旧进程）
     m_eProcState = ProcBooting;
     m_uptime.restart();
@@ -1458,6 +1486,11 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     oParams.insert(QStringLiteral("cwd"), a_sWorkDir);
     oParams.insert(QStringLiteral("provider"), EffectiveProvider());
     oParams.insert(QStringLiteral("model"), EffectiveModel());
+    // 2026-10-08 思考强度（SDK initialize reasoningEffort；off/low/high/max；
+    //   服务端校验非空字符串，空=不传走 adapter 默认）。
+    if (!s_sDshEffort.isEmpty()) {
+        oParams.insert(QStringLiteral("reasoningEffort"), s_sDshEffort);
+    }
     SendRequest(QStringLiteral("initialize"), oParams, m_iInitId);
     // 握手超时 30s：重试一次（重启进程），再失败判死。重启由本 lambda 独占——
     //   m_bRebooting 拦住 kill 触发的 slotOnFinished Booting 重试分支（防双重重启）。

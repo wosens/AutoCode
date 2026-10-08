@@ -1,4 +1,7 @@
 ﻿// CCodeReviewDialog.cpp —— 手动代码审查对话框实现
+// 2026-10-08 Tab 化改造：选择文件（过滤+复选清单）/ 审查（发现表+复选）两页；
+//   顶部「全量审查」开关（缺省不勾=仅自上次审查后修改/新增的文件且逐文件增量审，
+//   基线=exe 同级 review_cache/<目标哈希>.bl 内容快照仓）。
 
 #include "CCodeReviewDialog.h"
 #include "review/CReviewSdkClient.h"
@@ -14,6 +17,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMenu>
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
@@ -26,6 +30,17 @@
 #include <QCoreApplication>   // 2026-10-02 结果缓存目录（exe 同级 review_cache/）
 #include <QPainter>
 #include <QTimer>
+#include <QTabWidget>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QTableWidget>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // 过滤档案 GetPrivateProfileStringW/WritePrivateProfileStringW
+#endif
 
 // 2026-10-02 审查中动态图标：12 段渐变弧转圈（与 CExecutionPanel 的 CBusyIndicator
 // 同风格同参数，文件局部类免 moc）；空闲显示静态灰点。无 Q_OBJECT（基类 connect）。
@@ -81,28 +96,187 @@ private:
 namespace {
 // 目录递归收集上限（防误选巨型目录整轮跑数小时；超限截断并在状态里说明）。
 const int s_kiFolderCollectCap = 200;
+
 // 结果缓存目录（exe 同级 review_cache/，与 config.ini 同域；键=目标路径 SHA256）。
 QString CacheDirPath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/review_cache");
 }
-QString CacheFilePath(const QString& a_sTarget) {
-    const QString sKey = QString::fromLatin1(QCryptographicHash::hash(
+QString KeyOfTarget(const QString& a_sTarget) {
+    return QString::fromLatin1(QCryptographicHash::hash(
         QDir::cleanPath(a_sTarget).normalized(QString::NormalizationForm_C)
             .toLower().toUtf8(),
         QCryptographicHash::Sha256).toHex()).left(24);
-    return CacheDirPath() + QStringLiteral("/") + sKey + QStringLiteral(".json");
 }
+QString CacheFilePath(const QString& a_sTarget) {
+    return CacheDirPath() + QStringLiteral("/") + KeyOfTarget(a_sTarget)
+         + QStringLiteral(".json");
 }
 
+// exe 同目录 config.ini（与 CProjectManager::ConfigFilePath 同口径：GetModuleFileName
+// 取 exe 全路径——此处用 applicationDirPath 等价，禁用 GetCurrentDirectory）。
+QString GlobalConfigIni() {
+    return QDir::toNativeSeparators(
+        QCoreApplication::applicationDirPath() + QStringLiteral("/config.ini"));
+}
+
+// 大小人性化（清单「大小」列）。
+QString HumanSize(qint64 a_iBytes) {
+    if (a_iBytes < 1024) {
+        return QStringLiteral("%1 B").arg(a_iBytes);
+    }
+    if (a_iBytes < 1024 * 1024) {
+        return QStringLiteral("%1 KB").arg(a_iBytes / 1024);
+    }
+    return QString::number(a_iBytes / 1024.0 / 1024.0, 'f', 1) + QStringLiteral(" MB");
+}
+
+// 2026-10-08 缺省过滤档案（与 ReviewSdk 10 语言中用户指定的 8 项对齐；
+//   JavaScript/TypeScript 可经「编辑过滤…」自行添加）。
+QList<SReviewFilter> DefaultFilterProfiles() {
+    return {
+        {QStringLiteral("C/C++"),        QStringLiteral("cpp;cc;cxx;c;h;hh;hpp;hxx;inl")},
+        {QStringLiteral("Python"),       QStringLiteral("py;pyw")},
+        {QStringLiteral("C#"),           QStringLiteral("cs")},
+        {QStringLiteral("Delphi"),       QStringLiteral("pas;dpr;dpk;inc")},
+        {QStringLiteral("Visual Basic"), QStringLiteral("bas;vb;vbs")},
+        {QStringLiteral("Rust"),         QStringLiteral("rs")},
+        {QStringLiteral("Go"),           QStringLiteral("go")},
+        {QStringLiteral("Java"),         QStringLiteral("java")},
+    };
+}
+}   // namespace
+
+// ----------------------------------------------------------------------------
+// —— 2026-10-08 过滤档案编辑对话框（文件局部类；无自定义信号 → 免 Q_OBJECT/moc，
+//    按钮全部 lambda 连接；表格两列：名称 / 扩展名（分号分隔））——
+class CReviewFilterEditDialog : public QDialog {
+public:
+    explicit CReviewFilterEditDialog(const QList<SReviewFilter>& a_aCur, QWidget* a_pParent)
+        : QDialog(a_pParent) {
+        setWindowTitle(QStringLiteral("编辑过滤条件"));
+        setMinimumSize(420, 320);
+        auto* pLay = new QVBoxLayout(this);
+
+        auto* pLblHint = new QLabel(
+            QStringLiteral("每行一个过滤项：名称 + 扩展名（分号分隔，不含点，如 cpp;h;hpp）。"
+                           "「选择文件」页下拉框按此列出，可在各过滤项间切换。"), this);
+        pLblHint->setWordWrap(true);
+        QFont fH = pLblHint->font();
+        fH.setPointSize(11);
+        pLblHint->setFont(fH);
+        pLay->addWidget(pLblHint);
+
+        m_pTable = new QTableWidget(static_cast<int>(a_aCur.size()), 2, this);
+        m_pTable->setHorizontalHeaderLabels({QStringLiteral("名称"), QStringLiteral("扩展名")});
+        m_pTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        m_pTable->verticalHeader()->setVisible(false);
+        QFont fT = m_pTable->font();
+        fT.setPointSize(11);
+        m_pTable->setFont(fT);
+        for (int i = 0; i < a_aCur.size(); ++i) {
+            m_pTable->setItem(i, 0, new QTableWidgetItem(a_aCur.at(i).sName));
+            m_pTable->setItem(i, 1, new QTableWidgetItem(a_aCur.at(i).sExts));
+        }
+        pLay->addWidget(m_pTable, 1);
+
+        auto* pLayRow = new QHBoxLayout();
+        auto* pBtnAdd = new QPushButton(QStringLiteral("添加"), this);
+        auto* pBtnDel = new QPushButton(QStringLiteral("删除选中行"), this);
+        auto* pBtnDef = new QPushButton(QStringLiteral("恢复缺省"), this);
+        for (QPushButton* pB : {pBtnAdd, pBtnDel, pBtnDef}) {
+            QFont fB = pB->font();
+            fB.setPointSize(11);
+            pB->setFont(fB);
+        }
+        pLayRow->addWidget(pBtnAdd);
+        pLayRow->addWidget(pBtnDel);
+        pLayRow->addStretch(1);
+        pLayRow->addWidget(pBtnDef);
+        pLay->addLayout(pLayRow);
+
+        auto* pLayBtn = new QHBoxLayout();
+        auto* pBtnOk  = new QPushButton(QStringLiteral("确定"), this);
+        auto* pBtnCancel = new QPushButton(QStringLiteral("取消"), this);
+        for (QPushButton* pB : {pBtnOk, pBtnCancel}) {
+            QFont fB = pB->font();
+            fB.setPointSize(11);
+            pB->setFont(fB);
+        }
+        pLayBtn->addStretch(1);
+        pLayBtn->addWidget(pBtnOk);
+        pLayBtn->addWidget(pBtnCancel);
+        pLay->addLayout(pLayBtn);
+
+        connect(pBtnAdd, &QPushButton::clicked, this, [this]() {
+            const int iRow = m_pTable->rowCount();
+            m_pTable->insertRow(iRow);
+            m_pTable->setItem(iRow, 0, new QTableWidgetItem(QStringLiteral("新过滤项")));
+            m_pTable->setItem(iRow, 1, new QTableWidgetItem(QStringLiteral("ext")));
+            m_pTable->editItem(m_pTable->item(iRow, 0));
+        });
+        connect(pBtnDel, &QPushButton::clicked, this, [this]() {
+            const int iRow = m_pTable->currentRow();
+            if (iRow >= 0) {
+                m_pTable->removeRow(iRow);
+            }
+        });
+        connect(pBtnDef, &QPushButton::clicked, this, [this]() {
+            const QList<SReviewFilter> aDef = DefaultFilterProfiles();
+            m_pTable->setRowCount(static_cast<int>(aDef.size()));
+            for (int i = 0; i < aDef.size(); ++i) {
+                m_pTable->setItem(i, 0, new QTableWidgetItem(aDef.at(i).sName));
+                m_pTable->setItem(i, 1, new QTableWidgetItem(aDef.at(i).sExts));
+            }
+        });
+        connect(pBtnOk, &QPushButton::clicked, this, &QDialog::accept);
+        connect(pBtnCancel, &QPushButton::clicked, this, &QDialog::reject);
+    }
+
+    // 汇总表格内容（空名称/空扩展名行丢弃；扩展名规整为小写去点）。
+    QList<SReviewFilter> Result() const {
+        QList<SReviewFilter> aOut;
+        for (int i = 0; i < m_pTable->rowCount(); ++i) {
+            const QTableWidgetItem* pN = m_pTable->item(i, 0);
+            const QTableWidgetItem* pE = m_pTable->item(i, 1);
+            if (pN == nullptr || pE == nullptr) {
+                continue;
+            }
+            QStringList aExts;
+            for (const QString& s : pE->text().split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+                QString sExt = s.trimmed().toLower();
+                while (sExt.startsWith(QLatin1Char('.'))) {
+                    sExt.remove(0, 1);
+                }
+                if (!sExt.isEmpty()) {
+                    aExts.append(sExt);
+                }
+            }
+            if (!pN->text().trimmed().isEmpty() && !aExts.isEmpty()) {
+                aOut.append({pN->text().trimmed(), aExts.join(QLatin1Char(';'))});
+            }
+        }
+        return aOut;
+    }
+
+private:
+    QTableWidget* m_pTable = nullptr;
+};
+
+// ----------------------------------------------------------------------------
 CCodeReviewDialog::CCodeReviewDialog(const QString& a_sTarget, QWidget* a_pParent)
     : QDialog(a_pParent), m_sTarget(QDir::cleanPath(a_sTarget)) {
     setWindowFlag(Qt::WindowMinMaxButtonsHint, true);
     BuildUi();
+    m_aFilters = LoadFilters();
+    FillFilterCombo();   // 2026-10-08 「全部」+ 过滤档案项（缺省 8 项，见 DefaultFilterProfiles）
     CollectFiles();
-    // 2026-10-02 结果复用：目标代码未修改（送审清单的 mtime+size 指纹一致）→ 直接
-    //   展示上次结果不重跑（分钟级 LLM 调用零开销）；已修改/无缓存 → 照旧打开即审。
+    PopulateFileList();
+    // 2026-10-08 起不自动开审：用户在「选择文件」页勾选后右键/按钮开始；
+    //   代码未修改（全候选清单指纹与上次一致）→ 直接回填上次结果并停在审查页。
     if (!TryRestoreCache()) {
-        OnStart();
+        m_pLblStatus->setText(QStringLiteral(
+            "就绪：在「选择文件」页勾选待审文件后开始审查"
+            "（未勾「全量审查」时只列/只审自上次审查后修改的部分）。"));
     }
 }
 
@@ -115,7 +289,7 @@ CCodeReviewDialog::~CCodeReviewDialog() {
 
 void CCodeReviewDialog::BuildUi() {
     setWindowTitle(QStringLiteral("代码审查"));
-    setMinimumSize(860, 520);
+    setMinimumSize(900, 560);
     setSizeGripEnabled(true);
 
     auto* pLay = new QVBoxLayout(this);
@@ -127,11 +301,92 @@ void CCodeReviewDialog::BuildUi() {
     m_pLblTarget->setFont(fT);
     pLay->addWidget(m_pLblTarget);
 
+    // —— 2026-10-08 顶部「全量审查」开关（缺省不勾）——
+    m_pChkFull = new QCheckBox(QStringLiteral("全量审查"), this);
+    QFont fC = m_pChkFull->font();
+    fC.setPointSize(11);
+    m_pChkFull->setFont(fC);
+    m_pChkFull->setChecked(false);
+    m_pChkFull->setToolTip(QStringLiteral(
+        "不勾选（缺省）：文件清单只列自上次审查后修改/新增的文件，审查只送修改部分"
+        "（增量，首次审查自动全量）。\n勾选：列出全部文件并完整审查。"));
+    connect(m_pChkFull, &QCheckBox::toggled, this, &CCodeReviewDialog::OnFullToggled);
+    pLay->addWidget(m_pChkFull);
+
+    // —— 2026-10-08 双 Tab：选择文件 / 审查 ——
+    m_pTabs = new QTabWidget(this);
+    QFont fTab = m_pTabs->font();
+    fTab.setPointSize(11);
+    m_pTabs->setFont(fTab);
+    pLay->addWidget(m_pTabs, 1);
+
+    // ▍选择文件页
+    auto* pPageFiles = new QWidget(this);
+    auto* pLayFiles = new QVBoxLayout(pPageFiles);
+    pLayFiles->setContentsMargins(6, 6, 6, 6);
+
+    auto* pLayFilter = new QHBoxLayout();
+    m_pCboFilter = new QComboBox(this);
+    QFont fCb = m_pCboFilter->font();
+    fCb.setPointSize(11);
+    m_pCboFilter->setFont(fCb);
+    m_pCboFilter->addItem(QStringLiteral("全部"), QStringLiteral("*"));
+    m_pBtnEditFit = new QPushButton(QStringLiteral("编辑过滤…"), this);
+    QFont fE = m_pBtnEditFit->font();
+    fE.setPointSize(11);
+    m_pBtnEditFit->setFont(fE);
+    m_pBtnEditFit->setToolTip(QStringLiteral(
+        "编辑各过滤项的扩展名条件，或添加新的过滤项（存 config.ini [Review] Filters）"));
+    m_pLblCount = new QLabel(this);
+    QFont fN = m_pLblCount->font();
+    fN.setPointSize(11);
+    m_pLblCount->setFont(fN);
+    pLayFilter->addWidget(m_pCboFilter);
+    pLayFilter->addWidget(m_pBtnEditFit);
+    pLayFilter->addStretch(1);
+    pLayFilter->addWidget(m_pLblCount);
+    pLayFiles->addLayout(pLayFilter);
+
+    m_pTreeFiles = new QTreeWidget(this);
+    QFont fTreeF = m_pTreeFiles->font();
+    fTreeF.setPointSize(11);
+    m_pTreeFiles->setFont(fTreeF);
+    m_pTreeFiles->setColumnCount(5);
+    m_pTreeFiles->setHeaderLabels({QStringLiteral("选"), QStringLiteral("文件"),
+                                   QStringLiteral("状态"), QStringLiteral("大小"),
+                                   QStringLiteral("修改时间")});
+    m_pTreeFiles->setRootIsDecorated(false);
+    m_pTreeFiles->setAlternatingRowColors(true);
+    m_pTreeFiles->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_pTreeFiles->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_pTreeFiles->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_pTreeFiles->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_pTreeFiles->header()->setSectionResizeMode(1, QHeaderView::Interactive);
+    m_pTreeFiles->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_pTreeFiles->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_pTreeFiles->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_pTreeFiles->header()->resizeSection(1, 380);
+    m_pTreeFiles->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pTreeFiles, &QTreeWidget::customContextMenuRequested,
+            this, &CCodeReviewDialog::OnFilesContextMenu);
+    connect(m_pTreeFiles, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem*, int a_iCol) {
+        if (a_iCol == 0 && !m_bPopulating) {
+            RefreshCountLabel();
+        }
+    });
+    pLayFiles->addWidget(m_pTreeFiles, 1);
+    m_pTabs->addTab(pPageFiles, QStringLiteral("选择文件"));
+
+    // ▍审查页
+    auto* pPageReview = new QWidget(this);
+    auto* pLayReview = new QVBoxLayout(pPageReview);
+    pLayReview->setContentsMargins(6, 6, 6, 6);
+
     m_pProgress = new QProgressBar(this);
     m_pProgress->setTextVisible(false);
     m_pProgress->setRange(0, 1);
     m_pProgress->setValue(0);
-    pLay->addWidget(m_pProgress);
+    pLayReview->addWidget(m_pProgress);
 
     // 2026-10-02 状态行首动态图标：审查中转圈（12 段弧 70ms/帧），空闲静态灰点。
     auto* pLayStatus = new QHBoxLayout();
@@ -141,37 +396,52 @@ void CCodeReviewDialog::BuildUi() {
     m_pSpin->setObjectName(QStringLiteral("ReviewSpinner"));   // 无 Q_OBJECT，className 不可靠（同 CPromptFlyout 先例）
     m_pSpin->setToolTip(QStringLiteral("审查进行中"));
     pLayStatus->addWidget(m_pSpin);
-    pLayStatus->addWidget(m_pLblStatus = new QLabel(QStringLiteral("就绪"), this), 1);
+    m_pLblStatus = new QLabel(QStringLiteral("就绪"), this);
+    m_pLblStatus->setWordWrap(true);
     QFont fS = m_pLblStatus->font();
     fS.setPointSize(11);
     m_pLblStatus->setFont(fS);
-    pLay->addLayout(pLayStatus);
+    pLayStatus->addWidget(m_pLblStatus, 1);
+    pLayReview->addLayout(pLayStatus);
 
+    // 2026-10-08 发现表：行首加复选框列（缺省全勾；按建议修复只带走勾选行）。
     m_pTree = new QTreeWidget(this);
     QFont fTree = m_pTree->font();
     fTree.setPointSize(11);
     m_pTree->setFont(fTree);
-    m_pTree->setColumnCount(6);
-    m_pTree->setHeaderLabels({QStringLiteral("级别"), QStringLiteral("文件"),
-                              QStringLiteral("行"), QStringLiteral("规则"),
-                              QStringLiteral("问题"), QStringLiteral("建议")});
+    m_pTree->setColumnCount(7);
+    m_pTree->setHeaderLabels({QStringLiteral("选"), QStringLiteral("级别"),
+                              QStringLiteral("文件"), QStringLiteral("行"),
+                              QStringLiteral("规则"), QStringLiteral("问题"),
+                              QStringLiteral("建议")});
     m_pTree->setRootIsDecorated(false);
     m_pTree->setAlternatingRowColors(true);
     m_pTree->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pTree->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_pTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(1, QHeaderView::Interactive);
-    m_pTree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_pTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_pTree->header()->setSectionResizeMode(2, QHeaderView::Interactive);
     m_pTree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(4, QHeaderView::Stretch);
+    m_pTree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
     m_pTree->header()->setSectionResizeMode(5, QHeaderView::Stretch);
-    m_pTree->header()->resizeSection(1, 260);
+    m_pTree->header()->setSectionResizeMode(6, QHeaderView::Stretch);
+    m_pTree->header()->resizeSection(2, 260);
+    m_pTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pTree, &QTreeWidget::customContextMenuRequested,
+            this, &CCodeReviewDialog::OnFindingsContextMenu);
     connect(m_pTree, &QTreeWidget::itemDoubleClicked,
             this, &CCodeReviewDialog::OnItemDoubleClicked);
-    pLay->addWidget(m_pTree, 1);
+    connect(m_pTree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem*, int a_iCol) {
+        if (a_iCol == 0 && !m_bPopulating) {
+            UpdateCounts();   // 「按建议修复」可用性随勾选变化
+        }
+    });
+    pLayReview->addWidget(m_pTree, 1);
+    m_pTabs->addTab(pPageReview, QStringLiteral("审查"));
 
+    // —— 底部按钮（不变 + 开始文案随新流程调整）——
     auto* pLayBtn = new QHBoxLayout();
-    m_pBtnStart = new QPushButton(QStringLiteral("重新审查"), this);
+    m_pBtnStart = new QPushButton(QStringLiteral("开始审查"), this);
     m_pBtnStop  = new QPushButton(QStringLiteral("停止"), this);
     // 2026-10-02「按建议修复」：把审查意见交当前助手修复（存在就修复，不存在忽略）。
     m_pBtnFix   = new QPushButton(QStringLiteral("按建议修复"), this);
@@ -182,10 +452,13 @@ void CCodeReviewDialog::BuildUi() {
         fB.setPointSize(11);
         pB->setFont(fB);
     }
+    m_pBtnStop->setEnabled(false);
     m_pBtnSave->setEnabled(false);
     m_pBtnFix->setEnabled(false);
-    m_pBtnFix->setToolTip(QStringLiteral("把审查意见注入当前助手的提问框，交大模型修复"
+    m_pBtnFix->setToolTip(QStringLiteral("把**勾选**的审查意见注入当前助手的提问框，交大模型修复"
                                          "（存在就修复，不存在忽略），确认后点发送"));
+    m_pBtnStart->setToolTip(QStringLiteral("审查「选择文件」页勾选的文件"
+                                           "（未勾「全量审查」时仅送修改部分）"));
     pLayBtn->addWidget(m_pBtnStart);
     pLayBtn->addWidget(m_pBtnStop);
     pLayBtn->addStretch(1);
@@ -199,6 +472,9 @@ void CCodeReviewDialog::BuildUi() {
     connect(m_pBtnFix,   &QPushButton::clicked, this, &CCodeReviewDialog::OnFixToChat);
     connect(m_pBtnSave,  &QPushButton::clicked, this, &CCodeReviewDialog::OnSaveReport);
     connect(m_pBtnClose, &QPushButton::clicked, this, &QWidget::close);
+    connect(m_pCboFilter, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &CCodeReviewDialog::OnFilterChanged);
+    connect(m_pBtnEditFit, &QPushButton::clicked, this, &CCodeReviewDialog::OnEditFilters);
 
     // 引擎版本角标（未加载显示原因——OnStart 会给出明确提示）。
     QString sErr;
@@ -213,6 +489,132 @@ void CCodeReviewDialog::BuildUi() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// —— 2026-10-08 过滤档案 ——
+QList<SReviewFilter> CCodeReviewDialog::LoadFilters() const {
+    QList<SReviewFilter> aOut = DefaultFilterProfiles();
+#ifdef Q_OS_WIN
+    const QString sIni = GlobalConfigIni();
+    wchar_t wszBuf[4096] = {0};
+    const DWORD dwLen = ::GetPrivateProfileStringW(L"Review", L"Filters", L"",
+                                                   wszBuf, 4096,
+                                                   sIni.toStdWString().c_str());
+    const QString sJson = QString::fromWCharArray(wszBuf, static_cast<int>(dwLen)).trimmed();
+    if (!sJson.isEmpty()) {
+        const QJsonArray aArr = QJsonDocument::fromJson(sJson.toUtf8()).array();
+        if (!aArr.isEmpty()) {
+            aOut.clear();
+            for (const auto& v : aArr) {
+                const QJsonObject o = v.toObject();
+                const QString sName = o.value(QStringLiteral("n")).toString().trimmed();
+                const QString sExts = o.value(QStringLiteral("e")).toString().trimmed();
+                if (!sName.isEmpty() && !sExts.isEmpty()) {
+                    aOut.append({sName, sExts.toLower()});
+                }
+            }
+            if (aOut.isEmpty()) {
+                aOut = DefaultFilterProfiles();   // 全非法（手改坏）→ 回缺省
+            }
+        }
+    }
+#endif
+    return aOut;
+}
+
+void CCodeReviewDialog::SaveFilters(const QList<SReviewFilter>& a_aFilters) {
+#ifdef Q_OS_WIN
+    QJsonArray aArr;
+    for (const SReviewFilter& stF : a_aFilters) {
+        QJsonObject o;
+        o.insert(QStringLiteral("n"), stF.sName);
+        o.insert(QStringLiteral("e"), stF.sExts);
+        aArr.append(o);
+    }
+    const QString sJson = QString::fromUtf8(
+        QJsonDocument(aArr).toJson(QJsonDocument::Compact));
+    const std::wstring wsIni = GlobalConfigIni().toStdWString();
+    ::WritePrivateProfileStringW(L"Review", L"Filters", sJson.toStdWString().c_str(),
+                                 wsIni.c_str());
+#endif
+}
+
+QList<QByteArray> CCodeReviewDialog::ExtsOfProfile(const SReviewFilter& a_stProfile) {
+    QList<QByteArray> aOut;
+    for (const QString& s : a_stProfile.sExts.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+        aOut.append(s.trimmed().toLower().toUtf8());
+    }
+    return aOut;
+}
+
+QList<QByteArray> CCodeReviewDialog::AllFilterExts() const {
+    QList<QByteArray> aAll;
+    for (const SReviewFilter& stF : m_aFilters) {
+        aAll.append(ExtsOfProfile(stF));
+    }
+    return aAll;
+}
+
+// 「全部」+ 各过滤档案项；保名：编辑前后同名项选中态保持。
+void CCodeReviewDialog::FillFilterCombo() {
+    const QString sKeep = m_pCboFilter->currentData().toString();
+    m_pCboFilter->blockSignals(true);
+    m_pCboFilter->clear();
+    m_pCboFilter->addItem(QStringLiteral("全部"), QStringLiteral("*"));
+    int iKeep = 0;
+    for (int i = 0; i < m_aFilters.size(); ++i) {
+        m_pCboFilter->addItem(m_aFilters.at(i).sName, m_aFilters.at(i).sName);
+        if (sKeep == m_aFilters.at(i).sName) {
+            iKeep = i + 1;
+        }
+    }
+    m_pCboFilter->setCurrentIndex(iKeep);
+    m_pCboFilter->blockSignals(false);
+}
+
+void CCodeReviewDialog::OnEditFilters() {
+    CReviewFilterEditDialog dlg(m_aFilters, this);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    QList<SReviewFilter> aNew = dlg.Result();
+    if (aNew.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("过滤条件"),
+                                 QStringLiteral("未保留任何有效过滤项，维持原过滤条件不变。"));
+        return;
+    }
+    m_aFilters = aNew;
+    SaveFilters(m_aFilters);
+    FillFilterCombo();
+    PopulateFileList();
+}
+
+void CCodeReviewDialog::OnFilterChanged(int) {
+    PopulateFileList();
+}
+
+void CCodeReviewDialog::OnFullToggled(bool) {
+    PopulateFileList();
+}
+
+// ----------------------------------------------------------------------------
+// —— 基线/修改判定 ——
+QString CCodeReviewDialog::BaselineDirPath() const {
+    return CacheDirPath() + QStringLiteral("/") + KeyOfTarget(m_sTarget)
+         + QStringLiteral(".bl");
+}
+
+CCodeReviewDialog::EModState CCodeReviewDialog::ModStateOf(const QString& a_sRel,
+                                                           const QFileInfo& a_stInfo) const {
+    const auto it = m_mapBase.find(CReviewBaseline::NormKey(a_sRel));
+    if (it == m_mapBase.end()) {
+        return eModNew;
+    }
+    return (it.value().iMtimeMs == a_stInfo.lastModified().toMSecsSinceEpoch()
+            && it.value().iSize == a_stInfo.size())
+               ? eModSame
+               : eModChanged;
+}
+
 void CCodeReviewDialog::CollectFiles() {
     m_aAbsFiles.clear();
     CReviewSdkClient* pSdk = CReviewSdkClient::Get();
@@ -223,7 +625,9 @@ void CCodeReviewDialog::CollectFiles() {
         m_aAbsFiles.append(m_sTarget);
     } else if (stInfo.isDir()) {
         m_sRootDir = m_sTarget;
-        // 目录递归：跳过隐藏/.git/.vs/node_modules/build 等噪声目录 + 语言过滤 + 上限。
+        // 2026-10-08 候选口径 = 过滤档案扩展名并集 ∪ 引擎已知语言（档案被改窄时
+        //   已知类型仍可见于「全部」）；目录递归跳过生成目录噪声。
+        const QList<QByteArray> aExts = AllFilterExts();
         QDirIterator it(m_sTarget, QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden,
                         QDirIterator::Subdirectories);
         static const QStringList s_aSkipDirs = {
@@ -243,7 +647,8 @@ void CCodeReviewDialog::CollectFiles() {
             if (bSkip) {
                 continue;
             }
-            if (!pSdk->LanguageForFile(sAbs).isEmpty()) {
+            const QByteArray byExt = QFileInfo(sAbs).suffix().toLower().toUtf8();
+            if (aExts.contains(byExt) || !pSdk->LanguageForFile(sAbs).isEmpty()) {
                 m_aAbsFiles.append(sAbs);
             }
         }
@@ -252,12 +657,171 @@ void CCodeReviewDialog::CollectFiles() {
     }
 }
 
+void CCodeReviewDialog::PopulateFileList() {
+    if (m_pTreeFiles == nullptr) {
+        return;
+    }
+    m_bPopulating = true;
+    m_mapBase = CReviewBaseline::LoadMeta(BaselineDirPath());
+    m_pTreeFiles->clear();
+
+    const bool bFull = m_pChkFull->isChecked();
+    // 当前过滤项扩展名（「全部」= 空表 → 全候选）。
+    QList<QByteArray> aSelExts;
+    const QString sSel = m_pCboFilter->currentData().toString();
+    if (sSel != QStringLiteral("*") && !sSel.isEmpty()) {
+        for (const SReviewFilter& stF : m_aFilters) {
+            if (stF.sName == sSel) {
+                aSelExts = ExtsOfProfile(stF);
+                break;
+            }
+        }
+    }
+    int iShown = 0, iChanged = 0, iNew = 0, iChecked = 0;
+    for (const QString& sAbs : m_aAbsFiles) {
+        const QFileInfo stInfo(sAbs);
+        const QString sRel = CReviewSdkClient::RelativeToRoot(m_sRootDir, sAbs);
+        if (!aSelExts.isEmpty()
+            && !aSelExts.contains(stInfo.suffix().toLower().toUtf8())) {
+            continue;
+        }
+        const EModState eMod = ModStateOf(sRel, stInfo);
+        if (!bFull && eMod == eModSame) {
+            continue;   // 未勾全量：只列修改/新增
+        }
+        auto* pItem = new QTreeWidgetItem(m_pTreeFiles);
+        pItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        pItem->setCheckState(0, Qt::Checked);   // 缺省全勾
+        pItem->setText(1, sRel);
+        pItem->setTextAlignment(0, Qt::AlignCenter);
+        QColor clrState(150, 150, 150);
+        if (eMod == eModNew) {
+            pItem->setText(2, QStringLiteral("新增"));
+            clrState = QColor(30, 110, 210);
+            ++iNew;
+        } else if (eMod == eModChanged) {
+            pItem->setText(2, QStringLiteral("修改"));
+            clrState = QColor(200, 30, 30);
+            ++iChanged;
+        } else {
+            pItem->setText(2, QStringLiteral("无变化"));
+        }
+        pItem->setForeground(2, clrState);
+        pItem->setText(3, HumanSize(stInfo.size()));
+        pItem->setText(4, stInfo.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
+        pItem->setToolTip(1, QDir::toNativeSeparators(sAbs));
+        pItem->setData(0, Qt::UserRole, sAbs);
+        ++iShown;
+        ++iChecked;
+    }
+    m_pTreeFiles->sortByColumn(1, Qt::AscendingOrder);
+    m_bPopulating = false;
+
+    QString sTip = QStringLiteral("共 %1 个，已勾选 %2").arg(
+        QString::number(iShown), QString::number(iChecked));
+    if (!bFull) {
+        sTip += QStringLiteral("（修改 %1，新增 %2）")
+                    .arg(QString::number(iChanged), QString::number(iNew));
+    } else {
+        sTip += QStringLiteral("（修改 %1，新增 %2，无变化 %3）")
+                    .arg(QString::number(iChanged), QString::number(iNew),
+                         QString::number(iShown - iChanged - iNew));
+    }
+    m_pLblCount->setText(sTip);
+}
+
+void CCodeReviewDialog::RefreshCountLabel() {
+    if (m_pTreeFiles == nullptr || m_pLblCount == nullptr) {
+        return;
+    }
+    int iShown = 0, iChecked = 0;
+    for (int i = 0; i < m_pTreeFiles->topLevelItemCount(); ++i) {
+        const QTreeWidgetItem* pItem = m_pTreeFiles->topLevelItem(i);
+        ++iShown;
+        if (pItem->checkState(0) == Qt::Checked) {
+            ++iChecked;
+        }
+    }
+    m_pLblCount->setText(QStringLiteral("共 %1 个，已勾选 %2")
+                             .arg(QString::number(iShown), QString::number(iChecked)));
+}
+
+// ----------------------------------------------------------------------------
+// —— 右键菜单 ——
+void CCodeReviewDialog::OnFilesContextMenu(const QPoint& a_pt) {
+    auto* pMenu = new QMenu(this);
+    QAction* pActSel = pMenu->addAction(QStringLiteral("选择"));
+    QAction* pActUnsel = pMenu->addAction(QStringLiteral("取消选择"));
+    pMenu->addSeparator();
+    QAction* pActRun = pMenu->addAction(QStringLiteral("开始审查"));
+    const QPoint ptGlobal = m_pTreeFiles->viewport()->mapToGlobal(a_pt);
+    QAction* pAct = pMenu->exec(ptGlobal);
+    if (pAct == nullptr) {
+        return;
+    }
+    // 作用域：选中行（无选中=全部可见行）。
+    QList<QTreeWidgetItem*> aRows = m_pTreeFiles->selectedItems();
+    if (aRows.isEmpty()) {
+        for (int i = 0; i < m_pTreeFiles->topLevelItemCount(); ++i) {
+            aRows.append(m_pTreeFiles->topLevelItem(i));
+        }
+    }
+    if (pAct == pActSel || pAct == pActUnsel) {
+        const Qt::CheckState eState = (pAct == pActSel) ? Qt::Checked : Qt::Unchecked;
+        m_bPopulating = true;
+        for (QTreeWidgetItem* pItem : aRows) {
+            pItem->setCheckState(0, eState);
+        }
+        m_bPopulating = false;
+        RefreshCountLabel();
+    } else if (pAct == pActRun) {
+        OnStart();
+    }
+}
+
+void CCodeReviewDialog::OnFindingsContextMenu(const QPoint& a_pt) {
+    auto* pMenu = new QMenu(this);
+    QAction* pActAll = pMenu->addAction(QStringLiteral("全选"));
+    QAction* pActNone = pMenu->addAction(QStringLiteral("取消全选"));
+    const QPoint ptGlobal = m_pTree->viewport()->mapToGlobal(a_pt);
+    QAction* pAct = pMenu->exec(ptGlobal);
+    if (pAct == nullptr) {
+        return;
+    }
+    m_bPopulating = true;
+    for (int i = 0; i < m_pTree->topLevelItemCount(); ++i) {
+        m_pTree->topLevelItem(i)->setCheckState(
+            0, (pAct == pActAll) ? Qt::Checked : Qt::Unchecked);
+    }
+    m_bPopulating = false;
+    UpdateCounts();
+}
+
+// ----------------------------------------------------------------------------
+// —— 审查执行 ——
 void CCodeReviewDialog::OnStart() {
     if (m_pSvc != nullptr && m_pSvc->IsRunning()) {
         return;
     }
-    if (m_aAbsFiles.isEmpty()) {
-        m_pLblStatus->setText(QStringLiteral("没有可审查的代码文件（目录为空或均不受支持）"));
+    // 勾选文件清单 + 逐文件增量裁决（未勾全量且有基线 → 只审修改部分）。
+    const bool bFull = m_pChkFull->isChecked();
+    QList<SReviewItem> aItems;
+    for (int i = 0; i < m_pTreeFiles->topLevelItemCount(); ++i) {
+        const QTreeWidgetItem* pItem = m_pTreeFiles->topLevelItem(i);
+        if (pItem->checkState(0) != Qt::Checked) {
+            continue;
+        }
+        const QString sAbs = pItem->data(0, Qt::UserRole).toString();
+        const QFileInfo stInfo(sAbs);
+        const QString sRel = CReviewSdkClient::RelativeToRoot(m_sRootDir, sAbs);
+        const bool bInc = !bFull && ModStateOf(sRel, stInfo) == eModChanged;
+        aItems.append({sAbs, bInc});
+    }
+    if (aItems.isEmpty()) {
+        m_pTabs->setCurrentWidget(m_pTreeFiles->parentWidget());
+        QMessageBox::information(this, QStringLiteral("开始审查"),
+            QStringLiteral("「选择文件」页没有勾选任何文件——请先勾选（或右键「选择」）"
+                           "后再开始审查。"));
         return;
     }
     QString sErr;
@@ -275,31 +839,40 @@ void CCodeReviewDialog::OnStart() {
                 &CCodeReviewDialog::OnFileDone);
         connect(m_pSvc, &CReviewService::sigReviewDone, this,
                 &CCodeReviewDialog::OnReviewDone);
+        connect(m_pSvc, &CReviewService::sigInfo, this, [this](const QString& a_sLine) {
+            m_pLblStatus->setText(a_sLine);   // 增量/跳过/回退等逐文件说明
+        });
     }
 
+    m_bPopulating = true;
     m_pTree->clear();
+    m_bPopulating = false;
     m_iDoneFiles  = 0;
     m_iFindings   = 0;
     m_sReportMd.clear();
     m_sCachedTime.clear();
     m_aCacheFiles = QJsonArray();                       // 2026-10-02 新一轮：逐文件结果重新累积
     m_aFp         = ComputeFingerprint();               // 开审前指纹（保存时比对基准）
-    m_iTotalFiles = m_aAbsFiles.size();
+    m_iTotalFiles = aItems.size();
     m_pProgress->setRange(0, m_iTotalFiles);
     m_pProgress->setValue(0);
     m_pBtnStart->setEnabled(false);
     m_pBtnStop->setEnabled(true);
     m_pBtnSave->setEnabled(false);
-    m_pLblStatus->setText(QStringLiteral("开始审查：%1 个文件…")
-                              .arg(m_iTotalFiles));
+    m_pLblStatus->setText(QStringLiteral("开始审查：%1 个文件（%2）…")
+                              .arg(QString::number(m_iTotalFiles),
+                                   bFull ? QStringLiteral("全量")
+                                         : QStringLiteral("仅修改部分")));
     UpdateCounts();
+    m_pTabs->setCurrentIndex(1);   // 审查时自动切到审查页
 
-    if (!m_pSvc->Start(m_sRootDir, m_aAbsFiles, 600)) {
+    if (!m_pSvc->StartEx(m_sRootDir, aItems, BaselineDirPath(), 600)) {
         m_pLblStatus->setText(QStringLiteral("审查启动失败（引擎不可用或正在运行）"));
         m_pBtnStart->setEnabled(true);
         m_pBtnStop->setEnabled(false);
         return;
     }
+    m_bReviewRunning = true;
     m_pSpin->SetBusy(true);   // 2026-10-02 审查中转圈（完成/停止/失败在 OnReviewDone 停）
 }
 
@@ -345,6 +918,7 @@ void CCodeReviewDialog::OnReviewDone(bool bOk, bool bStopped, const QString& sFi
                                      const QString& sReportMd, int iFilesReviewed,
                                      int iFindings) {
     m_sReportMd = sReportMd;
+    m_bReviewRunning = false;
     m_pBtnStart->setEnabled(true);
     m_pBtnStop->setEnabled(false);
     m_pBtnSave->setEnabled(!sReportMd.isEmpty());
@@ -361,6 +935,9 @@ void CCodeReviewDialog::OnReviewDone(bool bOk, bool bStopped, const QString& sFi
         SaveCache(QDateTime::currentDateTime().toString(
             QStringLiteral("yyyy-MM-dd HH:mm:ss")));
     }
+    // 2026-10-08 基线已随逐文件成功前移：重建清单反映最新「修改/新增」状态
+    //   （未勾全量 + 全部审完 → 清单归空属预期语义「自上次审查无修改」）。
+    PopulateFileList();
 }
 
 void CCodeReviewDialog::AddFindings(const QString& sRelPath, const QString& sFindingsJson) {
@@ -369,15 +946,18 @@ void CCodeReviewDialog::AddFindings(const QString& sRelPath, const QString& sFin
         const QJsonObject oF = v.toObject();
         const QString sSev  = oF.value(QStringLiteral("severity")).toString();
         const int iLine     = oF.value(QStringLiteral("line")).toInt();
+        m_bPopulating = true;
         auto* pItem = new QTreeWidgetItem(m_pTree);
-        pItem->setText(0, sSev);
-        pItem->setText(1, oF.value(QStringLiteral("file")).toString(sRelPath));
-        pItem->setText(2, iLine > 0 ? QString::number(iLine) : QStringLiteral("-"));
-        pItem->setText(3, oF.value(QStringLiteral("rule")).toString());
-        pItem->setText(4, oF.value(QStringLiteral("message")).toString());
-        pItem->setText(5, oF.value(QStringLiteral("suggestion")).toString());
-        pItem->setToolTip(4, oF.value(QStringLiteral("message")).toString());
-        pItem->setToolTip(5, oF.value(QStringLiteral("suggestion")).toString());
+        pItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        pItem->setCheckState(0, Qt::Checked);   // 2026-10-08 缺省全勾
+        pItem->setText(1, sSev);
+        pItem->setText(2, oF.value(QStringLiteral("file")).toString(sRelPath));
+        pItem->setText(3, iLine > 0 ? QString::number(iLine) : QStringLiteral("-"));
+        pItem->setText(4, oF.value(QStringLiteral("rule")).toString());
+        pItem->setText(5, oF.value(QStringLiteral("message")).toString());
+        pItem->setText(6, oF.value(QStringLiteral("suggestion")).toString());
+        pItem->setToolTip(5, oF.value(QStringLiteral("message")).toString());
+        pItem->setToolTip(6, oF.value(QStringLiteral("suggestion")).toString());
         // 级别配色：high 红 / medium 橙 / low 灰。
         QColor clrSev(120, 120, 120);
         if (sSev == QStringLiteral("high")) {
@@ -385,28 +965,41 @@ void CCodeReviewDialog::AddFindings(const QString& sRelPath, const QString& sFin
         } else if (sSev == QStringLiteral("medium")) {
             clrSev = QColor(210, 120, 0);
         }
-        pItem->setForeground(0, clrSev);
+        pItem->setForeground(1, clrSev);
         // 行数据：绝对路径 + 行号（双击打开定位）。
+        const QString sFile = pItem->text(2);
         pItem->setData(0, Qt::UserRole,
-                       QDir::isAbsolutePath(pItem->text(1))
-                           ? pItem->text(1)
-                           : m_sRootDir + QLatin1Char('/') + pItem->text(1));
+                       QDir::isAbsolutePath(sFile)
+                           ? sFile
+                           : m_sRootDir + QLatin1Char('/') + sFile);
         pItem->setData(0, Qt::UserRole + 1, iLine);
+        m_bPopulating = false;
     }
     m_iFindings += aArr.size();
 }
 
 void CCodeReviewDialog::UpdateCounts() {
-    setWindowTitle(QStringLiteral("代码审查（%1 条问题 / %2 文件）")
+    int iChecked = 0;
+    int iTotalRows = 0;
+    if (m_pTree != nullptr) {
+        for (int i = 0; i < m_pTree->topLevelItemCount(); ++i) {
+            ++iTotalRows;
+            if (m_pTree->topLevelItem(i)->checkState(0) == Qt::Checked) {
+                ++iChecked;
+            }
+        }
+    }
+    setWindowTitle(QStringLiteral("代码审查（发现 %1 条，勾选 %2 条 / 送审 %3 文件）")
                        .arg(QString::number(m_iFindings),
+                            QString::number(iTotalRows > 0 ? iChecked : 0),
                             QString::number(m_iTotalFiles)));
-    // 2026-10-02 有发现才可「按建议修复」。
+    // 2026-10-08 有勾选发现才可「按建议修复」（空勾选=空提示词无意义）。
     if (m_pBtnFix != nullptr) {
-        m_pBtnFix->setEnabled(m_pTree != nullptr && m_pTree->topLevelItemCount() > 0);
+        m_pBtnFix->setEnabled(iChecked > 0);
     }
 }
 
-// 2026-10-02「按建议修复」：按用户指定模板拼修复提示词（审查意见=当前问题清单），
+// 2026-10-02「按建议修复」：按用户指定模板拼修复提示词（审查意见=勾选的问题清单），
 //   注入当前助手提问框（确认后手动发送；同「添加到聊天框」链路，不自动起 Agent）。
 void CCodeReviewDialog::OnFixToChat() {
     if (m_pTree == nullptr || m_pTree->topLevelItemCount() == 0) {
@@ -415,12 +1008,18 @@ void CCodeReviewDialog::OnFixToChat() {
     QString sList;
     for (int i = 0; i < m_pTree->topLevelItemCount(); ++i) {
         const QTreeWidgetItem* pItem = m_pTree->topLevelItem(i);
-        sList += QStringLiteral("- [%1] %2:%3（%4）%5\n")
-                     .arg(pItem->text(0), pItem->text(1), pItem->text(2),
-                          pItem->text(3), pItem->text(4));
-        if (!pItem->text(5).isEmpty()) {
-            sList += QStringLiteral("  建议：%1\n").arg(pItem->text(5));
+        if (pItem->checkState(0) != Qt::Checked) {
+            continue;   // 2026-10-08 只带走勾选行
         }
+        sList += QStringLiteral("- [%1] %2:%3（%4）%5\n")
+                     .arg(pItem->text(1), pItem->text(2), pItem->text(3),
+                          pItem->text(4), pItem->text(5));
+        if (!pItem->text(6).isEmpty()) {
+            sList += QStringLiteral("  建议：%1\n").arg(pItem->text(6));
+        }
+    }
+    if (sList.isEmpty()) {
+        return;
     }
     const QString sPrompt = QStringLiteral(
         "请根据审查意见修复代码（存在就修复，不存在忽略）：\n\n%1").arg(sList.trimmed());
@@ -502,7 +1101,7 @@ bool CCodeReviewDialog::TryRestoreCache() {
     if (aFiles.isEmpty()) {
         return false;
     }
-    // 指纹比对：送审清单的 mtime+size 任一变化 → 视为代码已修改，重新开审。
+    // 指纹比对：全候选清单的 mtime+size 任一变化 → 视为代码已修改，走正常选文件流程。
     const QString sFpNew = QString::fromUtf8(QJsonDocument(ComputeFingerprint())
                                                  .toJson(QJsonDocument::Compact));
     const QString sFpOld = QString::fromUtf8(
@@ -537,12 +1136,13 @@ bool CCodeReviewDialog::TryRestoreCache() {
     m_pBtnSave->setEnabled(!m_sReportMd.isEmpty());
     m_pLblStatus->setText(QStringLiteral(
         "代码未修改，已显示上次审查结果（%1；送审 %2 个文件，发现 %3 条问题%4）。"
-        "点「重新审查」强制重审。")
+        "在「选择文件」页重新勾选可强制重审。")
         .arg(m_sCachedTime, QString::number(m_iTotalFiles),
              QString::number(m_iFindings),
              iFailed > 0 ? QStringLiteral("，含 %1 个失败文件").arg(iFailed)
                          : QString()));
     UpdateCounts();
+    m_pTabs->setCurrentIndex(1);   // 无修改可选 → 直接停在审查页看上次结果
     return true;
 }
 

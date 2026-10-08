@@ -10,6 +10,7 @@
 
 #include "CReviewService.h"
 #include "CReviewSdkClient.h"
+#include "CReviewBaseline.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -22,9 +23,19 @@
 #include <QMetaObject>
 #include <QThread>
 #include <QTimer>
+#include <QFileInfo>
 
 #include "agent/CAgentRunnerFactory.h"
 #include "agent/CAgentRunnerBase.h"
+#include "core/CFrwDevice.h"   // 2026-10-08 增量路径自读原文（统一 fileread.dll 入口）
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // GB18030 严格校验（MultiByteToWideChar 54936）
+#endif
+#include <QStringDecoder>
 
 // ----------------------------------------------------------------------------
 // —— 同步 LLM 调用上下文（LCR 回调与 worker 共享；生命周期=单文件单次调用）——
@@ -51,29 +62,182 @@ public:
     bool         m_bAbort  = false;            // 停止标志（StopRun 置位；Run 入口复位）
     SSyncLlmCtx* m_pCurCtx = nullptr;          // 当前调用上下文（停止路径终止 LLM 用）
 
-    void Run(const QString& a_sRootDir, const QStringList& a_aAbsFiles, int a_iTimeoutSec) {
+    // 2026-10-08 编码自适应解码（与 CFilePreviewWidget::DetectAndDecode 同口径的
+    // 审查侧副本）：BOM(UTF-16LE/BE、UTF-8) → 严格 UTF-8 → GB18030(Windows 严格
+    // 校验) → 二进制判定（返回 false，该文件报失败）。增量/全量自读路径共用。
+    static bool DecodeText(const QByteArray& a_byBytes, QString& a_sText) {
+        if (a_byBytes.size() >= 2) {
+            if (uchar(a_byBytes[0]) == 0xFF && uchar(a_byBytes[1]) == 0xFE) {
+                QStringDecoder d(QStringLiteral("UTF-16LE"));
+                a_sText = d.decode(QByteArrayView(a_byBytes).sliced(2));
+                return true;
+            }
+            if (uchar(a_byBytes[0]) == 0xFE && uchar(a_byBytes[1]) == 0xFF) {
+                QStringDecoder d(QStringLiteral("UTF-16BE"));
+                a_sText = d.decode(QByteArrayView(a_byBytes).sliced(2));
+                return true;
+            }
+        }
+        if (a_byBytes.size() >= 3 && uchar(a_byBytes[0]) == 0xEF
+            && uchar(a_byBytes[1]) == 0xBB && uchar(a_byBytes[2]) == 0xBF) {
+            QStringDecoder d(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+            a_sText = d.decode(QByteArrayView(a_byBytes).sliced(3));
+            return true;
+        }
+        {
+            QStringDecoder d(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+            QString s = d.decode(a_byBytes);
+            if (!d.hasError()) {
+                a_sText = std::move(s);
+                return true;
+            }
+        }
+#ifdef Q_OS_WIN
+        if (!a_byBytes.contains('\0')) {
+            const int nLen = int(a_byBytes.size());
+            const int nW = MultiByteToWideChar(54936 /*GB18030*/, MB_ERR_INVALID_CHARS,
+                                               a_byBytes.constData(), nLen, nullptr, 0);
+            if (nW > 0 || (nW == 0 && nLen == 0)) {
+                std::wstring sBuf(nW, L'\0');
+                if (nW > 0) {
+                    MultiByteToWideChar(54936, MB_ERR_INVALID_CHARS,
+                                        a_byBytes.constData(), nLen, sBuf.data(), nW);
+                }
+                a_sText = QString::fromStdWString(sBuf);
+                return true;
+            }
+        }
+#endif
+        // 未知格式：空字节密集判二进制（审查无意义）
+        int iZero = 0;
+        for (char c : a_byBytes) {
+            if (c == '\0') {
+                ++iZero;
+            }
+        }
+        if (!a_byBytes.isEmpty() && iZero * 10 > a_byBytes.size()) {
+            return false;
+        }
+        a_sText = QString::fromLatin1(a_byBytes);
+        return true;
+    }
+
+    // 2026-10-08 统一入口：逐文件可选增量 + 基线前移（bUseBaseline=false 时
+    // 走 2026-09-30 原路径：SDK ReviewFile 库内读取链，任务阶段预审不变）。
+    void Run(const QString& a_sRootDir, const QList<SReviewItem>& a_aFiles,
+             const QString& a_sBaselineDir, int a_iTimeoutSec) {
         m_bAbort = false;   // 复位上轮残留的停止请求（Stop 在空转期置位无害化）
         CReviewSdkClient* pSdk = CReviewSdkClient::Get();
+        const bool bUseBaseline = !a_sBaselineDir.isEmpty();
+        CReviewBaseline::TMap mapBase = bUseBaseline
+            ? CReviewBaseline::LoadMeta(a_sBaselineDir)
+            : CReviewBaseline::TMap();
         QJsonArray aAll;
         QStringList aErrors;
-        int iReviewed = 0, iFindings = 0, iSkipped = 0;
-        const int n = static_cast<int>(a_aAbsFiles.size());
+        int iReviewed = 0, iFindings = 0, iSkipped = 0, iNoChange = 0, iIncr = 0;
+        const int n = static_cast<int>(a_aFiles.size());
         for (int i = 0; i < n; ++i) {
             if (m_bAbort) {
                 break;
             }
-            const QString sAbs = a_aAbsFiles.at(i);
+            const SReviewItem stItem = a_aFiles.at(i);
+            const QString sAbs = stItem.sAbs;
             const QString sRel = CReviewSdkClient::RelativeToRoot(a_sRootDir, sAbs);
             emit sigFileStart(sRel, i + 1, n);
 
+            int iRc = AUTOCODE_LCR_ERR_ARGS;
             QString sFindings, sErr;
+            QByteArray byRaw;
+            bool bCallSdk = false;   // false=读盘/解码已失败，跳过 SDK 直落错误分支
+
+            // LLM 调用上下文（停止路径终止 runner 用；两路共用）。
             SSyncLlmCtx stCtx;
             stCtx.pRelay     = this;
             stCtx.sWorkDir   = a_sRootDir;
             stCtx.iTimeoutMs = a_iTimeoutSec * 1000;
             m_pCurCtx = &stCtx;
-            const int iRc = pSdk->ReviewFile(sAbs, sRel, &ReviewLlmTrampoline, &stCtx,
-                                             sFindings, sErr);
+
+            if (!bUseBaseline) {
+                // —— 原路径：库内读取链（编码/透明加密回退都在 SDK 侧）——
+                bCallSdk = true;
+            } else {
+                // —— 基线路径：自读原文（基线需要原始字节）→ 增量裁决 → ContentEx ——
+                bool bReadOk = false;
+                {
+                    CFrwDevice stFile(sAbs);
+                    if (stFile.open(QIODevice::ReadOnly)) {
+                        byRaw = stFile.readAll();
+                        stFile.close();
+                        bReadOk = true;
+                    }
+                }
+                QString sText;
+                if (!bReadOk) {
+                    iRc = AUTOCODE_LCR_ERR_READ;
+                    sErr = QStringLiteral("文件读取失败");
+                } else if (!DecodeText(byRaw, sText)) {
+                    iRc = AUTOCODE_LCR_ERR_READ;
+                    sErr = QStringLiteral("二进制/未知编码文件，无法审查");
+                } else {
+                    bCallSdk = true;
+                    // 基线快照取读取时刻盘上 mtime/size（审查成功即入基线；期间
+                    // 外部再改 → 下次「修改过」检测按 mtime/size 判回，不漏网）。
+                    const QFileInfo stInfo(sAbs);
+                    const qint64 iMt = stInfo.lastModified().toMSecsSinceEpoch();
+                    const qint64 iSz = stInfo.size();
+
+                    QString sScope = sText;
+                    bool bInc = false;
+                    if (stItem.bIncremental) {
+                        const auto itBase = mapBase.find(CReviewBaseline::NormKey(sRel));
+                        QByteArray byOld;
+                        QString sOld;
+                        if (itBase != mapBase.end()
+                            && CReviewBaseline::ReadBlob(a_sBaselineDir,
+                                                         itBase.value().sSha1, byOld)
+                            && DecodeText(byOld, sOld)) {
+                            const QString sSc = pSdk->BuildIncrementalScope(sOld, sText);
+                            if (sSc.isEmpty()) {
+                                // 与上次审查版本零差异：零模型调用收尾，基线照常前移
+                                // （防「内容未变但被 touch」误判修改）。
+                                const QString sSha = CReviewBaseline::Sha1Of(byRaw);
+                                CReviewBaseline::WriteBlob(a_sBaselineDir, sSha, byRaw);
+                                itBase.value() = {iMt, iSz, sSha};
+                                CReviewBaseline::SaveMeta(a_sBaselineDir, mapBase);
+                                ++iNoChange;
+                                m_pCurCtx = nullptr;
+                                emit sigInfo(QStringLiteral("无修改，跳过模型调用：%1").arg(sRel));
+                                emit sigFileDone(sRel, AUTOCODE_LCR_OK,
+                                                 QStringLiteral("[]"), QString());
+                                continue;
+                            }
+                            sScope = sSc;
+                            bInc = true;
+                            ++iIncr;
+                            emit sigInfo(QStringLiteral("增量审查（仅修改部分）：%1").arg(sRel));
+                        } else {
+                            emit sigInfo(QStringLiteral("无上次审查基线，本次全量审查：%1"
+                                                        "（首次审查或上次未成功）").arg(sRel));
+                        }
+                    }
+                    iRc = pSdk->ReviewContentEx(pSdk->LanguageForFile(sAbs), sRel,
+                                                sScope, bInc,
+                                                &ReviewLlmTrampoline, &stCtx,
+                                                sFindings, sErr);
+                    if (iRc == AUTOCODE_LCR_OK) {
+                        // 审查成功 → 基线前移（内容寻址 blob + meta 原子替换）。
+                        const QString sSha = CReviewBaseline::Sha1Of(byRaw);
+                        CReviewBaseline::WriteBlob(a_sBaselineDir, sSha, byRaw);
+                        mapBase.insert(CReviewBaseline::NormKey(sRel), {iMt, iSz, sSha});
+                        CReviewBaseline::SaveMeta(a_sBaselineDir, mapBase);
+                    }
+                    bCallSdk = false;   // 已调过，下方不再重调
+                }
+            }
+            if (bCallSdk) {
+                iRc = pSdk->ReviewFile(sAbs, sRel, &ReviewLlmTrampoline, &stCtx,
+                                       sFindings, sErr);
+            }
             m_pCurCtx = nullptr;
 
             if (iRc == AUTOCODE_LCR_OK) {
@@ -119,6 +283,10 @@ public:
             .arg(iReviewed)
             .arg(iSkipped)
             .arg(iFindings);
+        if (bUseBaseline) {
+            sMd += QStringLiteral("- 增量审查（仅修改部分）：%1 个；无修改跳过：%2 个\n")
+                       .arg(QString::number(iIncr), QString::number(iNoChange));
+        }
         if (iFindings > 0) {
             sMd += QStringLiteral("\n## 问题清单\n\n");
             for (const auto& v : aAll) {
@@ -293,7 +461,18 @@ CReviewService::~CReviewService() {
 
 bool CReviewService::Start(const QString& a_sRootDir, const QStringList& a_aAbsFiles,
                            int a_iTimeoutSec) {
-    if (m_bRunning.load() || a_sRootDir.isEmpty() || a_aAbsFiles.isEmpty()) {
+    // 全量、无基线（任务阶段预审路径保持 2026-09-30 原行为）。
+    QList<SReviewItem> aItems;
+    aItems.reserve(a_aAbsFiles.size());
+    for (const QString& s : a_aAbsFiles) {
+        aItems.append({s, false});
+    }
+    return StartEx(a_sRootDir, aItems, QString(), a_iTimeoutSec);
+}
+
+bool CReviewService::StartEx(const QString& a_sRootDir, const QList<SReviewItem>& a_aFiles,
+                             const QString& a_sBaselineDir, int a_iTimeoutSec) {
+    if (m_bRunning.load() || a_sRootDir.isEmpty() || a_aFiles.isEmpty()) {
         return false;
     }
     QString sErr;
@@ -304,10 +483,11 @@ bool CReviewService::Start(const QString& a_sRootDir, const QStringList& a_aAbsF
     m_bRunning.store(true);
     CReviewWorkerImpl* pWorker = static_cast<CReviewWorkerImpl*>(m_pWorkerObj);
     const QString sRoot = a_sRootDir;
-    const QStringList aFiles = a_aAbsFiles;
+    const QList<SReviewItem> aFiles = a_aFiles;
+    const QString sBaseline = a_sBaselineDir;
     const int iTimeout = (a_iTimeoutSec > 0) ? a_iTimeoutSec : 600;
-    QMetaObject::invokeMethod(pWorker, [pWorker, sRoot, aFiles, iTimeout]() {
-        pWorker->Run(sRoot, aFiles, iTimeout);
+    QMetaObject::invokeMethod(pWorker, [pWorker, sRoot, aFiles, sBaseline, iTimeout]() {
+        pWorker->Run(sRoot, aFiles, sBaseline, iTimeout);
     }, Qt::QueuedConnection);
     return true;
 }

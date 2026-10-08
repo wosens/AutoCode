@@ -141,6 +141,25 @@ static bool ClaudeSupportsPartialMessages() {
     return s_bPartialSupported;
 }
 
+QList<SDshModelEntry> CClaudeRunner::s_aSharedModels;
+int  CClaudeRunner::s_iSharedActive = -1;
+bool CClaudeRunner::s_bFollowSharedModels = false;
+int  CClaudeRunner::s_iMaxThinkTok = 0;
+QString CClaudeRunner::s_sSmallFastModel;
+
+void CClaudeRunner::SetMaxThinkingTokens(int a_iTok) { s_iMaxThinkTok = a_iTok; }
+void CClaudeRunner::SetSmallFastModel(const QString& a_sModel) { s_sSmallFastModel = a_sModel.trimmed(); }
+
+void CClaudeRunner::SetSharedModelTable(const QList<SDshModelEntry>& a_aModels,
+                                        int a_iActive) {
+    s_aSharedModels = a_aModels;
+    s_iSharedActive = a_iActive;
+}
+
+void CClaudeRunner::SetFollowSharedModels(bool a_bOn) {
+    s_bFollowSharedModels = a_bOn;
+}
+
 void CClaudeRunner::SetClaudeCmd(const QString& a_sCmd) {
     // 2026.08.15 [Agent] ClaudeCmd：空串/全空白回退默认 "claude"（依赖 PATH）。
     s_sClaudeCmd = a_sCmd.trimmed().isEmpty() ? QStringLiteral("claude")
@@ -435,6 +454,46 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
         oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
         oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
         oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
+        // 2026-10-08 共享大模型表消费（任务/助手全覆盖）：本助手实例槽覆盖优先，
+        //   其次「Claude 后端跟随本表」开关 + 共享表当前条目。仅 anthropic-messages
+        //   兼容条目注入（claude CLI 只说 anthropic 协议；chat/openai 条目跳过并留痕，
+        //   走 claude 自身配置兜底）。每轮新进程 per-进程 env，无共享文件竞态。
+        {
+            const SDshModelEntry* pUse = nullptr;
+            QString sSrc;
+            if (HasStageModelOverride() && !m_stModelOv.sModelId.isEmpty()) {
+                pUse = &m_stModelOv;
+                sSrc = QStringLiteral("本助手覆盖");
+            } else if (s_bFollowSharedModels && s_iSharedActive >= 0
+                       && s_iSharedActive < s_aSharedModels.size()) {
+                pUse = &s_aSharedModels[s_iSharedActive];
+                sSrc = QStringLiteral("全局共享表");
+            }
+            if (pUse != nullptr) {
+                const QString sApi = pUse->sApi.trimmed().toLower();
+                if (sApi.isEmpty() || sApi == QLatin1String("anthropic-messages")) {
+                    oEnv.insert(QStringLiteral("ANTHROPIC_BASE_URL"), pUse->sBaseURL);
+                    if (!pUse->sApiKey.isEmpty()) {
+                        oEnv.insert(QStringLiteral("ANTHROPIC_API_KEY"), pUse->sApiKey);
+                    }
+                    oEnv.insert(QStringLiteral("ANTHROPIC_MODEL"), pUse->sModelId);
+                    emit sigInfo(QStringLiteral("[claude-model] %1 生效：%2（%3）")
+                        .arg(sSrc, pUse->sModelId, pUse->sBaseURL));
+                } else {
+                    emit sigInfo(QStringLiteral(
+                        "[claude-model] %1 条目「%2」API 类型为 %3（非 anthropic-messages），"
+                        "本轮跳过注入、走 claude 自身配置")
+                        .arg(sSrc, pUse->sModelId, pUse->sApi));
+                }
+            }
+        }
+        // 2026-10-08 Claude 专属参数（与共享表无关，设了就注入）。
+        if (s_iMaxThinkTok > 0) {
+            oEnv.insert(QStringLiteral("MAX_THINKING_TOKENS"), QString::number(s_iMaxThinkTok));
+        }
+        if (!s_sSmallFastModel.isEmpty()) {
+            oEnv.insert(QStringLiteral("ANTHROPIC_SMALL_FAST_MODEL"), s_sSmallFastModel);
+        }
         m_pProc->setProcessEnvironment(oEnv);
     }
     // 上一进程收尾等待已移至函数开头（Reset() 之前，2026.08.17 竞态修复），此处直接启动。

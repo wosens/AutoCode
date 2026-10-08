@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 #include <QProcessEnvironment>
+#include "core/CModelEntry.h"   // 2026-10-07 对话级模型覆盖槽（SDshModelEntry）
 
 // Agent 后端 runner 抽象基类（2026.08.18 多后端支持：Claude Code / DeepSeekHarness）。
 //
@@ -55,6 +56,22 @@ public:
 
     // 快速失败重试等待中（同上，仍占用 runner）。
     virtual bool IsRetryPending() const = 0;
+
+    // 2026-10-07 对话级模型覆盖（用户需求：右键「选择模型」只对本助手生效，不改
+    // 全局四张节/静态激活条目）：per-runner 实例槽（2026.09.03 起助手会话各持独立
+    // runner，实例注入互不影响其他会话/任务侧）。语义 = 本实例后续每次 StartStage
+    // 组装参数/配置时用 a_iIdx 指向的表内条目代替全局激活条目；-1 = 跟随全局。
+    // 各后端实现自行消费：Pi（--provider autocode-<n> 下标）/Codex（-c 路由+窗口
+    // +anthropic→chat 兑底）/DSH（env 槽位，进程保活时 key 变更自动重启）/Hermes
+    // （HERMES_* env + config 写入用条目快照）；claude 不参与共享表，忽略。
+    // 下标口径 = 该后端 runner 静态模型表（ApplySharedModelsToRunners 已把四表收敛
+    // 为同一份共享表，四后端表内容/顺序一致）；条目快照供无表静态的单值后端用。
+    void SetStageModelOverride(int a_iIdx, const SDshModelEntry& a_stE) {
+        m_iModelOvIdx = a_iIdx;
+        m_stModelOv = a_stE;
+    }
+    void ClearStageModelOverride() { m_iModelOvIdx = -1; }
+    bool HasStageModelOverride() const { return m_iModelOvIdx >= 0; }
 
     // 向当前运行中的进程追加一条用户轮次；未运行或失败时安全 no-op 返回 false。
     virtual bool InjectUserTurn(const QString& a_sText) = 0;
@@ -126,6 +143,15 @@ protected:
     qint64      m_iLastContextFill = 0; // 当前上下文占用（最后一条 assistant 的三项 input token 之和）
     int         m_iLastReqCount = 0;    // 本次运行 API 请求数（assistant 消息条数）
     QString     m_sLastModel;           // 最近 result 的 model 字段（供上层查上下文窗口）
+
+    // 2026-10-07 对话级模型覆盖槽（见公共段 SetStageModelOverride 注释）。
+    int             m_iModelOvIdx = -1;   // 覆盖下标（-1=跟随全局激活）
+    SDshModelEntry m_stModelOv;           // 覆盖条目快照（单值静态后端用）
+    // 覆盖下标对当前表长度的有效值（越界/未设回 -1）——各后端 StartStage 解析用。
+    int ModelOvIdxIn(int a_iTableSize) const {
+        return (a_iTableSize > 0 && m_iModelOvIdx >= 0 && m_iModelOvIdx < a_iTableSize)
+            ? m_iModelOvIdx : -1;
+    }
 
     // 2026-09-12 手工审批弹窗通道（全后端）：向子进程环境注入 AUTOCODE_ASK_EXE
     //   （AutoCode.exe 全路径）与 AUTOCODE_ASK_PIPE（本实例 AskServer 管道名）。

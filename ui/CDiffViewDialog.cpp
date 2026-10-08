@@ -136,9 +136,14 @@ void CDiffViewDialog::BuildUi() {
                 if (bOk[0] && bOk[1] && bOk[2] && bOk[3]
                     && iW >= 640 && iH >= 420 && iW <= rcDesk.width()
                     && iH <= rcDesk.height()) {
-                    setGeometry(QRect(qBound(rcDesk.left(), iX, rcDesk.right() - iW + 1),
-                                      qBound(rcDesk.top(), iY, rcDesk.bottom() - iH + 1),
-                                      iW, iH));
+                    // 2026-10-08 修「每次弹出往上跑」：setGeometry 改 move()+resize()
+                    //   （同 CRecentProjectsDialog/CRollbackDialog/CSettingsDialog
+                    //   2026.09.25 修复——Qt6.8.3 顶层窗口 setGeometry 客户区落点恒比
+                    //   请求 y 高 31px，hideEvent 存回偏移值 → 逐次上漂；move()+
+                    //   resize() 走精确客户区路径不漂）。
+                    move(QPoint(qBound(rcDesk.left(), iX, rcDesk.right() - iW + 1),
+                                qBound(rcDesk.top(), iY, rcDesk.bottom() - iH + 1)));
+                    resize(iW, iH);
                 }
             }
         }

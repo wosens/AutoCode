@@ -72,6 +72,17 @@ public:
                       FnLcrLlmInvoke a_pfnLlm, void* a_pUserCtx,
                       QString& a_sFindingsJson, QString& a_sErr);
 
+    // —— 2026-10-08 增量审查两件套（手动审查「仅审修改部分」）——
+    // 增量范围提取（纯函数不调模型）：旧/新全文 → 修改段文本；返回空串=两版无
+    // 差异（跳过模型）；isNull()=入参空指针。未加载返回空串。
+    QString BuildIncrementalScope(const QString& a_sOldContent, const QString& a_sNewContent);
+    // 全量/增量统一入口：a_bIncremental=true 时 a_sContent 须传 BuildIncrementalScope
+    // 产物（行号=当前文件真实 1-based、未列出部分不审）；false 等价 ReviewContent。
+    int ReviewContentEx(const QString& a_sLanguage, const QString& a_sDisplayPath,
+                        const QString& a_sContentUtf8, bool a_bIncremental,
+                        FnLcrLlmInvoke a_pfnLlm, void* a_pUserCtx,
+                        QString& a_sFindingsJson, QString& a_sErr);
+
     // 把磁盘绝对路径换算为工程相对路径（正斜杠；不在根下时回退绝对路径）。
     // 报告/注入块统一用相对路径（含 CReviewService/CCodeReviewDialog 两消费方）。
     static QString RelativeToRoot(const QString& a_sRootDir, const QString& a_sAbsPath);

@@ -1142,6 +1142,133 @@ private slots:
         QSKIP("非 Windows 平台跳过");
 #endif // Q_OS_WIN
     }
+    // ============ 2026-10-03 自动命名忙等待（AutoNameAsstNow 全忙排队至空闲） ============
+    //   实害：HarnessGatewayPlugin 单助手工程——収尾自动命名在 sigAdhocFinished 同步链里
+    //   跑，目标 runner 尚未退净被误判「忙」且无空闲会话可借 → 旧版直接 false 打
+    //   「✗ 无可用的空闲助手会话」。本用例：慢 stub 轮占住会话 → AutoNameAsstNow 返回
+    //   true（已受理）+ auto_name_wait 事件 + 不立即 done；轮结束退净后 3s 重查自动启动
+    //   命名轮回填成功；StopAdhoc 取消排队（不再冒命名轮）。
+    void autoNameBusyWaitUntilIdle() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 命名忙等待用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/busy_calls.log");
+        // 慢 stub：读入 stdin 后延时 4s 才输出 result（模拟长轮/收尾退净窗口）；命名轮
+        //   因提示词含【助手命名】走快路径立即回两行。
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "require('fs').appendFileSync(%1,'===\\n'+s+'\\n');"
+                "const bName=s.includes('【助手命名】');"
+                "const emit=()=>{"
+                "console.log(JSON.stringify({type:'session',sessionId:'stub-bw-1'}));"
+                "console.log(JSON.stringify({type:'assistant',text:'stub',"
+                "model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',"
+                "sessionId:'stub-bw-1',text:bName?"
+                "('延迟命名测试\\n'+'用户在该助手中验证忙等待机制。')"
+                ":'已完成'}));};"
+                "if(bName){emit();}else{setTimeout(emit,4000);}"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(0);   // 关专家模式：只读轮直投，不进深度链
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        QString sDoneId;
+        int iDoneCount = 0;
+        bool bDoneOk = false;
+        QString sDoneName;
+        bool bWaitEvent = false;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAsstAutoNameDone,
+                         [&](const QString& sId, bool bOk, const QString& sName,
+                             const QString&) {
+            ++iDoneCount; sDoneId = sId; bDoneOk = bOk; sDoneName = sName;
+        });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString&) {
+            if (sKind == QStringLiteral("auto_name_wait")) {
+                bWaitEvent = true;
+            }
+        });
+        // ① 慢轮占住 asst-busy 会话（4s 后才结束）。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-busy"),
+                           QStringLiteral("慢慢处理这个请求"),
+                           CTaskOrchestrator::PermReadOnly);
+        QTest::qWait(1500);   // 确保轮在跑（fnBusy 判忙）
+        // ② 忙且无空闲会话可借：不再 false，置等待 + 事件行 + 返回 true。
+        QVERIFY(stOrch.AutoNameAsstNow(QStringLiteral("asst-busy"),
+                                       QStringLiteral("1. 忙等待验证")));
+        QVERIFY(bWaitEvent);
+        QCOMPARE(iDoneCount, 0);   // 未立即回填（在排队）
+        // ③ 轮结束退净 + 3s 重查 → 命名轮自动启动并回填成功。
+        for (int iWait = 0; iWait < 200 && iDoneCount == 0; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iDoneCount, 1);
+        QCOMPARE(sDoneId, QStringLiteral("asst-busy"));
+        QVERIFY(bDoneOk);
+        QCOMPARE(sDoneName, QStringLiteral("延迟命名测试"));
+        // ④ Stop 取消：独立编排器实例（会话表内只有 asst-stop，无其他空闲会话可借，
+        //   确保走排队路径而非借道 asst-busy 的空闲会话）→ 排队 → StopAdhoc → 重试点
+        //   （3s）后不启动命名。
+        {
+            CTaskOrchestrator stOrch2(&stPm);
+            QString sDoneId2;
+            QObject::connect(&stOrch2, &CTaskOrchestrator::sigAsstAutoNameDone,
+                             [&](const QString& sId, bool, const QString&, const QString&) {
+                sDoneId2 = sId;
+            });
+            stOrch2.SubmitAdhoc(QStringLiteral("asst-stop"),
+                                QStringLiteral("停止验证轮"),
+                                CTaskOrchestrator::PermReadOnly);
+            QTest::qWait(1500);
+            QVERIFY(stOrch2.AutoNameAsstNow(QStringLiteral("asst-stop"),
+                                            QStringLiteral("1. 停止取消验证")));
+            stOrch2.StopAdhoc(QStringLiteral("asst-stop"));
+            QTest::qWait(5000);   // 覆盖 3s 重查点
+            QVERIFY(sDoneId2.isEmpty());   // 未回填（等待已被取消）
+        }
+        // 进程调用数恰 3：两轮 Submit + asst-busy 命名轮（asst-stop 被取消未起命名）。
+        QFile fLog(sLog);
+        QVERIFY(fLog.open(QIODevice::ReadOnly));
+        const int iCalls = QString::fromUtf8(fLog.readAll())
+                               .count(QStringLiteral("==="));
+        fLog.close();
+        QCOMPARE(iCalls, 3);
+
+        // 静态配置复位（不泄漏给同进程后续用例）。
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
 };
 
 QTEST_MAIN(CTestVerifyFlow)

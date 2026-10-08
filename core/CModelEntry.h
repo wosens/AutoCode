@@ -42,6 +42,27 @@ inline QString NormalizeModelApiForMerge(const QString& a_sApi) {
     return sApi;
 }
 
+// 条目身份串：URL + 归一 Api + ModelId（忽略大小写）——合并去重与 2026-10-07
+// 对话级模型覆盖解析共用同一口径。
+inline QString ModelEntryIdentity(const SDshModelEntry& a_stE) {
+    return a_stE.sBaseURL.trimmed().toLower() + QChar(1)
+         + NormalizeModelApiForMerge(a_stE.sApi) + QChar(1)
+         + a_stE.sModelId.trimmed().toLower();
+}
+
+// 2026-10-07 按身份在表中找下标（-1 = 不在表内）。对话级模型覆盖不能硬存下标跨次
+// 使用（共享表内容可能已变），每次覆盖生效前用条目快照现解析。
+inline int SharedModelIndexByIdentity(const QList<SDshModelEntry>& a_aTbl,
+                                      const SDshModelEntry& a_stE) {
+    const QString sId = ModelEntryIdentity(a_stE);
+    for (int i = 0; i < a_aTbl.size(); ++i) {
+        if (ModelEntryIdentity(a_aTbl.at(i)) == sId) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 // 四张同构模型表合并为一份共享表：
 //   - 基底 = 条目数最多的表（并列取传入顺序靠前者——调用方按优先级传参），
 //     保持基底原序；其余表按传入顺序把「新身份」条目追加到末尾；
@@ -64,9 +85,7 @@ inline SSharedModels MergeSharedModelTables(const QList<QList<SDshModelEntry>>& 
         }
     }
     auto fnIdent = [](const SDshModelEntry& a_stE) -> QString {
-        return a_stE.sBaseURL.trimmed().toLower() + QChar(1)
-             + NormalizeModelApiForMerge(a_stE.sApi) + QChar(1)
-             + a_stE.sModelId.trimmed().toLower();
+        return ModelEntryIdentity(a_stE);
     };
     QList<int> aOrder;
     aOrder.reserve(iN);

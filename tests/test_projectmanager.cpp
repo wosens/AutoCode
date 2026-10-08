@@ -5,6 +5,7 @@
 #include <QCoreApplication>
 #include <QTemporaryDir>   // 2026.09.09 v2.1.143 任务级配置覆盖用例
 #include <QHeaderView>     // 2026.09.11 模型表列宽用例
+#include <QCheckBox>
 #include <QTreeWidget>
 #include <QWindow>          // 窗口级 QTest 鼠标事件（真实输入管线）
 #include <QTabWidget>
@@ -694,7 +695,8 @@ private slots:
             CProjectManager stPm;
             CSettingsDialog stDlg(&stPm);
             const QList<QTreeWidget*> aTrees = stDlg.findChildren<QTreeWidget*>();
-            QCOMPARE(aTrees.size(), 4);
+            // 2026-10-08 设置页模型表收敛：四后端页的模型树全部取消，唯一树在「大模型」页。
+            QCOMPARE(aTrees.size(), 1);
             for (QTreeWidget* pTree : aTrees) {
                 QCOMPARE(pTree->columnCount(), 7);
                 QHeaderView* pHdr = pTree->header();
@@ -702,6 +704,21 @@ private slots:
                     QCOMPARE(pHdr->sectionResizeMode(i), QHeaderView::Interactive);
                 }
                 QVERIFY(pHdr->stretchLastSection());   // 末列「当前」填满剩余空间
+            }
+            // 2026-10-08 页序与归属：第 2 页 = 「模型」（2026-10-08 由「大模型」更名），唯一模型树在其中；
+            //   claude 跟随开关已随 v3.3.274 后半段调整迁至 Claude Code 页（tab 2，claude 专属语义集中），
+            //   四后端参数页不再含任何模型树。
+            {
+                const QList<QTabWidget*> aTabs = stDlg.findChildren<QTabWidget*>();
+                QVERIFY(!aTabs.isEmpty());
+                QTabWidget* pTabs = aTabs.first();
+                QVERIFY(pTabs->count() >= 6);
+                QCOMPARE(pTabs->tabText(1), QStringLiteral("模型"));
+                QVERIFY(aTrees.first()->parentWidget() != nullptr);
+                QWidget* pTreePage = aTrees.first()->parentWidget()->parentWidget();
+                QCOMPARE(pTabs->widget(1), pTreePage);
+                QCOMPARE(pTabs->tabText(2), QStringLiteral("Claude Code"));
+                QVERIFY(pTabs->widget(2)->findChildren<QCheckBox*>().size() >= 1);   // claude 跟随开关（已迁入本页）
             }
         }
         // ② 真实鼠标拖拽验证（QWindow 级 QTest 合成事件走真实输入管线，同真鼠标链路）：
@@ -768,7 +785,8 @@ private slots:
             CProjectManager stPm;
             CSettingsDialog stDlg(&stPm);
             const QList<QTreeWidget*> aTrees = stDlg.findChildren<QTreeWidget*>();
-            QCOMPARE(aTrees.size(), 4);
+            // 2026-10-08 设置页模型表收敛：四后端页的模型树全部取消，唯一树在「大模型」页。
+            QCOMPARE(aTrees.size(), 1);
             for (QTreeWidget* pTree : aTrees) {
                 QCOMPARE(pTree->columnWidth(0), 234);
                 QCOMPARE(pTree->columnWidth(3), 156);
@@ -791,6 +809,36 @@ private slots:
                 }
             }
             QVERIFY(bFoundDsh);
+        }
+        // ⑤ 列表高度随窗口高度自适应（2026-10-08）：拉高对话框 → 树同步长高；
+        //   缩回 → 树同步变矮（树在布局里 stretch=1，页尾无 stretch 抢高度）。
+        {
+            CProjectManager stPm;
+            CSettingsDialog stDlg(&stPm);
+            stDlg.resize(1000, 700);
+            stDlg.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&stDlg));
+            QApplication::processEvents();
+            QTreeWidget* pTree = stDlg.findChildren<QTreeWidget*>().first();
+            // 模型页非当前页时不参与布局（同②段），先切到前台再量高度。
+            for (QWidget* pW = pTree->parentWidget(); pW != nullptr; pW = pW->parentWidget()) {
+                if (auto* pTabW = qobject_cast<QTabWidget*>(pW)) {
+                    pTabW->setCurrentWidget(pTree->parentWidget()->parentWidget());
+                    break;
+                }
+            }
+            QApplication::processEvents();
+            const int iH700 = pTree->height();
+            stDlg.resize(1000, 950);
+            QApplication::processEvents();
+            const int iH950 = pTree->height();
+            QVERIFY2(iH950 - iH700 >= 200,
+                     qPrintable(QStringLiteral("tree 700:%1 -> 950:%2").arg(iH700).arg(iH950)));
+            stDlg.resize(1000, 700);
+            QApplication::processEvents();
+            QVERIFY2(pTree->height() <= iH700 + 2,
+                     qPrintable(QStringLiteral("shrink back %1 vs %2")
+                         .arg(pTree->height()).arg(iH700)));
         }
     }
 

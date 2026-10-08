@@ -2913,6 +2913,50 @@ private slots:
 
 
 
+    // 2026-10-08 GC 路径版 + tmp 新鲜度守卫（Open 尾 GC 改后台节流的回归）：
+    //   ①GcOrphanBlobsAtPath 仅携备份根路径独立回收（不依赖 store/宿主实例，
+    //     后台 GC 的真实形态）；②在途保护同口径扩展到 *.tmp*——新鲜 tmp 不删
+    //   （在途备份正在写），定居旧 tmp 才清；旧孤儿 blob 回收、新鲜孤儿跳过、
+    //   被引用 blob 永不动。
+    void testGcAtPathTmpFreshnessGuard() {
+        const QString sRoot = MakeSandbox();
+        const QString sBk = sRoot + "/.autodev/backups";
+        const QString sStore = sBk + "/store";
+        QVERIFY(QDir().mkpath(sStore));
+        // 手工meta：仅引用 h1（CBackupStore::Backup 落盘 manifest 的最小集）。
+        const QString sH1 = QStringLiteral("h1-ref");     // 被引用，定居 → 存活
+        const QString sH2 = QStringLiteral("h2-orphan");  // 无引用，定居 → 回收
+        const QString sH3 = QStringLiteral("h3-fresh");   // 无引用，新鲜 → 在途跳过
+        WriteFile(sBk, QStringLiteral("0001.meta.json"),
+                  ("{\"files\":{\"a.cpp\":{\"h\":\"" + sH1 + "\"}}}").toUtf8());
+        WriteFile(sStore, sH1 + QStringLiteral(".zst"), "ref");
+        WriteFile(sStore, sH2 + QStringLiteral(".zst"), "orphan");
+        WriteFile(sStore, sH3 + QStringLiteral(".zst"), "fresh");
+        WriteFile(sStore, QStringLiteral("inflight.tmp123"), "writing");
+        WriteFile(sStore, QStringLiteral("stale.tmp456"), "junk");
+        // 定居时间拨回 11 分钟前（与在途保护同口径：660s），新鲜的保持当前 mtime。
+        const QDateTime tOld = QDateTime::currentDateTime().addSecs(-660);
+        for (const QString& s : { sH1 + QStringLiteral(".zst"),
+                                  sH2 + QStringLiteral(".zst"),
+                                  QStringLiteral("stale.tmp456") }) {
+            QFile f(sStore + QLatin1Char('/') + s);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QVERIFY(f.setFileTime(tOld, QFileDevice::FileModificationTime));
+            f.close();
+        }
+        // 仅携路径执行：不建 CProjectManager/CBackupStore 实例（后台 GC 真实形态）。
+        QCOMPARE(CBackupStore::GcOrphanBlobsAtPath(sBk), 1);
+        const QStringList aZst = QDir(sStore).entryList({"*.zst"}, QDir::Files);
+        QVERIFY(aZst.contains(sH1 + QStringLiteral(".zst")));   // 被引用存活
+        QVERIFY(aZst.contains(sH3 + QStringLiteral(".zst")));   // 新鲜孤儿跳过
+        QVERIFY(!aZst.contains(sH2 + QStringLiteral(".zst")));  // 旧孤儿已回收
+        const QStringList aTmp = QDir(sStore).entryList({"*.tmp*"}, QDir::Files);
+        QCOMPARE(aTmp, QStringList{QStringLiteral("inflight.tmp123")});  // 新鲜 tmp 保留
+        Wipe(sRoot);
+    }
+
+
+
 
 
     // 用例 10：中文路径/文件名全链路无损。

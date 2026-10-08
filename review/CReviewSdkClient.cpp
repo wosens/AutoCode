@@ -255,3 +255,67 @@ QString CReviewSdkClient::RelativeToRoot(const QString& a_sRootDir, const QStrin
     }
     return QDir::fromNativeSeparators(sAbs);
 }
+
+// —— 2026-10-08 增量审查两件套 ——
+QString CReviewSdkClient::BuildIncrementalScope(const QString& a_sOldContent,
+                                                const QString& a_sNewContent) {
+#ifdef Q_OS_WIN
+    if (!m_bLoaded || m_pfnBuildIncrementalScope == nullptr || m_pfnFreeString == nullptr) {
+        return QString();
+    }
+    const QByteArray byOld = a_sOldContent.toUtf8();
+    const QByteArray byNew = a_sNewContent.toUtf8();
+    char* pszScope = m_pfnBuildIncrementalScope(byOld.constData(), byNew.constData());
+    if (pszScope == nullptr) {
+        return QString();   // 入参空指针（与库契约一致；空串经 isNull 区分）
+    }
+    QString sScope;
+    // 空串 "" = 两版无差异：用 isNull 语义回传（QString() 即 null）供调用方区分
+    // 「无差异」与「提取到修改段」。非空则取全文。
+    if (pszScope[0] != '\0') {
+        sScope = QString::fromUtf8(pszScope);
+    }
+    m_pfnFreeString(pszScope);
+    return sScope;
+#else
+    Q_UNUSED(a_sOldContent); Q_UNUSED(a_sNewContent);
+    return QString();
+#endif
+}
+
+int CReviewSdkClient::ReviewContentEx(const QString& a_sLanguage, const QString& a_sDisplayPath,
+                                      const QString& a_sContentUtf8, bool a_bIncremental,
+                                      FnLcrLlmInvoke a_pfnLlm, void* a_pUserCtx,
+                                      QString& a_sFindingsJson, QString& a_sErr) {
+    a_sFindingsJson.clear();
+    a_sErr.clear();
+#ifdef Q_OS_WIN
+    if (!m_bLoaded || m_pfnReviewContentEx == nullptr || m_pfnFreeString == nullptr) {
+        a_sErr = QStringLiteral("ReviewSdk.dll 未加载");
+        return AUTOCODE_LCR_ERR_ARGS;
+    }
+    const QByteArray byLang    = a_sLanguage.toUtf8();
+    const QByteArray byPath    = a_sDisplayPath.toUtf8();
+    const QByteArray byContent = a_sContentUtf8.toUtf8();
+    char* pszFindings = nullptr;
+    char* pszError    = nullptr;
+    const int iRc = m_pfnReviewContentEx(
+        (a_sLanguage.isEmpty() ? nullptr : byLang.constData()),
+        byPath.constData(), byContent.constData(), a_bIncremental ? 1 : 0,
+        a_pfnLlm, a_pUserCtx, &pszFindings, &pszError);
+    if (pszFindings != nullptr) {
+        a_sFindingsJson = QString::fromUtf8(pszFindings);
+        m_pfnFreeString(pszFindings);
+    }
+    if (pszError != nullptr) {
+        a_sErr = QString::fromUtf8(pszError);
+        m_pfnFreeString(pszError);
+    }
+    return iRc;
+#else
+    Q_UNUSED(a_sLanguage); Q_UNUSED(a_sDisplayPath); Q_UNUSED(a_sContentUtf8);
+    Q_UNUSED(a_bIncremental); Q_UNUSED(a_pfnLlm); Q_UNUSED(a_pUserCtx);
+    a_sErr = QStringLiteral("非 Windows 平台不支持 ReviewSdk.dll");
+    return AUTOCODE_LCR_ERR_ARGS;
+#endif
+}
