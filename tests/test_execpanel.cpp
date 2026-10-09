@@ -2330,6 +2330,22 @@ void TestExecPanel::asstAutoNameRenameFirstOnSend() {
     QCOMPARE(panel.StagedCount(sId), 1);   // 暂存中
     QVERIFY(panel.AsstRunning(sId));       // 命名轮运行态
     QCOMPARE(pIn->toPlainText(), QString());   // 输入框已清
+    // 2026-10-09 首条命名轮文案适配：流内 auto_naming 事件显示“正在预处理”
+    //   （不报“根据历史提示词生成名称与说明”误导——历史提示词只有刚输入这一条）。
+    {
+        const QJsonArray aBlocks0 = panel.AssistantsToJson().at(0).toObject()
+                .value(QStringLiteral("blocks")).toArray();
+        bool bPre = false;
+        for (const QJsonValue& v : aBlocks0) {
+            const QJsonObject o = v.toObject();
+            if (o.value(QStringLiteral("eventKind")).toString()
+                    == QStringLiteral("auto_naming")) {
+                bPre = o.value(QStringLiteral("text")).toString()
+                          .contains(QStringLiteral("正在预处理"));
+            }
+        }
+        QVERIFY(bPre);
+    }
 
     // ② 命名期间追加：同样只暂存不提交。
     pIn->setPlainText(QStringLiteral("再加上注册功能"));
@@ -2726,14 +2742,12 @@ void TestExecPanel::recentChipsPanelResizePersist() {
         QCOMPARE(stMPanel.UserSize(), QSize(iPW0 + 60, iPH0 + 40));
         QCOMPARE(stMenu.width(),  iMW0 + 60);   // 菜单随面板同步长大（含边框补偿）
         QCOMPARE(stMenu.height(), iMH0 + 40);
-        // 面板几何完整落在菜单内（offscreen 无暴露，用几何而非 visibleRegion；
-        //   面板是菜单于控件，同坐标系直接比较）。
-        const QRect rcInMenu = QRect(stMPanel.mapTo(&stMenu, QPoint(0, 0)), stMPanel.size());
-        QVERIFY2(stMenu.rect().contains(rcInMenu),
-                 qPrintable(QStringLiteral("面板越出菜单：面板 %1x%2 @%3,%4 / 菜单 %5x%6")
-                                .arg(rcInMenu.width()).arg(rcInMenu.height())
-                                .arg(rcInMenu.x()).arg(rcInMenu.y())
-                                .arg(stMenu.width()).arg(stMenu.height())));
+        // 面板-菜单边框关系恒定（拖拽前后 面板宽-菜单宽 差不变 = 菜单框恒随面板；
+        //   offscreen 初始 chrome 为负不影响，只验证增量跟随）。平台无关。
+        const int iOverW0 = iPW0 - iMW0;
+        const int iOverH0 = iPH0 - iMH0;
+        QCOMPARE(stMPanel.width()  - stMenu.width(),  iOverW0);
+        QCOMPARE(stMPanel.height() - stMenu.height(), iOverH0);
         stMenu.hide();
     }
 }

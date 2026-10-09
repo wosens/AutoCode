@@ -1342,6 +1342,8 @@ void CExecutionPanel::OnAdhocLog(const QString& a_sAsstId, const QString& a_sLin
     AppendAdhocBlock(st, a_sAsstId);
 }
 
+static bool IsDefaultAsstName(const QString& a_sName);   // 2026-10-09 首条命名轮文案适配用（定义在下方）
+
 void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sKind,
                                    const QString& a_sText) {
     // 2026.09.18 暂存提示词的实际处置（时序：emit sigAdhocSubmit 的同步链内到达，
@@ -1368,6 +1370,18 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sK
     SBlockData st;
     st.eKind      = CMessageBlock::Event;
     st.sEventKind = a_sKind;
+    // 2026-10-09 首条提示词「先改名后执行」轮文案适配：此时“历史提示词”只有刚
+    //   输入的这一条，报“正在根据历史提示词请 Agent 生成助手名称与说明…”易被
+    //   误解为指令已按历史执行；显示/落档文案改“正在预处理”（判定=缺省名且从未
+    //   收到过提示词，与 DoAdhocSend 触发改名先行同口径；非首条路径文案不变）。
+    QString sEvText = a_sText;
+    if (a_sKind == QStringLiteral("auto_naming")) {
+        const SAsst* pA = AsstById(a_sAsstId);
+        if (pA != nullptr && IsDefaultAsstName(pA->sName)
+                && !AsstHasUserPrompt(*pA)) {
+            sEvText = QStringLiteral("⚙ 正在预处理…");
+        }
+    }
     // 2026.09.19 done（已完成）带完成时间 + 当前提示词本轮总耗时（用户需求）：耗时锚点 =
     //   最近一次 SetAsstRunning(true)（每轮起点重锚）；tRound 无效/归零（异常路径/秒答）
     //   时只带时间。仅改展示文本，编排器语义不变；文本随对话流持久化到 assistant.json。
@@ -1381,7 +1395,7 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sK
             st.sText = QStringLiteral("%1（%2）").arg(a_sText, sNow);
         }
     } else {
-        st.sText = a_sText;
+        st.sText = sEvText;
     }
     AppendAdhocBlock(st, a_sAsstId);
 }
