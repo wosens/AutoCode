@@ -28,6 +28,10 @@ namespace {
 // 幽灵化标记（SetProp；崩溃后新实例可据此还原）。
 const wchar_t* kPropGhost   = L"AutoCodeSbxGhost.1";   // 值 = 收纳者 PID
 const wchar_t* kPropOrigEx  = L"AutoCodeSbxOrigEx.1";  // 值 = 原 GWL_EXSTYLE
+// 2026-10-08 「曾收纳」标记：AutoCode 退出还原在册窗口时保留（区别于用户主动
+//   还原——那会连此标记一并清）。新实例启动/切工程时扫到它：窗口进程 exe 在
+//   当前工程目录内 → 续收纳重新隐形（否则窗口裸奔在用户桌面，Compositer 实测）。
+const wchar_t* kPropAdopt   = L"AutoCodeSbxAdopt.1";
 
 // 永不收纳的窗口类（控制台 host / 提示 / 阴影等辅助窗口）。
 bool IsDeniedWndClass(const QString& a_sCls) {
@@ -152,6 +156,7 @@ bool GhostWindow(HWND a_hWnd) {
         return false;
     }
     SetPropW(a_hWnd, kPropOrigEx, reinterpret_cast<HANDLE>(static_cast<intptr_t>(lEx)));
+    SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(static_cast<intptr_t>(1)));   // 曾收纳（退出还原后留供继任实例续收）
     const LONG_PTR lNew = lEx | WS_EX_LAYERED | WS_EX_TRANSPARENT
                         | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
     SetLastError(0);   // SetWindowLongPtr 成功可合法返回 0（原值即 0），先清防残留误判
@@ -172,7 +177,7 @@ bool GhostWindow(HWND a_hWnd) {
     return true;
 }
 
-bool RestoreWindow(HWND a_hWnd) {
+bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark) {
     if (!IsWindow(a_hWnd)) {
         return false;
     }
@@ -191,6 +196,11 @@ bool RestoreWindow(HWND a_hWnd) {
     }
     RemovePropW(a_hWnd, kPropGhost);
     RemovePropW(a_hWnd, kPropOrigEx);
+    // 2026-10-08 用户主动还原（默认）连「曾收纳」标记一并清——之后新实例不会再
+    //   自动续收它；AutoCode 退出路径传 true 保留，供继任实例识别续收。
+    if (!a_bKeepAdoptMark) {
+        RemovePropW(a_hWnd, kPropAdopt);
+    }
     if (ITaskbarList* pList = nullptr;
         SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
                                    IID_PPV_ARGS(&pList))) && pList != nullptr) {
@@ -200,18 +210,35 @@ bool RestoreWindow(HWND a_hWnd) {
     return true;
 }
 
+struct SRestoreCtx {
+    int  iCount = 0;
+    bool bKeepAdopt = false;
+};
+
 BOOL CALLBACK RestoreMarkedProc(HWND a_hWnd, LPARAM a_lParam) {
+    auto* pCtx = reinterpret_cast<SRestoreCtx*>(a_lParam);
     if (GetPropW(a_hWnd, kPropGhost) != nullptr) {
-        RestoreWindow(a_hWnd);
-        ++(*reinterpret_cast<int*>(a_lParam));
+        RestoreWindow(a_hWnd, pCtx->bKeepAdopt);
+        ++pCtx->iCount;
     }
     return TRUE;
 }
 
-int RestoreAllMarked() {
-    int iCount = 0;
-    EnumWindows(RestoreMarkedProc, reinterpret_cast<LPARAM>(&iCount));
-    return iCount;
+int RestoreAllMarked(bool a_bKeepAdoptMark) {
+    SRestoreCtx stCtx;
+    stCtx.bKeepAdopt = a_bKeepAdoptMark;
+    EnumWindows(RestoreMarkedProc, reinterpret_cast<LPARAM>(&stCtx));
+    return stCtx.iCount;
+}
+
+bool HasAdoptMark(HWND a_hWnd) {
+    return IsWindow(a_hWnd) && GetPropW(a_hWnd, kPropAdopt) != nullptr;
+}
+
+void ClearAdoptMark(HWND a_hWnd) {
+    if (IsWindow(a_hWnd)) {
+        RemovePropW(a_hWnd, kPropAdopt);
+    }
 }
 
 bool IsGhosted(HWND a_hWnd) {

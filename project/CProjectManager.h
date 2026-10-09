@@ -531,6 +531,13 @@ public:
     // 2026.09.23 助手单轮 --max-turns（默认 40，合法 10..200）——大重构触顶可放大。
     bool SaveAdhocMaxTurns(int a_iN);
     int  LoadAdhocMaxTurns() const;
+    // 2026-10-08 提示词长度闸门（发送前估算 token，超限自动提炼）：
+    //   PromptCtxPctMax=占当前模型上下文窗口百分比上限（默认 5，0=不限，1..50）；
+    //   PromptTokMax=绝对 token 上限（默认 0=不限，两约束取更小者同时生效）。
+    bool SaveAdhocPromptCtxPctMax(int a_iPct);
+    int  LoadAdhocPromptCtxPctMax() const;
+    bool SaveAdhocPromptTokMax(int a_iTok);
+    int  LoadAdhocPromptTokMax() const;
     // 2026.09.23 v3.0.219 工作量评估开关（1=自动上调，0=恒用基值；缺省开）。
     bool SaveAdhocMaxTurnsAuto(bool a_bOn);
     bool LoadAdhocMaxTurnsAuto() const;

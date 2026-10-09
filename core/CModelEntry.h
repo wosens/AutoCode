@@ -5,6 +5,27 @@
 #include <QChar>
 #include <QLatin1String>
 
+// 2026-10-08 提示词 token 本地估算（发送闸门用，零依赖零网络）：CJK 字符 ≈1 token、
+//   其余 ≈1/3 token（保守偏大取整），仅作阈值判定，与模型实际计量存在小偏差。
+//   置于本头供面板（发送闸门）与编排器（提炼轮收尾校验）单源共用。
+inline int PromptTokenEstimate(const QString& a_sText) {
+    int iCjk = 0;
+    int iOther = 0;
+    for (const QChar& ch : a_sText) {
+        if (ch.isSpace()) {
+            continue;
+        }
+        const char16_t u = ch.unicode();
+        if ((u >= 0x2E80 && u <= 0x9FFF) || (u >= 0xF900 && u <= 0xFAFF)
+                || (u >= 0x3000 && u <= 0x303F) || (u >= 0xFF00 && u <= 0xFF60)) {
+            ++iCjk;
+        } else {
+            ++iOther;
+        }
+    }
+    return iCjk + (iOther + 2) / 3;
+}
+
 // 2026.08.20 自定义大模型条目（统一数据结构，DSH/Pi 两后端共用）。
 //   原定义在 CProjectManager.h（[DshModels] 节）；PiAgent 多条目管理接入后迁到
 //   本头（agent 层 runner 也要用，避免 agent → project 反向依赖）：

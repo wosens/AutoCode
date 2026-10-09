@@ -9,6 +9,7 @@
 #include <QTreeWidget>
 #include <QWindow>          // 窗口级 QTest 鼠标事件（真实输入管线）
 #include <QTabWidget>
+#include <QComboBox>       // 2026-10-08 思考强度下拉用例
 #include <QMainWindow>       // 2026.09.26 设置对话框几何漂移用例（父窗口）
 
 #include <windows.h>       // WritePrivateProfileStringW（坏档构造，与生产代码同通道）
@@ -839,6 +840,81 @@ private slots:
             QVERIFY2(pTree->height() <= iH700 + 2,
                      qPrintable(QStringLiteral("shrink back %1 vs %2")
                          .arg(pTree->height()).arg(iH700)));
+        }
+    }
+
+    // 2026-10-08 四后端思考强度/思考预算设置接通（DSH/Codex/Hermes 下拉 + claude 预算框）：
+    //   默认空/0、落盘回填、选项集合三段。接通前为半截工程（runner 注入/config 存取在，
+    //   UI 与主窗口接线缺，设置页无任何入口）。
+    void testBackendEffortSettings() {
+        // ① 空配置 → 默认项（getter 空/0）。
+        {
+            CProjectManager stPm;
+            CSettingsDialog stDlg(&stPm);
+            QVERIFY(stDlg.DshEffort().isEmpty());
+            QVERIFY(stDlg.CodexEffort().isEmpty());
+            QVERIFY(stDlg.HermesEffort().isEmpty());
+            QCOMPARE(stDlg.ClaudeThinkTok(), 0);
+        }
+        // ② 落盘 → 新对话框回填。
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveDshEffort(QStringLiteral("high")));
+            QVERIFY(stPm.SaveCodexEffort(QStringLiteral("xhigh")));
+            QVERIFY(stPm.SaveHermesEffort(QStringLiteral("ultra")));
+            QVERIFY(stPm.SaveClaudeMaxThinkTok(8192));
+            CSettingsDialog stDlg(&stPm);
+            QCOMPARE(stDlg.DshEffort(), QStringLiteral("high"));
+            QCOMPARE(stDlg.CodexEffort(), QStringLiteral("xhigh"));
+            QCOMPARE(stDlg.HermesEffort(), QStringLiteral("ultra"));
+            QCOMPARE(stDlg.ClaudeThinkTok(), 8192);
+        }
+        // ③ 选项集合：DSH（默认/off/low/high/max）、Codex（+minimal/medium/xhigh）、
+        //   Hermes（false/minimal/low/medium/high/ultra）；轻量修改 setter 后 getter 回读。
+        {
+            CProjectManager stPm;
+            CSettingsDialog stDlg(&stPm);
+            QComboBox* pDsh = nullptr;
+            QComboBox* pCodex = nullptr;
+            QComboBox* pHermes = nullptr;
+            for (QComboBox* pC : stDlg.findChildren<QComboBox*>()) {
+                if (pC->count() == 5 && pC->itemText(1) == QStringLiteral("off")) { pDsh = pC; }
+                if (pC->count() == 6 && pC->itemText(5) == QStringLiteral("xhigh")) { pCodex = pC; }
+                if (pC->count() == 7 && pC->itemText(1) == QStringLiteral("false")) { pHermes = pC; }
+            }
+            QVERIFY(pDsh != nullptr);
+            QVERIFY(pCodex != nullptr);
+            QVERIFY(pHermes != nullptr);
+            QCOMPARE(pDsh->itemText(4), QStringLiteral("max"));
+            QCOMPARE(pCodex->itemText(1), QStringLiteral("minimal"));
+            QCOMPARE(pHermes->itemText(6), QStringLiteral("ultra"));
+            pDsh->setCurrentIndex(3);
+            QCOMPARE(stDlg.DshEffort(), QStringLiteral("high"));
+            pDsh->setCurrentIndex(0);
+            QVERIFY(stDlg.DshEffort().isEmpty());
+        }
+    }
+
+    // 2026-10-08 提示词长度闸门配置（[Adhoc] PromptCtxPctMax 默认 5 / PromptTokMax
+    //   默认 0=不限）：空配置缺省、落盘回填两段。
+    void testPromptGateSettings() {
+        {
+            CProjectManager stPm;
+            QCOMPARE(stPm.LoadAdhocPromptCtxPctMax(), 5);
+            QCOMPARE(stPm.LoadAdhocPromptTokMax(), 0);
+            CSettingsDialog stDlg(&stPm);
+            QCOMPARE(stDlg.AdhocPromptCtxPctMax(), 5);
+            QCOMPARE(stDlg.AdhocPromptTokMax(), 0);
+        }
+        {
+            CProjectManager stPm;
+            QVERIFY(stPm.SaveAdhocPromptCtxPctMax(8));
+            QVERIFY(stPm.SaveAdhocPromptTokMax(20000));
+            QCOMPARE(stPm.LoadAdhocPromptCtxPctMax(), 8);
+            QCOMPARE(stPm.LoadAdhocPromptTokMax(), 20000);
+            CSettingsDialog stDlg(&stPm);
+            QCOMPARE(stDlg.AdhocPromptCtxPctMax(), 8);
+            QCOMPARE(stDlg.AdhocPromptTokMax(), 20000);
         }
     }
 

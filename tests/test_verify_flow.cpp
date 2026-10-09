@@ -1269,6 +1269,106 @@ private slots:
         QSKIP("非 Windows 平台跳过");
 #endif // Q_OS_WIN
     }
+
+    // ============ 2026-10-08 提示词超限提炼（RefinePromptAsstNow 全链） ============
+    //   面板闸门超限上抛 → 一次性只读提炼轮（fork 分支）→ 提炼稿回投 SubmitAdhoc
+    //   正常提交。stub：含【提示词提炼】的轮回「提炼后的短提示词」，其余回「普通完成」；
+    //   断言：refine_start/refine_done 事件、恰 2 次进程调用、第 2 次提交的提示词
+    //   = 提炼稿（不含提炼指令头）。
+    void promptRefineRoundTrip() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 提炼用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/refine_calls.log");
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "require('fs').appendFileSync(%1,'===\\n'+s+'\\n');"
+                "const bRefine=s.includes('【提示词提炼】');"
+                "console.log(JSON.stringify({type:'session',sessionId:'stub-rf-1'}));"
+                "console.log(JSON.stringify({type:'assistant',text:'stub',"
+                "model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',"
+                "sessionId:'stub-rf-1',text:bRefine?"
+                "'提炼后的短提示词：分三步完成重构并自测':'普通完成'}));"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(0);
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        bool bStartEvt = false;
+        bool bDoneEvt = false;
+        QStringList aEvtKinds;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString& sMsg) {
+            aEvtKinds << (sKind + QStringLiteral(" | ") + sMsg.left(400));
+            if (sKind == QStringLiteral("refine_start")) { bStartEvt = true; }
+            if (sKind == QStringLiteral("refine_done")) { bDoneEvt = true; }
+        });
+        // 原文 300 CJK（估算 300 > 上限 50）：触发提炼。
+        const QString sOriginal(300, QChar(0x539F));   // 「原」×300
+        stOrch.RefinePromptAsstNow(QStringLiteral("asst-rf"), sOriginal, 50,
+                                   CTaskOrchestrator::PermAuto);
+        QVERIFY(bStartEvt);   // 提炼轮同步受理并起跑
+        // 等提炼轮 + 回投提交轮两次进程调用都落地（快 stub，秒级）。
+        int iSegs = 0;
+        for (int iWait = 0; iWait < 200; ++iWait) {
+            QTest::qWait(100);
+            QFile fLog(sLog);
+            if (fLog.open(QIODevice::ReadOnly)) {
+                iSegs = QString::fromUtf8(fLog.readAll())
+                            .count(QStringLiteral("==="));
+                fLog.close();
+            }
+            if (bDoneEvt && iSegs >= 2) { break; }
+        }
+        QVERIFY2(bDoneEvt, qPrintable(aEvtKinds.join(QStringLiteral("\n"))));
+        QCOMPARE(iSegs, 2);   // 恰两次：提炼轮 + 提炼稿提交轮
+        QFile fLog(sLog);
+        QVERIFY(fLog.open(QIODevice::ReadOnly));
+        const QStringList aSegs = QString::fromUtf8(fLog.readAll())
+                                      .split(QStringLiteral("==="));
+        fLog.close();
+        QVERIFY(aSegs.size() >= 3);
+        QVERIFY(aSegs.at(1).contains(QStringLiteral("【提示词提炼】")));   // 第 1 轮含指令头+原文
+        QVERIFY(aSegs.at(1).contains(sOriginal.left(20)));
+        QVERIFY(aSegs.at(2).contains(
+            QStringLiteral("提炼后的短提示词")));   // 第 2 轮提交的是提炼稿
+        QVERIFY(!aSegs.at(2).contains(QStringLiteral("【提示词提炼】")));
+
+        // 静态配置复位。
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
 };
 
 QTEST_MAIN(CTestVerifyFlow)

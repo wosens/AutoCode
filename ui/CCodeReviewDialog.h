@@ -19,6 +19,7 @@
 // ============================================================================
 
 #include <QDialog>
+#include <QCloseEvent>
 #include <QString>
 #include <QStringList>
 #include <QJsonArray>
@@ -51,6 +52,14 @@ public:
     explicit CCodeReviewDialog(const QString& a_sTarget, QWidget* a_pParent = nullptr);
 
     ~CCodeReviewDialog() override;
+
+    // 2026-10-08 审查进行中关窗确认（缺省/Esc=继续审查；确认才中止关闭）。
+    void closeEvent(QCloseEvent* a_pEvent) override;
+
+    // 2026-10-08 运行态/目标名查询（主窗口退出确认枚举在跑的审查窗口用；
+    //   实现在 .cpp——需 CReviewService 完整类型）。
+    bool IsReviewRunning() const;
+    const QString& ReviewTargetName() const { return m_sTargetName; }
 
 signals:
     // 双击发现行：打开该文件并定位行（主窗口接 → 文件预览页）。
@@ -108,6 +117,7 @@ private:
     EModState ModStateOf(const QString& a_sRel, const QFileInfo& a_stInfo) const;
 
     QString m_sTarget;                  // 送审目标绝对路径（文件或目录）
+    QString m_sTargetName;              // 目标名（目录/文件名，标题栏区分多窗口用）
     QString m_sRootDir;                 // 相对路径基（目标文件=其父目录；目录=自身）
     QStringList m_aAbsFiles;            // 展开后的全部候选清单（过滤前）
     int     m_iTotalFiles   = 0;

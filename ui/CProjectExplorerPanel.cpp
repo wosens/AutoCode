@@ -1052,52 +1052,56 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
     if (bExtraRootRow) {
         pActRemoveRoot = menu.addAction(
             MenuIcon(QStringLiteral("ow-remove")),
-            QStringLiteral("移除该根节点（仅移出树，保留磁盘目录）"));
+            QStringLiteral("移除该根节点（仅移出树，保留磁盘目录）(&Y)"));
         menu.addSeparator();
     }
+    // 2026-10-08 菜单项加快捷键（用户需求：菜单弹出后按键字母即触发，如 R=属性）：
+    //   括号助记风格同 Windows 中文菜单；字母全菜单内唯一——标准操作沿用 Windows
+    //   习惯（X剪切/C复制/V粘贴/D删除/M改名/A复制路径），其余按语义/拼音首字母
+    //   （E资源管理器/W打开方式/N新建/L相对路径/H聊天/S审查/R属性/F刷新/Y移除根）。
     QAction* pActExplorer  = menu.addAction(
-        MenuIcon(QStringLiteral("ow-explorer")), QStringLiteral("通过资源管理器打开"));
+        MenuIcon(QStringLiteral("ow-explorer")), QStringLiteral("通过资源管理器打开(&E)"));
     // 2026.08.21 「打开方式」子菜单：列出该文件类型在注册表注册过的程序（仅文件）。
     QMenu* pMenuOpenWith = nullptr;
     if (QFileInfo(sSel).isFile()) {
         pMenuOpenWith = menu.addMenu(
-            MenuIcon(QStringLiteral("ow-openwith")), QStringLiteral("打开方式"));
+            MenuIcon(QStringLiteral("ow-openwith")), QStringLiteral("打开方式(&W)"));
         BuildOpenWithMenu(pMenuOpenWith, sSel);
     }
     QAction* pActCut       = menu.addAction(
-        MenuIcon(QStringLiteral("ow-cut")), QStringLiteral("剪切"));
+        MenuIcon(QStringLiteral("ow-cut")), QStringLiteral("剪切(&X)"));
     QAction* pActCopy      = menu.addAction(
-        MenuIcon(QStringLiteral("ow-copy")), QStringLiteral("复制"));
+        MenuIcon(QStringLiteral("ow-copy")), QStringLiteral("复制(&C)"));
     QAction* pActPaste     = menu.addAction(
-        MenuIcon(QStringLiteral("ow-paste")), QStringLiteral("粘贴"));
+        MenuIcon(QStringLiteral("ow-paste")), QStringLiteral("粘贴(&V)"));
     // 2026.09.26 v3.1.247 新建文件夹：目标=选中目录/选中文件父目录/根；建完即行内改名。
     QAction* pActNewFolder = menu.addAction(
-        MenuIcon(QStringLiteral("ow-newfolder")), QStringLiteral("新建文件夹"));
+        MenuIcon(QStringLiteral("ow-newfolder")), QStringLiteral("新建文件夹(&N)"));
     QAction* pActRename    = menu.addAction(
-        MenuIcon(QStringLiteral("ow-rename")), QStringLiteral("改名"));
+        MenuIcon(QStringLiteral("ow-rename")), QStringLiteral("改名(&M)"));
     menu.addSeparator();
     QAction* pActDelete    = menu.addAction(
-        MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除"));
+        MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除(&D)"));
     menu.addSeparator();
     QAction* pActCopyPath  = menu.addAction(
-        MenuIcon(QStringLiteral("ow-copypath")), QStringLiteral("复制路径"));
+        MenuIcon(QStringLiteral("ow-copypath")), QStringLiteral("复制路径(&A)"));
     QAction* pActCopyRel   = menu.addAction(
-        MenuIcon(QStringLiteral("ow-copyrel")), QStringLiteral("复制相对路径"));
+        MenuIcon(QStringLiteral("ow-copyrel")), QStringLiteral("复制相对路径(&L)"));
     QAction* pActAddChat   = menu.addAction(
-        MenuIcon(QStringLiteral("ow-chat")), QStringLiteral("添加到聊天框"));
+        MenuIcon(QStringLiteral("ow-chat")), QStringLiteral("添加到聊天框(&H)"));
     // 2026-09-30 代码审查（ReviewSdk 静态审查，选中文件/文件夹均可）。
     QAction* pActCReview   = menu.addAction(
-        MenuIcon(QStringLiteral("ow-review")), QStringLiteral("代码审查"));
+        MenuIcon(QStringLiteral("ow-review")), QStringLiteral("代码审查(&S)"));
     // 2026.10.02 属性：SHObjectProperties 原生属性框（失败兑底自绘）；只读/
     //   隐藏勾选可写回，与 NFR-7 口径一致根外禁用。
     QAction* pActProps     = menu.addAction(
-        MenuIcon(QStringLiteral("ow-properties")), QStringLiteral("属性"));
+        MenuIcon(QStringLiteral("ow-properties")), QStringLiteral("属性(&R)"));
     // 2026.09.23 刷新：树更新依赖 QFileSystemModel 内部 watcher 的文件系统事件，
     //   Windows 通知缓冲溢出/杀软延迟会丢事件致树停滞（如 Agent 批量落盘后新文件
     //   不出现）——手动触发一次全量重列（详见 NudgeDirWatch）。视图级操作恒可用。
     menu.addSeparator();
     QAction* pActRefresh   = menu.addAction(
-        MenuIcon(QStringLiteral("ow-refresh")), QStringLiteral("刷新"));
+        MenuIcon(QStringLiteral("ow-refresh")), QStringLiteral("刷新(&F)"));
 
     // 粘贴依赖工程根已设 + 剪贴板可能有文件（系统 CF_HDROP——含资源管理器剪切/复制，
     //   或写板失败时的内部快照兑底）；其余依赖选中节点在根内。

@@ -127,6 +127,9 @@ public:
     void SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 更新该助手上下文快照+进度条（<0 视为未知）
     void OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 该助手收到模型名 → 查表更新窗口分母
     void SetUserContextLimit(qint64 a_iLimit);    // 右键设窗口上限（>0 覆盖探测；0/负回退自动）
+    // 2026-10-08 提示词长度闸门（设置页保存/启动时由 CMainWindow 推送；占比与 token 两约束
+    //   取更小者同时生效，超限不直接发送——改起一次性提炼 Agent 压缩后发送）。
+    void SetPromptLimits(int a_iCtxPct, int a_iTokMax);
     // 2026-10-05 右键「选择模型」数据源：主窗口推送共享模型表（列表+当前项）——菜单列
     //   全部可用模型、进度条本体显示当前模型名也以此兜底；切换经 sigSwitchSharedModel
     //   上抛主窗口（四张节落盘 + 重应用 runner，下一轮立刻用新模型，无需重启/进设置页）。
@@ -252,6 +255,10 @@ signals:
     // 2026-09-22 右键「自动重命名」：面板收集该助手全部用户提示词（去时间戳、尾部限量），
     //   经主窗口转编排器 AutoNameAsstNow（借用会话交 Agent 总结名称+说明）。
     void sigAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts);
+    // 2026-10-08 提示词超限提炼：发送前闸门判定超限 → 上抛原文+限额+权限快照，
+    //   CMainWindow 转编排器起一次性提炼 Agent，提炼稿回来再走正常提交链。
+    void sigAsstRefinePrompt(const QString& a_sAsstId, const QString& a_sText,
+                             int a_iLimitTok, int a_iPerm);
     void sigTaskChatChanged(const QString& a_sTaskId);    // 任务流变化（#6 去抖存盘）
     // 右键「设置上下文大小」→ 上抛用户设的上下文窗口上限（token；0=回退自动探测）。
     void sigAdhocContextLimitChanged(qint64 a_iLimit);
@@ -359,6 +366,11 @@ private:
     //   m_sAdhocModel/m_pAdhocInput/m_pComboPerm/m_pBtnContext/m_pBtnSend/m_pBtnUndo——
     //   耗时钟/窗口分母/进度条/输入栏全部随助手存在 SAsst 内，切换页即切实例。）
     qint64          m_iUserContextLimit = 0;       // 用户设的窗口上限（>0 覆盖按模型探测；0=自动；全局配置对各助手一致）
+    int             m_iPromptCtxPct = 5;           // 2026-10-08 提示词占比上限（%，0=不限；CMainWindow 推送）
+    int             m_iPromptTokMax = 0;           // 2026-10-08 提示词 token 上限（0=不限；与占比取更小者同时生效）
+
+    // 2026-10-08 发送闸门有效限额（0=不拦截）：min(窗口×占比%, token 上限)。
+    int PromptGateLimit(const SAsst& a_stAsst) const;
 
     QString                          m_sCurId;
     CTaskInfo*                       m_pCurTask = nullptr;  // 需求3：当前显示任务（供阶段表右键取）

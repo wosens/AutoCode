@@ -2268,6 +2268,56 @@ bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString&
     return true;
 }
 
+void CTaskOrchestrator::RefinePromptAsstNow(const QString& a_sAsstId, const QString& a_sText,
+                                            int a_iLimitTok, int a_iPerm) {
+    // 2026-10-08 提示词超限提炼（用户需求：提示词不超上下文占比/token 上限）：面板发送
+    //   闸门（PromptGateLimit：占比×窗口 与 token 上限取更小者）判定超限后上抛到这里。
+    //   在目标助手自己的会话上起一次性只读提炼轮（fork 分支不动用户会话栈与撤销栈，
+    //   口径同 AsstAutoNaming），提炼稿回投 SubmitAdhoc 正常提交；失败/空输出兑底原文。
+    //   闸门只在面板空闲提交路径触发，正常无忙场景；极端竞态忙（收尾链未退净）则
+    //   兑底直接发原文（事件行留痕，不再排队等待——避免用户长时间无响应）。
+    if (a_sAsstId.isEmpty() || a_sText.trimmed().isEmpty() || a_iLimitTok <= 0) {
+        return;
+    }
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        SubmitAdhoc(a_sAsstId, a_sText, a_iPerm);   // 工程未开兑底：直接发原文
+        return;
+    }
+    SAdhocSession* pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
+    if (pS->pRunner != nullptr
+        && (pS->pRunner->IsRunning() || pS->pRunner->IsGraceActive()
+            || pS->pRunner->IsRetryPending())) {
+        emit sigAdhocEvent(a_sAsstId, QStringLiteral("refine_skip"),
+            QStringLiteral("⚠ 提示词超限但会话忙，跳过提炼按原文发送"));
+        SubmitAdhoc(a_sAsstId, a_sText, a_iPerm);
+        return;
+    }
+    const int iEst = PromptTokenEstimate(a_sText);
+    const QString sPrompt = QStringLiteral(
+        "【提示词提炼】下面这条要发给 AI 助手的提示词过长（约 %1 token，上限 %2 token），"
+        "请把它提炼成不超过 %2 token 的等效提示词。\n\n"
+        "提炼要求：\n"
+        "1. 保留全部关键信息：目标、涉及的文件/路径、命令、参数、约束、验收标准、"
+        "期望输出；一个都不能丢；\n"
+        "2. 删除重复、客套、铺垫与与任务无关的叙述；长示例只保留最小必要片段；\n"
+        "3. 结构化重排（编号列表），语句压缩但语义不失真，不得自行新增或变更需求；\n"
+        "4. 严格只输出提炼后的提示词正文：不要任何解释、前后缀、Markdown 代码围栏。\n\n"
+        "原始提示词：\n---\n%3\n---")
+        .arg(iEst).arg(a_iLimitTok).arg(a_sText);
+    pS->sRefineTargetAsst = a_sAsstId;
+    pS->sRefineOriginal  = a_sText;
+    pS->iRefineLimit     = a_iLimitTok;
+    pS->iRefinePerm      = a_iPerm;
+    pS->iPerm = PermReadOnly;   // 纯提炼：禁 Bash/Edit/Write
+    pS->sPendingPrompt.clear();
+    pS->eMode = PromptRefining;
+    emit sigAdhocEvent(a_sAsstId, QStringLiteral("refine_start"),
+        QStringLiteral("⚙ 提示词约 %1 token 超上限 %2，已起提炼 Agent 压缩后再发送"
+                       "（原文首 200 字：%3…）")
+            .arg(iEst).arg(a_iLimitTok).arg(a_sText.left(200).simplified()));
+    StartAdhocStage(*pS, sPrompt);
+}
+
 void CTaskOrchestrator::RecordSummary(CTaskInfo* a_pTask, EStage a_eStage,
                                       bool a_bOk, const QString& a_sSummary) {
     const QString sName = StageNameZh(a_eStage);
@@ -3640,6 +3690,53 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         sDesc = CTaskInfo::TrimNamePunct(sDesc);
         if (sDesc.size() > 80) { sDesc = sDesc.left(80).trimmed(); }
         emit sigAsstAutoNameDone(sTarget, true, sName, sDesc);
+        break;
+    }
+    case PromptRefining: {
+        // 2026-10-08 提示词超限提炼收尾：提炼稿回投目标助手正常提交。不动用户
+        //   会话栈、不推进 pS->sSid（fork 分支一次性使用，口径同 AsstAutoNaming）。
+        const QString sTarget   = pS->sRefineTargetAsst;
+        const QString sOriginal = pS->sRefineOriginal;
+        const qint64 iLimit     = pS->iRefineLimit;
+        const int iPerm         = pS->iRefinePerm;
+        pS->sRefineTargetAsst.clear();
+        pS->sRefineOriginal.clear();
+        pS->iRefineLimit = 0;
+        pS->eMode = Idle;
+        pS->sPendingPrompt.clear();
+        emit sigAdhocFinished(a_sAsstId);   // 提炼执行会话退出运行态
+        if (sTarget.isEmpty() || iLimit <= 0) {
+            break;
+        }
+        QString sRefined = a_sResult.trimmed();
+        // 剥可能的 Markdown 代码围栏包裹（模型偶发 ```text 整体包裹）。
+        if (sRefined.startsWith(QStringLiteral("```"))) {
+            const int iFirstNl = sRefined.indexOf(QLatin1Char('\n'));
+            if (iFirstNl > 0) { sRefined = sRefined.mid(iFirstNl + 1); }
+            const int iFence = sRefined.lastIndexOf(QStringLiteral("```"));
+            if (iFence >= 0) { sRefined = sRefined.left(iFence); }
+            sRefined = sRefined.trimmed();
+        }
+        if (!a_bOk || sRefined.isEmpty()) {
+            emit sigAdhocEvent(sTarget, QStringLiteral("refine_fail"),
+                QStringLiteral("⚠ 提示词提炼失败（%1），按原文发送")
+                    .arg(a_bOk ? QStringLiteral("空输出") : a_sResult.left(80)));
+            SubmitAdhoc(sTarget, sOriginal, iPerm);
+            break;
+        }
+        const int iNewTok = PromptTokenEstimate(sRefined);
+        const int iOldTok = PromptTokenEstimate(sOriginal);
+        if (iNewTok > iLimit) {
+            emit sigAdhocEvent(sTarget, QStringLiteral("refine_over"),
+                QStringLiteral("⚠ 提炼后仍超上限（%1 > %2 token）：按提炼稿发送，"
+                               "如需更狠压缩可再点发送前手动精简")
+                    .arg(iNewTok).arg(iLimit));
+        } else {
+            emit sigAdhocEvent(sTarget, QStringLiteral("refine_done"),
+                QStringLiteral("✓ 提示词提炼完成：%1 → %2 token（上限 %3），提炼稿已发送")
+                    .arg(iOldTok).arg(iNewTok).arg(iLimit));
+        }
+        SubmitAdhoc(sTarget, sRefined, iPerm);
         break;
     }
     case Submitting: {

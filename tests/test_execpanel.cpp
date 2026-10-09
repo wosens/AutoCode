@@ -137,6 +137,9 @@ private slots:
     //   挂起不提交；命名期间追加只暂存；命名收尾统一转正补发（多条合并）；
     //   停止撤销挂起退回输入框。
     void asstAutoNameRenameFirstOnSend();
+    // 2026-10-08 提示词长度闸门：占比/token 双约束取小；超限不提交改上抛
+    //   sigAsstRefinePrompt（原文+限额+权限快照）；关闸门直发；token 约束独立生效。
+    void promptGateRefineFlow();
     // 2026.09.26 v3.1.239 回归：「最近打开」按钮面板（流式行布局/次数渐变色/
     //   面板交互/菜单内嵌点击——设计定稿见 CRecentChipsPanel 头注）。
     void recentChipsPanel();
@@ -2426,6 +2429,84 @@ void TestExecPanel::asstAutoNameRenameFirstOnSend() {
     QCOMPARE(spySubmit2.count(), 0);
     panel.hide();
     panel2.hide();
+}
+
+void TestExecPanel::promptGateRefineFlow() {
+    // 2026-10-08 提示词长度闸门回归：
+    //   ①默认闸门（5%/不限 token，新助手模型未知→窗口 200K）小文本直接提交；
+    //   ②超限文本（CJK 12000 字 > 10000）不提交，改发射 sigAsstRefinePrompt
+    //     （原文 + 限额 10000 + 权限快照），用户块照常上屏、输入框清空、不置运行态；
+    //   ③关闸门 SetPromptLimits(0,0) → 同样超限的文本直接提交；
+    //   ④token 约束独立生效 SetPromptLimits(0,50) → 中等文本（CJK 200 > 50）也转提炼，
+    //     限额=50（两约束取小）。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("已命名助手"), 0));   // 非默认名：不走先改名链
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    QSignalSpy spySubmit(&panel, &CExecutionPanel::sigAdhocSubmit);
+    QSignalSpy spyRefine(&panel, &CExecutionPanel::sigAsstRefinePrompt);
+    QPlainTextEdit* pIn = nullptr;
+    QWidget* pPage = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("已命名助手"))) {
+            pTabs->setCurrentIndex(i);
+            pPage = pTabs->widget(i);
+            pIn = pPage->findChild<QPlainTextEdit*>();
+            break;
+        }
+    }
+    QVERIFY(pIn != nullptr && pPage != nullptr);
+    const QString sId = panel.ActiveAsstId();
+    QComboBox* pPerm = pPage->findChild<QComboBox*>();
+    QVERIFY(pPerm != nullptr);
+    pPerm->setCurrentIndex(2);   // 只读：验证权限快照随提炼信号携带
+    QTest::qWait(30);
+
+    // ① 小文本（远低于 200K×5%=10000）：直接提交。
+    pIn->setPlainText(QStringLiteral("小活直发"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(spySubmit.count(), 1);
+    QCOMPARE(spyRefine.count(), 0);
+    panel.SetAsstRunning(sId, false);   // 复位运行态供后续发送
+    QTest::qWait(30);
+
+    // ② 超限：CJK 12000 字 → 估算 12000 > 10000，转提炼。
+    const QString sBig(12000, QChar(0x6587));   // 「文」×12000
+    pIn->setPlainText(sBig);
+    panel.DoAdhocSend(sId);
+    QCOMPARE(spySubmit.count(), 1);            // 不再提交
+    QCOMPARE(spyRefine.count(), 1);
+    QCOMPARE(spyRefine.at(0).at(0).toString(), sId);
+    QCOMPARE(spyRefine.at(0).at(1).toString(), sBig);   // 原文完整携带
+    QCOMPARE(spyRefine.at(0).at(2).toInt(), 10000);     // 限额 = 200000×5%
+    QCOMPARE(spyRefine.at(0).at(3).toInt(), 2);         // 权限快照（只读）
+    QCOMPARE(pIn->toPlainText(), QString());            // 输入框已清
+    QVERIFY(!panel.AsstRunning(sId));                   // 未置运行态（等提炼轮）
+
+    // ③ 关闸门：超限文本直接提交。
+    panel.SetPromptLimits(0, 0);
+    pIn->setPlainText(sBig);
+    panel.DoAdhocSend(sId);
+    QCOMPARE(spySubmit.count(), 2);
+    QCOMPARE(spyRefine.count(), 1);
+    panel.SetAsstRunning(sId, false);
+    QTest::qWait(30);
+
+    // ④ token 约束独立生效：限额 = min(占比关, 50) = 50。
+    panel.SetPromptLimits(0, 50);
+    const QString sMid(200, QChar(0x5B57));   // 「字」×200 → 估算 200 > 50
+    pIn->setPlainText(sMid);
+    panel.DoAdhocSend(sId);
+    QCOMPARE(spySubmit.count(), 2);
+    QCOMPARE(spyRefine.count(), 2);
+    QCOMPARE(spyRefine.at(1).at(2).toInt(), 50);
+    panel.hide();
 }
 
 void TestExecPanel::recentChipsPanel() {

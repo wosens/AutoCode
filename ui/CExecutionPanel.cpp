@@ -1649,8 +1649,18 @@ void CExecutionPanel::OnAdhocFinished(const QString& a_sAsstId) {
                     sSend += QStringLiteral("\n\n【指令 %1】\n%2").arg(i + 1).arg(aTexts.at(i));
                 }
             }
-            SetAsstRunning(a_sAsstId, true);   // 先复位运行态再提交（同步失败链收尾归零口径不变）
-            emit sigAdhocSubmit(a_sAsstId, sSend, iSendPerm);
+            // 2026-10-08 提示词长度闸门（命名挂起收尾补发路径同口径）：多条合并后的
+            //   补发文本超限同样转提炼（合并更易超限）；转正上屏已完成，直接上抛。
+            int iFlushGate = 0;
+            if (SAsst* pG = AsstById(a_sAsstId); pG != nullptr) {
+                iFlushGate = PromptGateLimit(*pG);
+            }
+            if (iFlushGate > 0 && PromptTokenEstimate(sSend) > iFlushGate) {
+                emit sigAsstRefinePrompt(a_sAsstId, sSend, iFlushGate, iSendPerm);
+            } else {
+                SetAsstRunning(a_sAsstId, true);   // 先复位运行态再提交（同步失败链收尾归零口径不变）
+                emit sigAdhocSubmit(a_sAsstId, sSend, iSendPerm);
+            }
         }
     }
     // 2026-10-03 运行中挂起的自动重命名：当前指令已完成 → 现在执行（用户需求：助手
@@ -2011,6 +2021,30 @@ void CExecutionPanel::SetUserContextLimit(qint64 a_iLimit) {
     for (const SAsst& st : std::as_const(m_aAssts)) {
         UpdateContextButton(st);
     }
+}
+
+void CExecutionPanel::SetPromptLimits(int a_iCtxPct, int a_iTokMax) {
+    // 2026-10-08 提示词长度闸门参数（CMainWindow 启动/设置保存时推送）：
+    //   占比 1..50（0=不限）与 token 上限 0..1000000（0=不限），两约束取更小者同时生效。
+    m_iPromptCtxPct = qBound(0, a_iCtxPct, 50);
+    m_iPromptTokMax = qBound(0, a_iTokMax, 1000000);
+}
+
+int CExecutionPanel::PromptGateLimit(const SAsst& a_stAsst) const {
+    // 2026-10-08 发送闸门有效限额：min(窗口×占比%, token 上限)；两项都关（0）或窗口
+    //   未知 → 0 = 不拦截。窗口优先用户右键覆盖，未设按模型名探测（ContextLimitForModel
+    //   对未知模型回退 200K，新助手无 sModel 同样 200K——闸门始终有分母）。
+    qint64 iLimit = 0;
+    if (m_iPromptCtxPct > 0) {
+        const qint64 iCtx = AsstContextLimit(a_stAsst);
+        if (iCtx > 0) {
+            iLimit = iCtx * m_iPromptCtxPct / 100;
+        }
+    }
+    if (m_iPromptTokMax > 0) {
+        iLimit = (iLimit <= 0) ? m_iPromptTokMax : qMin(iLimit, (qint64)m_iPromptTokMax);
+    }
+    return static_cast<int>(qMin<qint64>(iLimit, 2000000000));
 }
 
 bool CExecutionPanel::ApplyAsstModelOverride(const QString& a_sAsstId, int a_iIdx) {
@@ -2440,6 +2474,23 @@ void CExecutionPanel::DoAdhocSend(const QString& a_sAsstId) {
     //   2026-10-08 命名挂起期间追加（bSendAfterAutoName）同样只暂存不提交——
     //   补发统一走命名收尾（OnAdhocFinished），不注入命名轮。
     const bool bDeferSend = pAsst->bSendAfterAutoName;   // 命名挂起：暂存后不走提交
+    // 2026-10-08 提示词长度闸门（用户需求：占比/token 双约束取小）：空闲直发路径
+    //   超限不提交——上抛 sigAsstRefinePrompt 起一次性提炼 Agent，提炼稿回来再走
+    //   正常提交链。用户块照常上屏（原文可见），事件行由编排器补（含原文首 200 字）。
+    if (!pAsst->bRunning && !bDeferSend) {
+        const int iGate = PromptGateLimit(*pAsst);
+        if (iGate > 0 && PromptTokenEstimate(sText) > iGate) {
+            AppendAdhocBlock(stUser, a_sId);
+            if (pPage != nullptr) {
+                m_pTabs->setCurrentWidget(pPage);
+            }
+            if (pInput != nullptr) {
+                pInput->clear();
+            }
+            emit sigAsstRefinePrompt(a_sId, sText, iGate, iPerm);
+            return;
+        }
+    }
     if (!pAsst->bRunning && !bDeferSend) {
         AppendAdhocBlock(stUser, a_sId);
     } else {

@@ -318,6 +318,12 @@ void CMainWindow::ApplySharedModelsToRunners() {
     if (m_pExecPanel != nullptr) {
         m_pExecPanel->SetSharedModels(stM.aModels, stM.iActive);
     }
+    // 2026-10-08 提示词长度闸门参数推送（启动/热重载/设置保存/右键切换四路都到这；
+    //   面板闸门与编排器提炼轮即时生效）。
+    if (m_pExecPanel != nullptr && m_pPm != nullptr) {
+        m_pExecPanel->SetPromptLimits(m_pPm->LoadAdhocPromptCtxPctMax(),
+                                      m_pPm->LoadAdhocPromptTokMax());
+    }
 }
 
 // 2026-10-05 上下文进度条右键「选择模型」：共享当前项换 a_iIndex（下标口径 = 面板
@@ -418,6 +424,8 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     CDeepSeekRunner::SetDshCordisPath(m_pPm->LoadDshCordisPath());
     CDeepSeekRunner::SetDshProvider(m_pPm->LoadDshProvider());
     CDeepSeekRunner::SetDshModel(m_pPm->LoadDshModel());
+    // 2026-10-08 思考强度（initialize reasoningEffort；空=默认不注入）。
+    CDeepSeekRunner::SetDshEffort(m_pPm->LoadDshEffort());
     CDeepSeekRunner::SetDshPriceInPerM(m_pPm->LoadDshPriceInPerM());
     CDeepSeekRunner::SetDshPriceCacheReadPerM(m_pPm->LoadDshPriceCacheReadPerM());
     CDeepSeekRunner::SetDshPriceCacheWritePerM(m_pPm->LoadDshPriceCacheWritePerM());
@@ -453,6 +461,10 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     CPiAgentRunner::SetPiNodePath(m_pPm->LoadPiNodePath());
     CPiAgentRunner::SetPiProvider(m_pPm->LoadPiProvider());
     CPiAgentRunner::SetPiThinking(m_pPm->LoadPiThinking());
+    // 2026-10-08 思考强度/思考预算（claude MAX_THINKING_TOKENS / codex -c / hermes config.yaml；空=默认）。
+    CClaudeRunner::SetMaxThinkingTokens(m_pPm->LoadClaudeMaxThinkTok());
+    CCodexRunner::SetCodexEffort(m_pPm->LoadCodexEffort());
+    CHermesRunner::SetHermesEffort(m_pPm->LoadHermesEffort());
     // 2026.08.20 PiAgent 自定义大模型表：四后端共享同一份（见下方 ApplySharedModelsToRunners）。
     // 配置了 Pi 后端但本机不可用 → 启动即明确警告（口径同 DSH，不等第一次阶段启动）。
     if (a_bStartup && CAgentRunnerFactory::IsPi()) {
@@ -692,6 +704,12 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 2026-09-22 助手右键「自动重命名」：面板收集提示词 → 编排器借会话交 Agent 总结。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstAutoRename,
             this, &CMainWindow::OnAsstAutoRename);
+    // 2026-10-08 提示词长度闸门：面板超限上抛 → 编排器起一次性提炼 Agent，
+    //   提炼稿回投 SubmitAdhoc 正常提交（失败兑底原文，事件行留痕）。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstRefinePrompt, this,
+            [this](const QString& sId, const QString& sText, int iLimitTok, int iPerm) {
+                m_pOrch->RefinePromptAsstNow(sId, sText, iLimitTok, iPerm);
+            });
     // 2026.08.15 助手消耗归集：一次成功调用 → 当前档任务（费用/输入/输出/耗时）。
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocUsage,
             this, &CMainWindow::OnAdhocUsage);
@@ -769,7 +787,8 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
 
     // 2026-09-26 内置测试沙箱：Agent 后代 GUI 窗口自动幽灵化收纳 + MP4 录像；
     //   同桥 ({type:sbx}) 承接 sandbox_* MCP 工具与 --sandbox CLI。退出时 closeEvent
-    //   统一 Shutdown（全部还原 + 停录像）；启动时先还原上次崩溃残留的幽灵窗口。
+    //   统一 Shutdown（全部还原 + 停录像）；启动时先还原上次崩溃残留的幽灵窗口
+    //   （2026-10-08 起：工程内残留窗口改为续收纳保持隐形，详见 ReadoptProjectWindows）。
     m_pSbx = new CSandboxManager(this);
     {
         CSandboxManager::SSbxCfg stCfg;
@@ -779,6 +798,7 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
         stCfg.iFps        = m_pPm->LoadSandboxFps();
         stCfg.iRetainDays = m_pPm->LoadSandboxRetainDays();
         m_pSbx->SetConfig(stCfg);
+        m_pSbx->SetProjectRoot(m_pPm->ProjectDir());   // 启动自动恢复工程时供续收纳判定
         m_pSbx->Start();
     }
 
@@ -921,22 +941,20 @@ void CMainWindow::CreateUi() {
         m_pExecPanel->ShowFileTab(a_sAbs, a_bSwitch);
     });
     // 2026-09-30 资源管理器右键「代码审查」→ 非模态审查对话框（ReviewSdk+当前后端）。
-    //   同一时刻只开一个（已开则切目标重审）；对话框双击发现行 → 文件预览定位。
+    //   2026-10-08 改为每次右键新建独立窗口（并存互不影响）——原先先关旧窗会连带
+    //   停掉正在跑的审查（关闭即析构 → Service::Stop）；对话框双击发现行 → 文件预览定位。
     connect(m_pTaskPanel, &CTaskListPanel::sigCodeReview,
             this, [this](const QString& a_sAbsPath) {
-        if (m_pReviewDlg != nullptr) {
-            m_pReviewDlg->close();   // WA_DeleteOnClose 自动销毁（QPointer 随之置空）
-        }
-        m_pReviewDlg = new CCodeReviewDialog(a_sAbsPath, this);
-        m_pReviewDlg->setAttribute(Qt::WA_DeleteOnClose);
-        connect(m_pReviewDlg, &CCodeReviewDialog::sigOpenFile,
+        auto* pDlg = new CCodeReviewDialog(a_sAbsPath, this);
+        pDlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(pDlg, &CCodeReviewDialog::sigOpenFile,
                 this, [this](const QString& a_sAbs, int a_iLine) {
             m_pExecPanel->ShowFileTab(a_sAbs, true, a_iLine);
         });
         // 2026-10-02「按建议修复」：修复提示词注入当前助手提问框（同「添加到聊天框」链路）。
-        connect(m_pReviewDlg, &CCodeReviewDialog::sigFixToChat,
+        connect(pDlg, &CCodeReviewDialog::sigFixToChat,
                 m_pExecPanel, &CExecutionPanel::AppendToAdhocInput);
-        m_pReviewDlg->show();
+        pDlg->show();
     });
     // FR-3：任务运行中介入输入栏 → 编排器 InjectTaskMessage。
     connect(m_pExecPanel, &CExecutionPanel::sigTaskInject,
@@ -1487,6 +1505,15 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
                 QStringLiteral("检测到上次回退被中断的残留，还原现场失败：%1").arg(sErr), this);
         }
     }
+
+    // 2026-10-08 沙箱跨实例续收纳：工程切换后刷新判定根，把「上个 AutoCode 实例
+    //   收纳中、进程未退出、exe 属于本工程」的测试窗口重新入册保持隐形——否则
+    //   它们既被退出还原成了可见窗口，新实例的进程树出身判定又永不再认（已退出
+    //   实例的后代），用户桌面被测试窗口打扰（Compositer 工程实测）。
+    if (m_pSbx != nullptr) {
+        m_pSbx->SetProjectRoot(m_pPm->ProjectDir());
+        m_pSbx->ReadoptProjectWindows();
+    }
 }
 
 void CMainWindow::OnOpenProject() {
@@ -1658,6 +1685,9 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveReviewResume(stDlg.ReviewResume());
     m_pPm->SaveReviewParallel(stDlg.ReviewParallel());
     m_pPm->SaveClaudeCmd(stDlg.ClaudeCmd());
+    // 2026-10-08 claude 思考预算：落盘 + 立即应用 runner 静态（下一轮即生效）。
+    m_pPm->SaveClaudeMaxThinkTok(stDlg.ClaudeThinkTok());
+    CClaudeRunner::SetMaxThinkingTokens(stDlg.ClaudeThinkTok());
     m_pPm->SaveAskTimeoutSec(stDlg.AskTimeoutSec());
     // 2026.08.18 后端切换保护（2026.09.21 收窄，用户需求）：任务 runner 或 guide
     //   运行中仍拒切后端——Backend 键保持原值（其余键照常落）；任务多阶段续跑
@@ -1723,6 +1753,9 @@ void CMainWindow::OnSettings() {
         m_pPm->SaveDshCordisPath(QString());
     }
     m_pPm->SaveDshProvider(stDlg.DshProvider());
+    // 2026-10-08 思考强度：落盘 + 应用（initialize reasoningEffort，下次冷启动即用）。
+    m_pPm->SaveDshEffort(stDlg.DshEffort());
+    CDeepSeekRunner::SetDshEffort(stDlg.DshEffort());
     m_pPm->SaveDshPriceInPerM(stDlg.DshPriceInPerM());
     m_pPm->SaveDshPriceCacheReadPerM(stDlg.DshPriceCacheReadPerM());
     m_pPm->SaveDshPriceCacheWritePerM(stDlg.DshPriceCacheWritePerM());
@@ -1743,6 +1776,9 @@ void CMainWindow::OnSettings() {
     //   入口收敛到上下文进度条右键「设置上下文大小…」（已存值继续生效，未设按模型探测）。
     m_pPm->SaveAdhocMaxTurns(stDlg.AdhocMaxTurns());   // 2026.09.23 助手轮次上限（下一条提示词即时生效）
     m_pPm->SaveAdhocMaxTurnsAuto(stDlg.AdhocMaxTurnsAuto());   // 2026.09.23 v3.0.219 工作量评估开关
+    // 2026-10-08 提示词长度闸门：落盘后由下方 ApplySharedModelsToRunners 尾部统一推面板。
+    m_pPm->SaveAdhocPromptCtxPctMax(stDlg.AdhocPromptCtxPctMax());
+    m_pPm->SaveAdhocPromptTokMax(stDlg.AdhocPromptTokMax());
     m_pPm->SaveScanExcludeDirs(stDlg.ScanExcludeDirs());
     m_pPm->SaveBackupExcludeDirs(stDlg.BackupExcludeDirs());
     // 2026.09.23 资源管理器显示隐藏目录：落盘 + 立即应用到树（含已加载行重隐/重显）。
@@ -1866,6 +1902,9 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveCodexNodePath(stDlg.CodexNodePath());
     m_pPm->SaveCodexProvider(stDlg.CodexProvider());
     m_pPm->SaveCodexWireApi(stDlg.CodexWireApi());
+    // 2026-10-08 思考强度：落盘 + 应用（-c model_reasoning_effort，下一轮即用）。
+    m_pPm->SaveCodexEffort(stDlg.CodexEffort());
+    CCodexRunner::SetCodexEffort(stDlg.CodexEffort());
     QString sCodexRootApply = stDlg.CodexRoot();
     if (!CCodexRunner::LooksLikeCodexRoot(sCodexRootApply)) {
         const QString sCodexProbed = CCodexRunner::ProbeSiblingRoot();
@@ -1908,6 +1947,9 @@ void CMainWindow::OnSettings() {
     //   只做探测告警）。
     m_pPm->SaveHermesNodePath(stDlg.HermesNodePath());
     m_pPm->SaveHermesRoot(stDlg.HermesRoot());
+    // 2026-10-08 思考强度：落盘 + 应用（config.yaml agent.reasoning_effort，同一次写管）。
+    m_pPm->SaveHermesEffort(stDlg.HermesEffort());
+    CHermesRunner::SetHermesEffort(stDlg.HermesEffort());
     m_pPm->SaveHermesPriceInPerM(stDlg.HermesPriceInPerM());
     m_pPm->SaveHermesPriceCacheReadPerM(stDlg.HermesPriceCacheReadPerM());
     m_pPm->SaveHermesPriceCacheWritePerM(stDlg.HermesPriceCacheWritePerM());
@@ -3717,28 +3759,44 @@ void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
     // 2026.09.18 v2.3.175 退出确认（用户需求：任务/助手在跑时关窗弹提示，明确说明当前
     //   工作、缺省选「否」）：命中任一运行态（流水线 runner/任一助手/改码前备份）先弹
     //   确认框；取消则忽略关闭事件。后续退出路径（落盘/持久化）保持原有行为不变。
-    if (m_pOrch != nullptr
+    //   2026-10-08 审查窗口多开后：正在跑的手动代码审查窗口一并计入。
+    QStringList aLines;
+    bool bReviewBusy = false;
+    for (const CCodeReviewDialog* pDlg : findChildren<CCodeReviewDialog*>()) {
+        if (pDlg != nullptr && pDlg->IsReviewRunning()) {
+            bReviewBusy = true;
+            aLines.append(QStringLiteral("• 代码审查「%1」正在进行")
+                              .arg(pDlg->ReviewTargetName()));
+        }
+    }
+    const bool bOrchBusy = (m_pOrch != nullptr
             && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning()
-                || m_pOrch->IsBackupRunning())) {
-        QStringList aLines;
-        if (m_pOrch->IsRunnerBusy()) {
-            QString sLine = QStringLiteral("• 任务正在运行");
-            if (const CTaskInfo* pRun = m_pOrch->RunningTask()) {
-                sLine = QStringLiteral("• 任务「%1」正在运行").arg(pRun->Name());
-                if (const SStageDef* pDef = FindStage(pRun->CurrentStage())) {
-                    sLine += QStringLiteral("（阶段：%1）").arg(pDef->sNameZh);
+                || m_pOrch->IsBackupRunning()));
+    if (bOrchBusy || bReviewBusy) {
+        if (m_pOrch != nullptr) {
+            if (m_pOrch->IsRunnerBusy()) {
+                QString sLine = QStringLiteral("• 任务正在运行");
+                if (const CTaskInfo* pRun = m_pOrch->RunningTask()) {
+                    sLine = QStringLiteral("• 任务「%1」正在运行").arg(pRun->Name());
+                    if (const SStageDef* pDef = FindStage(pRun->CurrentStage())) {
+                        sLine += QStringLiteral("（阶段：%1）").arg(pDef->sNameZh);
+                    }
                 }
+                aLines.prepend(sLine);
             }
-            aLines.append(sLine);
         }
-        if (m_pExecPanel != nullptr) {
+        if (m_pOrch != nullptr && m_pExecPanel != nullptr) {
+            QStringList aAsstLines;
             for (const QString& sId : m_pOrch->RunningAdhocIds()) {
-                aLines.append(QStringLiteral("• 助手「%1」正在运行")
-                                 .arg(m_pExecPanel->AsstDisplayName(sId)));
+                aAsstLines.append(QStringLiteral("• 助手「%1」正在运行")
+                                      .arg(m_pExecPanel->AsstDisplayName(sId)));
+            }
+            if (!aAsstLines.isEmpty()) {
+                aLines = aAsstLines + aLines;
             }
         }
-        if (m_pOrch->IsBackupRunning()) {
-            aLines.append(QStringLiteral("• 改码前备份正在进行"));
+        if (m_pOrch != nullptr && m_pOrch->IsBackupRunning()) {
+            aLines.prepend(QStringLiteral("• 改码前备份正在进行"));
         }
         QMessageBox oBox(this);
         oBox.setIcon(QMessageBox::Warning);

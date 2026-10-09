@@ -119,12 +119,15 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
-            "（windows/capture/click/type/keys/tree/restore…）。\n"
+            "（windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"
             " --sandbox click <hwnd> <x> <y> ｜ --sandbox type <hwnd> <文本> ｜"
             " --sandbox tree <hwnd>\n"
             "- 截图返回 PNG 路径，用读图工具查看后再定位坐标点击。\n"
-            "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入。")
+            "- 若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/进程早于本轮启动），"
+            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。\n"
+            "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入，"
+            "也禁止绕开沙箱用 python/ctypes 自制 Win32 驱动操控窗口。")
             .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
         return sSbxOnly;
     }
@@ -166,12 +169,15 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
-            "（windows/capture/click/type/keys/tree/restore…）。\n"
+            "（windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"
             " --sandbox click <hwnd> <x> <y> ｜ --sandbox type <hwnd> <文本> ｜"
             " --sandbox tree <hwnd>\n"
             "- 截图返回 PNG 路径，用读图工具查看后再定位坐标点击。\n"
-            "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入%2。\n")
+            "- 若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/进程早于本轮启动），"
+            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。\n"
+            "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入，"
+            "也禁止绕开沙箱用 python/ctypes 自制 Win32 驱动操控窗口%2。\n")
             .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()),
                  bPinnedSandbox
                      ? QStringLiteral("；更细操作指引可读 ui-sandbox 技能的 SKILL.md")

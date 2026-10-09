@@ -43,12 +43,23 @@ public:
     ~CSandboxManager() override;
 
     void SetConfig(const SSbxCfg& a_stCfg);
-    void Start();            // 孤儿还原 + 录像保留清理 +（启用时）钩子/扫描
+    void Start();            // 孤儿处理（续收纳/还原）+ 录像保留清理 +（启用时）钩子/扫描
     void Shutdown();         // 停钩子/扫描，全部还原 + 停录像（退出前必调）
     void ReloadConfig();     // 设置保存后热应用（开/停钩子）
 
+    // 2026-10-08 跨实例续收纳：AutoCode 重启（版本更新/用户重开）后，上个实例
+    //   收纳中的测试进程窗口（带幽灵标记残留、进程未退出）会被退出还原重新可见，
+    //   而本实例的进程树出身判定认不出「已退出实例的后代」→ 永不再收纳，用户桌面
+    //   被测试窗口打扰（Compositer 工程实测：16:14 实例重启后窗口一直裸奔）。
+    //   对策：窗口进程 exe 在当前工程目录内 → 重新入册保持隐形；无关残留照旧还原。
+    void SetProjectRoot(const QString& a_sRoot);   // 打开/切换工程时刷新
+    void ReadoptProjectWindows();                  // 扫描带标记窗口，工程内的续收纳
+
     // 钩子线程句柄（Start 时创建；无 Q_OBJECT 的内部类经指针直调 StopHook）。
     class CSbxHookThread* m_pHookTh = nullptr;
+
+    // 续收纳判定用：当前工程根（空 = 未开工程，孤儿一律还原）。
+    QString m_sProjRoot;
 
     // MCP/CLI 统一命令入口（cmd 小写）。成功返回 true，a_sOut 为多行文本。
     //   阻塞锁（可在工作线程长阻塞；UI 线程勿直调，用 ExecuteTry）。

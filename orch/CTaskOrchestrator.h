@@ -142,6 +142,12 @@ public:
     //   会话；全忙/无会话返回 false（调用方提示）。结果经 sigAsstAutoNameDone 回填。
     bool AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts);
 
+    // 2026-10-08 提示词超限提炼：面板发送闸门（占比/token 双约束取小）判定超限后
+    //   上抛到这里。起一次性只读提炼轮（fork 分支不动用户会话栈），提炼稿回投
+    //   SubmitAdhoc 正常提交；提炼失败/空输出兑底按原文发送（事件行留痕）。
+    void RefinePromptAsstNow(const QString& a_sAsstId, const QString& a_sText,
+                             int a_iLimitTok, int a_iPerm);
+
     // 设置评审阶段并行视角数（1=串行回退；>1=多视角并行 fan-out/fan-in）。
     void SetReviewParallel(int a_iN);
 
@@ -372,9 +378,11 @@ private:
     // AsstAutoNaming=助手自动重命名（2026-09-22：该助手全部用户提示词交 Agent 总结出
     //   名称+说明，sAutoNameTargetAsst 记被命名助手——执行会话可能是借用的其他助手）；
     // DeepPlan=专家模式规划轮（2026.09.26：分析请求产出计划+验收标准，fork 一次性分支）；
-    // DeepVerify=专家模式验证轮（独立验证者按验收标准编译/测试，fork 一次性分支）。
+    // DeepVerify=专家模式验证轮（独立验证者按验收标准编译/测试，fork 一次性分支）；
+    // PromptRefining=提示词超限提炼轮（2026-10-08：发送前闸门超限 → fork 只读一次性
+    //   分支把原提示词压缩到限额内，提炼稿回投 SubmitAdhoc 正常提交；失败兑底原文）。
     enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming,
-                      AsstAutoNaming, DeepPlan, DeepVerify };
+                      AsstAutoNaming, DeepPlan, DeepVerify, PromptRefining };
 
     // —— 助手会话（2026.09.03 多助手并发）：每助手独立 runner 进程 + 会话链 + 状态机 ——
     //   会话常驻 m_aAdhoc（id→堆指针，QHash 重哈希不移动指向体）；档切换/切工程整体
@@ -400,6 +408,13 @@ private:
         EAdhocMode            eMode = Idle;    // 异步流程状态机（多助手各一份，互不干扰）
         CTaskInfo*            pAutoNameTask = nullptr;   // AutoNaming 模式待命名任务
         QString               sAutoNameTargetAsst;       // AsstAutoNaming 模式：被命名的助手 id
+        // 2026-10-08 提示词超限提炼（PromptRefining 模式）：目标/原文/限额/权限快照，
+        //   收尾分支用来回投 SubmitAdhoc（失败兑底原文）。执行会话=目标助手自己的
+        //   会话（闸门仅在空闲提交路径触发，无借用场景）。
+        QString               sRefineTargetAsst;
+        QString               sRefineOriginal;
+        qint64                iRefineLimit = 0;
+        int                   iRefinePerm = PermAuto;
         // 2026-10-03 自动命名忙等待（HarnessGatewayPlugin 实害：claude result 到达即
         //   emit sigFinished、进程退净前 IsRunning()=true——收尾自动命名/挂起收尾执行
         //   在 sigAdhocFinished 同步链里跑必撞该窗口判「忙」；工程只有一个助手时也无

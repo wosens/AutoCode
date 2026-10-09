@@ -9,7 +9,9 @@
 //     收纳不做进程树判定，本进程窗口可测）；
 //  ⑧ 用户启动豁免：RegisterUserRoot 后 ConsiderWindow 不收纳；清除后宽限期
 //     (1.2s) 满才收纳；对已收纳窗口登记兑底网立即还原；
-//  ⑦ MP4 录像：CSandboxRecorder 跑 2 秒产出非空 mp4（ftyp 头）。
+//  ⑦ MP4 录像：CSandboxRecorder 跑 2 秒产出非空 mp4（ftyp 头）；
+//  ⑧ 跨实例续收纳：退出还原留 adopt 标记 → 继任实例 Start 对工程内窗口续收纳，
+//     工程外清标记；用户主动还原清标记；add 收编崩溃残留。
 // 需要真实 Win32 窗口：不进 offscreen 清单；无桌面会话环境自动 QSKIP。
 // 2026.09.27 测试宿主窗口一律屏外定位（见 CHost 构造注释）：ctest 全量回归频繁
 // 执行本用例，此前窗口在屏内会闪现用户桌面（"沙箱宿主"字样，用户反馈）。
@@ -84,6 +86,9 @@ public:
 // 按 pid 找子进程主窗口（UserRootExempt 用；EnumWindows 回调需函数指针）。
 HWND  g_hFoundChild = nullptr;
 DWORD g_dwFindPid = 0;
+// 2026-10-08 ZeroGhostGrace 用例：孙窗口查找（排除自身/中间层两个 pid）。
+DWORD g_dwSelfPidForFind = 0;
+DWORD g_dwMidPidForFind = 0;
 static BOOL CALLBACK FindWndByPidProc(HWND a_hWnd, LPARAM) {
     DWORD dwPid = 0;
     GetWindowThreadProcessId(a_hWnd, &dwPid);
@@ -348,6 +353,201 @@ private slots:
         CSandboxManager::ClearUserRoots();   // 防污染后续用例
     }
 
+    // 2026-10-08 零闪现收纳回归（SmartStore 工程实测：回归跑批反复启被测程序，
+    // 旧逻辑一律先排 1.2s 宽限 → 每个窗口都先裸奔一下，用户桌面反复闪窗）。
+    // 孙进程窗口（隔代后代 = 生产 Agent 链形态）首次判定即收纳，不进宽限队列。
+    void ZeroGhostGrace() {
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.Start();
+
+        QProcess stMid;   // 中间层（≈runner），孙窗口的直接父是它、不是测试进程
+        stMid.setProcessChannelMode(QProcess::ForwardedChannels);
+        stMid.start(QCoreApplication::applicationFilePath(),
+                    { QStringLiteral("--sandbox-grand-host") });
+        QVERIFY(stMid.waitForStarted(5000));
+
+        // 等孙窗口出现（可见顶层、pid != 测试进程/中间层 = 孙进程）。
+        const DWORD dwSelf = static_cast<DWORD>(QCoreApplication::applicationPid());
+        const DWORD dwMid = static_cast<DWORD>(stMid.processId());
+        g_dwSelfPidForFind = dwSelf;
+        g_dwMidPidForFind = dwMid;
+        HWND hGrand = nullptr;
+        QVERIFY(WaitCond(10000, [&]() {
+            g_hFoundChild = nullptr;
+            EnumWindows([](HWND h, LPARAM) {
+                DWORD dwPid = 0;
+                GetWindowThreadProcessId(h, &dwPid);
+                if (dwPid != 0 && dwPid != g_dwSelfPidForFind && dwPid != g_dwMidPidForFind
+                        && IsWindowVisible(h)) {
+                    wchar_t wsTitle[128] = {};
+                    GetWindowTextW(h, wsTitle, 128);
+                    if (wcsstr(wsTitle, L"sandbox-child-host") != nullptr) {
+                        g_hFoundChild = h;
+                    }
+                }
+                return TRUE;
+            }, 0);
+            return g_hFoundChild != nullptr;
+        }));
+        hGrand = g_hFoundChild;
+        QVERIFY(hGrand != nullptr);
+
+        // 隔代后代零宽限：窗口 SHOW 起，钩子（EVENT_OBJECT_SHOW，毫秒级投递）或
+        // 扫描兑底应立即收纳——旧逻辑下首次判定一律排 1.2s 宽限队列（窗口裸奔），
+        // 即使钩子即时到达也要等期满；新逻辑首次判定即 GhostAndTrack。
+        // 上限 2500ms：钩子即时路径外留扫描兜底（1.2s 周期）+ 事件循环余量。
+        QVERIFY2(WaitCond(2500, [&]() { return sbx::IsGhosted(hGrand); }),
+                 "隔代后代应在宽限期(800ms)内即被收纳（零闪现）");
+        QCOMPARE(stMgr.GhostedCount(), 1);
+
+        DWORD dwGrandPid = 0;
+        GetWindowThreadProcessId(hGrand, &dwGrandPid);
+        stMgr.Shutdown();
+        // 收尾杀整棵测试树：中间层 kill 后孙进程成孤儿不会跟着退（首跑实测挂住
+        // 锁 exe），须按 pid 单独终结，否则后续构建 LNK1104。
+        stMid.kill();
+        stMid.waitForFinished(3000);
+        if (dwGrandPid != 0) {
+            if (HANDLE hG = OpenProcess(PROCESS_TERMINATE, FALSE, dwGrandPid)) {
+                TerminateProcess(hG, 1);
+                CloseHandle(hG);
+            }
+        }
+    }
+
+    // 2026-10-08 跨实例续收纳回归（Compositer 工程实测：AutoCode 实例重启后，
+    // 退出还原的测试窗口裸奔用户桌面，且新实例进程树出身判定永不再认它）。
+    void ReadoptAcrossRestart() {
+        // 场景 C：用户主动还原（默认语义）应连「曾收纳」标记一并清。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));
+            QVERIFY(sbx::HasAdoptMark(h));        // 收纳时打上
+            QVERIFY(sbx::RestoreWindow(h));       // 用户语义（清 adopt）
+            QVERIFY(!sbx::IsGhosted(h));
+            QVERIFY(!sbx::HasAdoptMark(h));
+        }
+        // 场景 A（主场景）：上个实例「退出还原」留 adopt 标记 → 新实例 Start 时
+        // 窗口 exe 在工程目录内 → 续收纳重新入册（窗口回到隐形）。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));
+            QVERIFY(sbx::RestoreWindow(h, true)); // 退出还原：保留 adopt 标记
+            QVERIFY(!sbx::IsGhosted(h) && sbx::HasAdoptMark(h));   // 可见但带标记
+
+            CSandboxManager stMgr;                // 模拟继任实例
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable = true;
+            stCfg.bAutoGhost = false;             // 不走钩子，隔离考察续收纳路径
+            stCfg.bRecord = false;
+            stMgr.SetConfig(stCfg);
+            stMgr.SetProjectRoot(QCoreApplication::applicationDirPath()); // exe 本身在此目录
+            stMgr.Start();
+            QCOMPARE(stMgr.GhostedCount(), 1);     // 续收纳入册
+            QVERIFY(sbx::IsGhosted(h));            // 重新隐形
+            stMgr.Shutdown();                     // 清场（退出还原又留标记，窗口析构销毁 prop）
+        }
+        // 场景 B：工程外路径 → 不收纳，仅清 adopt 标记（恢复常态）。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));
+            QVERIFY(sbx::RestoreWindow(h, true));
+            QVERIFY(sbx::HasAdoptMark(h));
+
+            QTemporaryDir stDir;
+            CSandboxManager stMgr;
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable = true;
+            stCfg.bAutoGhost = false;
+            stCfg.bRecord = false;
+            stMgr.SetConfig(stCfg);
+            stMgr.SetProjectRoot(stDir.path());   // 与本进程 exe 无关的目录
+            stMgr.Start();
+            QCOMPARE(stMgr.GhostedCount(), 0);
+            QVERIFY(!sbx::IsGhosted(h));
+            QVERIFY(!sbx::HasAdoptMark(h));       // 标记清除，窗口恢复常态
+            stMgr.Shutdown();
+        }
+        // 场景 D：Agent 显式 add 收编「已幽灵但不在册」的崩溃残留窗口。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));         // 模拟崩溃残留（隐形、无管理器在册）
+
+            CSandboxManager stMgr;
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable = true;
+            stCfg.bAutoGhost = false;
+            stCfg.bRecord = false;
+            stMgr.SetConfig(stCfg);
+            stMgr.Start();
+            QString sOut;
+            QJsonObject oAdd;
+            oAdd.insert(QStringLiteral("hwnd"),
+                        QStringLiteral("0x%1").arg(reinterpret_cast<quintptr>(h), 0, 16));
+            QVERIFY(stMgr.Execute(QStringLiteral("add"), oAdd, sOut));
+            QCOMPARE(stMgr.GhostedCount(), 1);     // 收编入册
+            QVERIFY(sbx::IsGhosted(h));
+            stMgr.Execute(QStringLiteral("restore_all"), QJsonObject(), sOut); // 清场（清 adopt）
+        }
+    }
+
+    void HookPostRaceSurvives() {
+        // 2026-10-08 崩溃回归（Compositer 实测 ACCESS_VIOLATION）：钩子线程
+        //   HookProc→invokeMethod 的 postEvent receiver=管理器对象，load 与投递之间
+        //   管理器销毁 → Qt lockThreadPostEventList 读悬垂 threadData 崩溃。
+        //   修复后 HookProc 投递 receiver=qApp（永不悬垂）+ lambda 主线程 atomic 复查。
+        //   本用例反复「建管理器→SHOW 风暴→立即销毁」逼出竞态窗口：修复前可在
+        //   processEvents 中崩；修复后迟到投递被 atomic 复查丢弃，全程存活。
+        if (QGuiApplication::platformName() != QLatin1String("windows")) {
+            QSKIP("需要真实 Win32 窗口（windows 平台）");
+        }
+        QTemporaryDir stDir;
+        QVERIFY(stDir.isValid());
+        for (int iRound = 0; iRound < 4; ++iRound) {
+            auto* pMgr = new CSandboxManager(this);
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable    = true;
+            stCfg.bAutoGhost = true;    // 自动收纳：HookProc→ConsiderWindow 链路活跃
+            stCfg.bRecord    = false;
+            pMgr->SetConfig(stCfg);
+            pMgr->SetProjectRoot(stDir.path());
+            pMgr->Start();
+            // SHOW 风暴：3 个窗口 show 触发 EVENT_OBJECT_SHOW → 钩子线程排队 qApp
+            QList<CHost*> aW;
+            for (int k = 0; k < 3; ++k) {
+                auto* pW = new CHost();
+                pW->setWindowTitle(QStringLiteral("hookrace-%1-%2").arg(iRound).arg(k));
+                aW.append(pW);
+                pW->show();
+            }
+            QApplication::processEvents(QEventLoop::AllEvents, 80);
+            // 立即销毁：HookProc 的迟到投递在 processEvents 中被 atomic 复查丢弃
+            pMgr->Shutdown();
+            delete pMgr;
+            QApplication::processEvents(QEventLoop::AllEvents, 300);
+            qDeleteAll(aW);
+            QApplication::processEvents(QEventLoop::AllEvents, 100);
+        }
+        QVERIFY(true);
+    }
+
     void RecorderMp4() {
         CHost stHost;
         stHost.ShowGhosted();   // 屏内 + 先幽灵化再 show：像素用例（见 CHost 注释）
@@ -378,10 +578,23 @@ private slots:
     }
 };
 
-// 自定义 main：支持 --sandbox-child-host 子进程模式（UserRootExempt 的被测窗口宿主），
+// 自定义 main：支持 --sandbox-child-host 子进程模式（UserRootExempt 的被测窗口宿主）；
+// --sandbox-grand-host = 再拉一层 child-host（孙进程宿主，ZeroGhostGrace 用例用——
+// 生产 Agent 链 AutoCode→runner→bash→python→被测程序 同为「隔代后代」形态）。
 // 其余参数走标准 QTest 执行（原 QTEST_MAIN 展开）。
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
+        if (qstrcmp(argv[i], "--sandbox-grand-host") == 0) {
+            QApplication app(argc, argv);
+            QProcess stKid;
+            stKid.setProcessChannelMode(QProcess::ForwardedChannels);
+            stKid.start(QCoreApplication::applicationFilePath(),
+                        { QStringLiteral("--sandbox-child-host") });
+            if (!stKid.waitForStarted(5000)) {
+                return 1;
+            }
+            return stKid.waitForFinished(-1) ? 0 : 1;
+        }
         if (qstrcmp(argv[i], "--sandbox-child-host") == 0) {
             QApplication app(argc, argv);
             CHost stHost;

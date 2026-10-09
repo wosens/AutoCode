@@ -2369,6 +2369,52 @@ int CProjectManager::LoadAdhocMaxTurns() const {
     return (iN >= 10 && iN <= 200) ? iN : 40;
 }
 
+bool CProjectManager::SaveAdhocPromptCtxPctMax(int a_iPct) {
+    // 2026-10-08 落 [Adhoc] PromptCtxPctMax（提示词占上下文窗口百分比上限；0=不限）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Adhoc", L"PromptCtxPctMax",
+        QString::number(qBound(0, a_iPct, 50)).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadAdhocPromptCtxPctMax() const {
+    // 缺键/非法 → 默认 5（用户口径：每次提示词不超过上下文 5%）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 5;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iN = GetPrivateProfileIntW(L"Adhoc", L"PromptCtxPctMax", 5, wsPath.c_str());
+    return (iN >= 0 && iN <= 50) ? iN : 5;
+}
+
+bool CProjectManager::SaveAdhocPromptTokMax(int a_iTok) {
+    // 2026-10-08 落 [Adhoc] PromptTokMax（提示词绝对 token 上限；0=不限）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Adhoc", L"PromptTokMax",
+        QString::number(qBound(0, a_iTok, 1000000)).toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+int CProjectManager::LoadAdhocPromptTokMax() const {
+    // 缺键/非法 → 默认 0=不限（仅占比约束生效）。
+    const QString sPath = SettingsCfgPath();
+    if (sPath.isEmpty()) {
+        return 0;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    const int iN = GetPrivateProfileIntW(L"Adhoc", L"PromptTokMax", 0, wsPath.c_str());
+    return (iN >= 0 && iN <= 1000000) ? iN : 0;
+}
+
 bool CProjectManager::SaveAdhocMaxTurnsAuto(bool a_bOn) {
     // 2026.09.23 v3.0.219 落 [Adhoc] MaxTurnsAuto（1=按提示词难度自动上调轮次，0=恒用基值）。
     const QString sPath = SettingsCfgPath();

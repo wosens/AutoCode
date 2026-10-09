@@ -7,6 +7,7 @@
 #include "review/CReviewSdkClient.h"
 #include "review/CReviewService.h"
 #include "agent/CAgentRunnerFactory.h"
+#include "CTipStyle.h"   // 2026-10-08 条目 tooltip 自动换行（同 CExecutionPanel 条目 tip 口径）
 
 #include <QDir>
 #include <QDirIterator>
@@ -265,6 +266,11 @@ private:
 // ----------------------------------------------------------------------------
 CCodeReviewDialog::CCodeReviewDialog(const QString& a_sTarget, QWidget* a_pParent)
     : QDialog(a_pParent), m_sTarget(QDir::cleanPath(a_sTarget)) {
+    // 多窗口并存时靠标题区分目标（目录名/文件名；盘根回退全路径）。
+    m_sTargetName = QFileInfo(m_sTarget).fileName();
+    if (m_sTargetName.isEmpty()) {
+        m_sTargetName = m_sTarget;
+    }
     setWindowFlag(Qt::WindowMinMaxButtonsHint, true);
     BuildUi();
     m_aFilters = LoadFilters();
@@ -287,8 +293,43 @@ CCodeReviewDialog::~CCodeReviewDialog() {
     }
 }
 
+// 2026-10-08 运行态查询（主窗口退出确认枚举在跑的审查窗口）。
+bool CCodeReviewDialog::IsReviewRunning() const {
+    return (m_pSvc != nullptr && m_pSvc->IsRunning()) || m_bReviewRunning;
+}
+
+// 2026-10-08 审查进行中关窗确认（用户需求）：缺省/Esc=继续审查（误触保护）；
+//   确认关闭 → 析构链 Stop 中止本轮——已完成文件的发现已入表、基线已逐文件前移，
+//   被停止的轮次结果缓存不落盘（口径与「停止」按钮一致）。
+void CCodeReviewDialog::closeEvent(QCloseEvent* a_pEvent) {
+    if (!IsReviewRunning()) {
+        QDialog::closeEvent(a_pEvent);
+        return;
+    }
+    QMessageBox oBox(this);
+    oBox.setIcon(QMessageBox::Warning);
+    oBox.setWindowTitle(QStringLiteral("关闭代码审查窗口"));
+    oBox.setText(QStringLiteral(
+        "「%1」的审查正在进行（进度 %2/%3），关闭窗口将中止本轮审查。"
+        "\n已完成文件的结果保留，未审完的文件下次可重新勾选审查。\n\n确定关闭吗？")
+        .arg(m_sTargetName,
+             QString::number(m_iDoneFiles), QString::number(m_iTotalFiles)));
+    QPushButton* pBtnClose = oBox.addButton(
+        QStringLiteral("关闭并中止"), QMessageBox::YesRole);
+    QPushButton* pBtnGoOn = oBox.addButton(
+        QStringLiteral("继续审查"), QMessageBox::NoRole);
+    oBox.setDefaultButton(pBtnGoOn);   // 缺省选择：继续（不关）
+    oBox.setEscapeButton(pBtnGoOn);    // Esc 同继续（误触保护）
+    oBox.exec();
+    if (oBox.clickedButton() == pBtnClose) {
+        QDialog::closeEvent(a_pEvent);   // 确认 → 走正常关闭（析构链 Stop 中止）
+    } else {
+        a_pEvent->ignore();
+    }
+}
+
 void CCodeReviewDialog::BuildUi() {
-    setWindowTitle(QStringLiteral("代码审查"));
+    setWindowTitle(QStringLiteral("代码审查：%1").arg(m_sTargetName));
     setMinimumSize(900, 560);
     setSizeGripEnabled(true);
 
@@ -360,12 +401,13 @@ void CCodeReviewDialog::BuildUi() {
     m_pTreeFiles->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_pTreeFiles->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pTreeFiles->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_pTreeFiles->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_pTreeFiles->header()->setSectionResizeMode(1, QHeaderView::Interactive);
-    m_pTreeFiles->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    m_pTreeFiles->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    m_pTreeFiles->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_pTreeFiles->header()->setSectionResizeMode(QHeaderView::Interactive);   // 2026-10-08 全列允许手工拖宽
+    m_pTreeFiles->header()->setStretchLastSection(true);
+    m_pTreeFiles->header()->resizeSection(0, 40);
     m_pTreeFiles->header()->resizeSection(1, 380);
+    m_pTreeFiles->header()->resizeSection(2, 76);
+    m_pTreeFiles->header()->resizeSection(3, 84);
+    m_pTreeFiles->header()->resizeSection(4, 132);
     m_pTreeFiles->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_pTreeFiles, &QTreeWidget::customContextMenuRequested,
             this, &CCodeReviewDialog::OnFilesContextMenu);
@@ -418,14 +460,14 @@ void CCodeReviewDialog::BuildUi() {
     m_pTree->setAlternatingRowColors(true);
     m_pTree->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pTree->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_pTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(2, QHeaderView::Interactive);
-    m_pTree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
-    m_pTree->header()->setSectionResizeMode(5, QHeaderView::Stretch);
-    m_pTree->header()->setSectionResizeMode(6, QHeaderView::Stretch);
-    m_pTree->header()->resizeSection(2, 260);
+    m_pTree->header()->setSectionResizeMode(QHeaderView::Interactive);   // 2026-10-08 全列允许手工拖宽（尾列吃余量）
+    m_pTree->header()->setStretchLastSection(true);
+    m_pTree->header()->resizeSection(0, 40);
+    m_pTree->header()->resizeSection(1, 68);
+    m_pTree->header()->resizeSection(2, 240);
+    m_pTree->header()->resizeSection(3, 48);
+    m_pTree->header()->resizeSection(4, 88);
+    m_pTree->header()->resizeSection(5, 380);
     m_pTree->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_pTree, &QTreeWidget::customContextMenuRequested,
             this, &CCodeReviewDialog::OnFindingsContextMenu);
@@ -709,7 +751,7 @@ void CCodeReviewDialog::PopulateFileList() {
         pItem->setForeground(2, clrState);
         pItem->setText(3, HumanSize(stInfo.size()));
         pItem->setText(4, stInfo.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
-        pItem->setToolTip(1, QDir::toNativeSeparators(sAbs));
+        pItem->setToolTip(1, CTipStyle::WrapText(QDir::toNativeSeparators(sAbs)));   // 2026-10-08 长路径同样换行
         pItem->setData(0, Qt::UserRole, sAbs);
         ++iShown;
         ++iChecked;
@@ -956,8 +998,16 @@ void CCodeReviewDialog::AddFindings(const QString& sRelPath, const QString& sFin
         pItem->setText(4, oF.value(QStringLiteral("rule")).toString());
         pItem->setText(5, oF.value(QStringLiteral("message")).toString());
         pItem->setText(6, oF.value(QStringLiteral("suggestion")).toString());
-        pItem->setToolTip(5, oF.value(QStringLiteral("message")).toString());
-        pItem->setToolTip(6, oF.value(QStringLiteral("suggestion")).toString());
+        // 2026-10-08 条目 tooltip 自动换行：全局 CTipFilter 只截获 QWidget::setToolTip，
+        //   QTreeWidgetItem 走模型数据不经该事件 → 此处显式 WrapText（富文本自动按宽换行）。
+        const QString sMsg = oF.value(QStringLiteral("message")).toString();
+        const QString sSug = oF.value(QStringLiteral("suggestion")).toString();
+        if (!sMsg.isEmpty()) {
+            pItem->setToolTip(5, CTipStyle::WrapText(sMsg));
+        }
+        if (!sSug.isEmpty()) {
+            pItem->setToolTip(6, CTipStyle::WrapText(sSug));
+        }
         // 级别配色：high 红 / medium 橙 / low 灰。
         QColor clrSev(120, 120, 120);
         if (sSev == QStringLiteral("high")) {
@@ -989,8 +1039,9 @@ void CCodeReviewDialog::UpdateCounts() {
             }
         }
     }
-    setWindowTitle(QStringLiteral("代码审查（发现 %1 条，勾选 %2 条 / 送审 %3 文件）")
-                       .arg(QString::number(m_iFindings),
+    setWindowTitle(QStringLiteral("代码审查：%1（发现 %2 条，勾选 %3 条 / 送审 %4 文件）")
+                       .arg(m_sTargetName,
+                            QString::number(m_iFindings),
                             QString::number(iTotalRows > 0 ? iChecked : 0),
                             QString::number(m_iTotalFiles)));
     // 2026-10-08 有勾选发现才可「按建议修复」（空勾选=空提示词无意义）。

@@ -443,7 +443,10 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
                                 "先 sandbox_windows 列窗口，sandbox_capture 截图（PNG 路径，"
                                 "用读图工具查看），sandbox_click/type/keys 消息级操控"
                                 "（后台点击不抢焦点，不打扰用户），sandbox_tree 取控件树；"
-                                "禁止物理操控鼠标键盘。测试过程已自动录像，无需额外操作。");
+                                "若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/"
+                                "进程早于本轮启动），先 sandbox_add <hwnd> 收进沙箱再操控；"
+                                "禁止物理操控鼠标键盘，也禁止绕开沙箱用 python/ctypes "
+                                "自制 Win32 驱动操控可见窗口。测试过程已自动录像，无需额外操作。");
     }
 
     m_pProc->setWorkingDirectory(a_sWorkDir);

@@ -392,6 +392,13 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     }
     m_pEditDshWsRoot->setText(aExtraShow.join(QLatin1Char(';')));
     m_pEditDshProvider->setText(sDefDshProvider);
+    // 2026-10-08 思考强度回填（空/未知档 → 首项「（默认）」）。
+    {
+        const QString sDefDshEffort = (a_pPm != nullptr) ? a_pPm->LoadDshEffort() : QString();
+        m_pComboDshEffort->setCurrentIndex(
+            m_pComboDshEffort->findText(sDefDshEffort) < 0 ? 0
+                                                            : m_pComboDshEffort->findText(sDefDshEffort));
+    }
     m_pSpinDshPriceIn->setValue(dDefPriceIn);
     m_pSpinDshPriceCacheRead->setValue(dDefPriceCr);
     m_pSpinDshPriceCacheWrite->setValue(dDefPriceCw);
@@ -438,6 +445,13 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
                       (a_pPm != nullptr) ? a_pPm->LoadCodexWireApi()
                                          : QStringLiteral("chat")));
     DetectCodexInstalled(true);
+    // 2026-10-08 思考强度回填（空/未知档 → 首项「（默认）」）。
+    {
+        const QString sDefCodexEffort = (a_pPm != nullptr) ? a_pPm->LoadCodexEffort() : QString();
+        m_pComboCodexEffort->setCurrentIndex(
+            m_pComboCodexEffort->findText(sDefCodexEffort) < 0 ? 0
+                                                               : m_pComboCodexEffort->findText(sDefCodexEffort));
+    }
     // 2026.08.21 Codex 自定义大模型表回填（[CodexModels]；2026-10-08 列表 UI 收敛到大模型页）。
     m_aCodexModels = (a_pPm != nullptr) ? a_pPm->LoadCodexModels(&m_iCodexActiveModel)
                                         : QList<SDshModelEntry>();
@@ -455,6 +469,13 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pSpinHermesPriceCacheWrite->setValue(
         (a_pPm != nullptr) ? a_pPm->LoadHermesPriceCacheWritePerM() : 3.75);
     m_pSpinHermesPriceOut->setValue((a_pPm != nullptr) ? a_pPm->LoadHermesPriceOutPerM() : 15.0);
+    // 2026-10-08 思考强度回填（空/未知档 → 首项「（默认）」）。
+    {
+        const QString sDefHermesEffort = (a_pPm != nullptr) ? a_pPm->LoadHermesEffort() : QString();
+        m_pComboHermesEffort->setCurrentIndex(
+            m_pComboHermesEffort->findText(sDefHermesEffort) < 0 ? 0
+                                                                 : m_pComboHermesEffort->findText(sDefHermesEffort));
+    }
     DetectHermesInstalled(true);
     m_aHermesModels = (a_pPm != nullptr) ? a_pPm->LoadHermesModels(&m_iHermesActiveModel)
                                          : QList<SDshModelEntry>();
@@ -468,11 +489,24 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pChkWebSearch->setChecked(bDefWeb);
     m_pChkExpertAssistant->setChecked(bDefExpert);
     if (m_pChkClaudeFollow != nullptr) { m_pChkClaudeFollow->setChecked(bDefClaudeFollow); }
+    // 2026-10-08 思考预算回填（0 = 默认不注入 MAX_THINKING_TOKENS）。
+    if (m_pSpinClaudeThinkTok != nullptr) {
+        m_pSpinClaudeThinkTok->setValue((a_pPm != nullptr) ? a_pPm->LoadClaudeMaxThinkTok() : 0);
+    }
     m_pSpinCompactPct->setValue(iDefPct);
     // 2026.09.27 「上下文窗口上限」设置项已删：未设时按模型自动探测；手工覆盖
     //   入口保留在助手上下文进度条右键「设置上下文大小…」（同一 [Adhoc] ContextLimit）。
     m_pSpinMaxTurns->setValue(iDefAdhocTurns);
     m_pChkMaxTurnsAuto->setChecked(bDefAdhocTurnsAuto);
+    // 2026-10-08 提示词长度闸门回填。
+    if (m_pSpinPromptCtxPct != nullptr) {
+        m_pSpinPromptCtxPct->setValue(
+            (a_pPm != nullptr) ? a_pPm->LoadAdhocPromptCtxPctMax() : 5);
+    }
+    if (m_pSpinPromptTokMax != nullptr) {
+        m_pSpinPromptTokMax->setValue(
+            (a_pPm != nullptr) ? a_pPm->LoadAdhocPromptTokMax() : 0);
+    }
     m_pEditScanDirs->setText(sDefScan);
     m_pEditBackupDirs->setText(sDefBackup);
     m_pEditExplHidden->setText(sDefExplHidden);
@@ -613,17 +647,22 @@ void CSettingsDialog::SetupUi() {
     m_pChkWebSearch->setToolTip(QStringLiteral(
         "关闭后所有阶段的 --disallowedTools 追加 WebSearch、WebFetch（离线/内网环境用；[Agent] WebSearch）。\n"
         "仅 Claude Code 后端生效（DSH 侧忽略该参数，该项禁用）"));
-    pLayAgentCol->addWidget(m_pChkWebSearch);
-
+    // 2026-10-08 联网检索开关与版本管理按钮合并同一行（两者均短，压缩纵向占用）。
+    auto* pRowAgentChk = new QHBoxLayout();
+    pLayAgentCol->addLayout(pRowAgentChk);
+    pRowAgentChk->addWidget(m_pChkWebSearch);
+    pRowAgentChk->addSpacing(12);
     // 2026.09 后端版本管理入口（任务 23183ccb）：四后端当前/最新版本与更新一站式；
     //   与主窗功能菜单同源（D6 判据由 CMainWindow 注入透传）。
+    //   2026-10-08 与联网检索开关合并同一行（两者均短，压缩纵向占用）。
     auto* pBtnVersion = new QPushButton(
         QStringLiteral("后端版本管理…"), pGroupAgent);
     pBtnVersion->setToolTip(QStringLiteral(
         "查看四 Agent 后端（Claude Code/DSH/PIAgent/Codex）当前版本与远端最新版，\n"
         "并提供各自更新入口（结果仅本次会话有效，不落盘）"));
     connect(pBtnVersion, &QPushButton::clicked, this, &CSettingsDialog::OnVersionManage);
-    pLayAgentCol->addWidget(pBtnVersion);
+    pRowAgentChk->addWidget(pBtnVersion);
+    pRowAgentChk->addStretch(1);
 
     // —— 2026-10-08 Claude Code 独立页（用户需求：claude 专属参数集中一处，
     //   页序 = 常用/大模型/Claude Code/四后端参数页）——
@@ -754,7 +793,25 @@ void CSettingsDialog::SetupUi() {
     m_pEditDshProvider->setPlaceholderText(QStringLiteral("glm-custom"));
     m_pEditDshProvider->setToolTip(QStringLiteral(
         "LLM provider 名（组合 llm-pi-ai 内联 providers 键；[Agent] DshProvider，默认 glm-custom）"));
-    pFormDsh->addRow(QStringLiteral("Provider："), m_pEditDshProvider);
+    // 2026-10-08 思考强度（DSH initialize reasoningEffort；[Agent] DshEffort，空=默认不注入）。
+    m_pComboDshEffort = new QComboBox(pGroupDsh);
+    m_pComboDshEffort->addItem(QString());   // 空 = 默认
+    m_pComboDshEffort->addItems(QStringList()
+        << QStringLiteral("off") << QStringLiteral("low")
+        << QStringLiteral("high") << QStringLiteral("max"));
+    m_pComboDshEffort->setItemText(0, QStringLiteral("（默认）"));
+    m_pComboDshEffort->setToolTip(QStringLiteral(
+        "思考强度（握手 initialize 参数 reasoningEffort；[Agent] DshEffort，\n"
+        "空 = 用 DSH 默认；off = 关推理。仅推理模型生效，下一轮对话/新任务即用"));
+    // 2026-10-08 Provider+思考强度合并同一行（两短项，同 Pi 页范式，压缩纵向占用）。
+    auto* pRowDshPmt = new QWidget(pGroupDsh);
+    auto* pLayDshPmt = new QHBoxLayout(pRowDshPmt);
+    pLayDshPmt->setContentsMargins(0, 0, 0, 0);
+    pLayDshPmt->addWidget(m_pEditDshProvider, 2);
+    pLayDshPmt->addSpacing(12);
+    pLayDshPmt->addWidget(new QLabel(QStringLiteral("思考强度："), pRowDshPmt));
+    pLayDshPmt->addWidget(m_pComboDshEffort, 1);
+    pFormDsh->addRow(QStringLiteral("Provider："), pRowDshPmt);
     // 2026.08.18 DSH 计费单价（$/M token）：协议只报 token 不报金额，按单价折算，
     //   默认对齐 claude 后端 Sonnet 档价目（同网关口径）；全 0 = 不折算（费用列回 "-"）。
     auto* pRowPrice = new QWidget(pGroupDsh);
@@ -843,23 +900,52 @@ void CSettingsDialog::SetupUi() {
         "全部耗尽则保留会话与改动交还人工。禁用则回到纯对话模式（[Adhoc] ExpertAssistant，默认关闭，须手工勾选启用）"));
     pRowReviewChk->addWidget(m_pChkExpertAssistant);
     pRowReviewChk->addStretch(1);
+    // 2026-10-08 提示词长度闸门（用户需求：提示词不超上下文 5% + token 上限，超限自动提炼）：
+    //   发送前本地估算 token，超限 → 起一次性提炼 Agent 压缩后再发（对话流留事件行，
+    //   原文首 200 字随事件留痕；提炼失败/仍超限则按提炼稿/原文发送并警告）。
+    auto* pRowPromptLimit = new QHBoxLayout();
+    pLayReviewCol->addLayout(pRowPromptLimit);
+    m_pSpinPromptCtxPct = new QSpinBox(pGroupReview);
+    m_pSpinPromptCtxPct->setRange(0, 50);
+    m_pSpinPromptCtxPct->setValue(5);
+    m_pSpinPromptCtxPct->setSuffix(QStringLiteral(" %"));
+    m_pSpinPromptCtxPct->setSpecialValueText(QStringLiteral("不限"));
+    m_pSpinPromptCtxPct->setToolTip(QStringLiteral(
+        "发送提示词的上下文占比上限（[Adhoc] PromptCtxPctMax，默认 5，0=不限）：\n"
+        "估算 token > 助手当前模型上下文窗口 × 该比例 → 不直接发送，自动起一次性\n"
+        "提炼 Agent 压缩提示词后以提炼稿发送（对话流留事件行可追溯）"));
+    fnAddPair(pRowPromptLimit, QStringLiteral("提示词占比上限："), m_pSpinPromptCtxPct);
+    pRowPromptLimit->addSpacing(12);
+    m_pSpinPromptTokMax = new QSpinBox(pGroupReview);
+    m_pSpinPromptTokMax->setRange(0, 1000000);
+    m_pSpinPromptTokMax->setValue(0);
+    m_pSpinPromptTokMax->setSingleStep(1000);
+    m_pSpinPromptTokMax->setSpecialValueText(QStringLiteral("不限"));
+    m_pSpinPromptTokMax->setToolTip(QStringLiteral(
+        "发送提示词的绝对 token 上限（[Adhoc] PromptTokMax，默认 0=不限）：\n"
+        "与占比上限同时生效、取更小者；超限同样走自动提炼。token 为本地估算值\n"
+        "（CJK 字符≈1、其余≈1/3），与模型实际计量存在小偏差"));
+    fnAddPair(pRowPromptLimit, QStringLiteral("提示词 token 上限："), m_pSpinPromptTokMax);
+    pRowPromptLimit->addStretch(1);
 
-    // —— 目录排除 ——
+    // —— 目录排除（2026-10-08 指纹扫描/资源管理器两项合一行，备份恢复默认值最长保持整行）——
     auto* pGroupDirs = new QGroupBox(QStringLiteral("目录排除"), this);
-    auto* pFormDirs = new QFormLayout(pGroupDirs);
+    auto* pLayDirsCol = new QVBoxLayout(pGroupDirs);
+    auto* pRowDirs1 = new QHBoxLayout();
+    pLayDirsCol->addLayout(pRowDirs1);
     m_pEditScanDirs = new QLineEdit(pGroupDirs);
     m_pEditScanDirs->setPlaceholderText(QStringLiteral(".autodev"));
     m_pEditScanDirs->setToolTip(QStringLiteral(
         "guide 指纹扫描额外排除的目录名，逗号分隔；留空 = 内置默认。"
         "内置规则：隐藏文件/文件夹（'.' 开头，含 .git/.vs）始终排除，不可关闭；"
         ".autodev 正常扫描，仅指纹表自身 guide.md 不参与比对（防自我变更死循环）"));
-    pFormDirs->addRow(QStringLiteral("指纹扫描排除："), m_pEditScanDirs);
+    fnAddPair(pRowDirs1, QStringLiteral("指纹扫描排除："), m_pEditScanDirs, 1);
+    pRowDirs1->addSpacing(12);
     m_pEditBackupDirs = new QLineEdit(pGroupDirs);
     m_pEditBackupDirs->setPlaceholderText(QStringLiteral(
         ".autodev,build,Execute,.git,.vs,x64"));
     m_pEditBackupDirs->setToolTip(QStringLiteral(
         "代码备份/恢复排除的目录名，逗号分隔；留空 = 内置默认（[Backup] ExcludeDirs）"));
-    pFormDirs->addRow(QStringLiteral("备份恢复排除："), m_pEditBackupDirs);
     // 2026.09.23 资源管理器显示隐藏目录：只管树里显不显示，与扫描/备份排除无关。
     m_pEditExplHidden = new QLineEdit(pGroupDirs);
     m_pEditExplHidden->setPlaceholderText(QStringLiteral("build,.git,.vs,node_modules"));
@@ -867,7 +953,10 @@ void CSettingsDialog::SetupUi() {
         "资源管理器树中隐藏的目录名，逗号分隔；清空 = 全部可见。\n"
         "只管内置资源管理器的显示，与备份排除/指纹扫描排除互不相干。\n"
         "（[Explorer] HiddenDirs；保存后立即生效，新建/刷新的目录也按新清单处理）"));
-    pFormDirs->addRow(QStringLiteral("资源管理器隐藏目录："), m_pEditExplHidden);
+    fnAddPair(pRowDirs1, QStringLiteral("资源管理器隐藏目录："), m_pEditExplHidden, 1);
+    auto* pRowDirs2 = new QHBoxLayout();
+    pLayDirsCol->addLayout(pRowDirs2);
+    fnAddPair(pRowDirs2, QStringLiteral("备份恢复排除："), m_pEditBackupDirs, 1);
 
     // —— 内置测试沙箱（2026-09-26）——：Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 +
     //    点击穿透 + 无任务栏，用户无感），Agent 经 sandbox_* MCP 工具/--sandbox 命令
@@ -897,9 +986,11 @@ void CSettingsDialog::SetupUi() {
     m_pChkSbxRecord->setToolTip(QStringLiteral(
         "每个收纳窗口自动录像（PrintWindow 离屏截帧 + H264 编码），存"
         " exe\\sandbox\\rec\\；窗口还原/关闭时自动封盘（[Sandbox] Record，默认开）"));
-    pLaySbxCol->addWidget(m_pChkSbxRecord);
     auto* pRowSbxRec = new QHBoxLayout();
     pLaySbxCol->addLayout(pRowSbxRec);
+    // 2026-10-08 录制开关并入录像参数行（复选框+帧率+保留均短，合一行压缩纵向占用）。
+    pRowSbxRec->addWidget(m_pChkSbxRecord);
+    pRowSbxRec->addSpacing(12);
     m_pSpinSbxFps = new QSpinBox(pGroupSbx);
     m_pSpinSbxFps->setRange(1, 15);
     m_pSpinSbxFps->setSuffix(QStringLiteral(" fps"));
@@ -1261,14 +1352,34 @@ void CSettingsDialog::SetupUi() {
     m_pEditCodexProvider->setToolTip(QStringLiteral(
         "provider id（写入 ~/.codex/config.toml 的 [model_providers.<provider>] 槽位；"
         "[Agent] CodexProvider，空 = autocode）。不与用户手写 provider 冲突时可用任意名"));
-    pFormCodex->addRow(QStringLiteral("Provider："), m_pEditCodexProvider);
     m_pComboCodexWireApi = new QComboBox(pGroupCodex);
     m_pComboCodexWireApi->addItem(QStringLiteral("chat"));
     m_pComboCodexWireApi->addItem(QStringLiteral("responses"));
     m_pComboCodexWireApi->setToolTip(QStringLiteral(
         "wire_api（写入 ~/.codex 的 provider 槽位；[Agent] CodexWireApi，默认 chat）。"
         "v0.88+ 已移除 chat，本后端锁定 0.87.0"));
-    pFormCodex->addRow(QStringLiteral("WireApi："), m_pComboCodexWireApi);
+    // 2026-10-08 思考强度（官方键 model_reasoning_effort；[Agent] CodexEffort，空=默认）。
+    m_pComboCodexEffort = new QComboBox(pGroupCodex);
+    m_pComboCodexEffort->addItem(QString());   // 空 = 默认
+    m_pComboCodexEffort->addItems(QStringList()
+        << QStringLiteral("minimal") << QStringLiteral("low") << QStringLiteral("medium")
+        << QStringLiteral("high") << QStringLiteral("xhigh"));
+    m_pComboCodexEffort->setItemText(0, QStringLiteral("（默认）"));
+    m_pComboCodexEffort->setToolTip(QStringLiteral(
+        "思考强度（-c model_reasoning_effort；[Agent] CodexEffort，空 = 用 codex 默认）。\n"
+        "仅推理模型生效，下一轮对话/新任务即用"));
+    // 2026-10-08 Provider/WireApi/思考强度三项合一行（均短，压缩纵向占用）。
+    auto* pRowCodexPmt = new QWidget(pGroupCodex);
+    auto* pLayCodexPmt = new QHBoxLayout(pRowCodexPmt);
+    pLayCodexPmt->setContentsMargins(0, 0, 0, 0);
+    pLayCodexPmt->addWidget(m_pEditCodexProvider, 2);
+    pLayCodexPmt->addSpacing(12);
+    pLayCodexPmt->addWidget(new QLabel(QStringLiteral("WireApi："), pRowCodexPmt));
+    pLayCodexPmt->addWidget(m_pComboCodexWireApi, 1);
+    pLayCodexPmt->addSpacing(12);
+    pLayCodexPmt->addWidget(new QLabel(QStringLiteral("思考强度："), pRowCodexPmt));
+    pLayCodexPmt->addWidget(m_pComboCodexEffort, 1);
+    pFormCodex->addRow(QStringLiteral("Provider："), pRowCodexPmt);
     pLayCodex->addWidget(pGroupCodex);
 
     auto* pLblCodexHint = new QLabel(QStringLiteral(
@@ -1376,6 +1487,17 @@ void CSettingsDialog::SetupUi() {
     m_pSpinHermesPriceCacheWrite = fnHermesPriceSpin(QStringLiteral("缓存写"));
     m_pSpinHermesPriceOut = fnHermesPriceSpin(QStringLiteral("输出"));
     pFormHermes->addRow(QStringLiteral("计费单价($/M)："), pRowHermesPrice);
+    // 2026-10-08 思考强度（config.yaml agent.reasoning_effort；[Agent] HermesEffort，空=不托管）。
+    m_pComboHermesEffort = new QComboBox(pGroupHermes);
+    m_pComboHermesEffort->addItem(QString());   // 空 = 默认
+    m_pComboHermesEffort->addItems(QStringList()
+        << QStringLiteral("false") << QStringLiteral("minimal") << QStringLiteral("low")
+        << QStringLiteral("medium") << QStringLiteral("high") << QStringLiteral("ultra"));
+    m_pComboHermesEffort->setItemText(0, QStringLiteral("（默认）"));
+    m_pComboHermesEffort->setToolTip(QStringLiteral(
+        "思考强度（部署根 config.yaml agent.reasoning_effort；[Agent] HermesEffort，\n"
+        "空 = 不托管该键用 hermes 默认；false = 关推理。仅推理模型生效"));
+    pFormHermes->addRow(QStringLiteral("思考强度："), m_pComboHermesEffort);
     pLayHermes->addWidget(pGroupHermes);
     // 2026-10-08 后端提示（原标签定义在已删除的模型组块内，就地重建）。
     auto* pLblHermesHint = new QLabel(QStringLiteral(
@@ -2045,8 +2167,47 @@ QString CSettingsDialog::PiThinking() const {
     return m_pComboPiThinking->currentText();
 }
 
+QString CSettingsDialog::DshEffort() const {
+    // 2026-10-08 思考强度（首项「（默认）」＝ 空，不注入 reasoningEffort）。
+    if (m_pComboDshEffort == nullptr || m_pComboDshEffort->currentIndex() <= 0) {
+        return QString();
+    }
+    return m_pComboDshEffort->currentText();
+}
+
+QString CSettingsDialog::CodexEffort() const {
+    // 2026-10-08 思考强度（首项「（默认）」＝ 空，不传 -c model_reasoning_effort）。
+    if (m_pComboCodexEffort == nullptr || m_pComboCodexEffort->currentIndex() <= 0) {
+        return QString();
+    }
+    return m_pComboCodexEffort->currentText();
+}
+
+QString CSettingsDialog::HermesEffort() const {
+    // 2026-10-08 思考强度（首项「（默认）」＝ 空，不托管 config.yaml agent.reasoning_effort）。
+    if (m_pComboHermesEffort == nullptr || m_pComboHermesEffort->currentIndex() <= 0) {
+        return QString();
+    }
+    return m_pComboHermesEffort->currentText();
+}
+
+int CSettingsDialog::ClaudeThinkTok() const {
+    // 2026-10-08 思考预算（0 = 默认不注入 MAX_THINKING_TOKENS）。
+    return m_pSpinClaudeThinkTok != nullptr ? m_pSpinClaudeThinkTok->value() : 0;
+}
+
 double CSettingsDialog::PiPriceInPerM() const {
     return m_pSpinPiPriceIn != nullptr ? m_pSpinPiPriceIn->value() : 0.0;
+}
+
+int CSettingsDialog::AdhocPromptCtxPctMax() const {
+    // 2026-10-08 提示词占比上限（0=不限）。
+    return m_pSpinPromptCtxPct != nullptr ? m_pSpinPromptCtxPct->value() : 5;
+}
+
+int CSettingsDialog::AdhocPromptTokMax() const {
+    // 2026-10-08 提示词 token 上限（0=不限）。
+    return m_pSpinPromptTokMax != nullptr ? m_pSpinPromptTokMax->value() : 0;
 }
 
 double CSettingsDialog::PiPriceCacheReadPerM() const {

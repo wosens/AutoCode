@@ -225,8 +225,10 @@ private:
     CTaskOrchestrator* m_pOrch      = nullptr;
     CTaskListPanel*    m_pTaskPanel = nullptr;
     CExecutionPanel*   m_pExecPanel = nullptr;
-    // 2026-09-30 手动代码审查对话框（非模态单例，右键资源管理器触发；关闭自动销毁）。
-    QPointer<CCodeReviewDialog> m_pReviewDlg;
+    // 2026-10-08 手动代码审查对话框改为每次右键新建独立窗口（不再单例）——原先
+    //   开新窗前先关旧窗会把正在跑的审查一并停掉（关闭即析构 → Service::Stop）；
+    //   改后各窗口自持 Service 并发互不干扰，parent=this + WA_DeleteOnClose 自管
+    //   生命周期，主窗口无需持有引用。
     // 挂起的助手档切换（原 v2.3.174 挂起的取消选中切档；2026.09.23 v3.0.220 推广口径：
     //   助手运行中点任何目标——空白/任意任务/启动任务——档切换均挂起不停跑助手，
     //   全部助手结束后 OnAdhocRunFinished 自动完成；目标任务经 QPointer 防删悬垂）。

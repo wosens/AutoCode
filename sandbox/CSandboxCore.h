@@ -33,10 +33,14 @@ QString WndClass(HWND a_hWnd);
 // 任务栏摘除按钮；SetProp 标记（AutoCodeGhost/origEx），供崩溃后新实例还原。
 bool GhostWindow(HWND a_hWnd);
 // 还原：按标记恢复原 ex 样式（含原本非分层的窗口摘掉 WS_EX_LAYERED），任务栏补回。
-bool RestoreWindow(HWND a_hWnd);
+bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark = false);
 bool IsGhosted(HWND a_hWnd);
+// 2026-10-08 「曾收纳」标记（kPropAdopt）：AutoCode 退出还原时保留，用户主动还原
+//   时清除；新实例扫描到它 + 窗口进程 exe 在工程目录内 → 续收纳重新隐形。
+bool HasAdoptMark(HWND a_hWnd);
+void ClearAdoptMark(HWND a_hWnd);
 // 全屏扫描还原所有带本产品标记的窗口（启动兜底：上次崩溃残留的隐形窗口）。
-int  RestoreAllMarked();
+int  RestoreAllMarked(bool a_bKeepAdoptMark = false);
 
 // —— 收纳前置判定（不做进程树/宿主判定，那两步在 Manager 里做）——
 // 可见顶层窗口、非控制台/提示类、尺寸达下限、未被幽灵化、DWM 未 cloak。

@@ -10,6 +10,7 @@
 #include <QRegularExpression>
 #include <QThread>
 #include <QCoreApplication>
+#include <QPointer>
 #include <atomic>
 
 // —— WinEvent 钩子线程：EVENT_OBJECT_SHOW 到达即把候选 HWND 投递回主线程 ——
@@ -57,13 +58,22 @@ protected:
         if (a_lIdObject != OBJID_WINDOW || a_lIdChild != CHILDID_SELF) {
             return;
         }
-        if (g_pSbxMgrForHook == nullptr) {
+        CSandboxManager* pMgr = g_pSbxMgrForHook.load(std::memory_order_acquire);
+        if (pMgr == nullptr) {
             return;
         }
-        // 回调在钩子线程：跨线程排队到管理器（主线程）判定，避免阻塞事件流。
-        CSandboxManager* pMgr = g_pSbxMgrForHook.load(std::memory_order_acquire);
         const quintptr hVal = reinterpret_cast<quintptr>(a_hWnd);
-        QMetaObject::invokeMethod(pMgr, [pMgr, hVal]() {
+        // 2026-10-08 崩溃修复（Compositer 实测 ACCESS_VIOLATION）：原先 postEvent 的
+        //   receiver=管理器对象——原子指针只保证指针读取本身原子，load 与
+        //   invokeMethod 之间若管理器销毁/析构推进，钩子线程仍会踩悬垂对象
+        //   （Qt lockThreadPostEventList 读悬垂 threadData → 访问违例 0xFFFFFFFFFFFFFFFF，
+        //   dump 实证）。改为投递到 qApp（进程内永活、threadData 稳定）：postEvent
+        //   阶段不可能悬垂；lambda 在主线程执行时与析构天然串行，二次 atomic 复查
+        //   丢弃过期窗口（Shutdown/换实例后的迟到窗口）。
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [pMgr, hVal]() {
+            if (g_pSbxMgrForHook.load(std::memory_order_acquire) != pMgr) {
+                return;   // 已 Shutdown/实例已替换：窗口事件过期丢弃
+            }
             pMgr->ConsiderWindow(reinterpret_cast<HWND>(hVal));
         }, Qt::QueuedConnection);
     }
@@ -191,14 +201,64 @@ QString CSandboxManager::ShotDir() const {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/sandbox/shot");
 }
 
+void CSandboxManager::SetProjectRoot(const QString& a_sRoot) {
+    m_sProjRoot = a_sRoot;
+}
+
+// 2026-10-08 跨实例续收纳扫描：枚举全部带幽灵标记的顶层窗口（上个 AutoCode
+//   实例收纳中残留——正常退出时在册窗口被还原，但还原后的窗口标记已清；这里
+//   处理的是「标记仍在」的少数：上个实例崩溃被强杀、或本实例启动早于其退出
+//   还原竞态等）。窗口进程 exe 在当前工程目录内 → GhostAndTrack 续收纳（窗口
+//   保持隐形，Agent 可继续 sandbox_* 操控）；其余（与本工程无关/拿不准的）
+//   还原成可见由用户处置——替代旧的无差别 RestoreAllMarked（会把刚续收纳的
+//   窗口又还原掉）。
+void CSandboxManager::ReadoptProjectWindows() {
+    struct SCtx {
+        QVector<QPair<HWND, DWORD>> aMarked;
+    } stCtx;
+    struct SEnum {
+        static BOOL CALLBACK Proc(HWND a_hWnd, LPARAM a_lParam) {
+            auto* pCtx = reinterpret_cast<SCtx*>(a_lParam);
+            // 幽灵中（崩溃/强杀残留）或带「曾收纳」标记（上个实例退出还原后留存）
+            // 都算候选——后者正是跨实例主场景：窗口已被还原成可见。
+            if (sbx::IsGhosted(a_hWnd) || sbx::HasAdoptMark(a_hWnd)) {
+                DWORD dwPid = 0;
+                GetWindowThreadProcessId(a_hWnd, &dwPid);
+                pCtx->aMarked.append({ a_hWnd, dwPid });
+            }
+            return TRUE;
+        }
+    };
+    EnumWindows(SEnum::Proc, reinterpret_cast<LPARAM>(&stCtx));
+    // 前缀根规范化：去尾斜杠再统一补一个，防「E:/x/」+"/"="E:/x//" 前缀误判。
+    QString sRoot = QDir::fromNativeSeparators(m_sProjRoot).toLower();
+    if (!sRoot.isEmpty()) {
+        while (sRoot.endsWith(QLatin1Char('/'))) {
+            sRoot.chop(1);
+        }
+        sRoot += QLatin1Char('/');
+    }
+    for (const auto& pr : std::as_const(stCtx.aMarked)) {
+        const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(pr.second)).toLower();
+        if (!sRoot.isEmpty() && sExe.startsWith(sRoot)) {
+            GhostAndTrack(pr.first);   // 已幽灵的走幂等分支登记；已还原的重新幽灵化
+        } else if (sbx::IsGhosted(pr.first)) {
+            sbx::RestoreWindow(pr.first);   // 与工程无关的隐形残留：还原（清 adopt 标记）
+        } else {
+            sbx::ClearAdoptMark(pr.first);  // 只剩 adopt 标记的可见窗口：清标记即恢复常态
+        }
+    }
+}
+
 void CSandboxManager::Start() {
     if (m_bStarted) {
         return;
     }
     m_bStarted = true;
     m_bRecOn = m_stCfg.bRecord;
-    // ① 孤儿还原：上次崩溃/强杀残留的幽灵窗口（SetProp 标记跨进程存留）。
-    sbx::RestoreAllMarked();
+    // ① 孤儿处理（ReadoptProjectWindows 一体承担）：工程内残留窗口续收纳保持
+    //   隐形，其余带标记的（崩溃残留/无关进程）保守还原成可见由用户处置。
+    ReadoptProjectWindows();
     // ② 录像保留清理：超期 MP4 删除（启动一次即够）。
     QDir stRecDir(RecordDir());
     if (stRecDir.exists()) {
@@ -218,9 +278,12 @@ void CSandboxManager::Start() {
             auto* pHook = new CSbxHookThread(this);
             pHook->setObjectName(QStringLiteral("sbxHook"));
             m_pHookTh = pHook;
-            connect(pHook, &QThread::finished, pHook, [this, pHook]() {
-                if (m_pHookTh == pHook) {
-                    m_pHookTh = nullptr;
+            // 2026-10-08 同崩溃修复同类：捕获 this 的 lambda 若晚于管理器析构执行
+            //   （finished 排队到主线程时管理器已亡）→ 同类悬垂。改 QPointer 守护。
+            QPointer<CSandboxManager> pSelf(this);
+            connect(pHook, &QThread::finished, pHook, [pSelf, pHook]() {
+                if (!pSelf.isNull() && pSelf->m_pHookTh == pHook) {
+                    pSelf->m_pHookTh = nullptr;
                 }
                 pHook->deleteLater();
             });
@@ -245,18 +308,26 @@ void CSandboxManager::Shutdown() {
         }
         m_pHookTh = nullptr;   // finished→deleteLater 已挂，对象由事件循环回收
     }
-    // 全部还原 + 停录像。
+    // 全部还原 + 停录像。2026-10-08 退出还原保留「曾收纳」标记（kPropAdopt）：
+    //   继任实例（版本更新/重开）扫描到它 + 窗口进程 exe 在工程目录内 → 续收纳
+    //   重新隐形；否则该窗口被还原成可见且新实例的进程树出身判定永不再认它
+    //   （祖先是已退出实例的后代），Agent 继续测试就裸奔在用户桌面（Compositer
+    //   工程实测）。用户主动还原（对话框/restore 命令）仍走清标记语义。
     if (m_mtxState.tryLock(2000)) {
         // 2026-10-01 tryLock：工作线程卡在长 UIA 操作时退出不能无限等，拿不到锁跳过
         //   内存表还原——SetProp 幽灵标记由下方 RestoreAllMarked 兑底。
         while (!m_aEntries.isEmpty()) {
-            RestoreWindowEx(m_aEntries.first().h);
+            const HWND h = m_aEntries.first().h;
+            StopRecorderOf(0);
+            sbx::RestoreWindow(h, true);   // 退出还原：保留 adopt 标记
+            m_aEntries.removeAt(0);
         }
+        RebuildCacheLocked();
         m_mtxState.unlock();
     } else {
         qWarning("[CSandboxManager] Shutdown 未获状态锁（沙箱命令仍在执行），内存表还原跳过");
     }
-    sbx::RestoreAllMarked();   // 兜底（含命令通道手工收纳的）
+    sbx::RestoreAllMarked(true);   // 兑底（含命令通道手工收纳的；同样保留 adopt 标记）
     m_bStarted = false;
 }
 
@@ -334,11 +405,19 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     if (sbx::IsSystemHostPid(dwPid)) {
         return false;   // 树内系统宿主（explorer 等被 agent shell 打开等极端情形）
     }
-    // 2026.09.27 宽限期收纳（终判除外）：延迟 kGhostGraceMs 后重走全部判定再
-    //   幽灵化——ShellExecuteEx 内部可能泵消息，用户点击启动（OpenWithShell）的
-    //   窗口可能在豁免 pid 登记落地前就触发钩子/扫描判定；宽限期复判能等到登记。
-    if (!a_bFinal && m_stCfg.bAutoGhost) {
-        constexpr int kGhostGraceMs = 1200;
+    // 2026-10-08 零闪现收纳：旧逻辑对所有树内窗口一律先排 kGhostGraceMs 宽限期
+    //   （为等用户启动豁免登记落地），代价是 Agent 后代窗口每个都先裸奔 1.2 秒
+    //   ——回归跑批反复启被测程序时用户桌面反复闪窗（SmartStore 工程实测）。
+    //   区分两类：直接父 == 本 AutoCode 进程 = 用户经资源管理器双击/打开方式/
+    //   CMD 运行（ShellExecuteEx 由本进程发起，豁免 pid 在其返回后才登记，需要
+    //   宽限等待）；链上隔了 runner（cmd/claude/hermes→bash→python→被测程序）
+    //   = Agent 后代，豁免登记永不涉及 → 立即收纳。
+    const bool bUserLaunchLike =
+        (m_oParentMap.value(dwPid, 0) == GetCurrentProcessId());
+    if (!a_bFinal && bUserLaunchLike && m_stCfg.bAutoGhost) {
+        // 800ms：豁免登记在 ShellExecuteExW 返回后立即执行（毫秒级），800 绰绰
+        //   有余（旧 1200 过度保守，用户启动的程序也多闪半秒）。
+        constexpr int kGhostGraceMs = 800;
         const quintptr hKey = reinterpret_cast<quintptr>(a_hWnd);
         if (!m_aPendingGhosts.contains(hKey)) {
             m_aPendingGhosts.insert(hKey);
@@ -357,7 +436,9 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
 void CSandboxManager::GhostAndTrack(HWND a_hWnd) {
     // 2026.09.28 返回收纳成败（旧实现 GhostWindow 失败时静默 return 仍建不了条目，
     //   AddWindow 却恒报成功，--sandbox add 误报「已收纳」）。
-    if (!sbx::GhostWindow(a_hWnd)) {
+    // 2026-10-08 已带标记窗口（跨实例残留，ReadoptProjectWindows 续收纳路径）
+    //   GhostWindow 幂等返回 false 是预期——IsGhosted 前提成立则继续登记入册。
+    if (!sbx::GhostWindow(a_hWnd) && !sbx::IsGhosted(a_hWnd)) {
         return;
     }
     SEntry st;
@@ -381,14 +462,16 @@ void CSandboxManager::GhostAndTrack(HWND a_hWnd) {
 
 bool CSandboxManager::AddWindow(HWND a_hWnd) {
     // 显式收纳：不做出身判定（自身进程窗口/手工指定均允许），仅做有效性校验
-    //（可见顶层未幽灵化）。GhostWindow 幂等，重复 add 安全。
+    //（可见顶层）。已带幽灵标记但不在册的（跨实例/崩溃残留）也收——GhostAndTrack
+    // 幂等分支直接登记入册（2026-10-08；此前 IsGhosted 一律拒绝，Agent 对残留
+    // 窗口 sandbox add 会失败，只能裸操控可见窗口）。
     for (const SEntry& st : std::as_const(m_aEntries)) {
         if (st.h == a_hWnd) {
             return true;
         }
     }
     if (!IsWindow(a_hWnd) || !IsWindowVisible(a_hWnd)
-            || GetAncestor(a_hWnd, GA_ROOT) != a_hWnd || sbx::IsGhosted(a_hWnd)) {
+            || GetAncestor(a_hWnd, GA_ROOT) != a_hWnd) {
         return false;
     }
     GhostAndTrack(a_hWnd);

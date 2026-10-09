@@ -55,6 +55,7 @@ public:
     QString DshEffort() const;
     QString CodexEffort() const;
     QString HermesEffort() const;
+    int     ClaudeThinkTok() const;   // 2026-10-08 claude 思考预算（0=默认不注入）
     // 2026.08.26 专家助手开关（[Adhoc] ExpertAssistant）：缺省启用，可手工禁用。
     bool    ExpertAssistant() const;
     // 2026.08.18 Agent 后端与 DSH 参数（全局单选；1=claude，2=dsh）。
@@ -109,6 +110,9 @@ public:
     int     AdhocMaxTurns() const;
     // 2026.09.23 v3.0.219 工作量评估开关（缺省开；关=恒用基值）。
     bool    AdhocMaxTurnsAuto() const;
+    // 2026-10-08 提示词长度闸门（占比% / 绝对 token；0=不限；两约束取更小者同时生效）。
+    int     AdhocPromptCtxPctMax() const;
+    int     AdhocPromptTokMax() const;
     QString ScanExcludeDirs() const;
     QString BackupExcludeDirs() const;
     QString ExplorerHiddenDirs() const;   // 2026.09.23 资源管理器隐藏目录（全量清单原文）
@@ -269,6 +273,8 @@ private:
     int         m_iHermesActiveModel = -1;   // -1=未启用（走 HermesModel 固定路由）
     QSpinBox*   m_pSpinCompactPct   = nullptr;
     QSpinBox*   m_pSpinMaxTurns     = nullptr;   // 2026.09.23 助手轮次上限（[Adhoc] MaxTurns）
+    QSpinBox*   m_pSpinPromptCtxPct = nullptr;   // 2026-10-08 提示词占比上限（[Adhoc] PromptCtxPctMax，0=不限）
+    QSpinBox*   m_pSpinPromptTokMax = nullptr;   // 2026-10-08 提示词 token 上限（[Adhoc] PromptTokMax，0=不限）
     QCheckBox*  m_pChkMaxTurnsAuto = nullptr;   // 2026.09.23 工作量评估开关（[Adhoc] MaxTurnsAuto）
     QLineEdit*  m_pEditScanDirs     = nullptr;
     QLineEdit*  m_pEditBackupDirs   = nullptr;
