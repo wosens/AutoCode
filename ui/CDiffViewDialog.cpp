@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <vector>
 
+#include "CFilePreviewWidget.h"   // 2026-10-08 DetectAndDecode 同源编码探测（GBK 等本地编码）
+
 namespace {
 void SetPt11(QWidget* a_pW) {
     QFont f = a_pW->font();
@@ -37,22 +39,36 @@ const QChar kPad = QChar(0x01);
 // LCS 行对齐上限：O(n·m) 内存/耗时保护，超限退化前后缀整块对齐（保可用性）。
 constexpr int k_iLcsMaxLines = 6000;
 
-// 按通用换行拆行（吞 \r，保留空行结构——空行参与对齐）。
-QList<QString> SplitLines(const QByteArray& a_buf) {
-    const QString s = QString::fromUtf8(a_buf);
+// 2026-10-08 编码自适应解码（用户反馈：查看变更 GBK 文件中文乱码，ASCII 正常）：
+//   复用 CFilePreviewWidget::DetectAndDecode（BOM→UTF-8 严格→GB18030→Latin1 兜底），
+//   取代旧 QString::fromUtf8 硬解码——GBK 双字节中文在 UTF-8 下必非法，旧路径
+//   直接产乱码；二进制/未知字节流由 Latin1 兑底可显示（NUL 密集路径已在 Fill 前置拦截）。
+QString DecodeBuf(const QByteArray& a_buf) {
+    QString sText;
+    bool bBinary = false;
+    CFilePreviewWidget::DetectAndDecode(a_buf, sText, bBinary);
+    if (sText.isEmpty() && !a_buf.isEmpty()) {
+        sText = QString::fromUtf8(a_buf);   // 防御兑底（空产物时保旧行为）
+    }
+    return sText;
+}
+
+// 按通用换行拆行（吞 \r，保留空行结构——空行参与对齐）。2026-10-08 入参改已解码
+//   文本（编码探测在 DecodeBuf 统一做，本函数只拆行）。
+QList<QString> SplitLines(const QString& a_s) {
     QList<QString> aLines;
     int iStart = 0;
-    for (int i = 0; i < s.size(); ++i) {
-        if (s.at(i) == QLatin1Char('\n')) {
+    for (int i = 0; i < a_s.size(); ++i) {
+        if (a_s.at(i) == QLatin1Char('\n')) {
             int iEnd = i;
-            if (iEnd > iStart && s.at(iEnd - 1) == QLatin1Char('\r')) {
+            if (iEnd > iStart && a_s.at(iEnd - 1) == QLatin1Char('\r')) {
                 --iEnd;
             }
-            aLines.append(s.mid(iStart, iEnd - iStart));
+            aLines.append(a_s.mid(iStart, iEnd - iStart));
             iStart = i + 1;
         }
     }
-    aLines.append(s.mid(iStart));
+    aLines.append(a_s.mid(iStart));
     return aLines;
 }
 
@@ -224,7 +240,7 @@ void CDiffViewDialog::Fill() {
             m_pTxtNew->setPlainText(QStringLiteral("（该记录点中不存在此文件）"));
         }
         QPlainTextEdit* pFull = m_bOldMissing ? m_pTxtNew : m_pTxtOld;
-        pFull->setPlainText(QString::fromUtf8(m_bOldMissing ? m_bufNew : m_bufOld));
+        pFull->setPlainText(DecodeBuf(m_bOldMissing ? m_bufNew : m_bufOld));
         QList<QTextEdit::ExtraSelection> aSel;
         QTextCursor stCur(pFull->document());
         stCur.movePosition(QTextCursor::Start);
@@ -251,8 +267,8 @@ void CDiffViewDialog::Fill() {
     //   子序列，缺失侧插占位行；只有真正变更的行着色（删除=旧侧红 / 新增=新侧绿 /
     //   占位=灰），公共行不着色——替代旧「前后缀夹逼整块标色」（改一行红绿几十行，
     //   看不出实质修改）。
-    const QList<QString> aOld = SplitLines(m_bufOld);
-    const QList<QString> aNew = SplitLines(m_bufNew);
+    const QList<QString> aOld = SplitLines(DecodeBuf(m_bufOld));
+    const QList<QString> aNew = SplitLines(DecodeBuf(m_bufNew));
     QList<QString> aOldAl, aNewAl;
     AlignLinesLcs(aOld, aNew, aOldAl, aNewAl);
 

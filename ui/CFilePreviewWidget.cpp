@@ -457,7 +457,7 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
     }
 }
 
-QString CFilePreviewWidget::DetectAndDecode(const QByteArray& a_aBytes, QString& a_sText, bool& a_bBinary) const {
+QString CFilePreviewWidget::DetectAndDecode(const QByteArray& a_aBytes, QString& a_sText, bool& a_bBinary) {
     // ① BOM：UTF-16LE/BE
     if (a_aBytes.size() >= 2) {
         if (uchar(a_aBytes[0]) == 0xFF && uchar(a_aBytes[1]) == 0xFE) {

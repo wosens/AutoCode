@@ -31,7 +31,9 @@ public:
 
     // 编码探测：成功填充 a_sText 并返回编码名；字节流判为二进制返回空串。
     // 2026.08.26 public（单元测试直调；纯函数无副作用）：BOM→UTF-8严格→GB18030→二进制→Latin1。
-    QString DetectAndDecode(const QByteArray& a_aBytes, QString& a_sText, bool& a_bBinary) const;
+    // 2026-10-08 改 static：CDiffViewDialog（查看变更）复用同源探测解码 GBK 等本地编码
+    //   （实例名调用语法不变，旧调用处零改动）。
+    static QString DetectAndDecode(const QByteArray& a_aBytes, QString& a_sText, bool& a_bBinary);
 
     // 2026.09.22 文件内查找（顶部工具栏「查找」按钮/Ctrl+F 打开查找栏；此为按钮/
     //   回车的执行核心，public 供单测直调）：在当前视图（纯文本/MD/HTML 的

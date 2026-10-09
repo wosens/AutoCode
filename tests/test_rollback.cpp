@@ -597,6 +597,91 @@ private slots:
 
 
 
+    void testDiffGbkChinese()
+
+
+    {
+
+
+        // 2026-10-08 查看变更 GBK 中文乱码回归（用户反馈：ASCII 正常、中文乱码）：
+
+        //   GBK 双字节中文旧版 QString::fromUtf8 硬解码必产 U+FFFD 乱码；现复用
+
+        //   CFilePreviewWidget::DetectAndDecode 同源探测（UTF-8 严格失败 → GB18030）。
+
+        const QString sCn = QStringLiteral("第一行 中文注释\n第二行 修改内容\n第三行");
+
+        const wchar_t* pw = (const wchar_t*)sCn.utf16();
+
+        const int n = WideCharToMultiByte(936, 0, (LPCWSTR)pw, -1, nullptr, 0, nullptr, nullptr);
+
+        QByteArray aGbk(n - 1, Qt::Uninitialized);
+
+        WideCharToMultiByte(936, 0, (LPCWSTR)pw, -1, aGbk.data(), n, nullptr, nullptr);
+
+        // 旧=原文，新=改一行：两侧均须正确解出中文（无 U+FFFD）。
+
+        const QString sCnNew = QStringLiteral("第一行 中文注释\n第二行 已修改\n第三行");
+
+        const wchar_t* pw2 = (const wchar_t*)sCnNew.utf16();
+
+        const int n2 = WideCharToMultiByte(936, 0, (LPCWSTR)pw2, -1, nullptr, 0, nullptr, nullptr);
+
+        QByteArray aGbkNew(n2 - 1, Qt::Uninitialized);
+
+        WideCharToMultiByte(936, 0, (LPCWSTR)pw2, -1, aGbkNew.data(), n2, nullptr, nullptr);
+
+        CDiffViewDialog stDlg(QStringLiteral("gbk.cpp"), aGbk, aGbkNew, false, false,
+
+                              QStringLiteral("old"), QStringLiteral("new"));
+
+        const QList<QPlainTextEdit*> aEdits = stDlg.findChildren<QPlainTextEdit*>();
+
+        QCOMPARE(aEdits.size(), 2);
+
+        QPlainTextEdit* pEdOld = aEdits.at(0)->toPlainText().contains(QStringLiteral("修改内容"))
+
+                                     ? aEdits.at(0) : aEdits.at(1);
+
+        const QString sTxtOld = pEdOld->toPlainText();
+
+        QVERIFY(!sTxtOld.contains(QChar(0xFFFD)));   // 无替换符乱码
+
+        QVERIFY(sTxtOld.contains(QStringLiteral("第一行 中文注释")));
+
+        QVERIFY(sTxtOld.contains(QStringLiteral("修改内容")));
+
+        // UTF-8 内容路径不受影响（严格解码优先命中）。
+
+        {
+
+            CDiffViewDialog stUtf8(QStringLiteral("u8.md"),
+
+                                   QStringLiteral("中文甲\n乙").toUtf8(),
+
+                                   QStringLiteral("中文甲\n丙").toUtf8(),
+
+                                   false, false, QStringLiteral("o"), QStringLiteral("n"));
+
+            const QList<QPlainTextEdit*> aU8 = stUtf8.findChildren<QPlainTextEdit*>();
+
+            bool bOkU8 = false;
+
+            for (QPlainTextEdit* pE : aU8) {
+
+                if (pE->toPlainText().contains(QStringLiteral("中文甲"))) { bOkU8 = true; }
+
+            }
+
+            QVERIFY(bOkU8);
+
+        }
+
+    }
+
+
+
+
 
     // ============ v1.4.85：无差异 turn 快照建「同源引用版」（回退列表不再缺条目）============
 

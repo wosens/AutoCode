@@ -530,6 +530,8 @@ qt_add_executable(test_rollback
     ui/CRollbackDialog.cpp
     ui/CDiffViewDialog.h
     ui/CDiffViewDialog.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
     project/CProjectManager.h
     project/CProjectManager.cpp
     project/CGuideFingerprintScanner.h
