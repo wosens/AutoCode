@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QEvent>
 #include <QLabel>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QScreen>
@@ -15,6 +16,11 @@
 #include <QFontMetrics>
 #include <QGuiApplication>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // 2026-10-09 持久化 profile API
+
 // —— 面板几何常量（11 号字体口径）——
 static constexpr int kChipH      = 30;   // 按钮高
 static constexpr int kChipHPad   = 10;   // 按钮左右内边距
@@ -22,7 +28,12 @@ static constexpr int kSpacing    = 6;    // 按钮间 / 行间距
 static constexpr int kHostMargin = 8;    // 滚动内容区边距
 static constexpr int kStatusH    = 26;   // 状态栏高
 static constexpr int kMaxVisRows = 9;    // 可视行数封顶（每行 4~6 个 → 约 40~54 可视）
-static constexpr int kPanelW     = 560;  // 面板固定宽（钳到屏宽-40）
+static constexpr int kPanelW     = 560;  // 面板自动宽（钳到屏宽-40）
+// —— 2026-10-09 边缘拖拽改尺寸 ——
+static constexpr int kChipMinW   = 360;  // 用户尺寸下限（能容纳 2~3 个按钮列）
+static constexpr int kChipMinH   = 240;  // 下限（状态栏 + 约 6 行）
+static constexpr int kEdgeRight  = 1;    // 边掩码（与 EdgeAt/拖拽分支对应）
+static constexpr int kEdgeBottom = 2;
 
 // ============================================================================
 // CRecentChipButton —— 自绘按钮：平时底色=打开次数渐变色，悬停=蓝底白字 +
@@ -109,8 +120,9 @@ private:
 // CRecentChipsPanel
 // ============================================================================
 CRecentChipsPanel::CRecentChipsPanel(FOpenProject a_fnOpen, FMore a_fnMore,
-                                     QWidget* a_pParent)
-    : QWidget(a_pParent), m_fnOpen(std::move(a_fnOpen)), m_fnMore(std::move(a_fnMore)) {
+                                     QWidget* a_pParent, const FCfgPath& a_fnCfgPath)
+    : QWidget(a_pParent), m_fnOpen(std::move(a_fnOpen)), m_fnMore(std::move(a_fnMore)),
+      m_fnCfgPath(a_fnCfgPath) {
     QFont stF = font();
     stF.setPointSize(11);   // 全局 UI 11 号字体
     setFont(stF);
@@ -124,6 +136,14 @@ CRecentChipsPanel::CRecentChipsPanel(FOpenProject a_fnOpen, FMore a_fnMore,
     m_pHost->setContentsMargins(kHostMargin, kHostMargin, kHostMargin, kHostMargin);
     m_pHost->installEventFilter(this);   // 视口宽变化（滚动条出现/消失）→ 重排
     m_pScroll->setWidget(m_pHost);
+    // 2026-10-09 边缘拖拽改尺寸：右/下/右下 6px 边缘带可能落在滚动区/状态栏之上
+    //   （子控件先收事件），对相关子控件装过滤器统一拦截；拖拽中鼠标被隐式抓取，
+    //   后续 Move/Release 也回到同一于控件 → 过滤器全程可见。
+    m_pScroll->installEventFilter(this);
+    m_pScroll->viewport()->installEventFilter(this);
+    // 含垂直滚动条：条目多时滚动条占指滚动区右缘 ~12px，右边缘带恰好压在它
+    //   上面，不过滤则右侧拖不动（且会被当滚动条拖拽）。
+    m_pScroll->verticalScrollBar()->installEventFilter(this);
 
     m_pLblStat = new QLabel(this);
     m_pLblStat->setFixedHeight(kStatusH);
@@ -132,6 +152,7 @@ CRecentChipsPanel::CRecentChipsPanel(FOpenProject a_fnOpen, FMore a_fnMore,
     m_pLblStat->setStyleSheet(QStringLiteral(
         "background:#f3f4f6;border-top:1px solid #e0e3e8;"
         "padding:1px 8px;color:#4b5563;"));
+    m_pLblStat->installEventFilter(this);   // 2026-10-09 下/右下边缘带落在状态栏上
 
     auto* pLay = new QVBoxLayout(this);
     pLay->setContentsMargins(0, 0, 0, 0);
@@ -187,22 +208,32 @@ void CRecentChipsPanel::Refresh(const QStringList& a_aPaths, const QList<int>& a
         m_aNames.append(sName);
     }
 
-    m_sStatDefault = QStringLiteral("共 %1 个工程 · 悬停按钮显示路径 · 滚轮查看更多")
+    m_sStatDefault = QStringLiteral("共 %1 个工程 · 悬停按钮显示路径 · 滚轮查看更多 · 边缘可拖拽改大小")
                          .arg(a_aPaths.size());
     m_pLblStat->setText(m_sStatDefault);
 
-    // 固定尺寸（用户规则 5）：宽=固定值（钳屏宽），高按行数封顶（约 40~54 个可视）。
-    int iW = kPanelW;
-    if (QScreen* pSc = screen(); pSc != nullptr) {
-        iW = qMin(iW, pSc->availableGeometry().width() - 40);
+    // 2026-10-09 首次弹出读档：用户拖拽过的尺寸优先（宽/高钳屏可用区），
+    //   未拖拽/无档保持自动尺寸（宽 kPanelW / 高按行数封顶）。
+    LoadUserSize();
+    const int iAvailScrW = (screen() != nullptr)
+        ? screen()->availableGeometry().width() - 40 : kPanelW;
+    int iW = (m_iUserW > 0) ? qBound(kChipMinW, m_iUserW, iAvailScrW)
+                            : qMin(kPanelW, iAvailScrW);
+    int iH;
+    if (m_iUserH > 0) {
+        iH = qBound(kChipMinH, m_iUserH,
+                    (screen() != nullptr ? screen()->availableGeometry().height() - 40
+                                         : m_iUserH));
+    } else {
+        const int iRows = LayoutChips(m_aNames, QFontMetrics(font()),
+                                      iW - 2 * kHostMargin, kSpacing, kChipHPad).size();
+        const int iNatH = 2 * kHostMargin + iRows * kChipH
+                          + (iRows > 0 ? (iRows - 1) * kSpacing : 0) + kStatusH;
+        const int iCapH = 2 * kHostMargin + kMaxVisRows * kChipH
+                          + (kMaxVisRows - 1) * kSpacing + kStatusH;
+        iH = qMin(iNatH, iCapH);
     }
-    const int iRows = LayoutChips(m_aNames, QFontMetrics(font()),
-                                  iW - 2 * kHostMargin, kSpacing, kChipHPad).size();
-    const int iNatH = 2 * kHostMargin + iRows * kChipH + (iRows > 0 ? (iRows - 1) * kSpacing : 0)
-                      + kStatusH;
-    const int iCapH = 2 * kHostMargin + kMaxVisRows * kChipH + (kMaxVisRows - 1) * kSpacing
-                      + kStatusH;
-    setFixedSize(iW, qMin(iNatH, iCapH));
+    setFixedSize(iW, iH);
     Relayout();
 }
 
@@ -218,7 +249,154 @@ bool CRecentChipsPanel::eventFilter(QObject* a_pObj, QEvent* a_pEv) {
     if (a_pObj == m_pHost && a_pEv->type() == QEvent::Resize) {
         Relayout();   // 视口宽变化（滚动条出现/消失）→ 按实宽重排
     }
+    // —— 2026-10-09 边缘拖拽改尺寸（右/下/右下 6px 边缘带，覆盖滚动区/状态栏）——
+    //   面板经 QWidgetAction 内嵌在 QMenu 中，拖的是面板 fixedSize + 同步所在菜单窗口
+    //   resize(sizeHint())（菜单尺寸随内嵌件固定尺寸走）；Press/Release 全吃掉防菜单
+    //   误触发/误关，拖拽中鼠标被隐式抓取，后续 Move 恒回同一子控件 → 过滤器全程可见。
+    if (a_pEv->type() == QEvent::Leave) {
+        // Leave 不是 QMouseEvent（不可 static_cast 取坐标）：只做光标复位。
+        if (auto* pW = qobject_cast<QWidget*>(a_pObj); pW != nullptr && !m_bResizing) {
+            pW->setCursor(Qt::ArrowCursor);
+        }
+        return QWidget::eventFilter(a_pObj, a_pEv);
+    }
+    if (a_pEv->type() == QEvent::MouseButtonPress
+            || a_pEv->type() == QEvent::MouseMove
+            || a_pEv->type() == QEvent::MouseButtonRelease) {
+        auto* pW = qobject_cast<QWidget*>(a_pObj);
+        if (pW != nullptr) {
+            auto* pMEv = static_cast<QMouseEvent*>(a_pEv);
+            const int iEdge = EdgeAt(pW->mapTo(this, pMEv->position().toPoint()));
+            if (a_pEv->type() == QEvent::MouseButtonPress
+                    && pMEv->button() == Qt::LeftButton && !m_bResizing && iEdge != 0) {
+                m_bResizing = true;
+                m_iRsEdge   = iEdge;
+                m_ptRsStart = pMEv->globalPosition().toPoint();
+                m_iRsStartW = width();
+                m_iRsStartH = height();
+                // 显式抓取：拖拽中光标会移过芯片等无过滤器子控件，凭隐式抓取
+                //   （被过滤吃掉 Press 后不成立）收不到后续 Move；抓在按压子控件上。
+                m_pRsGrabber = pW;
+                pW->grabMouse();
+                pW->setCursor((iEdge == kEdgeRight)  ? Qt::SizeHorCursor
+                            : (iEdge == kEdgeBottom) ? Qt::SizeVerCursor
+                                                     : Qt::SizeFDiagCursor);
+                a_pEv->accept();
+                return true;   // 吃掉：不落入子控件/菜单
+            }
+            if (m_bResizing) {
+                if (a_pEv->type() == QEvent::MouseMove) {
+                    const QPoint ptD = pMEv->globalPosition().toPoint() - m_ptRsStart;
+                    const int iW = (m_iRsEdge & kEdgeRight)
+                                       ? m_iRsStartW + ptD.x() : m_iRsStartW;
+                    const int iH = (m_iRsEdge & kEdgeBottom)
+                                       ? m_iRsStartH + ptD.y() : m_iRsStartH;
+                    ApplyUserSize(iW, iH);
+                    a_pEv->accept();
+                    return true;
+                }
+                if (a_pEv->type() == QEvent::MouseButtonRelease) {
+                    m_bResizing = false;
+                    if (m_pRsGrabber != nullptr) {
+                        m_pRsGrabber->releaseMouse();
+                        m_pRsGrabber->setCursor(Qt::ArrowCursor);
+                        m_pRsGrabber = nullptr;
+                    }
+                    SaveUserSize();   // 拖完落盘
+                    a_pEv->accept();
+                    return true;
+                }
+                return false;
+            }
+            // 非拖拽态：悬停边缘带 → 光标提示（水平/垂直/斜向）
+            if (a_pEv->type() == QEvent::MouseMove && iEdge != 0) {
+                pW->setCursor((iEdge == kEdgeRight)  ? Qt::SizeHorCursor
+                            : (iEdge == kEdgeBottom) ? Qt::SizeVerCursor
+                                                     : Qt::SizeFDiagCursor);
+            } else if (a_pEv->type() == QEvent::MouseMove && iEdge == 0) {
+                pW->setCursor(Qt::ArrowCursor);
+            }
+        }
+    }
     return QWidget::eventFilter(a_pObj, a_pEv);
+}
+
+// 面板局部坐标 → 边缘带掩码（0=不在边缘；右 6px=1，下 6px=2，右下角=3）。
+int CRecentChipsPanel::EdgeAt(const QPoint& a_stPanelPos) const {
+    const int iEdge = 6;
+    const int iR = (a_stPanelPos.x() >= width() - iEdge && a_stPanelPos.x() <= width()) ? kEdgeRight : 0;
+    const int iB = (a_stPanelPos.y() >= height() - iEdge && a_stPanelPos.y() <= height()) ? kEdgeBottom : 0;
+    // 仅右/下/右下角（左/上边缘被子菜单锚定，拖动会破坏菜单定位）
+    if (iR == 0 && iB == 0) {
+        return 0;
+    }
+    if (iR != 0 && iB == 0) {
+        return kEdgeRight;
+    }
+    if (iR == 0 && iB != 0) {
+        return kEdgeBottom;
+    }
+    return kEdgeRight | kEdgeBottom;
+}
+
+// 钳位后落尺寸：宽/高各自限幅，同步所在 QMenu 重排（菜单尺寸随内嵌件固定尺寸走）。
+//   QMenu::sizeHint 有缓存（内嵌件 setFixedSize 不使 itemsDirty），resize(sizeHint())
+//   无效（实测菜单恒田尺寸）；改按当前边框补偿（菜单尺寸-面板尺寸，拖拽期间稳定）
+//   直接叠加同增量，菜单框恒包住面板。
+void CRecentChipsPanel::ApplyUserSize(int a_iW, int a_iH) {
+    QScreen* pSc = screen() != nullptr ? screen() : QGuiApplication::primaryScreen();
+    const int iMaxW = (pSc != nullptr) ? pSc->availableGeometry().width() - 40 : 4096;
+    const int iMaxH = (pSc != nullptr) ? pSc->availableGeometry().height() - 40 : 4096;
+    QMenu* pM = qobject_cast<QMenu*>(window());
+    const int iChromeW = (pM != nullptr) ? pM->width() - width() : 0;
+    const int iChromeH = (pM != nullptr) ? pM->height() - height() : 0;
+    m_iUserW = qBound(kChipMinW, a_iW, iMaxW);
+    m_iUserH = qBound(kChipMinH, a_iH, iMaxH);
+    setFixedSize(m_iUserW, m_iUserH);
+    if (pM != nullptr) {
+        pM->resize(m_iUserW + iChromeW, m_iUserH + iChromeH);
+    }
+}
+
+// 读档（首次 Refresh 时一次）：[Layout] RecentChipsSize="w,h"；坏档/无档=保持自动尺寸。
+void CRecentChipsPanel::LoadUserSize() {
+    if (m_bUserLoaded) {
+        return;
+    }
+    m_bUserLoaded = true;
+    if (!m_fnCfgPath || m_fnCfgPath().isEmpty()) {
+        return;
+    }
+    wchar_t szBuf[64] = {0};
+    if (GetPrivateProfileStringW(L"Layout", L"RecentChipsSize", L"", szBuf, 64,
+                                 (LPCWSTR)m_fnCfgPath().utf16()) <= 0) {
+        return;
+    }
+    const QStringList aParts = QString::fromWCharArray(szBuf).split(QLatin1Char(','));
+    if (aParts.size() == 2) {
+        bool bOkW = false, bOkH = false;
+        const int iW = aParts.at(0).toInt(&bOkW);
+        const int iH = aParts.at(1).toInt(&bOkH);
+        if (bOkW && bOkH && iW >= kChipMinW && iH >= kChipMinH) {
+            m_iUserW = iW;
+            m_iUserH = iH;
+        }
+    }
+}
+
+// 落盘：拖拽释放时写 [Layout] RecentChipsSize="w,h"（含 profile 写缓存冲刷）。
+void CRecentChipsPanel::SaveUserSize() {
+    if (m_iUserW <= 0 || m_iUserH <= 0) {
+        return;
+    }
+    if (!m_fnCfgPath || m_fnCfgPath().isEmpty()) {
+        return;
+    }
+    const QString sVal = QStringLiteral("%1,%2").arg(m_iUserW).arg(m_iUserH);
+    WritePrivateProfileStringW(L"Layout", L"RecentChipsSize",
+                               (LPCWSTR)sVal.utf16(), (LPCWSTR)m_fnCfgPath().utf16());
+    // 冲刷 profile 写缓存（防下一次打开读到空）。
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, (LPCWSTR)m_fnCfgPath().utf16());
 }
 
 void CRecentChipsPanel::Relayout() {

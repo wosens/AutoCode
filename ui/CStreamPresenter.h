@@ -9,8 +9,9 @@
 #include <memory>
 
 #include "CMessageBlock.h"
+#include "CMessageView.h"   // 2026-10-09 QPointer<CMessageView> 需完整类型（前向声明下 qpointer.h static_cast 编译错）
 
-class CMessageView;
+// class CMessageView;   // 2026-10-09 已改含完整头（QPointer 实例化点需知道 QObject 派生关系）
 
 // =============================================================================
 // SBlockData：一条对话流中单个消息块的数据快照（2026.09.03 自 CExecutionPanel 嵌套
@@ -112,7 +113,12 @@ private:
     QObject*              m_pGuard = new QObject;  // 生命周期哨兵：singleShot 帧回调的 context
                                                   //   （流本体非 QObject 且寿命可短于视图——队列中
                                                   //   未决帧经 QPointer 判活，流亡即弃，防悬垂解引）
-    CMessageView*         m_pView = nullptr;       // 绑定视图（空=纯数据态：任务未选中/助手 Tab 已关）
+    // 2026-10-09 悬垂视图修复：QPointer——拆页路径（跨档幽灵 TakeRunningForReload/
+    //   RemoveAsstEntry/DropAsstEntries 的 pPage->deleteLater）销毁视图后流对象仍存活，
+    //   裸指针复绑（Bind→Unbind→m_pView->Clear）踩已释放内存（foreignPhantom 实崩栈：
+    //   AttachForeignAssistants→CreateAsstTab→CreateAsstWidgets→Bind→Unbind→Clear）；
+    //   QPointer 销毁自动置空，判空路径自然回退纯数据态，无需逐拆页点补 Unbind。
+    QPointer<CMessageView> m_pView;                    // 绑定视图（空=纯数据态：任务未选中/助手 Tab 已关）
     std::function<void()> m_fnDirty;               // 数据变化回调（落盘路由）
     QList<SBlockData>     m_aBlocks;               // 对话流数据（唯一正本）
     QList<CMessageBlock*> m_aWidgets;              // 并行块 widget（aWidgets[k] ↔ 数据下标 frontier+k）

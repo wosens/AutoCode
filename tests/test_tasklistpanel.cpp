@@ -47,6 +47,10 @@ private slots:
     // 2026.09.26 v3.1.244 回归：.bat/.cmd「打开方式」精简口径（首项=CMD 运行哨兵、
     //   条目数收敛不爆全量；普通扩展名不受影响、无哨兵）。
     void openWithBatCurated();
+    // 2026-10-09 回归：可执行类（.exe/.msi/.com/.scr/.pif）打开方式收敛——不兑
+    //   NONE 全量（旧版把全机自荐处理器堆进来，用户实测截图实害）；无推荐则
+    //   禁用子菜单；.txt 不受影响。
+    void openWithExecCurated();
     // 2026.09.19 剪切/复制/粘贴与 Windows 资源管理器联动：CF_HDROP+Preferred
     //   DropEffect 双向跨进程（PowerShell 与资源管理器用同一套剪贴板 API）。
     void explorerClipboardInterop();
@@ -300,6 +304,67 @@ void TestTaskListPanel::openWithBatCurated() {
         }
         QVERIFY2(!bHasSentinel, ".txt 不应出现 CMD 哨兵项");
         QVERIFY2(nItems >= 1, ".txt 仍应有打开方式条目");
+        menu.clear();
+    }
+}
+
+// 2026-10-09 可执行类打开方式收敛回归（用户实测：.exe 混入 KMPlayer/Foxmail/IE/
+//   WPS 等全机自荐处理器——旧版 RECOMMENDED 空时兑 NONE 全量封顶 12）：
+//   ① .exe/.msi/.com/.scr/.pif 不再走 NONE 全量兑底：无推荐项时子菜单禁用；
+//   ② 即便机器有推荐项（少见）也只应 RECOMMENDED 级别短清单（≤8，远小于
+//      NONE 全量的 12 上限）；
+//   ③ .txt 不受影响（仍有条目且菜单可用）。
+void TestTaskListPanel::openWithExecCurated() {
+    QTemporaryDir oTmp;
+    QVERIFY(oTmp.isValid());
+    CProjectExplorerPanel panel;
+    const QStringList aExts = { QStringLiteral("exe"), QStringLiteral("msi"),
+                                QStringLiteral("com"), QStringLiteral("scr"),
+                                QStringLiteral("pif") };
+    for (const QString& sExt : aExts) {
+        const QString sFile = oTmp.path() + QStringLiteral("/probe.") + sExt;
+        QFile f(sFile);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("x");
+        f.close();
+        QMenu menu;
+        panel.BuildOpenWithMenu(&menu, sFile);
+        int nItems = 0;
+        for (QAction* pAct : menu.actions()) {
+            if (!pAct->isSeparator() && pAct->data().userType() != QMetaType::Int) {
+                // 无 data 的动作也计（兑底路径的注册表项不带索引）
+            }
+            if (!pAct->isSeparator() && !pAct->text().isEmpty()) {
+                ++nItems;
+            }
+        }
+        if (nItems == 0) {
+            QVERIFY2(!menu.isEnabled(),
+                     qPrintable(QStringLiteral(".%1 无推荐项时应禁用子菜单").arg(sExt)));
+        } else {
+            QVERIFY2(nItems <= 8,
+                     qPrintable(QStringLiteral(".%1 只应 RECOMMENDED 短清单（≤8），实际=%2")
+                                .arg(sExt).arg(nItems)));
+        }
+        menu.clear();
+    }
+    // .txt 不受影响。
+    const QString sTxt = oTmp.path() + QStringLiteral("/probe.txt");
+    QFile fTxt(sTxt);
+    QVERIFY(fTxt.open(QIODevice::WriteOnly));
+    fTxt.write("hello");
+    fTxt.close();
+    {
+        QMenu menu;
+        panel.BuildOpenWithMenu(&menu, sTxt);
+        int nItems = 0;
+        for (QAction* pAct : menu.actions()) {
+            if (!pAct->isSeparator() && !pAct->text().isEmpty()) {
+                ++nItems;
+            }
+        }
+        QVERIFY2(nItems >= 1, ".txt 仍应有打开方式条目");
+        QVERIFY2(menu.isEnabled(), ".txt 菜单应可用");
         menu.clear();
     }
 }

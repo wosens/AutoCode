@@ -990,7 +990,12 @@ void CMainWindow::CreateMenus() {
     m_pMenuRecent = pMenu->addMenu(QStringLiteral("最近打开"));
     m_pRecentPanel = new CRecentChipsPanel(
         [this](const QString& sPath) { OnRecentChipOpen(sPath); },
-        [this]() { OnRecentChipMore(); });
+        [this]() { OnRecentChipMore(); },
+        /*a_pParent=*/this,
+        // 2026-10-09 拖拽尺寸持久化：调用时取当前 config.ini（exe 同级，PM 可能未建）
+        [this]() -> QString {
+            return (m_pPm != nullptr) ? m_pPm->ConfigFilePath() : QString();
+        });
     {
         auto* pWgtAct = new QWidgetAction(m_pMenuRecent);
         pWgtAct->setDefaultWidget(m_pRecentPanel);

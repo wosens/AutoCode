@@ -23,6 +23,7 @@
 #include <QWidget>
 #include <QColor>
 #include <QList>
+#include <QPointer>
 #include <QStringList>
 #include <functional>
 
@@ -37,9 +38,13 @@ public:
     //   回调内负责先收起菜单链再执行动作。
     using FOpenProject = std::function<void(const QString&)>;
     using FMore = std::function<void()>;
+    // 2026-10-09 持久化路径提供器（调用时取当前 config.ini 全路径；空返回 = 禁用读写）：
+    //   面板构造时 PM 可能尚未就绪，传函数而非值；键 [Layout] RecentChipsSize="w,h"。
+    using FCfgPath = std::function<QString()>;
 
     CRecentChipsPanel(FOpenProject a_fnOpen, FMore a_fnMore,
-                      QWidget* a_pParent = nullptr);
+                      QWidget* a_pParent = nullptr,
+                      const FCfgPath& a_fnCfgPath = FCfgPath());
 
     // 刷新数据（菜单 aboutToShow 时调用，MRU 顺序；计数缺失按 1）。
     void Refresh(const QStringList& a_aPaths, const QList<int>& a_aOpens);
@@ -64,19 +69,37 @@ public:
     QList<CRecentChipButton*> Chips() const { return m_aChips; }
     QWidget* ChipAt(int a_iIdx) const;   // 按下标取按钮（QWidget* 观察口，测试/诊断用）
     QString StatusText() const;
+    // 2026-10-09 用户拖拽尺寸观察口（0=未自定义，自动尺寸）；测试断言用。
+    QSize UserSize() const { return QSize(m_iUserW, m_iUserH); }
 
 protected:
     bool eventFilter(QObject* a_pObj, QEvent* a_pEv) override;
 
 private:
     void Relayout();          // 按内容部件实宽重排（滚动条出现会变窄）
+    // —— 2026-10-09 边缘拖拽改尺寸 ——
+    int  EdgeAt(const QPoint& a_stPanelPos) const;   // 面板局部坐标→边掩码（1=右 2=下 4=右下角）
+    void ApplyUserSize(int a_iW, int a_iH);           // 钳位后落尺寸（含同步所在 QMenu 重排）
+    void LoadUserSize();                              // 首次 Refresh 时读档（一次）
+    void SaveUserSize();                              // 拖拽释放时落盘
 
     FOpenProject      m_fnOpen;
     FMore             m_fnMore;
+    FCfgPath          m_fnCfgPath;                    // 2026-10-09 持久化路径提供器
     QScrollArea*      m_pScroll  = nullptr;
     QWidget*          m_pHost    = nullptr;   // 滚动内容（chips 宿主，手动几何）
     QLabel*           m_pLblStat = nullptr;
     QStringList       m_aNames;               // 含首个「更多...」占位名
     QList<CRecentChipButton*> m_aChips;
     QString           m_sStatDefault;
+    // —— 2026-10-09 拖拽改尺寸状态 ——
+    int   m_iUserW = 0;         // 用户尺寸（0=自动：宽 kPanelW / 高按行数封顶）
+    int   m_iUserH = 0;
+    bool  m_bUserLoaded = false;   // 档只读一次（失败/无档=自动尺寸）
+    bool  m_bResizing = false;     // 拖拽中（吃掉 Press/Move/Release，防菜单误触发）
+    QPoint m_ptRsStart;            // 拖拽起点（全局）
+    int   m_iRsStartW = 0;         // 拖拽起始尺寸
+    int   m_iRsStartH = 0;
+    int   m_iRsEdge = 0;           // 起始边掩码
+    QPointer<QWidget> m_pRsGrabber;   // 拖拽中抓取鼠标的子控件（释放时归还）
 };

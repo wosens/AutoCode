@@ -2671,6 +2671,23 @@ void CProjectExplorerPanel::BuildOpenWithMenu(QMenu* a_pParentMenu,
         }
         return;
     }
+    // 2026-10-09 可执行类（.exe/.msi/.com/.scr/.pif）同 .bat 收敛（用户实测截图：
+    //   .exe 右键打开方式混入 KMPlayer/Foxmail/IE/WPS/智能播放器等全机自荐处理器
+    //   ——RECOMMENDED 空时旧版兑 NONE 全量封顶 12，恰把 HKCR\Applications 无
+    //   SupportedTypes 限制的自荐项全倒出来）。Explorer 对可执行文件本就不列
+    //   打开方式程序：此处只走 RECOMMENDED、绝不退 NONE；无推荐 → 子菜单禁用
+    //   （同资源管理器语义）。也不走注册表兑底——可执行类的 ProgID 动词是自身
+    //   open（"%1" %*），列进「打开方式」无意义。
+    if (sSuffix == QStringLiteral("exe") || sSuffix == QStringLiteral("msi")
+            || sSuffix == QStringLiteral("com") || sSuffix == QStringLiteral("scr")
+            || sSuffix == QStringLiteral("pif")) {
+        AddShellAssocHandlers(a_pParentMenu, m_aOpenWithHandlers, sExtKey,
+                              ASSOC_FILTER_RECOMMENDED);
+        if (m_aOpenWithHandlers.isEmpty()) {
+            a_pParentMenu->setEnabled(false);
+        }
+        return;
+    }
     if (AddShellAssocHandlers(a_pParentMenu, m_aOpenWithHandlers, sExtKey,
                               ASSOC_FILTER_RECOMMENDED) > 0) {
         return;

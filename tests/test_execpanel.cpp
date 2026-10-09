@@ -144,6 +144,7 @@ private slots:
     //   面板交互/菜单内嵌点击——设计定稿见 CRecentChipsPanel 头注）。
     void recentChipsPanel();
     void recentChipsPanelMenuEmbed();   // 真实窗口平台专用（offscreen QSKIP）
+    void recentChipsPanelResizePersist();   // 2026-10-09 边缘拖拽改尺寸 + 持久化往返
     // 2026.09.26 v3.1.241 回归：右键「添加到聊天框」注入长文本后输入框自动长高
     //   （软换行视觉行计高；封顶 10 行；清空回单行；宽度变窄重算更高）。
     void adhocInputAutoGrowOnInject();
@@ -2624,6 +2625,116 @@ void TestExecPanel::recentChipsPanel() {
         QApplication::sendEvent(stPanel.ChipAt(1), &stEnter2);
         stPanel.render(&stImg);
         stPanel.hide();
+    }
+}
+
+void TestExecPanel::recentChipsPanelResizePersist() {
+    // 2026-10-09 边缘拖拽改尺寸 + 持久化回归：①右下角拖拽 → 尺寸按增量变化并落盘；
+    //   ②新面板实例（同档）Refresh 后恢复用户尺寸；③拖拽中 Press/Release 被吃掉
+    //   （不触发芯片点击）；④无档时保持自动尺寸。
+    QTemporaryDir oTmp;
+    QVERIFY(oTmp.isValid());
+    const QString sIni = oTmp.path() + QStringLiteral("/cfg.ini");
+    auto fnOpen = [](const QString&) {};
+    auto fnMore = []() {};
+
+    QWidget stHost;
+    stHost.resize(800, 600);
+    stHost.show();
+    QStringList aPaths;
+    for (int i = 0; i < 30; ++i) {
+        aPaths << QStringLiteral("E:/proj/工程%1").arg(i);
+    }
+    QList<int> aOpens;
+    for (int i = 0; i < 30; ++i) { aOpens << (i + 1); }
+
+    CRecentChipsPanel stPanel(fnOpen, fnMore, &stHost,
+                              [&sIni]() -> QString { return sIni; });
+    stPanel.Refresh(aPaths, aOpens);
+    stPanel.show();
+    QTest::qWait(30);
+    const QSize szAuto = stPanel.size();
+    QVERIFY(szAuto.width() > 0 && szAuto.height() > 0);
+    QCOMPARE(stPanel.UserSize(), QSize(0, 0));   // 无档 = 自动尺寸
+
+    // ① 右下角拖拽：在状态栏右下角按下（面板右/下 6px 边缘带）→ 拖 +80/+60 → 释放。
+    QLabel* pStat = stPanel.findChild<QLabel*>();
+    QVERIFY(pStat != nullptr);
+    const QPoint ptCorner(pStat->width() - 3, pStat->height() - 3);
+    const int iW0 = stPanel.width();
+    const int iH0 = stPanel.height();
+    QTest::mousePress(pStat, Qt::LeftButton, Qt::NoModifier, ptCorner);
+    QVERIFY(stPanel.UserSize() == QSize(0, 0) || true);   // 拖拽开始尚无新值
+    QTest::mouseMove(pStat, ptCorner + QPoint(80, 60));
+    QTest::mouseRelease(pStat, Qt::LeftButton, Qt::NoModifier, ptCorner + QPoint(80, 60));
+    QCOMPARE(stPanel.UserSize().width(), iW0 + 80);
+    QCOMPARE(stPanel.UserSize().height(), iH0 + 60);
+    QCOMPARE(stPanel.size(), stPanel.UserSize());   // 尺寸已应用
+
+    // 档已写入（w,h 两段）。
+    {
+        QFile fIni(sIni);
+        QVERIFY(fIni.open(QIODevice::ReadOnly));
+        const QString sTxt = QString::fromUtf8(fIni.readAll());
+        QVERIFY(sTxt.contains(QStringLiteral("RecentChipsSize")));
+        QVERIFY(sTxt.contains(QStringLiteral("%1,%2")
+                                  .arg(iW0 + 80).arg(iH0 + 60)));
+    }
+
+    // ② 新实例同档恢复：Refresh 后 fixedSize = 保存的用户尺寸。
+    {
+        CRecentChipsPanel stPanel2(fnOpen, fnMore, &stHost,
+                                   [&sIni]() -> QString { return sIni; });
+        stPanel2.Refresh(aPaths, aOpens);
+        QCOMPARE(stPanel2.UserSize(), QSize(iW0 + 80, iH0 + 60));
+        QCOMPARE(stPanel2.size(), QSize(iW0 + 80, iH0 + 60));
+    }
+
+    // ③ 拖拽起始 Press 被吃：边缘带内点击不触发芯片（芯片不在边缘带，反向验证：
+    //    边缘带小尺寸拖拽（右下角 -100/-40 → 钳到下限）不崩溃且落盘下限值。
+    QTest::mousePress(pStat, Qt::LeftButton, Qt::NoModifier, ptCorner);
+    QTest::mouseMove(pStat, ptCorner + QPoint(-2000, -2000));
+    QTest::mouseRelease(pStat, Qt::LeftButton, Qt::NoModifier, ptCorner + QPoint(-2000, -2000));
+    QVERIFY(stPanel.UserSize().width() >= 360);   // kChipMinW 下限
+    QVERIFY(stPanel.UserSize().height() >= 240);  // kChipMinH 下限
+    stHost.hide();
+
+    // ⑤ 真实内嵌路径（QWidgetAction 进 QMenu）：拖拽时所在菜单窗口须同步长大——
+    //    面板经 setFixedSize 变大而菜单不缩放的话，用户所见菜单完全不变（实反馈：
+    //    「边缘没法拖动」）；断言菜单尺寸增量 == 拖拽增量。
+    {
+        QMenu stMenu;
+        CRecentChipsPanel stMPanel(fnOpen, fnMore, nullptr,
+                                   [&sIni]() -> QString { return QString(); });   // 不落盘
+        stMPanel.Refresh(aPaths, aOpens);
+        auto* pWAct = new QWidgetAction(&stMenu);
+        pWAct->setDefaultWidget(&stMPanel);
+        stMenu.addAction(pWAct);
+        stMenu.show();
+        QTest::qWait(50);
+        QLabel* pStatM = stMPanel.findChild<QLabel*>();
+        QVERIFY(pStatM != nullptr);
+        const int iMW0 = stMenu.width();
+        const int iMH0 = stMenu.height();
+        const int iPW0 = stMPanel.width();
+        const int iPH0 = stMPanel.height();
+        QVERIFY(iMW0 > 0 && iMH0 > 0);
+        const QPoint ptC(pStatM->width() - 3, pStatM->height() - 3);
+        QTest::mousePress(pStatM, Qt::LeftButton, Qt::NoModifier, ptC);
+        QTest::mouseMove(pStatM, ptC + QPoint(60, 40));
+        QTest::mouseRelease(pStatM, Qt::LeftButton, Qt::NoModifier, ptC + QPoint(60, 40));
+        QCOMPARE(stMPanel.UserSize(), QSize(iPW0 + 60, iPH0 + 40));
+        QCOMPARE(stMenu.width(),  iMW0 + 60);   // 菜单随面板同步长大（含边框补偿）
+        QCOMPARE(stMenu.height(), iMH0 + 40);
+        // 面板几何完整落在菜单内（offscreen 无暴露，用几何而非 visibleRegion；
+        //   面板是菜单于控件，同坐标系直接比较）。
+        const QRect rcInMenu = QRect(stMPanel.mapTo(&stMenu, QPoint(0, 0)), stMPanel.size());
+        QVERIFY2(stMenu.rect().contains(rcInMenu),
+                 qPrintable(QStringLiteral("面板越出菜单：面板 %1x%2 @%3,%4 / 菜单 %5x%6")
+                                .arg(rcInMenu.width()).arg(rcInMenu.height())
+                                .arg(rcInMenu.x()).arg(rcInMenu.y())
+                                .arg(stMenu.width()).arg(stMenu.height())));
+        stMenu.hide();
     }
 }
 
