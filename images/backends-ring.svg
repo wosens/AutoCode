@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="430" viewBox="0 0 1100 430" role="img" aria-label="Five agent backends orchestrated by AutoCode">
+  <defs>
+    <linearGradient id="cbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0c1424"/>
+      <stop offset="100%" stop-color="#0a101f"/>
+    </linearGradient>
+    <radialGradient id="cGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cblur" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="1099" height="429" rx="18" fill="url(#cbg)" stroke="#1e293b"/>
+  <text x="40" y="46" font-family="'Segoe UI',Arial,sans-serif" font-size="12" fill="#475569" letter-spacing="3">FIVE BACKENDS &#183; ONE PIPELINE</text>
+
+  <!-- connections: glow layer -->
+  <g fill="none" stroke-width="6" stroke-opacity="0.28" filter="url(#cblur)">
+    <path d="M550 65 L550 170" stroke="#fb923c"/>
+    <path d="M930 169 L610 203" stroke="#22d3ee"/>
+    <path d="M785 336 L600 244" stroke="#34d399"/>
+    <path d="M315 336 L500 244" stroke="#f43f5e"/>
+    <path d="M170 169 L490 203" stroke="#a78bfa"/>
+  </g>
+  <!-- connections: line layer -->
+  <g fill="none" stroke-width="1.6" stroke-opacity="0.55">
+    <path d="M550 65 L550 170" stroke="#fb923c"/>
+    <path d="M930 169 L610 203" stroke="#22d3ee"/>
+    <path d="M785 336 L600 244" stroke="#34d399"/>
+    <path d="M315 336 L500 244" stroke="#f43f5e"/>
+    <path d="M170 169 L490 203" stroke="#a78bfa"/>
+  </g>
+  <g fill-opacity="0.9">
+    <circle cx="550" cy="118" r="2.6" fill="#fb923c"/>
+    <circle cx="770" cy="186" r="2.6" fill="#22d3ee"/>
+    <circle cx="693" cy="290" r="2.6" fill="#34d399"/>
+    <circle cx="408" cy="290" r="2.6" fill="#f43f5e"/>
+    <circle cx="330" cy="186" r="2.6" fill="#a78bfa"/>
+  </g>
+
+  <!-- central hub -->
+  <circle cx="550" cy="215" r="100" fill="url(#cGlow)"/>
+  <circle cx="550" cy="215" r="66" fill="none" stroke="#3b82f6" stroke-opacity="0.3" stroke-dasharray="3 7"/>
+  <circle cx="550" cy="215" r="56" fill="#0b1b36" stroke="#3b82f6" stroke-width="2"/>
+  <text x="550" y="212" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="19" font-weight="700" fill="#e2e8f0">AutoCode</text>
+  <text x="550" y="234" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="9.5" fill="#60a5fa" letter-spacing="2.5">ORCHESTRATOR</text>
+
+  <!-- node: Claude Code (top) -->
+  <g>
+    <rect x="466" y="37" width="168" height="56" rx="12" fill="#101a2f" stroke="#fb923c" stroke-opacity="0.5"/>
+    <rect x="466" y="45" width="4.5" height="40" rx="2.25" fill="#fb923c"/>
+    <text x="556" y="59" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="15" font-weight="700" fill="#fdba74">Claude Code</text>
+    <text x="556" y="79" text-anchor="middle" font-family="Consolas,Menlo,monospace" font-size="11" fill="#64748b">claude CLI</text>
+  </g>
+
+  <!-- node: PiAgent (right) -->
+  <g>
+    <rect x="846" y="141" width="168" height="56" rx="12" fill="#101a2f" stroke="#22d3ee" stroke-opacity="0.5"/>
+    <rect x="846" y="149" width="4.5" height="40" rx="2.25" fill="#22d3ee"/>
+    <text x="936" y="163" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="15" font-weight="700" fill="#67e8f9">PiAgent</text>
+    <text x="936" y="183" text-anchor="middle" font-family="Consolas,Menlo,monospace" font-size="11" fill="#64748b">pi &#183; rpc mode</text>
+  </g>
+
+  <!-- node: Codex (bottom right) -->
+  <g>
+    <rect x="701" y="308" width="168" height="56" rx="12" fill="#101a2f" stroke="#34d399" stroke-opacity="0.5"/>
+    <rect x="701" y="316" width="4.5" height="40" rx="2.25" fill="#34d399"/>
+    <text x="791" y="330" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="15" font-weight="700" fill="#6ee7b7">Codex</text>
+    <text x="791" y="350" text-anchor="middle" font-family="Consolas,Menlo,monospace" font-size="11" fill="#64748b">codex CLI</text>
+  </g>
+
+  <!-- node: Hermes (bottom left) -->
+  <g>
+    <rect x="231" y="308" width="168" height="56" rx="12" fill="#101a2f" stroke="#f43f5e" stroke-opacity="0.5"/>
+    <rect x="231" y="316" width="4.5" height="40" rx="2.25" fill="#f43f5e"/>
+    <text x="321" y="330" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="15" font-weight="700" fill="#fda4af">Hermes</text>
+    <text x="321" y="350" text-anchor="middle" font-family="Consolas,Menlo,monospace" font-size="11" fill="#64748b">hermes -z</text>
+  </g>
+
+  <!-- node: DeepSeek Harness (left) -->
+  <g>
+    <rect x="86" y="141" width="168" height="56" rx="12" fill="#101a2f" stroke="#a78bfa" stroke-opacity="0.5"/>
+    <rect x="86" y="149" width="4.5" height="40" rx="2.25" fill="#a78bfa"/>
+    <text x="176" y="163" text-anchor="middle" font-family="'Segoe UI',Arial,sans-serif" font-size="15" font-weight="700" fill="#c4b5fd">DeepSeek Harness</text>
+    <text x="176" y="183" text-anchor="middle" font-family="Consolas,Menlo,monospace" font-size="11" fill="#64748b">dsh &#183; sdk profile</text>
+  </g>
+</svg>

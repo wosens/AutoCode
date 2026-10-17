@@ -1,4 +1,4 @@
-﻿版本：v4.4.389
+版本：v4.4.389
   2) PowerShell profile 已写入 [Console]::Input/OutputEncoding + $OutputEncoding = UTF-8（F:\Backup\我的文档\WindowsPowerShell\profile.ps1）；
   3) 可选终极方案：设置 → 时间和语言 → 语言和区域 → 管理语言设置 → 更改系统区域设置 → 勾选「Beta: 使用 Unicode UTF-8 提供全球语言支持」→ 重启。
      注意：会把系统 ACP 从 GBK 改为 65001，极少数老 GBK 软件（记事本旧版/某些国产工具）可能乱码；出问题取消勾选即可还原。
@@ -469,3 +469,5 @@ pm + 重装 + claude --version 验证，AutoCode 侧 v4.0.313+ 探测链兼容�
 [2026-10-17] [v4.4.388] 修复关于窗口作者/开发时间元信息行显示 &nbsp; 字样：QLabel 纯文本不解析 HTML 实体（字符串无标签时 mightBeRichText 判纯文本），改用普通空格分隔；顺带修复 CDeepSeekRunner.cpp 沙箱低完整性标签AddMandatoryAce 首参误传 &pNew（PACL* → PACL）导致的编译阻塞 - ui/CAboutDialog.cpp agent/CDeepSeekRunner.cpp
 
 [2026-10-17] [v4.4.389] 修 DSH 额外可写目录放行不完整（TukanPrint 沙箱内链接落宿主 PlugIns 报 LNK1104/Access denied 实害）：harness 受限令牌被 restrictTokenIntegrity 降到 Low IL（S-1-16-4096），只授 workspace SID 的 DACL ACE 不够——Low 令牌写 Medium 目录被 No-Write-Up 完整性检查拒，必须同 SACL 补 Low 标签（harness grantWrite 对每个放行根双写，acl.js 原文实证）；修 DshApplyDirAce 授权路径增 DshEnsureLowLabel（幂等 AddMandatoryAce，NO_WRITE_UP+OI|CI，revoke 不回摘 standing 同 harness）+ 幂等命中路径同口径；现场已直接处置（宿主 PlugIns 手授 S-1-4-304827438-534387053 ACE + Low (OI)(CI)(NW) 标签，三处 config [Agent] ExtraWriteDirs 已写 E:/wosens/Programs/VisualC++/MyProgram/TuKan/Execute/PlugIns）；回归 test_verify_flow testDshExtraWriteDirsAclAndLabel（DACL ACE mask/SID + SACL Low 标签双断言）——agent/CDeepSeekRunner.cpp、agent/CDeepSeekRunner.h、tests/test_verify_flow.cpp
+
+[2026-10-17] [v4.4.389] 新增根目录图文介绍文档 readme.md（用户需求：图文并茂+高级审美）：手绘 SVG 矢量横幅×2（images/hero-banner.svg 深蓝科技风主横幅、backends-ring.svg 五后端汇聚编排中枢环图）+ 实机 UI 截图×4（引用 Execute/help/images 既有素材）+ Mermaid×3（分层架构/任务流水线/备份回退）+ 特性矩阵/五后端对比表/目录树/构建指南/shields 徽章；rich-doc 技能编排，pwsh 沙箱故障（SetNamedSecurityInfoW Win32 5）flux-gen 文生图不可用，降级手绘 SVG（矢量任意 DPI 清晰、纯文件工具落盘零 shell 依赖）；纯文档改动无构建，版本沿用当前 v4.4.389 - readme.md、images/hero-banner.svg、images/backends-ring.svg
