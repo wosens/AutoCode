@@ -1,4 +1,4 @@
-// CVersionDialog.cpp —— 后端版本管理对话框（任务 23183ccb）。
+﻿// CVersionDialog.cpp —— 后端版本管理对话框（任务 23183ccb）。
 // T3：骨架 + 本地版本加载（DSH/Pi/Codex 同步直读，Claude 异步探测 + npm 回退）
 //     + 纯函数（PickLatestTag/TagToVersion/Verdict，T6 单测靶点）。
 // T4：QueryLatestAll 联网查询与 OnUpdateBackend 更新分派（占位实装见各 TODO）。
@@ -442,8 +442,18 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
     switch (a_iBackend) {
     case 1:
         // npm 全局装/更一体：未安装也可直接装（无未装禁用概念）。
+        // 2026.10.10 Node 预检闸：claude-code@2.x 引擎要求 Node>=22——旧 Node
+        //   （如 32 位 0.x 残装）npm 装最新版后 postinstall 新语法必 SyntaxError，
+        //   提前拦截并给一键升级入口（install_env.bat /node）。
+        if (!EnsureNodeOk(22, QStringLiteral("更新 Claude Code"))) {
+            return;
+        }
         if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 Claude Code"),
-                QStringLiteral("npm install -g @anthropic-ai/claude-code@latest"))) {
+                // 2026.10.10 验收包装：直发命令无 bat 段的 [OK]/[错误] echo，
+                //   下方的完成提示无从判据——按 npm 退出码现场生成。
+                QStringLiteral("npm install -g @anthropic-ai/claude-code@latest"
+                               " && echo [OK] Claude Code 更新完成"
+                               " || echo [错误] npm 安装失败，见上方报错"))) {
             QMessageBox::warning(this, QStringLiteral("更新 Claude Code"),
                 QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
         } else {
@@ -469,8 +479,32 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
         if (eForm == CPiAgentRunner::EPiFormNpm) {
             // npm 全局形态：更新 npm 全局包（不走 bat /pi——会把形态静默换成
             //   源码布局且可能降级，评审 M2/M3 根因）。
+            // 2026.10.10 优先走 bat /pi-npm：直连 `cmd /k npm install -g` 继承
+            //   主程序启动时的旧环境（本机刚装完 Node 未重启时 PATH 无 nodejs/
+            //   npm）必报「找不到 npm」；bat 模式窗口内 :RefreshPath 读注册表
+            //   PATH + 缺 Node 自动补装（同设置页「联网安装（npm）」口径）。
+            //   npm 全局重装幂等即更新，形态不变。脚本缺失时退回旧直连。
+            if (QFile::exists(sBat)) {
+                if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 PIAgent"),
+                        QStringLiteral("\"%1\" /pi-npm").arg(sBatNative))) {
+                    QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
+                        QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
+                    return;
+                }
+                QMessageBox::information(this, QStringLiteral("更新 PIAgent"),
+                    QStringLiteral("已在管理员窗口中启动 npm 全局更新。\n\n"
+                                   "窗口出现「[OK]」才算完成（出现 [错误] 按提示"
+                                   "处理后重跑）；完成后回到本窗点「刷新版本」。"));
+                return;
+            }
+            // 2026.10.10 Node 预检闸（pi-coding-agent 需现代 Node，同 Codex 口径 20）。
+            if (!EnsureNodeOk(20, QStringLiteral("更新 PIAgent"))) {
+                return;
+            }
             if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 PIAgent"),
-                    QStringLiteral("npm install -g @earendil-works/pi-coding-agent"))) {
+                    QStringLiteral("npm install -g @earendil-works/pi-coding-agent"
+                                   " && echo [OK] PIAgent 更新完成"
+                                   " || echo [错误] npm 安装失败，见上方报错"))) {
                 QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
                     QStringLiteral("未能以管理员权限启动更新（UAC 被取消或被拒）。"));
                 return;
@@ -527,8 +561,15 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
         if (sRoot.isEmpty() || !CCodexRunner::LooksLikeCodexRoot(sRoot)) {
             return;
         }
+        // 2026.10.10 Node 预检闸（Codex CLI 要求 Node>=20，与
+        //   install_env.bat /codex 段的版本检查同口径）。
+        if (!EnsureNodeOk(20, QStringLiteral("更新 CodexHarness"))) {
+            return;
+        }
         if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 更新 CodexHarness"),
-                QStringLiteral("npm install @openai/codex@%1 --save-exact")
+                QStringLiteral("npm install @openai/codex@%1 --save-exact"
+                               " && echo [OK] CodexHarness 更新完成"
+                               " || echo [错误] npm 安装失败，见上方报错")
                     .arg(CCodexRunner::ExpectedCodexVersion()),
                 sRoot)) {
             QMessageBox::warning(this, QStringLiteral("更新 CodexHarness"),
@@ -785,6 +826,82 @@ bool CVersionDialog::ConfirmIfBusy(int a_iBackend, const QString& a_sWhat) {
             .arg(a_sWhat),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     return iRet == QMessageBox::Yes;
+}
+
+int CVersionDialog::ProbeNodeMajor(QString* a_psVerOut) {
+    // 同步短探测 PATH 上的 node -v（≤3s 硬超时，RunGitSync 同款口径；npm.cmd
+    //   解析的 node 同样来自 PATH，探测口径与 npm 实际执行一致）。
+    QProcess stProc;
+    stProc.start(QStringLiteral("node.exe"), QStringList() << QStringLiteral("-v"));
+    if (!stProc.waitForStarted(2000) || !stProc.waitForFinished(3000)
+        || stProc.exitCode() != 0) {
+        return -1;   // 无 node / 超时 / 异常退出
+    }
+    const QString sOut = QString::fromUtf8(stProc.readAllStandardOutput()).trimmed();
+    if (a_psVerOut != nullptr) {
+        *a_psVerOut = sOut.isEmpty() ? QStringLiteral("未知") : sOut;
+    }
+    static const QRegularExpression reNodeVer(QStringLiteral("^v?(\\d+)"));
+    const QRegularExpressionMatch mVer = reNodeVer.match(sOut);
+    return mVer.hasMatch() ? mVer.captured(1).toInt() : -1;
+}
+
+bool CVersionDialog::EnsureNodeOk(int a_iMinMajor, const QString& a_sTitle) {
+    // 2026.10.10 npm 类更新前置闸：目标机器常见「残装古董 Node」（如 32 位
+    //   v0.12 + npm 2.7），npm 装最新包后 postinstall 新语法（const { spawnSync }
+    //   = require('child_process')）旧 Node 解析不了必 SyntaxError（ELIFECYCLE
+    //   中止）。此闸把失败提前到点更新之前，并给一键「安装/升级 Node.js LTS」
+    //   （install_env.bat /node）+「仍然继续更新」出口（保留旧行为）。
+    QString sVerRaw;
+    const int iMajor = ProbeNodeMajor(&sVerRaw);
+    if (iMajor >= a_iMinMajor) {
+        return true;   // 版本达标：直接放行原更新
+    }
+    const QString sBat = QCoreApplication::applicationDirPath()
+                       + QStringLiteral("/install_env.bat");
+    const QString sBatNative = QDir::toNativeSeparators(sBat);
+
+    QMessageBox stBox(this);
+    stBox.setWindowTitle(a_sTitle);
+    stBox.setIcon(QMessageBox::Warning);
+    stBox.setText(iMajor < 0
+        ? QStringLiteral("未检测到 Node.js（PATH 中无 node）。\n\n"
+                         "本更新走 npm 执行，需要 Node.js（%1 要求主版本 %2 以上）。")
+              .arg(a_sTitle).arg(a_iMinMajor)
+        : QStringLiteral("本机 Node.js 版本过低（%1），不满足 %2 的最低要求"
+                         "（主版本 %3 以上）。\n\n"
+                         "npm 会安装最新版并触发 postinstall 脚本，旧 Node 解析"
+                         "不了新语法（SyntaxError），直接更新必然失败。")
+              .arg(sVerRaw, a_sTitle).arg(a_iMinMajor));
+    QPushButton* pBtnFix = stBox.addButton(QStringLiteral("安装/升级 Node.js LTS"),
+                                           QMessageBox::AcceptRole);
+    QPushButton* pBtnGo  = stBox.addButton(QStringLiteral("仍然继续更新"),
+                                           QMessageBox::DestructiveRole);
+    stBox.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    stBox.exec();
+    if (stBox.clickedButton() == pBtnGo) {
+        return true;   // 用户明确选择继续：保留旧直更新行为（自行承担失败）
+    }
+    if (stBox.clickedButton() != pBtnFix) {
+        return false;   // 取消/关窗：不做任何事
+    }
+    if (!QFile::exists(sBat)) {
+        QMessageBox::warning(this, a_sTitle,
+            QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。").arg(sBatNative));
+        return false;
+    }
+    if (!LaunchCmdWindow(true, QStringLiteral("AutoCode - 安装/升级 Node.js LTS"),
+            QStringLiteral("\"%1\" /node").arg(sBatNative))) {
+        QMessageBox::warning(this, a_sTitle,
+            QStringLiteral("未能以管理员权限启动安装（UAC 被取消或被拒）。"));
+        return false;
+    }
+    QMessageBox::information(this, a_sTitle,
+        QStringLiteral("已在管理员窗口中安装/升级 Node.js LTS。\n\n"
+                       "窗口出现「[OK] Node.js 已就绪」才算完成（若提示旧版遮蔽，"
+                       "按指引卸载旧版 Node.js 后重跑）；完成后关闭并重开 AutoCode"
+                       "（让新 PATH 生效），再回本窗点更新。"));
+    return false;
 }
 
 void CVersionDialog::StartPooledProcess(int a_iKey, const QString& a_sProgram,

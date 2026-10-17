@@ -6,12 +6,15 @@
 #include <cstring>
 
 #include "ui/CMainWindow.h"
+#include "ui/CAppStyle.h"   // 2026.10.16 菜单图标列 20px 代理样式
 #include "agent/CMcpAskServer.h"
 #include "core/CCrashDump.h"
 #include "sandbox/CSandboxCore.h"   // 2026-09-26 --sandbox 命令解析（sbx::ParseCli）
 #include <windows.h>   // v2.2.146 诊断模式 ExitProcess 直退（析构拆序段错误兑底）
 #include "ui/CSettingsDialog.h"
+#include "ui/CRecentProjectsDialog.h"   // 2026.10.09 启动界面（launcher 模式）
 #include "project/CProjectManager.h"
+#include "core/COrchConfig.h"   // 2026-10-14 任务编排配置（启动加载+动态阶段注册）
 #include <QTabWidget>
 #include <QTreeWidget>
 #include <QLabel>
@@ -228,7 +231,7 @@ static int RunSandboxMode(int argc, char* argv[]) {
     QJsonObject oArgs;
     if (!sbx::ParseCli(aArgs, &sCmd, &oArgs)) {
         std::cout << "[沙箱不可用：用法 AutoCode.exe --sandbox <命令> [参数]，命令集 "
-                     "windows/status/capture/click/drag/type/keys/command/button/tree/"
+                     "launch/windows/status/capture/click/drag/type/keys/command/button/tree/"
                      "add/restore/restore-all/close/record_on/record_off]\n";
         return 4;
     }
@@ -292,6 +295,12 @@ static int RunSandboxMode(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+    // 2026.10.11 进程外 dump 助手模式：最先分流（早于 QApplication/过滤器安装——
+    //   助手自身不装崩溃过滤器，意外崩溃直接系统默认处理，防助手拉助手递归）。
+    //   由 UnhandledExFilter 在崩溃时拉起，为指定 pid 写可用 dump（见 CCrashDump.cpp）。
+    if (argc >= 6 && std::strcmp(argv[1], "--crash-dump-helper") == 0) {
+        return CCrashDump::RunDumpHelper(argc, argv);
+    }
     // 2026.08.22 崩溃转储：崩溃/abort/purecall/std::terminate 等异常退出时
     //   在 <exe 目录>\dump\ 落 MiniDump（最先装，覆盖后续所有路径，含 --mcp-ask-server 模式）。
     CCrashDump::Install();
@@ -332,6 +341,10 @@ int main(int argc, char* argv[]) {
     app.setApplicationName(QStringLiteral("AutoCode"));
     app.setOrganizationName(QStringLiteral("AutoCode"));
 
+    // 2026.10.16 菜单图标尺寸升级：QMenu 图标列 16→20px（与 11pt 菜单字体行高匹配，
+    //   代理样式只覆盖「菜单上下文」的 PM_SmallIconSize，其余 metric 全透传基础样式）。
+    app.setStyle(new CAppStyle(QStringLiteral("windowsvista")));
+
     // FR-10：应用图标（任务栏 / 标题栏 / 自绘标题栏 / exe 资源 四入口）。
     app.setWindowIcon(QIcon(QStringLiteral(":/icons/app.ico")));
 
@@ -359,7 +372,60 @@ int main(int argc, char* argv[]) {
         "QMenuBar::item { background-color: transparent; padding: 5px 10px; border-radius: 3px; }"
         "QMenuBar::item:selected { background-color: #dbeafe; color: #1e40af; }"));
 
+    // 2026.10.09 启动界面：主窗口构造/显示前先弹「最近打开」启动页（launcher 模式）——
+    //   双击/「打开」= 启动后直接进入选中工程；「跳过」= 改开 exe 同级 AutoCode 工作
+    //   目录（2026.10.14 起不再进空主界面：免选工程即可建任务/对话助手，不算工程、
+    //   不进最近列表）；「退出」= 直接结束进程（不构造主窗口、不进主循环）。右键删除
+    //   的条目经临时 CProjectManager 落 MRU，主窗口构造时 LoadRecent 读到的即删除后
+    //   的表。
+    //   --no-launcher：跳过启动页（自动化/沙箱脚本直达主界面用）。
+    bool bNoLauncher = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--no-launcher") == 0) {
+            bNoLauncher = true;
+            break;
+        }
+    }
+    QString sStartupProject;
+    // 2026.10.14 启动页「跳过」→ 打开 exe 同级 AutoCode 工作目录（不存在则创建）：
+    //   免选工程即可建任务/对话助手；不算工程，主窗口侧旁路最近列表记录。
+    bool bStartupWorkspace = false;
+    if (!bNoLauncher) {
+        CProjectManager stPmLaunch;          // 轻量实例（构造为空，仅 LoadRecent 读 MRU）
+        stPmLaunch.LoadRecent();
+        CRecentProjectsDialog stLaunch(stPmLaunch.RecentProjects(),
+                                       stPmLaunch.RecentOpenCounts(),
+                                       stPmLaunch.ConfigFilePath(),
+                                       CRecentProjectsDialog::EMode::kLauncher);
+        const int iRc = stLaunch.exec();
+        for (const QString& sPath : stLaunch.RemovedPaths()) {
+            stPmLaunch.RemoveRecent(sPath);
+        }
+        if (stLaunch.ExitRequested()) {
+            return 0;
+        }
+        if (stLaunch.SkipRequested()) {
+            const QString sWs = QCoreApplication::applicationDirPath()
+                                + QStringLiteral("/AutoCode");
+            if (QDir().mkpath(sWs)) {   // 已存在时幂等成功；失败则退回空主界面
+                sStartupProject = sWs;
+                bStartupWorkspace = true;
+            }
+        } else if (iRc == QDialog::Accepted) {
+            sStartupProject = stLaunch.SelectedPath();
+        }
+    }
+
+    // 2026-10-14 任务编排设计：加载 <exe>/prompts/orchestration.json（缺文件自动种子
+    //   默认编排）并注册自定义阶段（EStage≥100）进运行期定义表——后续任何
+    //   FindStage/新建任务对话框/执行引擎均即刻可见；设计窗口保存后再增量重注册。
+    COrchConfig::Instance()->ApplyToRuntime();
+
     CMainWindow window;
     window.show();
+    // 启动页选定的工程在主窗口 show 后打开（多实例锁确认框等弹窗需要主窗口作宿主）。
+    if (!sStartupProject.isEmpty()) {
+        window.OpenStartupProject(sStartupProject, bStartupWorkspace);
+    }
     return app.exec();
 }

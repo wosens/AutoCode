@@ -1,5 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M8 8 H24 M13 8 V5.5 H19 V8" stroke="#e74c3c" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M10 8 L11.2 27.5 H20.8 L22 8" stroke="#e74c3c" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M14 13.5 V22 M18 13.5 V22" stroke="#e74c3c" stroke-width="2.2" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 删除：垃圾桶 -->
+  <path d="M6.4 7 H17.6 M10 7 V5 Q10 4 11 4 H13 Q14 4 14 5 V7" stroke="#E5484D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M8 7 L8.85 18.8 Q8.9 20 10.05 20 H13.95 Q15.1 20 15.15 18.8 L16 7" stroke="#E5484D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M11 10.5 V16.5 M13 10.5 V16.5" stroke="#E5484D" stroke-width="1.8" stroke-linecap="round"/>
 </svg>

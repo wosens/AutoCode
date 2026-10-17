@@ -16,11 +16,13 @@
 
 #include "core/CTaskInfo.h"
 #include "core/CStageMachine.h"
+#include "core/COrchConfig.h"
 #include "core/StageDef.h"
 #include "core/TaskTypes.h"
 
 CNewTaskDialog::CNewTaskDialog(EMode a_eMode, QWidget* a_pParent)
-    : QDialog(a_pParent), m_eMode(a_eMode) {
+    : QDialog(a_pParent), m_eMode(a_eMode),
+      m_pOrch(COrchConfig::Instance()) {   // 单例加载编排配置+注册自定义阶段
     SetupUi();
     ApplyMode();
 }
@@ -35,21 +37,49 @@ void CNewTaskDialog::SetupUi() {
     m_pName->setPlaceholderText(QStringLiteral("如：为 X 模块增加导出 CSV 功能（可以为空）"));
 
     m_pType = new QComboBox(this);
-    m_pType->addItem(QStringLiteral("feature（新功能）"),
-                     static_cast<int>(ETaskType::Feature));
-    m_pType->addItem(QStringLiteral("bugfix（修缺陷）"),
-                     static_cast<int>(ETaskType::Bugfix));
+    // 2026-10-14 任务编排设计：类型/档位清单改由编排配置驱动（功能菜单
+    //   「任务编排设计」可增删改；每次打开对话框读同进程单例 = 最新版本）。
+    if (m_pOrch->aTypes.isEmpty()) {
+        m_pType->addItem(QStringLiteral("feature（新功能）"),
+                         static_cast<int>(ETaskType::Feature));
+        m_pType->addItem(QStringLiteral("bugfix（修缺陷）"),
+                         static_cast<int>(ETaskType::Bugfix));
+    } else {
+        for (int i = 0; i < m_pOrch->aTypes.size(); ++i) {
+            const SOrchType& t = m_pOrch->aTypes.at(i);
+            m_pType->addItem(t.sName, i);   // UserData = 配置下标（Type() 取 base 映射）
+        }
+    }
 
     // 2026.08.15 (流程档位) 档位下拉：只决定阶段清单默认勾选 + 评审聚合方式/轮次/视角数；
     // 阶段清单才是权威，用户可在下方清单自由增删勾选。
     m_pTier = new QComboBox(this);
-    m_pTier->addItem(QStringLiteral("简单（精简阶段，代码审查单视角，评审多数决）"),
-                     static_cast<int>(ETier::Simple));
-    m_pTier->addItem(QStringLiteral("标准（完整阶段，评审多数决）"),
-                     static_cast<int>(ETier::Standard));
-    m_pTier->addItem(QStringLiteral("严格（完整阶段，评审一票否决）"),
-                     static_cast<int>(ETier::Strict));
-    m_pTier->setCurrentIndex(static_cast<int>(ETier::Standard));   // 默认标准（向后兼容）
+    if (m_pOrch->aTiers.isEmpty()) {
+        m_pTier->addItem(QStringLiteral("简单（精简阶段，代码审查单视角，评审多数决）"),
+                         static_cast<int>(ETier::Simple));
+        m_pTier->addItem(QStringLiteral("标准（完整阶段，评审多数决）"),
+                         static_cast<int>(ETier::Standard));
+        m_pTier->addItem(QStringLiteral("严格（完整阶段，评审一票否决）"),
+                         static_cast<int>(ETier::Strict));
+    } else {
+        for (int i = 0; i < m_pOrch->aTiers.size(); ++i) {
+            const SOrchTier& t = m_pOrch->aTiers.at(i);
+            m_pTier->addItem(t.sName, i);
+        }
+    }
+    // 默认选中标准档（base=standard 的首个配置项；无则第 0 项）
+    for (int i = 0; i < m_pTier->count(); ++i) {
+        const QString sBase = (m_pOrch->aTiers.isEmpty()
+                        || m_pTier->itemData(i).toInt() >= m_pOrch->aTiers.size())
+                ? QString() : m_pOrch->aTiers.at(m_pTier->itemData(i).toInt()).sBase;
+        if (m_pOrch->aTiers.isEmpty()) {
+            if (m_pTier->itemData(i).toInt() == static_cast<int>(ETier::Standard)) {
+                m_pTier->setCurrentIndex(i);
+            }
+        } else if (sBase == QLatin1String("standard")) {
+            m_pTier->setCurrentIndex(i);
+        }
+    }
     m_pTier->setToolTip(QStringLiteral(
         "简单：需求收集→确认需求→开发→代码审查(单视角)→验证→测试（bugfix 同理精简），轻评审轮次 12；\n"
         "标准：完整阶段清单，评审多数决（2/3 驳回才驳回，少数意见随流程携带），轻评审轮次 18；\n"
@@ -169,11 +199,26 @@ bool CNewTaskDialog::Validate() {
 }
 
 ETaskType CNewTaskDialog::Type() const {
-    return static_cast<ETaskType>(m_pType->currentData().toInt());
+    // 配置驱动：当前选中配置类型的 base 映射为引擎枚举（决定驳回路由等引擎行为）
+    const int iIdx = m_pType->currentData().toInt();
+    if (!m_pOrch->aTypes.isEmpty() && iIdx >= 0 && iIdx < m_pOrch->aTypes.size()) {
+        return COrchConfig::BaseToType(m_pOrch->aTypes.at(iIdx).sBase);
+    }
+    return static_cast<ETaskType>(iIdx);
 }
 
 ETier CNewTaskDialog::Tier() const {
-    return static_cast<ETier>(m_pTier->currentData().toInt());
+    const int iIdx = m_pTier->currentData().toInt();
+    if (!m_pOrch->aTiers.isEmpty() && iIdx >= 0 && iIdx < m_pOrch->aTiers.size()) {
+        return COrchConfig::BaseToTier(m_pOrch->aTiers.at(iIdx).sBase);
+    }
+    return static_cast<ETier>(iIdx);
+}
+
+// 2026-10-14 勾选流与该基础类型的内置规范流完全一致 → true（主窗口据此存空表，
+//   语义同旧任务；否则（自定义阶段/重排序）必须显式存清单，执行才按编排序走）。
+bool CNewTaskDialog::IsCanonicalFlow() const {
+    return CheckedStages() == CStageMachine::GetFlowStages(Type());
 }
 
 QList<EStage> CNewTaskDialog::CheckedStages() const {
@@ -197,8 +242,8 @@ bool CNewTaskDialog::StartImmediately() const {
 }
 
 QList<EStage> CNewTaskDialog::TierPresetStages(ETaskType a_eType, ETier a_eTier) {
-    // 档位默认勾选集：标准/严格 = 完整规范流；简单 = 精简流
-    //   （Feature 跳 需求评审/设计/设计评审/计划/计划评审；Bugfix 跳 根因核实）。
+    // 【已由编排配置取代——保留兼容旧路径】档位默认勾选集：标准/严格 = 完整规范流；
+    //   简单 = 精简流（Feature 跳 需求评审/设计/设计评审/计划/计划评审；Bugfix 跳 根因核实）。
     const QList<EStage> aFull = CStageMachine::GetFlowStages(a_eType);
     if (a_eTier != ETier::Simple) {
         return aFull;
@@ -232,7 +277,21 @@ void CNewTaskDialog::RebuildStageList(bool a_bKeepChecked) {
         }
     }
     m_pStages->clear();
-    const QList<EStage> aFlow = CStageMachine::GetFlowStages(Type());
+    // 2026-10-14 编排配置驱动：当前配置类型的阶段流（配置序即执行序，含自定义阶段）；
+    //   配置缺失（空类型表）回退内置规范流。
+    QList<EStage> aFlow;
+    const int iTypeIdx = m_pType->currentData().toInt();
+    if (!m_pOrch->aTypes.isEmpty() && iTypeIdx >= 0 && iTypeIdx < m_pOrch->aTypes.size()) {
+        for (const QString& sId : m_pOrch->aTypes.at(iTypeIdx).aStages) {
+            const int iEv = m_pOrch->EnumForStageId(sId);
+            if (iEv > 0) {
+                aFlow.append(static_cast<EStage>(iEv));
+            }
+        }
+    }
+    if (aFlow.isEmpty()) {
+        aFlow = CStageMachine::GetFlowStages(Type());
+    }
     for (EStage e : aFlow) {
         const SStageDef* pDef = FindStage(e);
         auto* pItem = new QListWidgetItem(pDef ? pDef->sNameZh : QString::number(int(e)), m_pStages);
@@ -253,14 +312,61 @@ void CNewTaskDialog::RebuildStageList(bool a_bKeepChecked) {
 }
 
 void CNewTaskDialog::ApplyTierPreset() {
-    const QList<EStage> aPreset = TierPresetStages(Type(), Tier());
+    // 2026-10-14 编排配置驱动：档位预设 = 配置档位的阶段 id 集（与当前类型流取交集）；
+    //   预设为空 → 回退各阶段「缺省选择」标志；配置缺失回退旧内置预设。
+    QSet<int> aPreset;
+    const int iTierIdx = m_pTier->currentData().toInt();
+    if (!m_pOrch->aTiers.isEmpty() && iTierIdx >= 0 && iTierIdx < m_pOrch->aTiers.size()) {
+        for (const QString& sId : m_pOrch->aTiers.at(iTierIdx).aStages) {
+            const int iEv = m_pOrch->EnumForStageId(sId);
+            if (iEv > 0) {
+                aPreset.insert(iEv);
+            }
+        }
+        if (aPreset.isEmpty()) {
+            // 档位未配预设 → 按阶段缺省选择标志
+            for (const SOrchStage& s : m_pOrch->aStages) {
+                if (s.bDefault) {
+                    const int iEv = m_pOrch->EnumForStageId(s.sId);
+                    if (iEv > 0) {
+                        aPreset.insert(iEv);
+                    }
+                }
+            }
+        }
+    } else {
+        const QList<EStage> aOld = TierPresetStages(Type(), Tier());
+        for (EStage e : aOld) {
+            aPreset.insert(static_cast<int>(e));
+        }
+    }
+    // 2026-10-14 新增自定义阶段的兑底：未出现在任何档位预设里的阶段（新编排项天然
+    //   不在旧预设内），只要「缺省选择」勾着就默认勾选——否则新阶段永远默认不勾；
+    //   而被某档位显式排除的阶段（如简单档排除 design，design 在标准/严格预设里出现）
+    //   不受此影响，仍按预设交集。
+    QSet<QString> aInAnyTier;
+    for (const SOrchTier& t : m_pOrch->aTiers) {
+        for (const QString& sId : t.aStages) {
+            aInAnyTier.insert(sId);
+        }
+    }
     for (int i = 0; i < m_pStages->count(); ++i) {
         QListWidgetItem* pItem = m_pStages->item(i);
         if (pItem == nullptr) {
             continue;
         }
         const EStage e = static_cast<EStage>(pItem->data(Qt::UserRole).toInt());
-        pItem->setCheckState(aPreset.contains(e) ? Qt::Checked : Qt::Unchecked);
+        if (e == EStage::Intake) {
+            continue;   // 入口恒勾
+        }
+        bool bCheck = aPreset.contains(static_cast<int>(e));
+        if (!bCheck) {
+            const SOrchStage* pS = m_pOrch->FindStageCfg(m_pOrch->StageIdForEnum(int(e)));
+            if (pS != nullptr && pS->bDefault && !aInAnyTier.contains(pS->sId)) {
+                bCheck = true;
+            }
+        }
+        pItem->setCheckState(bCheck ? Qt::Checked : Qt::Unchecked);
     }
 }
 
@@ -268,24 +374,48 @@ void CNewTaskDialog::SetTask(const CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
     }
-    // 名称/类型/需求描述
+    // 名称/需求描述
     m_pName->setText(a_pTask->Name());
-    const int iType = static_cast<int>(a_pTask->Type());
-    for (int i = 0; i < m_pType->count(); ++i) {
-        if (m_pType->itemData(i).toInt() == iType) {
-            m_pType->setCurrentIndex(i);
-            break;
+    m_pReq->setPlainText(a_pTask->UserRequest());
+
+    // 2026-10-14 类型回显：配置驱动时按 base 匹配首个同基础类型的配置项
+    //  （任务仅持久化 base 枚举；具体配置类型名属创建时编排，查看回退 base 对应项）
+    {
+        int iPick = -1;
+        for (int i = 0; i < m_pType->count(); ++i) {
+            const int iIdx = m_pType->itemData(i).toInt();
+            const ETaskType eItem = (!m_pOrch->aTypes.isEmpty()
+                                     && iIdx >= 0 && iIdx < m_pOrch->aTypes.size())
+                ? COrchConfig::BaseToType(m_pOrch->aTypes.at(iIdx).sBase)
+                : static_cast<ETaskType>(iIdx);
+            if (eItem == a_pTask->Type()) {
+                iPick = i;
+                break;
+            }
+        }
+        if (iPick >= 0) {
+            m_pType->setCurrentIndex(iPick);
         }
     }
-    m_pReq->setPlainText(a_pTask->UserRequest());
 
     // 2026.08.15 (流程档位) 档位 + 阶段清单回显：档位切换会触发 ApplyTierPreset，
     //   随后按任务持久化的 flowStages（空=完整流）重设勾选，覆盖预设。
-    const int iTier = static_cast<int>(a_pTask->Tier());
-    for (int i = 0; i < m_pTier->count(); ++i) {
-        if (m_pTier->itemData(i).toInt() == iTier) {
-            m_pTier->setCurrentIndex(i);
-            break;
+    //   2026-10-14 同样按 base 匹配回显配置档位项。
+    {
+        int iPick = -1;
+        for (int i = 0; i < m_pTier->count(); ++i) {
+            const int iIdx = m_pTier->itemData(i).toInt();
+            const ETier eItem = (!m_pOrch->aTiers.isEmpty()
+                                 && iIdx >= 0 && iIdx < m_pOrch->aTiers.size())
+                ? COrchConfig::BaseToTier(m_pOrch->aTiers.at(iIdx).sBase)
+                : static_cast<ETier>(iIdx);
+            if (eItem == a_pTask->Tier()) {
+                iPick = i;
+                break;
+            }
+        }
+        if (iPick >= 0) {
+            m_pTier->setCurrentIndex(iPick);
         }
     }
     const QList<EStage> aFlow = a_pTask->FlowStages().isEmpty()

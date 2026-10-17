@@ -1,4 +1,4 @@
-﻿#include "CMessageBlock.h"
+#include "CMessageBlock.h"
 
 #include <QLabel>
 #include <QFrame>
@@ -19,6 +19,8 @@
 #include <QColor>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QFontMetrics>
+#include <QScrollBar>
 
 namespace {
 
@@ -55,16 +57,18 @@ QString ToolIcon(const QString& a_sTool) {
     return QStringLiteral("🔧");
 }
 
+const char* k_szMonoFont = "Consolas, 'Courier New', monospace";
+
+} // namespace
+
 // 判断工具结果是否为错误（Claude tool_result 的 is_error 未单独透传，按文本启发式）
-bool IsErrorResult(const QString& a_sResult) {
+//（2026-10-17 自绘三期上移为类公开静态：CChatModel/CChatDelegate 与 Legacy 卡片同源共用；
+//   定义须在全局作用域——匿名命名空间内定义成员属非良构）
+bool CMessageBlock::IsErrorResult(const QString& a_sResult) {
     return a_sResult.contains(QStringLiteral("<error>")) ||
            a_sResult.startsWith(QStringLiteral("Error:")) ||
            a_sResult.startsWith(QStringLiteral("[错误]"));
 }
-
-const char* k_szMonoFont = "Consolas, 'Courier New', monospace";
-
-} // namespace
 
 CMessageBlock::CMessageBlock(EKind a_eKind, QWidget* a_pParent)
     : QWidget(a_pParent), m_eKind(a_eKind) {
@@ -102,6 +106,7 @@ void CMessageBlock::BuildAssistant() {
 
     m_pBrowser = new QTextBrowser(this);
     m_pBrowser->setReadOnly(true);
+    m_pBrowser->setUndoRedoEnabled(false);   // 2026.10.16 只读浏览器禁撤销栈：省内存，弃正文重挂 doc 无历史包衢
     m_pBrowser->setFrameShape(QFrame::NoFrame);
     m_pBrowser->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_pBrowser->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -128,12 +133,27 @@ void CMessageBlock::BuildAssistant() {
     pV->addWidget(m_pBrowser);
 }
 
+void CMessageBlock::ConnectDocSignals() {
+    // 当前 document 的 layout ↔ 自适应高度 接线：换 doc（预排版落地/弃正文重挂）后旧连接
+    //   随旧 doc 销毁失效，必须对新 doc 重连（原逻辑内联两处，2026.10.16 抽出复用）。
+    if (m_pBrowser == nullptr) {
+        return;
+    }
+    disconnect(m_pBrowser->document()->documentLayout(), nullptr, this, nullptr);
+    connect(m_pBrowser->document()->documentLayout(),
+            &QAbstractTextDocumentLayout::documentSizeChanged,
+            this, &CMessageBlock::slotAdjustBrowserHeight);
+}
+
 void CMessageBlock::slotAdjustBrowserHeight() {
     // #2 助手 Markdown 块自适应高度 + 换行：按浏览器视口宽度 setTextWidth 重排，
     //   使长行按视口宽度折行（setMarkdown 早于布局就绪时 WidgetWidth 不一定生效，
     //   显式 setTextWidth 兜底）；防重入避免 setFixedHeight→resizeEvent 回环。
     if (m_pBrowser == nullptr || m_bAdjusting) {
         return;
+    }
+    if (m_bLazy && !m_bMaterialized) {
+        return;   // 2026.10.16 惰性未排版/已弃正文：高度由估高锁定，不吃空文档尺寸
     }
     m_bAdjusting = true;
     QTextDocument* pDoc = m_pBrowser->document();
@@ -155,7 +175,17 @@ void CMessageBlock::resizeEvent(QResizeEvent* a_pEvent) {
     //   注意布局滞后一拍：块 resize 时子 m_pBrowser 尚未布局到新宽度（viewport 仍旧值），
     //   立即调整会读到过期宽度——延迟到事件循环下一拍，待子控件布局稳定后再重排。
     if (m_eKind == Assistant && m_pBrowser != nullptr) {
-        QTimer::singleShot(0, this, &CMessageBlock::slotAdjustBrowserHeight);
+        if (m_bLazy && !m_bMaterialized) {
+            // 2026.10.16 惰性未排版：按新宽重估高度（slotAdjust 对惰性块自守卫不适用）
+            QTimer::singleShot(0, this, [this]() {
+                if (m_bLazy && !m_bMaterialized) {
+                    m_dLazyWidth = qMax<qreal>(80.0, width() - 13);   // 减 border-left 3 + padding-left 10
+                    setFixedHeight(EstimateAssistantHeight(m_sLazyMarkdown, m_dLazyWidth));
+                }
+            });
+        } else {
+            QTimer::singleShot(0, this, &CMessageBlock::slotAdjustBrowserHeight);
+        }
     }
     // 2026.09.22 工具卡标题单行截断：块宽变化（首次布局就绪/视口缩放）→ 按新宽
     //   重新省略号截断（同上滞后一拍，待子控件布局稳定后再取真实宽度）。
@@ -214,6 +244,10 @@ void CMessageBlock::ApplyPreloadedDoc(QTextDocument* a_pDoc, bool a_bFallbackSyn
         delete a_pDoc;
         return;
     }
+    if (m_bLazy && !m_bMaterialized) {
+        delete a_pDoc;   // 2026.10.16 弃正文竞态：在途预排版落地时块已 Dematerialize——丢弃，待再材化重提
+        return;
+    }
     if (a_pDoc == nullptr) {
         if (a_bFallbackSync && m_sPendingMarkdown.isEmpty() == false) {
             SetAssistantText(m_sPendingMarkdown);
@@ -221,15 +255,99 @@ void CMessageBlock::ApplyPreloadedDoc(QTextDocument* a_pDoc, bool a_bFallbackSyn
         return;
     }
     m_sPendingMarkdown.clear();
-    a_pDoc->setParent(m_pBrowser);   // 所有权：随浏览器销毁（QTextBrowser 不强制收养）
+    a_pDoc->setParent(m_pBrowser);   // 所有权：收养为本块所有（随浏览器销毁）
+    QTextDocument* pOld = m_pBrowser->document();
+    // 2026.10.16 旧 doc 释放分权：仅删自己收养的（parent=本浏览器：弃正文空 doc/上次落地
+    //   doc）；浏览器默认 doc 的 parent=内部控制件，setDocument 内部会自删（Qt6 源
+    //   QWidgetTextControl::setDocument：if (d->doc->parent() == this) delete d->doc）
+    //   ——显式再删即双重释放（Debug 实崩）。不删自养 doc 则随浏览器长存，材化/弃正文循环下无限累积。
+    const bool bOwnedOld = (pOld != nullptr && pOld->parent() == m_pBrowser);
     m_pBrowser->setDocument(a_pDoc);
+    if (bOwnedOld) {
+        delete pOld;
+    }
     // 旧 document 被 setDocument 释放，其 layout 上的 documentSizeChanged 连接随之失效——
     //   对新 doc 的 layout 重连（自适应高度链路继续工作）。
-    disconnect(m_pBrowser->document()->documentLayout(), nullptr, this, nullptr);
-    connect(m_pBrowser->document()->documentLayout(),
-            &QAbstractTextDocumentLayout::documentSizeChanged,
-            this, &CMessageBlock::slotAdjustBrowserHeight);
+    ConnectDocSignals();
     slotAdjustBrowserHeight();   // 真实宽度微调重排（预排版按预估宽度，此处校正）
+}
+
+// ---------------------------------------------------------------------------
+// 2026.10.16 视口惰性排版（打开助手日志慢二期）：批量建件只记文本+估高，
+//   正文排版推迟到滚入视口带（CMessageView::RefreshMaterialization 驱动），
+//   远离视口再弃正文保高度——窗口内只有视口附近的块付排版成本。
+// ---------------------------------------------------------------------------
+void CMessageBlock::SetAssistantTextDeferred(const QString& a_sMarkdown, qreal a_dEstWidth) {
+    if (m_eKind != Assistant || m_pBrowser == nullptr) {
+        return;
+    }
+    m_bLazy = true;
+    m_bMaterialized = false;
+    m_sLazyMarkdown = a_sMarkdown;
+    m_dLazyWidth = a_dEstWidth > 0 ? a_dEstWidth : 776.0;
+    // 估高锁块：正文不排，块高按文本量估算——滚动条范围/视口几何全程有意义，
+    //   滚入视口带后 Materialize 用真实排版高度替换（误差一次自愈）。
+    setFixedHeight(EstimateAssistantHeight(a_sMarkdown, m_dLazyWidth));
+}
+
+int CMessageBlock::EstimateAssistantHeight(const QString& a_sMarkdown, qreal a_dWidthPx) const {
+    // 惰性占位估高（仅供滚动几何近似）：行数按「ASCII×1 + CJK×2 个平均字符宽」
+    //   逐行折算折行，标题/代码栏/空行按经验补块间距；正文落地后由真实排版接管。
+    if (m_pBrowser == nullptr) {
+        return 64;
+    }
+    const QFontMetrics fm(m_pBrowser->fontMetrics());
+    const int iLineH = qMax(15, fm.lineSpacing());
+    const qreal dAvg = qMax(qreal(3.0), qreal(fm.averageCharWidth()));
+    const qreal dUsable = qMax(qreal(80.0), a_dWidthPx - 6.0);
+    int iLines = 0;
+    int iExtra = 0;
+    const QStringList aLines = a_sMarkdown.split(QLatin1Char('\n'));
+    for (const QString& sLine : aLines) {
+        qreal dUnits = 0.0;
+        for (const QChar& ch : sLine) {
+            dUnits += (ch.unicode() > 0x2E7F) ? 2.0 : 1.0;   // CJK/全宽记 2 倍宽
+        }
+        iLines += qMax(1, int(dUnits * dAvg / dUsable + 0.5));
+        if (sLine.isEmpty())                             iExtra += 6;    // 段间距
+        else if (sLine.startsWith(QLatin1Char('#')))     iExtra += 10;   // 标题上下留白
+        else if (sLine.startsWith(QStringLiteral("```"))) iExtra += 8;    // 代码块 padding
+    }
+    return iLines * iLineH + iExtra + 40;   // +说话人行/布局间距/块内边距
+}
+
+bool CMessageBlock::MaterializeAssistant() {
+    if (!m_bLazy || m_bMaterialized || m_pBrowser == nullptr) {
+        return false;
+    }
+    m_bMaterialized = true;
+    // 占位+子线程预排版（与既有批量异步链路同款）：占位纯文本给出接近真实的高度，
+    //   预排版落地后覆盖为富文本。由 CMessageView 在块滚入视口带时驱动（幂等）。
+    SetAssistantTextAsync(m_sLazyMarkdown, m_dLazyWidth);
+    // 解除估高锁定，恢复高度自适应（正文/占位已落地，slotAdjustBrowserHeight 接管）
+    setMinimumHeight(0);
+    setMaximumHeight(QWIDGETSIZE_MAX);
+    return true;
+}
+
+void CMessageBlock::DematerializeAssistant() {
+    if (!m_bLazy || !m_bMaterialized || m_pBrowser == nullptr) {
+        return;
+    }
+    m_bMaterialized = false;
+    m_sPendingMarkdown.clear();   // 在途预排版由 ApplyPreloadedDoc 落地守卫丢弃
+    const int iKeepH = height();  // 保形防跳：锁定当前真实高度
+    m_bAdjusting = true;          // 换空 doc 触发 documentSizeChanged → 防护缩高
+    QTextDocument* pOld = m_pBrowser->document();
+    const bool bOwnedOld = (pOld != nullptr && pOld->parent() == m_pBrowser);   // 同 ApplyPreloadedDoc：默认 doc 由 Qt 内部删
+    QTextDocument* pEmpty = new QTextDocument(m_pBrowser);
+    m_pBrowser->setDocument(pEmpty);
+    if (bOwnedOld) {
+        delete pOld;   // 自养旧 doc（正文+排版缓存）显式释放，防材化/弃正文循环累积
+    }
+    ConnectDocSignals();
+    m_bAdjusting = false;
+    setFixedHeight(iKeepH);
 }
 
 void CMessageBlock::SetSpeakerBackend(const QString& a_sName) {
@@ -264,8 +382,8 @@ void CMessageBlock::BuildToolCard() {
     m_pHeader->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     connect(m_pHeader, &QToolButton::toggled, this, [this](bool a_bChecked) {
         m_bExpanded = a_bChecked;
-        if (a_bChecked) {
-            RebuildToolContent();   // 展开时重建：折叠期间回填的结果/新并入条目此时才呈现
+        if (a_bChecked && m_bToolDirty) {
+            RebuildToolContent();   // 2026.10.16 展开且内容脏：一次建齐（折叠期并入/回填只标脏不建件）
         }
         m_pContent->setVisible(a_bChecked);
         UpdateToolHeaderText();   // 刷新 ▶/▼ 箭头与 ×N 计数（含单行截断）
@@ -295,7 +413,9 @@ QString CMessageBlock::HeaderText(bool a_bArrowDown) const {
     return QStringLiteral("%1 %2").arg(a_bArrowDown ? QStringLiteral("▼") : QStringLiteral("▶"), sBody);
 }
 
-QString CMessageBlock::ToolSummary(const QString& a_sTool, const QString& a_sInputJson) {
+//（2026-10-17 自绘三期上移为类公开静态：CChatDelegate 折叠头/tooltip 同源共用）
+QString CMessageBlock::ToolSummary(const QString& a_sTool, const QString& a_sInputJson,
+                                   int a_iTargetMax, int a_iFallbackMax) {
     const QJsonDocument stDoc = QJsonDocument::fromJson(a_sInputJson.toUtf8());
     const QJsonObject o = stDoc.object();
 
@@ -310,11 +430,11 @@ QString CMessageBlock::ToolSummary(const QString& a_sTool, const QString& a_sInp
 
     if (sTarget.isEmpty()) {
         sTarget = a_sInputJson;
-        if (sTarget.size() > 60) {
-            sTarget = sTarget.left(60) + QStringLiteral("...");
+        if (sTarget.size() > a_iFallbackMax) {
+            sTarget = sTarget.left(a_iFallbackMax) + QStringLiteral("...");
         }
-    } else if (sTarget.size() > 80) {
-        sTarget = sTarget.left(80) + QStringLiteral("...");
+    } else if (sTarget.size() > a_iTargetMax) {
+        sTarget = sTarget.left(a_iTargetMax) + QStringLiteral("...");
     }
     return a_sTool + QStringLiteral("(") + sTarget + QStringLiteral(")");
 }
@@ -392,6 +512,7 @@ void CMessageBlock::RebuildToolContent() {
         pOut->setPlainText(st.sResult);
         m_pContentLay->addWidget(pOut);
     }
+    m_bToolDirty = false;   // 2026.10.16 懒重建：展开区与 m_aTools 数据同步标记清
 }
 
 // 2026.09.22 工具卡标题恒单行：完整标题按当前宽度省略号截断（ElideMiddle 保住
@@ -419,7 +540,11 @@ void CMessageBlock::SetTool(const QString& a_sTool, const QString& a_sInputJson)
     m_aTools.clear();
     m_aTools.append(st);
     UpdateToolHeaderText();
-    RebuildToolContent();
+    // 2026.10.16 懒重建：折叠态不建展开区（默认折叠，×N 合并卡载档 O(N²) 控件创建治理）
+    m_bToolDirty = true;
+    if (m_bExpanded) {
+        RebuildToolContent();
+    }
 }
 
 void CMessageBlock::AddMergedTool(const QString& a_sTool, const QString& a_sInputJson) {
@@ -428,14 +553,17 @@ void CMessageBlock::AddMergedTool(const QString& a_sTool, const QString& a_sInpu
     st.sInput = a_sInputJson;
     m_aTools.append(st);
     UpdateToolHeaderText();
-    RebuildToolContent();   // 折叠态不可见，重建成本可忽略；展开中追加即时可见
+    m_bToolDirty = true;
+    if (m_bExpanded) {
+        RebuildToolContent();   // 展开态即时可见；折叠态只标脏（展开时一次建齐）
+    }
 }
 
 int CMessageBlock::ToolCount() const {
     return m_aTools.size();
 }
 
-void CMessageBlock::SetResult(const QString& a_sResult) {
+void CMessageBlock::SetResult(const QString& a_sResult, bool a_bAutoExpandOnError) {
     // 2026.08.22 合并卡：结果按到达顺序回填到首个尚无结果的条目（与面板块序一致）
     if (m_aTools.isEmpty()) {
         return;   // 2026.09.28 防越界：结果先于 SetTool 到达/异常时序时旧实现会 m_aTools[-1] 写入
@@ -448,17 +576,23 @@ void CMessageBlock::SetResult(const QString& a_sResult) {
         iTarget = m_aTools.size() - 1;   // 兜底：覆盖末条
     }
     m_aTools[iTarget].sResult = a_sResult;
-    // 展开态：即时刷新该条结果框（折叠态等展开时由 RebuildToolContent 呈现）
+    // 展开态：即时刷新该条结果框；折叠态标脏（展开时由 RebuildToolContent 呈现）
     if (m_bExpanded && m_pContentLay != nullptr) {
         RebuildToolContent();
+    } else {
+        m_bToolDirty = true;
     }
-    // 错误结果：标题栏标红 + 自动展开
+    // 错误结果：标题栏标红（醒目）；自动展开仅限 a_bAutoExpandOnError（实时回填）
+    //   且当前为单条卡——2026.10.15 pdfplumber 实害修正：DSH 会话大量 Error: 前缀
+    //   结果（权限/沙箱拒），历史恢复与合并路径照旧自动展开会把 ×N 大卡整张摊开
+    //   （×52 组卡连入参/结果全部平铺），打开日志即刷屏；回放/合并只标红，
+    //   实时单条错误卡保持展开（即时反馈体验不变）。
     if (IsErrorResult(a_sResult) && m_pHeader != nullptr) {
         m_pHeader->setStyleSheet(QStringLiteral(
             "QToolButton { text-align: left; background: #fee2e2; border: 1px solid #ef4444;"
             "              border-radius: 4px; padding: 5px 8px; color: #b91c1c; }"
             "QToolButton:hover { background: #fecaca; }"));
-        if (!m_bExpanded) {
+        if (a_bAutoExpandOnError && !m_bExpanded && m_aTools.size() <= 1) {
             m_pHeader->setChecked(true);   // 触发 toggled → 展开
         }
     }
@@ -580,6 +714,7 @@ void CMessageBlock::BuildSystem(bool a_bError) {
 //   载档重建时在此转为人读摘要：tooldone→✔/✘ 工具耗时、think→💭 思考、
 //   tool→⚙ 工具预览、progress→丢弃（返回空串，调用方跳过）；非裸 JSON
 //   行原样返回（零副作用）。
+//（2026-10-17 自绘三期上移为类公开静态：CChatModel 载档投影同源共用）
 QString CMessageBlock::PrettyLegacyJsonLine(const QString& a_sText) {
     if (!a_sText.startsWith(QLatin1String("{\"type\": "))) {
         return a_sText;

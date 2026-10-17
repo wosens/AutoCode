@@ -29,7 +29,8 @@ const SStageDef* FindStageById(const QString& a_sId);
 
 // —— 自定义阶段清单（2026-08-15 流程档位）：清单是权威，档位只是预设 ——
 // 解析任务的生效阶段流：a_aCustom 为空 → 返回该类型完整规范流（向后兼容）；
-//   非空 → 按规范流顺序过滤出勾选的阶段（忽略非法值），Intake 为入口阶段强制包含在首位。
+//   非空 → 按存储顺序去重校验（配置序即执行序——2026-10-14 任务编排设计支持
+//   自定义阶段与自由排序），Intake 为入口阶段强制包含在首位。
 QList<EStage> ResolveFlow(ETaskType a_eType, const QList<EStage>& a_aCustom);
 
 // 按生效流过滤某阶段的输入文件：aInputs 中仅保留「产物由流内阶段产出」的项
@@ -42,6 +43,14 @@ QStringList FilterInputs(const SStageDef& a_stDef, const QList<EStage>& a_aFlow,
 
 // 解析 prompts 目录（兼容开发期 exe 在 Execute/ 子目录 与 部署期 exe 同级）
 QString GetPromptsDir();
+
+// —— 动态阶段注册（2026-10-14 任务编排设计）：自定义阶段（EStage≥100）由
+//    COrchConfig 在启动加载/设计窗口保存后注册进定义表，FindStage/
+//    GetStageDefs/FilterInputs 即刻可见；双标志 bFeature/bBugfix 均为 false，
+//    不进任何规范流，仅经任务自定义流（flowStages）生效。——
+void RegisterDynamicStages(const QVector<SStageDef>& a_aDyn);
+void ClearDynamicStages();
+bool IsDynamicStage(EStage a_eStage);   // 值 ≥100 即动态（自定义编排阶段）
 
 // 工具集（deny 黑名单）：--dangerously-skip-permissions(bypass) 下 allow 白名单失效、deny 仍生效
 //   （实测：CodeReview 白名单无 Bash 却跑了 7 次 Bash；改 deny 后 agent 明确报告无 Bash）。

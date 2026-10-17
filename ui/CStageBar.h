@@ -43,6 +43,8 @@ public:
 
     // 整体重设（切任务/刷新状态）。空向量 = 清空（无任务）。
     void SetStages(const QVector<SNode>& a_aNodes);
+    // 2026.10.14 节点观察口（测试/诊断）：回炉后进度点之后的阶段是否回落待执行。
+    const QVector<SNode>& Nodes() const { return m_aNodes; }
     // 本地坐标 → 阶段原值；命中间隙/越界返回 -1（右键菜单抑制）。
     int StageAt(const QPoint& a_stPt) const;
 

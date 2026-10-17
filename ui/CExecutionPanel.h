@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QWidget>
 #include <QHash>
@@ -9,8 +9,8 @@
 #include <QColor>
 #include <QElapsedTimer>
 
-#include "ui/CMessageBlock.h"   // 块控件（SBlockData 现居 CStreamPresenter.h）
-#include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 亦在此）
+#include "ui/CMessageBlock.h"   // 块控件（EKind/IsErrorResult/PrettyLegacyJsonLine/ToolSummary 公开静态同源）
+#include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 已拆至 ui/SBlockData.h，经本头第 9 行分发）
 #include "ui/CStageBar.h"          // 2026.09.04 阶段横向图标条
 #include "core/CModelEntry.h"      // 2026-10-05 SDshModelEntry（右键「选择模型」共享表数据源）
 
@@ -31,6 +31,8 @@ class CAsstTabWidget;   // 同上：宿主 QTabWidget（解禁 setTabBar，构�
 class CArtifactView;
 class CTaskInfo;
 class CMessageView;
+class CChatModel;       // 2026-10-17 自绘三期：ModelView 引擎显示条目模型
+class CChatListView;    // 2026-10-17 自绘三期：ModelView 引擎自绘视图
 class CFilePreviewWidget;   // 2026.08.25 文件预览 Tab（md/html/hex 多视图容器）
 class CPromptFlyout;   // FR-3：助手日志提示词下拉浮层（半透明按钮 hover 弹出）
 
@@ -41,7 +43,11 @@ class CExecutionPanel : public QWidget {
     Q_OBJECT
 
 public:
-    explicit CExecutionPanel(QWidget* a_pParent = nullptr);
+    // a_bEngineMV：对话日志渲染引擎（2026-10-17 自绘三期，[View] Engine 缺省 false=
+    //   Legacy 卡片流）——构造时快照并据此建任务/助手页视图，已建页不随设置热切
+    //   （重开 Tab/重启生效）。由 CMainWindow 构造时读配置传入（面板自身不依赖
+    //   CProjectManager.cpp，测试目标免拖入其依赖链）。
+    explicit CExecutionPanel(QWidget* a_pParent = nullptr, bool a_bEngineMV = false);
     ~CExecutionPanel() override;   // 2026.09.03 释放全部任务流（CStreamPresenter 堆对象；助手流随 SAsst/shared_ptr 自清）
 
     // —— 结构化对话流（直接接编排器信号）——
@@ -66,12 +72,18 @@ public:
     void DeleteAsstCore(const QString& a_sId);
     void ShowTaskLogPage();
     void SetTaskTabsVisible(bool a_bShow);  // 2026-10-03 任务侧 Tab（日志/产物）显隐统一入口
-    // 2026.08.29 上下文进度条菜单（右键/左键共用）：立即压缩 + 设置上下文大小。
+    // 2026.08.29 上下文进度条菜单（右键入口；2026.09.11 左键单击入口已取消，
+    //   2026-10-15 「设置上下文大小」已删——上下文窗口唯一来源 = 按模型自动探测）：
+    //   立即压缩 + 选择模型。
     //   2026.09.05 per-助手控件：目标助手 id 显式传入（该助手自己的进度条/会话）。
     void ShowContextMenu(const QString& a_sAsstId, const QPoint& a_stGlobalPos);
     // 2026.08.29 阶段产物页分割条持久化（[Layout] ArtifactsSplit，base64 saveState）。
     QByteArray ArtifactsSplitState() const;
     void RestoreArtifactsSplit(const QByteArray& a_stState);
+    // 2026-10-16 助手重命名弹窗几何持久化（[Layout] RenameDlgGeo，base64 saveGeometry；
+    //   主窗口启动回填/退出落盘，同 ArtifactsSplit 管线；空档=Qt 缺省居中于父窗口）。
+    QByteArray RenameDlgGeo() const { return m_stRenameDlgGeo; }
+    void SetRenameDlgGeo(const QByteArray& a_stState) { m_stRenameDlgGeo = a_stState; }
     void ShowActiveAssistantPage();           // 2026.08.26 切到当前激活助手 Tab（新建任务后立即看到助手日志）
     void RefreshTask(CTaskInfo* a_pTask);       // 状态变化时刷新阶段表/cost
     // FR-5：阶段产物落盘后由主窗口在 stage_done 事件调用——重扫产物目录并保留当前选中态
@@ -111,6 +123,11 @@ public:
     bool AsstRunning(const QString& a_sAsstId) const;      // 指定助手是否运行中
     bool AnyAsstRunning() const;                            // 是否有任一助手运行中（旧 m_bAdhocRunning 语义）
     QStringList RunningAsstIds() const;                     // 2026-10-02 运行中助手 id 表（孤儿 busy 看门狗用）
+    // 2026-10-09 孤儿看门狗自愈配套：解除首条命名挂起（bSendAfterAutoName——
+    //   OnAdhocFinished 已丢失永不再补发）并把暂存指令退回输入框（同「提交被拒
+    //   退回输入框」口径），否则后续发送永远只暂存不提交（另机实测「输入继续
+    //   也不行」的死锁）。
+    void AdhocOrphanHeal(const QString& a_sAsstId);
 
     // —— 2026-10-02 跨档幽灵（任务助手不停跑跨档保留）——
     // 视图 key（当前展示的存档：任务 id 或空=工程全局档）：与本档不一致的助手为外档
@@ -126,7 +143,6 @@ public:
     QJsonArray AssistantsJsonOf(const QString& a_sOwnerKey) const;
     void SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill);   // 更新该助手上下文快照+进度条（<0 视为未知）
     void OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel);   // 该助手收到模型名 → 查表更新窗口分母
-    void SetUserContextLimit(qint64 a_iLimit);    // 右键设窗口上限（>0 覆盖探测；0/负回退自动）
     // 2026-10-08 提示词长度闸门（设置页保存/启动时由 CMainWindow 推送；占比与 token 两约束
     //   取更小者同时生效，超限不直接发送——改起一次性提炼 Agent 压缩后发送）。
     void SetPromptLimits(int a_iCtxPct, int a_iTokMax);
@@ -188,6 +204,8 @@ public:
     // 2026.09.23 v3.1.227 阶段条显隐观察口（测试/诊断）：无任务选中时阶段条自隐藏、
     //   日志 Tab 区顶上移到原任务进度位置（SetCurrentTask/RefreshTask 驱动）。
     bool StageBarVisible() const { return m_pStageBar != nullptr && m_pStageBar->isVisible(); }
+    // 2026.10.14 阶段条节点状态观察口（测试/诊断）：回炉后进度点之后的阶段回落待执行。
+    CStageBar* StageBar() const { return m_pStageBar; }
     // 2026-10-03 任务侧底栏显隐观察口（测试/诊断）：无任务隐藏介入栏与费用栏容器。
     bool TaskBarsVisible() const {
         return (m_pTaskBarWidget != nullptr && m_pTaskBarWidget->isVisibleTo(parentWidget()))
@@ -260,8 +278,6 @@ signals:
     void sigAsstRefinePrompt(const QString& a_sAsstId, const QString& a_sText,
                              int a_iLimitTok, int a_iPerm);
     void sigTaskChatChanged(const QString& a_sTaskId);    // 任务流变化（#6 去抖存盘）
-    // 右键「设置上下文大小」→ 上抛用户设的上下文窗口上限（token；0=回退自动探测）。
-    void sigAdhocContextLimitChanged(qint64 a_iLimit);
     // 2026-10-05 右键「选择模型」切换共享当前模型（下标按 SetSharedModels 推送的表）：
     //   主窗口存四张节（Dsh/Pi/Codex/Hermes）+ ApplySharedModelsToRunners 重应用 +
     //   回推面板（进度条模型名/菜单勾选即时刷新）；下一轮即用新模型。
@@ -300,6 +316,10 @@ private:
 
     void AppendData(const QString& a_sTaskId, const SBlockData& a_stData);   // 入流数据 + 当前任务则上屏（路由到 EnsureStream(id)->Append）
     void RebuildView();        // 重建当前任务流视图（m_pCurStream->Rebuild；无当前流时空操作）
+    // 2026-10-17 自绘三期：任务日志页当前引擎控件（Tab 操作/页切换统一出口——
+    //   Legacy=m_pView、ModelView=m_pView2，二者互斥恒一非空）。
+    QWidget* TaskLogWidget() const { return m_bEngineMV ? static_cast<QWidget*>(m_pView2)
+                                                        : static_cast<QWidget*>(m_pView); }
     void AppendAdhocBlock(const SBlockData& a_stData, const QString& a_sTargetId = QString());   // ad-hoc 块入助手流 + 上屏（目标 id 空=运行中助手，否则指定助手；2026.08.27 增 id 直投——跨助手排队徽标要落到指定助手）
     void RebuildAdhocView();   // 按激活助手数据重建其对话流（撤销/切档后调用）
     void RebuildAsstView(const QString& a_sId);   // 2026.08.23 按指定助手重建（多助手各自独立控件，加载后预建防切换卡顿）
@@ -324,7 +344,11 @@ private:
     // 2026.09.05 per-助手控件组：上下文进度条/统计标签随助手走，入参 = 目标助手。
     void UpdateContextButton(const SAsst& a_stAsst);   // 该助手上下文进度条占比/颜色/tooltip
     void UpdateAsstCostLabel(const SAsst& a_stAsst);   // 该助手统计栏（费用/token/请求/耗时）
-    qint64 AsstContextLimit(const SAsst& a_stAsst) const;   // 该助手窗口分母（用户上限>模型探测）
+    qint64 AsstContextLimit(const SAsst& a_stAsst) const;   // 该助手窗口分母（按模型自动探测）
+    // 2026-10-16 空模型兜底取共享表激活条目：非 claude 后端恒认；claude 后端须跟随
+    //   开关开且条目 anthropic-messages 兼容（与 CClaudeRunner StartStage env 注入条件
+    //   镜像——「下一轮即将用的模型」才诚实，不张冠李戴）。无效 → nullptr。
+    const SDshModelEntry* SharedActiveEntryForBackend(const QString& a_sBackend) const;
     void CreateAsstWidgets(SAsst& a_stAsst);   // 建助手页容器（日志视图+输入栏+统计栏）并接信号
     void SyncRunTimer();            // 2026.09.05 耗时定时器统一开关（任务或任一助手在跑即跑）
     void UpdateTaskInjectState();   // FR-3 按当前任务 Running 态刷新介入输入栏可用性
@@ -337,6 +361,7 @@ private:
     void LoadStageOutputs(CTaskInfo* a_pTask);  // 「阶段产物」页：按任务流程阶段列出已生成的 .md
     void OnOutputSelected(int a_iRow);          // 选中某阶段产物 → 读取文件内容显示
     void OnStagesContextMenu(const QPoint& a_stPos);   // 需求3：阶段表右键「再次执行」
+    void OnOutputsContextMenu(const QPoint& a_stPos);  // 2026.10.15 阶段产物清单右键「另存为」
 
     CStageBar*      m_pStageBar = nullptr;   // 2026.09.04 阶段横向图标条（替代 QTreeWidget 阶段表）
     // （m_pStageSplit 已删：阶段条固定高移出 splitter，FR-9 高度对齐随图标条化移除。）
@@ -345,13 +370,23 @@ private:
     QWidget*        m_pAddTabPage = nullptr;  // 「+」新增助手占位页（选中即新增并弹回，参考 DSHAgentManage）
     QWidget*        m_pArtifactsPage = nullptr;  // 「阶段产物」页本体（Tab 布局管制时识别非助手页用）
     QSplitter*      m_pArtifactsSplit = nullptr;  // 2026.08.29 阶段清单|Markdown 分割条（持久化）
+    QByteArray      m_stRenameDlgGeo;              // 2026-10-16 重命名弹窗几何（saveGeometry 快照，弹后回写）
     CFilePreviewWidget* m_pFileView = nullptr;  // 2026.08.25 文件预览 Tab（单实例复用，内部分发纯文本/md/html/hex）
-    CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志
+    CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志（Legacy 引擎；ModelView 引擎下为 null）
+    // —— 2026-10-17 自绘三期 ModelView 引擎（doc/对话流视图自绘改造方案.md §9.2
+    //    双引擎灰度，[View] Engine 缺省 Legacy）：与 m_pView 互斥——构造时按引擎
+    //    二选一建任务日志页；助手页同理（SAsst::pView2/pModel）。模型/视图归面板
+    //    持有（任务侧共享——同一对模型+视图随任务流 Bind/Unbind 换投影，与 Legacy
+    //    共享 m_pView 同构）。切换设置后已建页不重建（重开 Tab/重启生效）。——
+    CChatListView*  m_pView2   = nullptr;   // Tab1：对话流日志（ModelView 引擎）
+    CChatModel*     m_pChatModel = nullptr; // 任务侧共享显示条目模型（ModelView 引擎）
+    bool            m_bEngineMV = false;    // 构造时快照的引擎选择（true=ModelView）
     QPlainTextEdit* m_pTaskInput = nullptr; // FR-3 任务对话流下方的介入输入栏
     QPushButton*    m_pBtnInject = nullptr; // FR-3 介入发送按钮
     QWidget*        m_pTaskBarWidget = nullptr; // 2026-10-03 介入栏容器（无任务整体隐藏）
     QWidget*        m_pCostBarWidget = nullptr; // 2026-10-03 任务侧费用栏容器（同上）
     QListWidget*    m_pOutputs = nullptr;   // Tab2 左：阶段产物清单
+    QString         m_sLastArtifactSaveDir; // 2026.10.15 产物另存上次目录（会话级记忆；空=系统缺省）
     CArtifactView* m_pArtifactView = nullptr;  // Tab2 右：选中产物的 Markdown 渲染
     QLabel*         m_pLblCost = nullptr;
     QLabel*         m_pLblLive = nullptr;   // 2026.08.27 本轮实时 token（运行中“本轮 ↑x ↓y”直观反馈）
@@ -365,7 +400,6 @@ private:
     // （2026.09.05 per-助手化已删：m_tAdhocClock/m_iContextLimit/m_iLastContextFill/
     //   m_sAdhocModel/m_pAdhocInput/m_pComboPerm/m_pBtnContext/m_pBtnSend/m_pBtnUndo——
     //   耗时钟/窗口分母/进度条/输入栏全部随助手存在 SAsst 内，切换页即切实例。）
-    qint64          m_iUserContextLimit = 0;       // 用户设的窗口上限（>0 覆盖按模型探测；0=自动；全局配置对各助手一致）
     int             m_iPromptCtxPct = 5;           // 2026-10-08 提示词占比上限（%，0=不限；CMainWindow 推送）
     int             m_iPromptTokMax = 0;           // 2026-10-08 提示词 token 上限（0=不限；与占比取更小者同时生效）
 
@@ -422,6 +456,11 @@ public:
         //   重开重建（统计数值随 SAsst 持久化字段还原，不随控件丢）。
         QWidget*              pPage = nullptr;        // Tab 页容器（日志+输入栏+统计栏）
         CMessageView*         pView = nullptr;    // 该助手的对话流视图（pPage 内；关闭后为 null，重开重建）
+        // 2026-10-17 自绘三期：ModelView 引擎的助手视图（与 pView 互斥，按面板
+        //   构造时引擎二选一；pModel 归本助手独占——助手页各自独立流各自独立模型，
+        //   随 pPage 生灭）。判空口径：pView/pView2 任一非空即“视图已建”。
+        CChatListView*        pView2 = nullptr;
+        CChatModel*           pModel = nullptr;
         QPlainTextEdit*       pInput = nullptr;   // 该助手指令输入框（Ctrl+Enter 发送）
         QComboBox*            pComboPerm = nullptr;   // 2026-09-11 权限下拉：0 自动审批（缺省）/1 手工审批/2 只读（原 pBtnReadOnly 勾选钮）
         int                   iPerm = 0;              // 权限三态持久化字段（assistant.json "perm"；闭页后控件重建回显）
@@ -458,6 +497,18 @@ public:
     void AttachForeignAssistants(QList<SAsst> a_aList, const QString& a_sTaskNameOf);
     // 按 id 除列表项（档重载去重：文件版让位存活版；宿主在载档后、挂回前调用）。
     void DropAsstEntries(const QStringList& a_aIds);
+    // 2026.10.15 批量另存核心（多选路径用，独立成静态函数便于离屏单测）：逐条复制到
+    //   a_sDir，目标名冲突（目录已有/本轮已用，Windows 文件名不区分大小写）自动加序号
+    //   （计划(2).md）；返回成功数，失败明细追加进 *a_pFail。
+    static int SaveOutputsToDir(const QList<QPair<QString, QString>>& aItems,
+                                const QString& a_sDir, QStringList* a_pFail);
+    // 2026.10.15 产物另存缺省中文名：条目阶段中文名（LoadStageOutputs 存 UserRole+1）
+    //   + 原后缀（plan.md → 计划.md，用户需求）；无阶段名的异常条目兑底回退原文件名。
+    QString OutputSaveName(const QListWidgetItem* a_pItem) const;
+    // 2026-10-11 幽灵助手+UAF 崩溃修复：助手页安全摘除（预切走当前页 + 拆除期重置守卫），
+    //   TakeRunningForReload / DropAsstEntries / RemoveAsstEntry 三处裸 removeTab 统一改走此口
+    //   （防摘当前页时 Qt 自动激活「+」页被误判新增助手 → 嵌套 append 悬垂外层 SAsst&）。
+    void RemoveAsstPageSafe(QWidget* a_pPage);
     bool AsstIsForeign(const SAsst& a_st) const { return a_st.sOwnerKey != m_sViewKey; }
     QList<SAsst> AllAsstsSnapshot() const { return m_aAssts; }
 
@@ -489,7 +540,17 @@ private:
     void SetupTabsInteraction();      // 可移动 / 原生「x」/「+」页 /「▾」角落按钮（构造一次，参考 DSHAgentManage）
     void UpdateTabCloseButtons();     // 非助手页与「+」页隐藏关闭按钮；「+」页钉在最后助手 Tab 之后
     void OnAsstTabCloseRequested(int a_iIdx);   // 原生「x」：关闭对应助手
-    CMessageView* CreateAsstTab(SAsst& a_stAsst, int a_iPos = -1);   // 建视图 + 提示词按钮 + 插 Tab
+    // 建视图 + 提示词按钮 + 插 Tab（返回值已无用武之地——调用点全部忽略，2026-10-17
+    //   自绘三期改 void：双引擎下页内控件类型不定）
+    void CreateAsstTab(SAsst& a_stAsst, int a_iPos = -1);
+    // 2026-10-17 自绘三期：助手日志视图当前引擎控件（浮层按钮 parent/几何/事件
+    //   过滤统一出口——Legacy=pView、ModelView=pView2）。
+    static QWidget* AsstViewWidget(const SAsst& a_st) {
+        return a_st.pView2 != nullptr ? static_cast<QWidget*>(a_st.pView2)
+                                      : static_cast<QWidget*>(a_st.pView);
+    }
+    // 该助手视图是否已建（双引擎判空口径：任一引擎控件非空）
+    static bool AsstViewBuilt(const SAsst& a_st) { return a_st.pView != nullptr || a_st.pView2 != nullptr; }
     void RemoveAsstTab(SAsst& a_stAsst);                            // 摘 Tab（视图交 parent 回收）
     void CloseAsst(const QString& a_sId);       // 点「x」：关闭该助手（Tab 摘除、数据保留，可经「▾」恢复）
     // 2026.09.09 右键彻底删除 UI 层：守卫（运行中/最后一个打开助手）+ 二次确认弹窗，

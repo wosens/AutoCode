@@ -17,6 +17,8 @@
 #include <QTimer>
 #include <QTextStream>
 #include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "agent/CClaudeRunner.h"
 
@@ -49,11 +51,30 @@ int RunStubMode(int a_iArgc, char* a_pArgv[]) {
     QDir().mkpath(sDir);
     const QString sStub = sDir + QStringLiteral("/claude_stub.cmd");
     const QString sEnvTxt = sDir + QStringLiteral("/env.txt");
+    const QString sPathTxt = sDir + QStringLiteral("/path.txt");
+    const QString sArgsTxt = sDir + QStringLiteral("/args.txt");
+    const QString sAuthStub = sDir + QStringLiteral("/claude_auth_stub.cmd");
+    {   // 2026.10.11 鉴权失败诊断 stub：回一条含鉴权错误的 assistant 文本，验证
+        //   诊断事件行（注入 key 指纹/非法字符提示）被追发。
+        QFile f(sAuthStub);
+        f.open(QIODevice::WriteOnly | QIODevice::Text);
+        f.write(QStringLiteral("echo {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Failed to authenticate. API Error: 401 Invalid API key format\"}]}}\n").toUtf8());
+        f.write(QStringLiteral("echo {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"stub-sid-auth\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n").toUtf8());
+        f.close();
+    }
     {
         QFile f(sStub);
         f.open(QIODevice::WriteOnly | QIODevice::Text);
         f.write(QStringLiteral("set ANTHROPIC > \"%1\"\n")
                     .arg(sEnvTxt).toUtf8());
+        // 2026.10.10 合并 PATH 回归：落盘子进程实际拿到的 PATH。
+        f.write(QStringLiteral("set PATH > \"%1\"\n")
+                    .arg(sPathTxt).toUtf8());
+        // 2026.10.10 --settings 注入回归：落盘完整命令行（验证本轮启动参数携带
+        //   本轮刚生成的临时 settings 文件，修「成员被 Reset 先清空、aArgs 预取
+        //   恒空、文件永不传给 claude」的一轮滞后）。
+        f.write(QStringLiteral("echo %* > \"%1\"\n")
+                    .arg(sArgsTxt).toUtf8());
         f.write(QStringLiteral("echo {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"session_id\":\"stub-sid-env\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n").toUtf8());
         f.close();
     }
@@ -104,6 +125,12 @@ int RunStubMode(int a_iArgc, char* a_pArgv[]) {
                QStringLiteral("覆盖条目应注入 ANTHROPIC_MODEL=ov-claude"));
         Check2(fnEnvOf(QStringLiteral("ANTHROPIC_BASE_URL")).contains(QStringLiteral("127.0.0.1:9/ov")),
                QStringLiteral("覆盖条目应注入 BASE_URL"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_DEFAULT_SONNET_MODEL")) == QStringLiteral("ov-claude")
+                   && fnEnvOf(QStringLiteral("ANTHROPIC_DEFAULT_HAIKU_MODEL")) == QStringLiteral("ov-claude")
+                   && fnEnvOf(QStringLiteral("ANTHROPIC_DEFAULT_OPUS_MODEL")) == QStringLiteral("ov-claude"),
+               QStringLiteral("辅助档位三 env 应同源注入（子代理/后台任务不走官方模型名）"));
+        Check2(fnEnvOf(QStringLiteral("ANTHROPIC_AUTH_TOKEN")) == QStringLiteral("ov-key"),
+               QStringLiteral("AUTH_TOKEN 应同值双注入（Bearer 类中转兼容）"));
     }
     {   // B. 无覆盖 + 跟随开 → 共享表当前条目
         CClaudeRunner runner;
@@ -118,6 +145,252 @@ int RunStubMode(int a_iArgc, char* a_pArgv[]) {
         Check2(fnEnvOf(QStringLiteral("ANTHROPIC_MODEL")).isEmpty(),
                QStringLiteral("跟随关不应注入 ANTHROPIC_MODEL"));
     }
+    {   // H/I. --settings 注入回归（2026.10.10 修一轮滞后）：本轮启动参数必须携带本轮
+        //    刚生成的临时 settings 文件（此前 Reset 先清空成员、aArgs 预取恒空，文件
+        //    永不传给 claude → env 注入被用户 settings.json 顶掉，改了网关仍连旧地址）。
+        auto fnArgsOf = [&sArgsTxt]() {
+            QFile f(sArgsTxt);
+            const QString s = f.open(QIODevice::ReadOnly)
+                ? QString::fromLocal8Bit(f.readAll()) : QString();
+            f.close();
+            return s;
+        };
+        auto fnFileJson = [](const QString& a_sArgsTxt) {
+            // 从落盘命令行里抠 --settings 后面的路径，读回 JSON env 块。
+            QFile f(a_sArgsTxt);
+            const QString sCmd = f.open(QIODevice::ReadOnly)
+                ? QString::fromLocal8Bit(f.readAll()) : QString();
+            f.close();
+            const int iFlag = sCmd.indexOf(QLatin1String("--settings"));
+            if (iFlag < 0) { return QJsonObject(); }
+            const QString sRest = sCmd.mid(iFlag + 10).trimmed();
+            const int iEnd = sRest.indexOf(QLatin1Char(' '));
+            QString sPath = (iEnd < 0 ? sRest : sRest.left(iEnd)).trimmed();
+            if (sPath.startsWith(QLatin1Char('"')) && sPath.endsWith(QLatin1Char('"'))) {
+                sPath = sPath.mid(1, sPath.size() - 2);
+            }
+            QFile fSet(sPath);
+            if (!fSet.open(QIODevice::ReadOnly)) { return QJsonObject(); }
+            const QJsonDocument oDoc = QJsonDocument::fromJson(fSet.readAll());
+            fSet.close();
+            return oDoc.object().value(QStringLiteral("env")).toObject();
+        };
+        CClaudeRunner::SetFollowSharedModels(true);
+        {   // H. 跟随轮启动参数应携带 --settings <本轮文件>，内容=当前条目
+            CClaudeRunner runner;
+            fnRun(runner, QStringLiteral("settings轮"));
+            const QJsonObject oEnvSet = fnFileJson(sArgsTxt);
+            Check2(!oEnvSet.isEmpty(),
+                   QStringLiteral("本轮启动参数应携带 --settings 且文件可读回"));
+            Check2(oEnvSet.value(QStringLiteral("ANTHROPIC_BASE_URL")).toString()
+                       == QStringLiteral("http://127.0.0.1:9/g"),
+                   QStringLiteral("settings 文件 BASE_URL 应=当前条目（不滞后）"));
+            Check2(oEnvSet.value(QStringLiteral("ANTHROPIC_AUTH_TOKEN")).toString()
+                       == QStringLiteral("g-key"),
+                   QStringLiteral("settings 文件应含 AUTH_TOKEN（Bearer 类中转兼容）"));
+        }
+        {   // I. 改地址同轮生效（核心回归）：换激活条目内容 → 下一轮 --settings 文件
+            //    立即携带新 URL（不再传上一轮旧文件）。
+            aTbl[0].sBaseURL = QStringLiteral("http://127.0.0.1:9/g2-new");
+            aTbl[0].sModelId = QStringLiteral("g-claude-2");
+            CClaudeRunner::SetSharedModelTable(aTbl, /*active=*/0);
+            CClaudeRunner runner;
+            fnRun(runner, QStringLiteral("改地址轮"));
+            const QJsonObject oEnvSet = fnFileJson(sArgsTxt);
+            Check2(oEnvSet.value(QStringLiteral("ANTHROPIC_BASE_URL")).toString()
+                       == QStringLiteral("http://127.0.0.1:9/g2-new"),
+                   QStringLiteral("改地址后本轮 --settings 应立即携带新 URL"));
+            Check2(oEnvSet.value(QStringLiteral("ANTHROPIC_MODEL")).toString()
+                       == QStringLiteral("g-claude-2"),
+                   QStringLiteral("改地址后本轮 --settings 应立即携带新模型名"));
+            // env 注入同源（双通道一致）。
+            Check2(fnEnvOf(QStringLiteral("ANTHROPIC_BASE_URL")).contains(QStringLiteral("g2-new")),
+                   QStringLiteral("改地址后 env 注入应同步新 URL"));
+            aTbl[0].sBaseURL = QStringLiteral("http://127.0.0.1:9/g");
+            aTbl[0].sModelId = QStringLiteral("g-claude");
+            CClaudeRunner::SetSharedModelTable(aTbl, 0);   // 还原
+        }
+        {   // J. 鉴权失败自诊断（2026.10.11）：claude 回鉴权错误文本 → 追发诊断行
+            //    （含注入 key 指纹）；Key 含非法字符时注入后即预警。
+            CClaudeRunner::SetClaudeCmd(sAuthStub);
+            QString sDiagLine, sPreLine;
+            {
+                CClaudeRunner runner;
+                QObject::connect(&runner, &CAgentRunnerBase::sigInfo, &runner,
+                                 [&](const QString& a_s) {
+                                     if (a_s.contains(QStringLiteral("鉴权失败诊断"))) {
+                                         sDiagLine = a_s;
+                                     }
+                                     if (a_s.contains(QStringLiteral("网关直探"))) {
+                                         sDiagLine += QStringLiteral(" | ") + a_s;
+                                     }
+                                 });
+                fnRun(runner, QStringLiteral("鉴权诊断轮"));
+                Check2(sDiagLine.contains(QStringLiteral("长度 5"))
+                           && sDiagLine.contains(QStringLiteral("g-ke…-key"))
+                           && sDiagLine.contains(QStringLiteral("格式合法")),
+                       QStringLiteral("鉴权失败应追发诊断（key 指纹/格式）实际：%1")
+                           .arg(sDiagLine.left(160)));
+                // 2026.10.11 网关直探：诊断后异步 POST 注入的接入点（stub 表指向
+                //   127.0.0.1:9 → 连接拒绝快速失败），事件循环退出前应收到探测结果行。
+                QTimer::singleShot(6000, []() { QCoreApplication::exit(0); });
+                QCoreApplication::exec();
+                Check2(sDiagLine.contains(QStringLiteral("网关直探"))
+                           && sDiagLine.contains(QStringLiteral("127.0.0.1:9")),
+                       QStringLiteral("诊断应附带网关直探结果行实际：%1")
+                           .arg(sDiagLine.left(200)));
+            }
+            {   // K. 注入 Key 含非法字符（Bearer 前缀）→ 注入即预警
+                aTbl[0].sApiKey = QStringLiteral("Bearer e943-abc");
+                CClaudeRunner::SetSharedModelTable(aTbl, 0);
+                QString sWarnLine;
+                CClaudeRunner runner;
+                QObject::connect(&runner, &CAgentRunnerBase::sigInfo, &runner,
+                                 [&](const QString& a_s) {
+                                     if (a_s.contains(QStringLiteral("注入的 Key 含非法字符"))) {
+                                         sWarnLine = a_s;
+                                     }
+                                 });
+                fnRun(runner, QStringLiteral("非法 Key 轮"));
+                Check2(sWarnLine.contains(QStringLiteral("401 Invalid API key format")),
+                       QStringLiteral("非法 Key 应注入即预警实际：%1").arg(sWarnLine.left(120)));
+                aTbl[0].sApiKey = QStringLiteral("g-key");
+                CClaudeRunner::SetSharedModelTable(aTbl, 0);   // 还原
+            }
+            CClaudeRunner::SetClaudeCmd(sStub);
+        }
+    }
+    {   // D. 子进程 PATH = 注册表合并环境（2026.10.10 MergedPathEnvironment 回归）：
+        //    stub 轮实际拿到的 PATH 应与 MergedPathEnvironment() 计算值一致，
+        //    且包含 System32（合并后命令搜索域完整的基本健全性）。
+        QFile f(sPathTxt);
+        const bool bOpen = f.open(QIODevice::ReadOnly);
+        QString sSubPath;
+        if (bOpen) {
+            // cmd `set PATH >` 按控制台码页（本地 8 位）落盘，且 set 为前缀匹配会把
+            // PATHEXT 一并列出——只取首行再剥 PATH= 前缀。
+            sSubPath = QString::fromLocal8Bit(f.readAll());
+            f.close();
+            const int iNl = sSubPath.indexOf(QLatin1Char('\n'));
+            if (iNl >= 0) {
+                sSubPath = sSubPath.left(iNl);
+            }
+            if (sSubPath.startsWith(QStringLiteral("PATH="), Qt::CaseInsensitive)) {
+                sSubPath = sSubPath.mid(5);
+            }
+            sSubPath = sSubPath.trimmed();
+        }
+        const QString sMerged = CAgentRunnerBase::MergedPathEnvironment()
+                                    .value(QStringLiteral("PATH"));
+        Check2(bOpen && sSubPath == sMerged,
+               QStringLiteral("子进程 PATH 应等于合并环境 PATH"));
+        Check2(sSubPath.contains(QStringLiteral("System32"), Qt::CaseInsensitive),
+               QStringLiteral("合并 PATH 应含 System32"));
+    }
+    {   // E. 裸命令名预检（2026.10.10）：命令不在（含注册表合并后的）PATH 且兕底探测
+        //    落空（测试注入恒空）→ StartStage 同步立即可操作报错（含「未在 PATH 中找到」
+        //    指引），不进三连快速失败重试、不落地启动。
+        CClaudeRunner::s_fnProbeFallback = [](QString*) { return QString(); };
+        CClaudeRunner::SetClaudeCmd(QStringLiteral("autocode_missing_claude_cmd_xyz"));
+        CClaudeRunner runner;
+        QString sFailMsg;
+        QObject::connect(&runner,
+                         qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
+                             &CAgentRunnerBase::sigFinished),
+                         &runner, [&](bool, const QString& a_sMsg, qint64, qint64, double,
+                                      const QString&) { sFailMsg = a_sMsg; });
+        runner.StartStage(sDir, QStringLiteral("预检轮"), QString(), 40,
+                          QString(), false, 0, false);
+        // EmitFailed 同步发射（同线程直连），StartStage 返回即已送达。
+        Check2(sFailMsg.contains(QStringLiteral("未在 PATH 中找到")),
+               QStringLiteral("预检应报「未在 PATH 中找到」实际报：%1")
+                   .arg(sFailMsg.left(120)));
+        Check2(sFailMsg.contains(QStringLiteral("环境诊断")) && sFailMsg.contains(QStringLiteral("npm prefix")),
+               QStringLiteral("报错应附环境诊断（node/npm/prefix/where 现场一次性收集）"));
+        CClaudeRunner::s_fnProbeFallback = nullptr;   // 钩子还原
+    }
+    {   // F. 绝对路径预检（2026.10.10）：配置路径不存在且兕底探测落空（注入恒空）→
+        //    同步精确报错（含「路径不存在」），不再让 cmd 甩模糊的「系统找不到指定的路径」。
+        CClaudeRunner::s_fnProbeFallback = [](QString*) { return QString(); };
+        CClaudeRunner::SetClaudeCmd(QStringLiteral("C:/no_such_dir_xyz/claude.exe"));
+        CClaudeRunner runner;
+        QString sFailMsg;
+        QObject::connect(&runner,
+                         qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
+                             &CAgentRunnerBase::sigFinished),
+                         &runner, [&](bool, const QString& a_sMsg, qint64, qint64, double,
+                                      const QString&) { sFailMsg = a_sMsg; });
+        runner.StartStage(sDir, QStringLiteral("路径预检轮"), QString(), 40,
+                          QString(), false, 0, false);
+        Check2(sFailMsg.contains(QStringLiteral("路径不存在")),
+               QStringLiteral("绝对路径预检应报「路径不存在」实际报：%1")
+                   .arg(sFailMsg.left(120)));
+        CClaudeRunner::s_fnProbeFallback = nullptr;   // 钩子还原
+    }
+    {   // G. 兕底探测自动切换（2026.10.10）：配置路径失效但探测命中（注入返回 stub 命令）
+        //    → 不报错、事件行含「已自动探测到可用安装」、替换后整轮 stub 照常跑通。
+        CClaudeRunner::s_fnProbeFallback = [&sStub](QString* a_psFrom) {
+            if (a_psFrom != nullptr) { *a_psFrom = QStringLiteral("测试注入"); }
+            return sStub;
+        };
+        CClaudeRunner::SetClaudeCmd(QStringLiteral("C:/no_such_dir_xyz/claude.exe"));
+        CClaudeRunner runner;
+        QString sSysLine;
+        bool bFailed = false;
+        QObject::connect(&runner, &CAgentRunnerBase::sigInfo, &runner,
+                         [&](const QString& a_s) { if (a_s.contains(QStringLiteral("已自动探测到可用安装"))) sSysLine = a_s; });
+        QObject::connect(&runner,
+                         qOverload<bool, const QString&, qint64, qint64, double, const QString&>(
+                             &CAgentRunnerBase::sigFinished),
+                         &runner, [&](bool a_bOk, const QString&, qint64, qint64, double,
+                                      const QString&) { if (!a_bOk) bFailed = true; });
+        runner.StartStage(sDir, QStringLiteral("兕底轮"), QString(), 40,
+                          QString(), false, 0, false);
+        Check2(!sSysLine.isEmpty() && sSysLine.contains(QStringLiteral("测试注入")),
+               QStringLiteral("兕底轮应发自动切换事件行（含来源）实际：%1")
+                   .arg(sSysLine.left(100)));
+        Check2(!bFailed, QStringLiteral("兕底切换后 stub 轮不应失败"));
+        CClaudeRunner::s_fnProbeFallback = nullptr;   // 钩子还原
+    }
+    {   // I. 共享表条目 iCtx 窗口优先（2026-10-14/15）：同名多级条目按槽位/激活项取值；
+        //    无条目/条目 iCtx 非法（≤0）→ 名字探测兑底（glm=128K）。
+        {
+            SDshModelEntry stA;   // M0：激活条目，glm-5.3 设 990K
+            stA.sDisp = QStringLiteral("glm-5.3");
+            stA.sModelId = QStringLiteral("glm-5.3");
+            stA.iCtx = 990000;
+            SDshModelEntry stB;   // M1：同名副本条目，glm-5.3 设 1M
+            stB.sDisp = QStringLiteral("glm-5.3-副本");
+            stB.sModelId = QStringLiteral("glm-5.3");
+            stB.iCtx = 1000000;
+            SDshModelEntry stC;   // M2：不同模型
+            stC.sDisp = QStringLiteral("glm-4.6");
+            stC.sModelId = QStringLiteral("glm-4.6");
+            stC.iCtx = 200000;
+            CClaudeRunner::SetSharedModelTable({ stA, stB, stC }, 0);
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("autocode-2/glm-5.3")) == 1000000,
+                   QStringLiteral("槽位前缀命中第 2 条（1M 副本）应返回 1000000"));
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("autocode-1/glm-5.3")) == 990000,
+                   QStringLiteral("槽位前缀命中第 1 条（激活 990K）应返回 990000"));
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("glm-5.3")) == 990000,
+                   QStringLiteral("无前缀 → 激活条目优先（990K 而非首个之外的同名 1M）"));
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("autocode-9/glm-5.3")) == 990000,
+                   QStringLiteral("槽位越界 → 退回激活/同名兑底（990K）"));
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("claude-sonnet-4-5")) == 200000,
+                   QStringLiteral("claude 不在表内 → 兑底 200K 不受条目影响"));
+            stA.iCtx = 0;   // 激活条目非法 + 无前缀 → 取同名下一条有效值
+            CClaudeRunner::SetSharedModelTable({ stA, stB, stC }, 0);
+            Check2(CClaudeRunner::ContextWindowForModel(
+                       QStringLiteral("glm-5.3")) == 1000000,
+                   QStringLiteral("激活条目 iCtx≤0 → 同名下一条有效值 1M"));
+        }
+    }
+    CClaudeRunner::SetClaudeCmd(sStub);   // 恢复正常 stub 配置（后续场景/再入安全）
     return g_iFail == 0 ? 0 : 1;
 }
 }   // namespace

@@ -94,6 +94,16 @@ private:
     bool LaunchCmdWindow(bool a_bRunAs, const QString& a_sTitle, const QString& a_sCmdLine,
                          const QString& a_sWorkDir = QString());
     bool ConfirmIfBusy(int a_iBackend, const QString& a_sWhat);   // D6 提示确认
+    // 2026.10.10 Node 预检闸（claude-code@2.x 引擎要求 Node>=22，旧 Node 残装时
+    //   npm postinstall 新语法必解析失败）：PATH 上的 node -v 同步短探测
+    //   （RunGitSync 同款口径，npm.cmd 解析的 node 同样来自 PATH，探测与执行一致）。
+    //   返回 -1 = node 不在 PATH/探测失败；>=0 = 主版本（v0.12.2 → 0）。
+    //   a_psVerOut 可空出参回写原始版本串（供提示文案展示）。
+    static int ProbeNodeMajor(QString* a_psVerOut = nullptr);
+    // npm 类更新前置闸：node 缺失或主版本 < a_iMinMajor 时弹窗给出
+    //   「安装/升级 Node.js LTS」一键入口（install_env.bat /node）+「仍然继续更新」
+    //   出口（保留旧行为）。返回 true=放行原更新流程；false=已拦截（升级中/取消）。
+    bool EnsureNodeOk(int a_iMinMajor, const QString& a_sTitle);
 
     // 池化启动：杀同键旧进程 → 起新 QProcess（父=this）+ iTimeoutMs 单发 QTimer，
     //   finished/FailedToStart/超时 kill 收敛到 a_fnOnDone(退出码, 合并输出) 一次。

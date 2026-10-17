@@ -2180,13 +2180,17 @@ bool CTaskOrchestrator::AutoNameNow(CTaskInfo* a_pTask, const QString& a_sAsstId
     return true;
 }
 
-bool CTaskOrchestrator::AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts) {
+bool CTaskOrchestrator::AutoNameAsstNow(QString a_sAsstId, QString a_sPrompts) {
     // 2026-09-22 助手自动重命名：右键菜单「自动重命名」/收尾自动命名/挂起收尾执行 →
     //   面板收集该助手全部用户提示词经 sigAsstAutoRename → CMainWindow 转到这里。优先
     //   借用该助手自己的会话（fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲
     //   会话；全忙则排队忙等待（2026-10-03：3s 周期重查至空闲，取代旧版直接 false）。
     //   结果在 OnAdhocFinished 的 AsstAutoNaming 分支解析两行（名称+说明）后发
     //   sigAsstAutoNameDone → 面板回填 sName/sDesc 并落盘。
+    //   2026.10.11 参数改值传（172129 dump 实证崩溃）：调用链 emit 直连全程 const& 引用
+    //   面板 SAsst::sId，本函数内 emit sigAdhocEvent 同步槽链可重排/销毁助手数组 →
+    //   之后 singleShot(3000) lambda 捕获拷贝 a_sAsstId 时读已释放内存（QString 拷贝
+    //   构造内写 AV，d 指针 0x3c000003c0）。值拷贝在链前完成，链上任意时点安全。
     if (a_sAsstId.isEmpty() || a_sPrompts.trimmed().isEmpty()) {
         return false;
     }
@@ -2404,16 +2408,19 @@ EReviewDecision CTaskOrchestrator::ParseReviewDecision(CTaskInfo* a_pTask,
 
     // 2026.08.12 (修假驳回) 三层决策解析，取代原关键词全文本子串匹配：
     //   原「驳回/reject/不通过/未通过」子串匹配会误判——「无不通过项」「未通过的检查项为零」
-    //   这类正面表述也命中 → 假驳回 → 死循环熔断。所有评审模板已要求文末单行「决策：通过|驳回」，
-    //   故改为：Tier1 行锚定正则取最后一条决策行（Test append 到 cr.md 时取最后一条=本阶段决策）；
-    //   Tier2 仅当无决策行，在末尾 1500 字查「驳回/reject」独立词（不查「不通过/未通过」子串）；
-    //   Tier3 默认 Pass（评审未显式驳回即放行）。
-    //
+    //   这类正面表述也命中 → 假驳回 → 死循环熔断。所有评审模板已要求文末单行「决策：通过|驳回」。
+    //   2026.10.14 Tier1/2/3 抽为无状态 ParseDecisionText（可单测）；本函数只负责文本拼装。
+    return ParseDecisionText(sText);
+}
+
+// 2026.10.14 三层决策解析的纯文本部分（无状态，Tier1 行锚定 → Tier2 尾部词扫描 →
+//   Tier3 默认通过）；文件/流文本拼装留在 ParseReviewDecision。
+EReviewDecision CTaskOrchestrator::ParseDecisionText(const QString& a_sText) {
     // —— Tier 1：行锚定，取最后一条「决策：xxx」行（容忍全/半角冒号、首尾空白）——
     static const QRegularExpression reDecision(
         QStringLiteral("(?m)^\\s*决策\\s*[:：]\\s*(.+?)\\s*$"));
     QString sLastDecision;
-    auto itMatch = reDecision.globalMatch(sText);
+    auto itMatch = reDecision.globalMatch(a_sText);
     while (itMatch.hasNext()) {
         sLastDecision = itMatch.next().captured(1).trimmed();
     }
@@ -2431,7 +2438,13 @@ EReviewDecision CTaskOrchestrator::ParseReviewDecision(CTaskInfo* a_pTask,
 
     // —— Tier 2：无有效决策行时，仅在末尾 1500 字查显式 reject 词 ——
     //   只匹配「驳回 / reject」独立词，不匹配「不通过/未通过」子串（假阳性源头）。
-    const QString sTail = sText.right(1500);
+    //   2026.10.14 二次加固：先剔除否定式/指代式驳回叙述（「不构成本轮驳回」「判非驳回」
+    //   「上轮唯一驳回项」「驳回意见」等）——通过报告转述历史驳回结论时极易带这些短语，
+    //   曾致通过被误判驳回后无限回炉（评审通过会重置迭代计数，熔断永不触发）。
+    QString sTail = a_sText.right(1500);
+    static const QRegularExpression reNegReject(
+        QStringLiteral("不[^，。；\n]{0,12}驳回|无需驳回|非本轮驳回|非驳回|驳回项|驳回意见"));
+    sTail.remove(reNegReject);
     const QRegularExpression reRejectWord(
         QStringLiteral("驳回|\\breject\\b"),
         QRegularExpression::CaseInsensitiveOption);
@@ -2831,7 +2844,7 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     //   （实测确认 → #4 O(1) 撤销可行）；无 sid（首条提问 / CompactReseed 前已清空）则纯新建会话。
     const bool bFork = !a_S.sSid.isEmpty();
     // 2026.08.15 autocompact 比例制：K（千 token）= 窗口 × [Adhoc] AutoCompactPct ÷ 100 ÷ 1000，
-    //   窗口优先 [Adhoc] ContextLimit 用户覆盖、未设按助手最近所用模型探测（替代旧千 token 档位）。
+    //   窗口按助手最近所用模型探测（2026-10-15 [Adhoc] ContextLimit 用户覆盖已删，探测为唯一来源）。
     const int iAutoCompactK = m_pPm
         ? m_pPm->AutoCompactKFor(a_S.pRunner->LastModel()) : 150;
     a_S.dtStart = QDateTime::currentDateTime();   // 耗时归集：本次调用起点
@@ -2846,12 +2859,20 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     }
     // 2026.09.23 v3.0.219 轮次预算：SubmitAdhoc 按提示词难度评估（iTurnsBudget），
     //   内部链路（命名/续跑等未评估路径）回退全局基值。
+    // 2026-10-09 运行态广播必须先于 StartStage（另机实测卡死修复）：五后端的
+    //   StartStage 都可能**同步**失败——FailedToStart（QProcess::start 内同步发
+    //   errorOccurred）、CLI 探测失败/未装、waitForStarted 失败等路径都在调用内
+    //   同步 EmitFailed→sigFinished→OnAdhocFinished→SetAsstRunning(false)。若广播
+    //   在 StartStage 之后，会把刚被归零的运行态重新置真 → 面板永久卡「运行中」
+    //   （会话 runner 实际空闲）→ 20s 后孤儿看门狗误报自愈；且命名挂起
+    //   （bSendAfterAutoName）永不解除，后续发送全部只暂存不提交。先广播：同步
+    //   失败链的归零落在最后，终态正确；手动发送路径面板已自置，置为幂等重锚。
+    emit sigAdhocRunning(a_S.sId);   // 面板进该助手运行态（手动发送已自置，此处兜自动续发/压缩）
     a_S.pRunner->StartStage(sWorkDir, sFinalPrompt, sTools,
                             (a_iTurnsOverride > 0 ? a_iTurnsOverride
                                 : (a_S.iTurnsBudget > 0 ? a_S.iTurnsBudget
                                                        : AdhocMaxTurns())),
                             a_S.sSid, bFork, iAutoCompactK, /*a_bEnableAskUser=*/true);
-    emit sigAdhocRunning(a_S.sId);   // 面板进该助手运行态（手动发送已自置，此处兜自动续发/压缩）
 }
 
 int CTaskOrchestrator::AdhocMaxTurns() const {
@@ -2923,6 +2944,14 @@ int CTaskOrchestrator::EstimateAdhocTurns(const QString& a_sUserText, int a_iBas
     return qBound(iBase, iEst, 200);
 }
 
+
+int CTaskOrchestrator::TurnsBudgetAfterLimitHit(int a_iEstimate, int a_iPrevBudget) {
+    // 2026-10-09 触顶历史感知阶梯：上一轮撞上限说明当前工程的工作粒度超出预算——
+    //   预算取「评估值」与「上轮预算×1.5」的较大者，封顶 200（与 [Adhoc] MaxTurns
+    //   钳位上限同源）。评估值是提示词启发式（「继续」二字称不出真实工作量），
+    //   上轮预算是会话事实——取大者保证只升不降、快速爬到合适量级。
+    return qMin(200, qMax(a_iEstimate, a_iPrevBudget * 3 / 2));
+}
 int CTaskOrchestrator::MaxIter() const {
     // 2026.08.15 [Policy] MaxIter 现读（设置保存即生效）；m_pPm 为空回退默认 3。
     return (m_pPm != nullptr) ? m_pPm->LoadMaxIter() : 3;
@@ -2971,6 +3000,60 @@ void CTaskOrchestrator::InjectTaskMessage(CTaskInfo* a_pTask, const QString& a_s
 //   [Adhoc] ExpertAssistant；0/1=强制关/开。定义前置：SubmitAdhoc 在前、实现在后。
 static int g_iAdhocDeepOverride = -1;
 
+// 2026.10.12 排队指令延迟排空（修「指令搁浅」——见调用处注释）：
+//   出队→转正→合并→延迟 1.5s 投递（等 runner 退净；其间用户新起轮则入其队列）。
+//   2026-10-16 扩展：①FinishAdhocSuccess 轮末排空与 SubmitAdhoc 退净窗口提交一并
+//   接入（原先同步 SubmitAdhoc 恒撞「result 已收、进程未退」窗口 → 指令原样排回 +
+//   无 sigAdhocFinished → 面板卡运行态被孤儿看门狗收割，且队列永不清空、此后每轮
+//   done 重演，另机 348 实测同一提问连触 4 次 self_heal）；②tick 内 runner 仍存活且
+//   本轮已收尾（IsTurnClosed）时静默续等下一拍（注入帧在 CLI 内溢出为收尾后新轮的
+//   场景实测可跑十余分钟，逐拍重投事件会刷屏）；runner 在跑真轮（用户新起）则照常
+//   投递，由 SubmitAdhoc 处置（注入或入该轮队列，随其正常排空）。
+void CTaskOrchestrator::DeferredDrainPendingInjects(SAdhocSession& a_S) {
+    if (a_S.aPendingInjects.isEmpty()) {
+        return;
+    }
+    QStringList aBatch;
+    for (const QString& s : a_S.aPendingInjects) {
+        if (!s.trimmed().isEmpty()) {
+            aBatch << s;
+        }
+    }
+    a_S.aPendingInjects.clear();
+    if (aBatch.isEmpty()) {
+        return;
+    }
+    const QString sId   = a_S.sId;
+    const int iPerm     = a_S.iPerm;
+    const QString sTask = a_S.sLastTaskId;
+    QTimer::singleShot(1500, this,
+        [this, sId, aBatch, iPerm, sTask]() { DrainPendingTick(sId, aBatch, iPerm, sTask); });
+}
+
+void CTaskOrchestrator::DrainPendingTick(const QString& a_sId, const QStringList& a_aBatch,
+                                         int a_iPerm, const QString& a_sTaskId) {
+    SAdhocSession* pS = m_aAdhoc.value(a_sId, nullptr);
+    if (pS == nullptr) {
+        return;   // 会话已删（助手删除/切工程）：排队指令随行作废
+    }
+    if (pS->pRunner != nullptr && pS->pRunner->IsRunning()
+            && pS->pRunner->IsTurnClosed()) {
+        QTimer::singleShot(1500, this, [this, a_sId, a_aBatch, a_iPerm, a_sTaskId]() {
+            DrainPendingTick(a_sId, a_aBatch, a_iPerm, a_sTaskId);
+        });
+        return;   // 退净窗口/注入溢出轮：进程在而本轮已收，注入必失败——静默续等
+    }
+    for (const QString& s : a_aBatch) {
+        emit sigAdhocPendingStarted(a_sId, s);
+    }
+    if (a_aBatch.size() > 1) {
+        emit sigAdhocEvent(a_sId, QStringLiteral("batch"),
+            QStringLiteral("已将 %1 条排队指令合并为本轮一次性投送").arg(a_aBatch.size()));
+    }
+    SubmitAdhoc(a_sId, a_aBatch.size() == 1 ? a_aBatch.first() : MergeQueuedPrompts(a_aBatch),
+                a_iPerm, a_sTaskId);
+}
+
 void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText,
                                     int a_iPerm, const QString& a_sTaskId,
                                    const QStringList* a_pTranscript) {
@@ -2994,6 +3077,19 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
                     .arg(a_sText.left(120)));
         } else if (!a_sText.trimmed().isEmpty()) {
             pS->aPendingInjects.append(a_sText);
+            if (pS->pRunner->IsTurnClosed()) {
+                // 2026-10-16 退净窗口提交（result 已收、进程未退——如注入帧在 CLI 内
+                //   溢出为收尾后新轮继续跑）：入队即搁浅（本轮收尾已过、无人再驱动
+                //   排空），且 DoAdhocSend 先置的面板运行态无人归零 → 孤儿看门狗收割
+                //   （另机 348 首例即此路径）。改：入队 + 先交还输入栏 + 延迟排空等
+                //   退净后作为新轮投送（同命名分支 10.12 口径）。
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("queued"),
+                    QStringLiteral("已排队追加指令（后端收尾中，退出后自动发送）：%1")
+                        .arg(a_sText.left(120)));
+                emit sigAdhocFinished(a_sAsstId);
+                DeferredDrainPendingInjects(*pS);
+                return;
+            }
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("queued"),
                 QStringLiteral("已排队追加指令（本轮结束后自动发送）：%1")
                     .arg(a_sText.left(120)));
@@ -3013,6 +3109,10 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
         emit sigAdhocEvent(a_sAsstId, QStringLiteral("warn"),
             QStringLiteral("请先打开一个工程再使用助手"));
+        // 2026-10-09 未起轮即拒绝：归零面板运行态（DoAdhocSend/补发链已先置 true，
+        //   不归零会卡死到孤儿看门狗才恢复）。Grace/Retry 分支不归零——runner 仍占用
+        //   属健康运行态；本分支 runner 空闲，必须收尾。
+        emit sigAdhocFinished(a_sAsstId);
         return;
     }
     // 2026.09.20 粘性后端绑定/提示：未绑定会话首次提交时绑当前全局（之后不再随全局
@@ -3035,9 +3135,26 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     //   可关）；预算随会话存续——续跑/纠偏/压缩重发沿用（同一条提问工作量不变）。
     {
         const int iBase = AdhocMaxTurns();
-        pS->iTurnsBudget = AdhocMaxTurnsAuto()
+        const int iEstimate = AdhocMaxTurnsAuto()
             ? EstimateAdhocTurns(a_sText, iBase) : iBase;
-        if (pS->iTurnsBudget > iBase) {
+        int iBudget = iEstimate;
+        // 2026-10-09 触顶历史感知：上一轮（同会话）曾撞轮次上限 → 本轮预算阶梯
+        //   上调。依据是会话事实（实际跑满）而非提示词启发式——「继续」类短指令
+        //   同样受益（Compositer 实害：77/78 轮触顶全靠手动续）；不受 MaxTurnsAuto
+        //   开关限制（事实反馈优先于启发式猜测）；正常完成一轮后自动回落。
+        if (pS->iHitLimitStreak > 0) {
+            const int iBoost = TurnsBudgetAfterLimitHit(iBudget, pS->iTurnsBudget);
+            if (iBoost > iBudget) {
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("turns_budget"),
+                    QStringLiteral("⚙ 上一轮达到轮次上限，本轮轮次预算自动上调 %1 → %2"
+                                   "（连续触顶 %3 轮，不再触顶后自动回落）")
+                        .arg(iBudget).arg(iBoost).arg(pS->iHitLimitStreak));
+                iBudget = iBoost;
+            }
+        }
+        pS->iTurnsBudget = iBudget;
+        const bool bBoosted = (iBudget > iEstimate);   // 触顶上调已发事件，评估事件互斥防双报
+        if (pS->iTurnsBudget > iBase && !bBoosted) {
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("turns_budget"),
                 QStringLiteral("⚙ 工作量评估：本轮任务较重，轮次上限 %1 → %2")
                     .arg(iBase).arg(pS->iTurnsBudget));
@@ -3045,6 +3162,7 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     }
     pS->bNudgeUsed = false;   // 2026.09.09 v2.1.131 新提问重置纠偏配额
     pS->bAutoCompactDone = false;   // 2026.09.09 v2.1.132 新提问重置超限自愈配额
+    pS->bNameRetryUsed = false;   // 2026-10-09 新提问重置任务命名重试配额
     pS->eMode = Submitting;
     pS->sPendingPrompt = a_sText;   // 原始提问入栈（注入内容不进撤销栈，保持用户可见语义）
 
@@ -3636,6 +3754,21 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         emit sigAdhocFinished(a_sAsstId);   // 助手面板退出运行态（命名过程会短暂占用输入栏）
         if (pTask == nullptr) { break; }
         if (!a_bOk) {
+            // 2026-10-09 瞬态崩溃自愈重试（pdfplumber 实害：命名轮 pi RPC 进程流式
+            //   输出中 libuv 断言 fail-fast 退出——非配置错误，重试一次即恢复）。
+            //   singleShot(0) 防重入（此刻 runner 刚收尾状态复位中）；QPointer 防任务
+            //   删除悬垂；重试位防循环（重试轮再失败走原失败路径）。
+            if (!pS->bNameRetryUsed) {
+                pS->bNameRetryUsed = true;
+                StageEvent(pTask, QStringLiteral("auto_name_retry"),
+                    QStringLiteral("↻ 命名轮进程异常退出（瞬态故障），自动重试一次"));
+                QPointer<CTaskInfo> pGuard = pTask;
+                const QString sAsstId = a_sAsstId;
+                QTimer::singleShot(0, this, [this, pGuard, sAsstId]() {
+                    if (pGuard != nullptr) { AutoNameNow(pGuard, sAsstId); }
+                });
+                break;   // 不发 sigAutoNameDone：重试轮会再进这里
+            }
             StageEvent(pTask, QStringLiteral("auto_name_failed"),
                 QStringLiteral("✗ Agent 自动命名失败：%1（任务名保持不变）")
                     .arg(a_sResult.left(120)));
@@ -3657,6 +3790,7 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         }
         pTask->SetAutoNamed(false);
         pTask->SetName(sName);   // 发 sigChanged → task.json 回写 + UI 刷新
+        pS->bNameRetryUsed = false;   // 2026-10-09 命名成功：重试位复位（下次命名干净起点）
         StageEvent(pTask, QStringLiteral("auto_named"),
             QStringLiteral("⚙ Agent 已自动命名：「%1」").arg(sName));
         emit sigAutoNameDone(pTask, true, sName);
@@ -3670,6 +3804,12 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         pS->eMode = Idle;
         pS->sPendingPrompt.clear();
         emit sigAdhocFinished(a_sAsstId);   // 借用的执行会话退出运行态
+        // 2026.10.12 排队指令排空（修「命名后指令搁浅」）：命名收尾分支原先不排空
+        //   aPendingInjects——同步链上 SubmitAdhoc 撞进程退净窗口入队的指令会永久
+        //   搁浅（无驱动轮排空）→ 面板孤儿态被看门狗收割、指令丢失。同
+        //   FinishAdhocSuccess 口径出队合并，延迟 1.5s 等 runner 退净再投（其间
+        //   用户新起轮则入其队列，由该轮正常排空）。
+        DeferredDrainPendingInjects(*pS);
         if (sTarget.isEmpty()) { break; }
         if (!a_bOk) {
             emit sigAsstAutoNameDone(sTarget, false, QString(),
@@ -3705,6 +3845,7 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         pS->eMode = Idle;
         pS->sPendingPrompt.clear();
         emit sigAdhocFinished(a_sAsstId);   // 提炼执行会话退出运行态
+        DeferredDrainPendingInjects(*pS);   // 2026.10.12 同命名分支：排队指令延迟排空
         if (sTarget.isEmpty() || iLimit <= 0) {
             break;
         }
@@ -3748,6 +3889,7 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             if (pS->pRunner != nullptr && pS->pRunner->LastWasMaxTurns()
                 && !a_sSid.isEmpty()) {
                 pS->sSid = a_sSid;   // 链基点推进到断点 sid：后续 fork 从断点续，不丢已完成轮次
+                ++pS->iHitLimitStreak;   // 2026-10-09 触顶历史感知：下轮预算阶梯上调的依据
                 if (pS->iResume < 2) {
                     ++pS->iResume;
                     emit sigAdhocEvent(a_sAsstId, QStringLiteral("resume"),
@@ -4001,8 +4143,11 @@ void CTaskOrchestrator::SetAdhocDeepOverride(int a_iMode) {
 }
 
 // 专家模式规划/验证轮的 --max-turns 覆盖：轻量辅助轮（只出计划/只跑验收），无需
-// 执行轮的重预算；20 轮足够只读探索大工程 + 编译/测试两三轮。
-static constexpr int k_iDeepAuxTurns = 20;
+// 执行轮的重预算。2026.10.14 由 20 提到 40（InfraredImagery 实锤：规划轮只读探索
+// 大工程 + 多文档时 20 轮不够，error_max_turns → deep_plan_failed → 跳过规划直接
+// 执行，验收标准缺失拉低执行/验证质量；两轮均禁 Edit/Write，多轮只是多读几次，
+// 成本可控）。
+static constexpr int k_iDeepAuxTurns = 40;
 
 void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
     // 深度链第 1 步：规划轮（fork 一次性分支，不动撤销栈/sid 基点）。只读探索，
@@ -4075,6 +4220,20 @@ void CTaskOrchestrator::DeepChainRestart(SAdhocSession& a_S, const QString& a_sW
         emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_restart"),
             QStringLiteral("♻ %1——专家模式自动重启深度链（第 %2/%3 次：重新规划→执行→验证）")
                 .arg(a_sWhy).arg(a_S.iDeepRestart).arg(iCap));
+        // 2026-10-10 触顶历史感知（链内，Compositer 实害）：执行轮上限耗尽是会话
+        //   事实——重启轮预算阶梯上调（同 SubmitAdhoc 口径上轮×1.5 封顶 200），链
+        //   内自动爬升，不再等用户手发下一条「继续」才抬预算（深度链轮不经
+        //   SubmitAdhoc，v4.0.309 的入口上调管不到这里）。
+        if (a_S.iHitLimitStreak > 0) {
+            const int iBoost = TurnsBudgetAfterLimitHit(a_S.iTurnsBudget, a_S.iTurnsBudget);
+            if (iBoost > a_S.iTurnsBudget) {
+                emit sigAdhocEvent(a_S.sId, QStringLiteral("turns_budget"),
+                    QStringLiteral("⚙ 深度链重启：执行轮轮次预算自动上调 %1 → %2"
+                                   "（连续触顶 %3 轮，不再触顶后自动回落）")
+                        .arg(a_S.iTurnsBudget).arg(iBoost).arg(a_S.iHitLimitStreak));
+                a_S.iTurnsBudget = iBoost;
+            }
+        }
         StartDeepPlan(a_S);
         return;
     }
@@ -4086,6 +4245,7 @@ void CTaskOrchestrator::DeepChainRestart(SAdhocSession& a_S, const QString& a_sW
 }
 
 void CTaskOrchestrator::FinishAdhocSuccess(SAdhocSession& a_S, const QString& a_sFinalSid) {
+    a_S.iHitLimitStreak = 0;   // 2026-10-09 本轮正常完成：触顶计数回落（下轮预算回基线）
     // 原 Submitting 成功尾段提炼（2026.09.26）：压栈 (prompt, newSid) 并推进链基点
     //   （sid 空=异常不压栈、链不动）→ 模型/上下文上报 → guide 同步节流 → 排队指令
     //   续发（多条合并投送）。深度链 PASS 与纯对话成功统一走这里。
@@ -4106,34 +4266,14 @@ void CTaskOrchestrator::FinishAdhocSuccess(SAdhocSession& a_S, const QString& a_
         m_tGuideSyncIdle.start();
     }
     emit sigAdhocEvent(a_S.sId, QStringLiteral("done"), QStringLiteral("已完成"));
-    // 2026.08.27 运行中排队的追加指令自动续发（同会话续跑，在 sigAdhocFinished 之前）；
-    //   2026.09.20 v2.4.185 多条排队指令一次性合并投送：全部出队，逐条转正面板暂存
-    //   块后合并为一次 SubmitAdhoc；单条行为不变（无包装原文投递）。
-    if (!a_S.aPendingInjects.isEmpty()) {
-        QStringList aBatch;
-        for (const QString& s : a_S.aPendingInjects) {
-            if (!s.trimmed().isEmpty()) {
-                aBatch << s;
-            }
-        }
-        a_S.aPendingInjects.clear();
-        for (const QString& s : aBatch) {
-            emit sigAdhocPendingStarted(a_S.sId, s);
-        }
-        if (aBatch.isEmpty()) {
-            // 全空白（防御，正常排队路径已拦空文本）：直接归空闲。
-            emit sigAdhocFinished(a_S.sId);
-        } else if (aBatch.size() == 1) {
-            SubmitAdhoc(a_S.sId, aBatch.first(), a_S.iPerm, a_S.sLastTaskId);
-        } else {
-            emit sigAdhocEvent(a_S.sId, QStringLiteral("batch"),
-                QStringLiteral("已将 %1 条排队指令合并为本轮一次性投送")
-                    .arg(aBatch.size()));
-            SubmitAdhoc(a_S.sId, MergeQueuedPrompts(aBatch),
-                        a_S.iPerm, a_S.sLastTaskId);
-        }
-        return;
-    }
+    // 2026.08.27 运行中排队的追加指令自动续发（同会话续跑）；2026.09.20 v2.4.185 多条
+    //   排队指令一次性合并投送。2026-10-16 改延迟排空：本函数在 result 行同步链内执行，
+    //   此刻进程必未退（IsRunning()=true）且 InjectUserTurn 必 false（m_bFinished 已置）——
+    //   原同步 SubmitAdhoc 恒把刚出队的指令原样排回，且 return 前不发 sigAdhocFinished →
+    //   面板卡运行态被孤儿看门狗收割（self_heal），队列永不清空、此后每轮 done 重演
+    //   （另机 348 实测同一提问连触 4 次）。改先交还输入栏，延迟 1.5s 等 runner 退净
+    //   再投（同命名分支 10.12 口径；其间用户新起轮则入其队列由该轮正常排空）。
+    DeferredDrainPendingInjects(a_S);
     emit sigAdhocFinished(a_S.sId);
 }
 

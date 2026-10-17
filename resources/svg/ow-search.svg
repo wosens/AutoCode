@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <circle cx="13.5" cy="13.5" r="7.5" stroke="#2563eb" stroke-width="2.6"/>
-  <path d="M19 19 L27.5 27.5" stroke="#2563eb" stroke-width="3.2" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 查找：放大镜 + 高光 -->
+  <circle cx="10.3" cy="10.3" r="6.6" stroke="#2563EB" stroke-width="2.2"/>
+  <path d="M15.2 15.2 L20.5 20.5" stroke="#2563EB" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M6.8 10.5 A3.8 3.8 0 0 1 9.2 7.2" stroke="#2563EB" stroke-width="1.6" stroke-linecap="round" stroke-opacity="0.5"/>
 </svg>

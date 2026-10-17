@@ -1,6 +1,7 @@
-<RCC>
+﻿<RCC>
     <qresource prefix="/icons">
         <file>app.ico</file>
+        <file>launcher-title.png</file>
         <file>user.png</file>
         <file>menu/16/ow-explorer.png</file>
         <file>menu/16/ow-cut.png</file>
@@ -15,6 +16,7 @@
         <file>menu/16/ow-chat.png</file>
         <file>menu/16/ow-openwith.png</file>
         <file>menu/16/ow-view.png</file>
+        <file>menu/16/ow-saveas.png</file>
         <file>menu/16/ow-autoname.png</file>
         <file>menu/16/ow-rerun.png</file>
         <file>menu/16/ow-compress.png</file>
@@ -40,6 +42,7 @@
         <file>menu/32/ow-chat.png</file>
         <file>menu/32/ow-openwith.png</file>
         <file>menu/32/ow-view.png</file>
+        <file>menu/32/ow-saveas.png</file>
         <file>menu/32/ow-autoname.png</file>
         <file>menu/32/ow-rerun.png</file>
         <file>menu/32/ow-compress.png</file>
@@ -56,5 +59,98 @@
         <file>qbox/q-expand16.png</file>
         <file>qbox/q-collapse8.png</file>
         <file>qbox/q-collapse16.png</file>
-    </qresource>
+            <file>menu/20/ow-autoname.png</file>
+        <file>menu/20/ow-chat.png</file>
+        <file>menu/20/ow-compress.png</file>
+        <file>menu/20/ow-copy.png</file>
+        <file>menu/20/ow-copypath.png</file>
+        <file>menu/20/ow-copyrel.png</file>
+        <file>menu/20/ow-cut.png</file>
+        <file>menu/20/ow-delete.png</file>
+        <file>menu/20/ow-diff.png</file>
+        <file>menu/20/ow-explorer.png</file>
+        <file>menu/20/ow-newfolder.png</file>
+        <file>menu/20/ow-openwith.png</file>
+        <file>menu/20/ow-paste.png</file>
+        <file>menu/20/ow-properties.png</file>
+        <file>menu/20/ow-refresh.png</file>
+        <file>menu/20/ow-remove.png</file>
+        <file>menu/20/ow-rename.png</file>
+        <file>menu/20/ow-rerun.png</file>
+        <file>menu/20/ow-review.png</file>
+        <file>menu/20/ow-rootadd.png</file>
+        <file>menu/20/ow-rootdown.png</file>
+        <file>menu/20/ow-rootup.png</file>
+        <file>menu/20/ow-saveas.png</file>
+        <file>menu/20/ow-search.png</file>
+        <file>menu/20/ow-size.png</file>
+        <file>menu/20/ow-view.png</file>
+        <file>menu/24/ow-autoname.png</file>
+        <file>menu/24/ow-chat.png</file>
+        <file>menu/24/ow-compress.png</file>
+        <file>menu/24/ow-copy.png</file>
+        <file>menu/24/ow-copypath.png</file>
+        <file>menu/24/ow-copyrel.png</file>
+        <file>menu/24/ow-cut.png</file>
+        <file>menu/24/ow-delete.png</file>
+        <file>menu/24/ow-diff.png</file>
+        <file>menu/24/ow-explorer.png</file>
+        <file>menu/24/ow-newfolder.png</file>
+        <file>menu/24/ow-openwith.png</file>
+        <file>menu/24/ow-paste.png</file>
+        <file>menu/24/ow-properties.png</file>
+        <file>menu/24/ow-refresh.png</file>
+        <file>menu/24/ow-remove.png</file>
+        <file>menu/24/ow-rename.png</file>
+        <file>menu/24/ow-rerun.png</file>
+        <file>menu/24/ow-review.png</file>
+        <file>menu/24/ow-rootadd.png</file>
+        <file>menu/24/ow-rootdown.png</file>
+        <file>menu/24/ow-rootup.png</file>
+        <file>menu/24/ow-saveas.png</file>
+        <file>menu/24/ow-search.png</file>
+        <file>menu/24/ow-size.png</file>
+        <file>menu/24/ow-view.png</file>
+        <file>menu/40/ow-autoname.png</file>
+        <file>menu/40/ow-chat.png</file>
+        <file>menu/40/ow-compress.png</file>
+        <file>menu/40/ow-copy.png</file>
+        <file>menu/40/ow-copypath.png</file>
+        <file>menu/40/ow-copyrel.png</file>
+        <file>menu/40/ow-cut.png</file>
+        <file>menu/40/ow-delete.png</file>
+        <file>menu/40/ow-diff.png</file>
+        <file>menu/40/ow-explorer.png</file>
+        <file>menu/40/ow-newfolder.png</file>
+        <file>menu/40/ow-openwith.png</file>
+        <file>menu/40/ow-paste.png</file>
+        <file>menu/40/ow-properties.png</file>
+        <file>menu/40/ow-refresh.png</file>
+        <file>menu/40/ow-remove.png</file>
+        <file>menu/40/ow-rename.png</file>
+        <file>menu/40/ow-rerun.png</file>
+        <file>menu/40/ow-review.png</file>
+        <file>menu/40/ow-rootadd.png</file>
+        <file>menu/40/ow-rootdown.png</file>
+        <file>menu/40/ow-rootup.png</file>
+        <file>menu/40/ow-saveas.png</file>
+        <file>menu/40/ow-search.png</file>
+        <file>menu/40/ow-size.png</file>
+        <file>menu/40/ow-view.png</file>
+        <file>brands/vd-claude-20.png</file>
+        <file>brands/vd-claude-40.png</file>
+        <file>brands/vd-codex-20.png</file>
+        <file>brands/vd-codex-40.png</file>
+        <file>brands/vd-dsh-20.png</file>
+        <file>brands/vd-dsh-40.png</file>
+        <file>brands/vd-hermes-20.png</file>
+        <file>brands/vd-hermes-40.png</file>
+        <file>brands/vd-pi-20.png</file>
+        <file>brands/vd-pi-40.png</file>
+        <file>menu/16/ow-shield.png</file>
+        <file>menu/20/ow-shield.png</file>
+        <file>menu/24/ow-shield.png</file>
+        <file>menu/32/ow-shield.png</file>
+        <file>menu/40/ow-shield.png</file>
+</qresource>
 </RCC>

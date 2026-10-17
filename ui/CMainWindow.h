@@ -38,6 +38,13 @@ public:
     explicit CMainWindow(QWidget* a_pParent = nullptr);
     ~CMainWindow() override;
 
+    // 2026.10.09 启动界面（CRecentProjectsDialog launcher 模式）选定工程后的打开入口：
+    //   OpenProjectDir 为私有实现，此处公有薄转调供 main.cpp 启动流程调用
+    //   （须在 show() 之后调，多实例锁确认框等弹窗需要主窗口作宿主）。
+    //   2026.10.14 a_bAsWorkspace=true：启动页「跳过」路径——a_sDir 为 exe 同级
+    //   AutoCode 工作目录，功能同开工程但不算工程：不进最近列表（RecordRecent 旁路）。
+    void OpenStartupProject(const QString& a_sDir, bool a_bAsWorkspace = false);
+
 protected:
     void closeEvent(QCloseEvent* a_pEvent) override;
     // FR-3：Win32 WM_NCHITTEST 拦截——标题栏区返回 HTCAPTION（可拖拽 + 双击最大化），
@@ -62,6 +69,8 @@ private slots:
     void OnInstallEnv();
     // 2026.08.15 设置对话框：编辑 config.ini 全部可调参数，确定后落盘并应用到运行期。
     void OnSettings();
+    // 2026-10-14 任务编排设计：编辑任务类型/流程档位/执行阶段（含阶段要求提示词）。
+    void OnOrchDesign();
     // 2026.09 后端版本管理对话框（任务 23183ccb）：四后端版本查看/查询/更新入口。
     void OnVersionManage();
 
@@ -115,7 +124,7 @@ private slots:
     void OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText, int a_iPerm);
     // 2026-09-22 助手右键「自动重命名」：面板收集的提示词 → 编排器 AutoNameAsstNow；
     //   同步失败（全忙/无会话）也走面板 ApplyAsstAutoName 留事件行。
-    void OnAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts);
+    void OnAsstAutoRename(QString a_sAsstId, QString a_sPrompts);   // 2026.10.11 值传：防链上结构体释放后引用悬垂（172129 崩溃）
     void OnAdhocUndo(const QString& a_sAsstId);
     void OnAdhocCompact(const QString& a_sAsstId);
     // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
@@ -177,7 +186,12 @@ private:
     void OnEscalation(CTaskInfo* a_pTask, const QString& a_sEventText);
     // 2026.09.07 v2.1.123 多实例工程锁：他实例持锁时弹阻断式确认（默认 No）；
     //   2026.09.09 v2.1.137 a_bAutoRestore 参数已随「启动自动恢复上次工程」移除而删除。
-    void OpenProjectDir(const QString& a_sDir);
+    // 2026.10.14 a_bRecordRecent=false：不记录最近列表（跳过后的 AutoCode 工作目录
+    //   不算工程）；缺省 true 保持原行为（打开失败路径同样不记，见实现内注释）。
+    void OpenProjectDir(const QString& a_sDir, bool a_bRecordRecent = true);
+    // 2026.10.14 是否为「跳过」模式的 AutoCode 工作目录（exe 同级 \AutoCode，大小写
+    //   不敏感）：标题栏据此不重复显示「AutoCode-AutoCode」，仍回退纯 AutoCode 标题。
+    static bool IsWorkspaceDir(const QString& a_sDir);
     // 2026.09.07 标题=工程名-AutoCode 版本（未开工程=AutoCode 版本）：窗口标题供任务
     //   管理器/Alt-Tab 辨认多实例各开的工程；自绘标题栏同步刷左上角标题文本。
     void UpdateWindowTitle();

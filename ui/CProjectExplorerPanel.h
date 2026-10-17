@@ -39,7 +39,8 @@ public:
     // 添加关联根目录（a_sDir 必须存在且不与现有根重复）；返回 false=拒绝（未开工程/
     //   路径无效/重复）。成功后新根行选中并展开，立即持久化。
     bool AddExtraRoot(const QString& a_sDir);
-    // 移除关联根（仅允许移除非工程根的额外根）；同时持久化。
+    // 移除关联根（仅允许移除非工程根的额外根）；同时持久化。右键菜单入口前置
+    //   二次确认（2026-10-15 防误删）；本函数保持纯逻辑，单测直调不弹窗。
     bool RemoveExtraRoot(const QString& a_sDir);
     // 当前选中根节点上移（a_iDelta=-1）/下移（+1）；仅当选中树顶层根行且目标
     //   位置合法时生效，成功后保持该根选中并持久化。
@@ -192,8 +193,11 @@ public:
     static QStringList ReadFileClipboard(bool* a_pbCut = nullptr);
     // 单项转入目标目录（剪切/粘贴与拖拽共用语义：同名 " (n)" 编号、目录禁入自身子树、
     //   跨盘移动退复制+删源）。返回 0=成功 1=忽略（原地/缺失） 2=失败。
+    // 2026.10.16 a_bOverwrite=true（粘贴同名弹窗「覆盖」档）：替换目标同名文件、目录
+    //   合并覆盖；缺省 false 保持原自动编号行为。
     enum ETransfer { XferOk = 0, XferSkip = 1, XferFail = 2 };
-    static ETransfer TransferItem(const QString& a_sSrc, const QString& a_sDstDir, bool a_bMove);
+    static ETransfer TransferItem(const QString& a_sSrc, const QString& a_sDstDir,
+                                  bool a_bMove, bool a_bOverwrite = false);
 
 private:
     // 拖出候选态：左键按下未超阈值时记录起点与按下项（超距才升级为 QDrag）。

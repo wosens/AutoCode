@@ -34,6 +34,7 @@
 #include <QTabWidget>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QSpinBox>   // 2026-10-08 并发审查 Agent 数
 #include <QTableWidget>
 
 #ifdef Q_OS_WIN
@@ -342,7 +343,7 @@ void CCodeReviewDialog::BuildUi() {
     m_pLblTarget->setFont(fT);
     pLay->addWidget(m_pLblTarget);
 
-    // —— 2026-10-08 顶部「全量审查」开关（缺省不勾）——
+    // —— 2026-10-08 顶部「全量审查」开关（缺省不勾）+ 并发审查 Agent 数（同行右置）——
     m_pChkFull = new QCheckBox(QStringLiteral("全量审查"), this);
     QFont fC = m_pChkFull->font();
     fC.setPointSize(11);
@@ -352,7 +353,29 @@ void CCodeReviewDialog::BuildUi() {
         "不勾选（缺省）：文件清单只列自上次审查后修改/新增的文件，审查只送修改部分"
         "（增量，首次审查自动全量）。\n勾选：列出全部文件并完整审查。"));
     connect(m_pChkFull, &QCheckBox::toggled, this, &CCodeReviewDialog::OnFullToggled);
-    pLay->addWidget(m_pChkFull);
+    auto* pLayTop = new QHBoxLayout();
+    pLayTop->addWidget(m_pChkFull);
+    pLayTop->addStretch(1);
+    auto* pLblAgents = new QLabel(QStringLiteral("审查Agent数"), this);
+    QFont fA = pLblAgents->font();
+    fA.setPointSize(11);
+    pLblAgents->setFont(fA);
+    m_pSpinAgents = new QSpinBox(this);
+    QFont fAg = m_pSpinAgents->font();
+    fAg.setPointSize(11);
+    m_pSpinAgents->setFont(fAg);
+    m_pSpinAgents->setRange(1, 32);
+    m_pSpinAgents->setValue(LoadAgents());
+    m_pSpinAgents->setSuffix(QStringLiteral(" 个"));
+    m_pSpinAgents->setToolTip(QStringLiteral(
+        "并发审查的 Agent（模型实例）数量：每个待审文件起一个一次性只读 Agent，"
+        "N 个同时审不同文件。\n缺省 10；1=逐文件串行。存 config.ini [Review] Agents。"));
+    connect(m_pSpinAgents, &QSpinBox::valueChanged, this, [this](int a_iVal) {
+        SaveAgents(a_iVal);   // 即改即存（下次开窗/新窗口回填）
+    });
+    pLayTop->addWidget(pLblAgents);
+    pLayTop->addWidget(m_pSpinAgents);
+    pLay->addLayout(pLayTop);
 
     // —— 2026-10-08 双 Tab：选择文件 / 审查 ——
     m_pTabs = new QTabWidget(this);
@@ -403,6 +426,20 @@ void CCodeReviewDialog::BuildUi() {
     m_pTreeFiles->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_pTreeFiles->header()->setSectionResizeMode(QHeaderView::Interactive);   // 2026-10-08 全列允许手工拖宽
     m_pTreeFiles->header()->setStretchLastSection(true);
+    // 2026-10-08 双击文件行预览（同发现行双击链路，不带行号）。
+    connect(m_pTreeFiles, &QTreeWidget::itemDoubleClicked,
+            this, [this](QTreeWidgetItem* a_pItem, int) {
+        if (a_pItem == nullptr) {
+            return;
+        }
+        const QString sAbs = a_pItem->data(0, Qt::UserRole).toString();
+        if (!sAbs.isEmpty() && QFile::exists(sAbs)) {
+            emit sigOpenFile(sAbs, 0);
+        } else if (m_pLblStatus != nullptr) {
+            m_pLblStatus->setText(QStringLiteral("双击预览失败，文件不存在：%1")
+                                      .arg(QDir::toNativeSeparators(sAbs)));
+        }
+    });
     m_pTreeFiles->header()->resizeSection(0, 40);
     m_pTreeFiles->header()->resizeSection(1, 380);
     m_pTreeFiles->header()->resizeSection(2, 76);
@@ -580,6 +617,29 @@ void CCodeReviewDialog::SaveFilters(const QList<SReviewFilter>& a_aFilters) {
 #endif
 }
 
+// 2026-10-08 并发审查 Agent 数持久化（[Review] Agents；缺省 10，1..32 钳位）。
+int CCodeReviewDialog::LoadAgents() const {
+#ifdef Q_OS_WIN
+    wchar_t wszBuf[16] = {0};
+    ::GetPrivateProfileStringW(L"Review", L"Agents", L"", wszBuf, 16,
+                               GlobalConfigIni().toStdWString().c_str());
+    const int iVal = QString::fromWCharArray(wszBuf).trimmed().toInt();
+    if (iVal > 0) {
+        return qBound(1, iVal, 32);
+    }
+#endif
+    return 10;   // 未配置/非法 → 缺省 10
+}
+
+void CCodeReviewDialog::SaveAgents(int a_iAgents) {
+#ifdef Q_OS_WIN
+    const int iVal = qBound(1, a_iAgents, 32);
+    ::WritePrivateProfileStringW(L"Review", L"Agents",
+                                 QString::number(iVal).toStdWString().c_str(),
+                                 GlobalConfigIni().toStdWString().c_str());
+#endif
+}
+
 QList<QByteArray> CCodeReviewDialog::ExtsOfProfile(const SReviewFilter& a_stProfile) {
     QList<QByteArray> aOut;
     for (const QString& s : a_stProfile.sExts.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
@@ -735,6 +795,7 @@ void CCodeReviewDialog::PopulateFileList() {
         pItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
         pItem->setCheckState(0, Qt::Checked);   // 缺省全勾
         pItem->setText(1, sRel);
+        pItem->setData(0, Qt::UserRole, sAbs);   // 2026-10-08 双击预览（无行号定位）
         pItem->setTextAlignment(0, Qt::AlignCenter);
         QColor clrState(150, 150, 150);
         if (eMod == eModNew) {
@@ -901,14 +962,19 @@ void CCodeReviewDialog::OnStart() {
     m_pBtnStart->setEnabled(false);
     m_pBtnStop->setEnabled(true);
     m_pBtnSave->setEnabled(false);
-    m_pLblStatus->setText(QStringLiteral("开始审查：%1 个文件（%2）…")
+    const int iAgents = (m_pSpinAgents != nullptr) ? m_pSpinAgents->value() : 1;
+    if (m_pSpinAgents != nullptr) {
+        m_pSpinAgents->setEnabled(false);   // 轮内锁定（本轮 Agent 数已取定）
+    }
+    m_pLblStatus->setText(QStringLiteral("开始审查：%1 个文件（%2，%3 Agent 并发）…")
                               .arg(QString::number(m_iTotalFiles),
                                    bFull ? QStringLiteral("全量")
-                                         : QStringLiteral("仅修改部分")));
+                                         : QStringLiteral("仅修改部分"),
+                                   QString::number(iAgents)));
     UpdateCounts();
     m_pTabs->setCurrentIndex(1);   // 审查时自动切到审查页
 
-    if (!m_pSvc->StartEx(m_sRootDir, aItems, BaselineDirPath(), 600)) {
+    if (!m_pSvc->StartEx(m_sRootDir, aItems, BaselineDirPath(), 600, iAgents)) {
         m_pLblStatus->setText(QStringLiteral("审查启动失败（引擎不可用或正在运行）"));
         m_pBtnStart->setEnabled(true);
         m_pBtnStop->setEnabled(false);
@@ -964,6 +1030,9 @@ void CCodeReviewDialog::OnReviewDone(bool bOk, bool bStopped, const QString& sFi
     m_pBtnStart->setEnabled(true);
     m_pBtnStop->setEnabled(false);
     m_pBtnSave->setEnabled(!sReportMd.isEmpty());
+    if (m_pSpinAgents != nullptr) {
+        m_pSpinAgents->setEnabled(true);   // 2026-10-08 轮内锁定解除
+    }
     m_pSpin->SetBusy(false);   // 2026-10-02 转圈停（完成/停止/失败统一在此收口）
     m_pLblStatus->setText(QStringLiteral("%1：送审 %2 个文件，发现 %3 条问题。")
                               .arg(bStopped ? QStringLiteral("已停止")
@@ -1084,7 +1153,13 @@ void CCodeReviewDialog::OnItemDoubleClicked(QTreeWidgetItem* pItem, int) {
     const QString sAbs = pItem->data(0, Qt::UserRole).toString();
     const int iLine    = pItem->data(0, Qt::UserRole + 1).toInt();
     if (!sAbs.isEmpty() && QFile::exists(sAbs)) {
-        emit sigOpenFile(sAbs, iLine);
+        emit sigOpenFile(sAbs, iLine);   // 主窗口接 → 文件预览页加载 + 定位行
+        return;
+    }
+    // 2026-10-08 反馈补齐：文件已被删除/移走时明确提示（原先静默无反馈）。
+    if (m_pLblStatus != nullptr) {
+        m_pLblStatus->setText(QStringLiteral("双击定位失败，文件不存在：%1")
+                                  .arg(QDir::toNativeSeparators(sAbs)));
     }
 }
 

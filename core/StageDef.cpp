@@ -4,6 +4,28 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
+#include <QSet>
+
+// —— 动态阶段表（2026-10-14 任务编排设计）：自定义阶段由 COrchConfig 注册 ——
+namespace {
+QVector<SStageDef> g_aDynStages;
+bool g_bAllDirty = true;
+QVector<SStageDef> g_aAllStages;
+}   // namespace
+
+void RegisterDynamicStages(const QVector<SStageDef>& a_aDyn) {
+    g_aDynStages = a_aDyn;
+    g_bAllDirty = true;   // 合表重建（注册仅发生在启动/设计保存两个低频时点；
+}                        // FindStage 返回指针均为短生命周期使用，无悬垂风险）
+
+void ClearDynamicStages() {
+    g_aDynStages.clear();
+    g_bAllDirty = true;
+}
+
+bool IsDynamicStage(EStage a_eStage) {
+    return static_cast<int>(a_eStage) >= 100;
+}
 
 const QVector<SStageDef>& GetStageDefs() {
     static const QVector<SStageDef> s_aDefs = {
@@ -69,11 +91,14 @@ const QVector<SStageDef>& GetStageDefs() {
             QStringLiteral(".autodev/guide.md") },
           QStringLiteral("verify.md") },
 
-        // 10. 测试：跑测试 + 写测试文件（无 Edit，不改业务代码）
+        // 10. 测试：跑测试 + 写测试文件（无 Edit，不改业务代码）；报告与决策行追加进 cr.md
+        //    （10_test.md 输出节明确要求）——sOutput 必须与之一致，否则
+        //    ParseReviewDecision 读不到文末「决策：通过/驳回」行，会退到 Tier2 尾部关键词
+        //    扫描，报告叙述里的「不构成本轮驳回」曾致通过被误判驳回、无限回炉（2026.10.14）。
         { EStage::Test, "test", QStringLiteral("测试"),
           true, true, ToolsTest(), "10_test.md",
           { QStringLiteral("cr.md") },
-          QString() },
+          QStringLiteral("cr.md") },
 
         // 11. 根因分析（Bugfix）：写 root_cause.md
         { EStage::RootCause, "root_cause", QStringLiteral("根因分析"),
@@ -93,7 +118,13 @@ const QVector<SStageDef>& GetStageDefs() {
           { QStringLiteral("root_cause.md") },
           QString() },
     };
-    return s_aDefs;
+    // 2026-10-14 合表：内置静态表 + 已注册动态阶段（脏标记重建；无动态时即内置表副本）
+    if (g_bAllDirty) {
+        g_aAllStages = s_aDefs;
+        g_aAllStages += g_aDynStages;
+        g_bAllDirty = false;
+    }
+    return g_aAllStages;
 }
 
 const SStageDef* FindStage(EStage a_eStage) {
@@ -115,27 +146,34 @@ const SStageDef* FindStageById(const QString& a_sId) {
 }
 
 QList<EStage> ResolveFlow(ETaskType a_eType, const QList<EStage>& a_aCustom) {
-    // 规范流 = 定义表序 + bFeature/bBugfix 成员标志（与 CStageMachine 的流数组一致）；
-    //   此处自包含取流（不依赖 CStageMachine），避免拖累仅链 StageDef 的小目标（tests/工具）。
-    const bool bFeature = (a_eType == ETaskType::Feature);
+    // 空 → 该类型完整规范流（定义表序 + bFeature/bBugfix 成员标志，向后兼容）。
     if (a_aCustom.isEmpty()) {
+        const bool bFeature = (a_eType == ETaskType::Feature);
         QList<EStage> aCanonical;
         for (const SStageDef& sDef : GetStageDefs()) {
+            // 动态阶段双标志均 false，天然不进规范流（仅经任务自定义流生效）
             if ((bFeature && sDef.bFeature) || (!bFeature && sDef.bBugfix)) {
                 aCanonical.append(sDef.eStage);
             }
         }
-        return aCanonical;   // 未自定义 → 完整规范流（旧任务兼容）
+        return aCanonical;
     }
+    // 2026-10-14 任务编排设计：非空 → 按存储顺序去重 + 有效性校验后原序返回
+    //   （配置序即执行序；自定义阶段双标志 false，旧版按标志过滤会丢弃它们）。
+    //   Intake 入口强制首位；未知阶段值（配置已删）静默跳过。
     QList<EStage> aOut;
-    for (const SStageDef& sDef : GetStageDefs()) {
-        if (!(bFeature ? sDef.bFeature : sDef.bBugfix)) {
+    QSet<int> aSeen;
+    for (EStage e : a_aCustom) {
+        if (e == EStage::Intake || aSeen.contains(static_cast<int>(e))) {
             continue;
         }
-        if (sDef.eStage == EStage::Intake || a_aCustom.contains(sDef.eStage)) {
-            aOut.append(sDef.eStage);   // 按规范序取勾选值；Intake 为入口强制包含
+        if (FindStage(e) == nullptr) {
+            continue;   // 定义表中不存在（内置表 + 动态注册均无）→ 跳过
         }
+        aSeen.insert(static_cast<int>(e));
+        aOut.append(e);
     }
+    aOut.prepend(EStage::Intake);
     return aOut;
 }
 

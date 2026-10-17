@@ -269,11 +269,27 @@ QString CPiAgentRunner::NpmGlobalCliPath() {
     if (!s_sPiNpmCliCache.isEmpty()) {
         return s_sPiNpmCliCache;
     }
-    const QString sNpm = QStandardPaths::findExecutable(QStringLiteral("npm.cmd"));
+    // 2026.10.10 npm.cmd 定位：继承 PATH 找不到时用合并 PATH（注册表）兑底
+    //   （同 CClaudeRunner::NpmGlobalClaudePkgPath——异地新机装完环境未重启场景）。
+    QString sNpm = QStandardPaths::findExecutable(QStringLiteral("npm.cmd"));
+    if (sNpm.isEmpty()) {
+        const QStringList aPathDirs = CAgentRunnerBase::MergedPathEnvironment()
+                                          .value(QStringLiteral("PATH"))
+                                          .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        for (const QString& sDir : aPathDirs) {
+            const QString sTry = QDir::fromNativeSeparators(sDir.trimmed())
+                                 + QStringLiteral("/npm.cmd");
+            if (QFileInfo::exists(sTry)) {
+                sNpm = sTry;
+                break;
+            }
+        }
+    }
     if (sNpm.isEmpty()) {
         return QString();
     }
     QProcess stProc;
+    stProc.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
     stProc.start(sNpm, { QStringLiteral("root"), QStringLiteral("-g") });
     if (!stProc.waitForFinished(10000)) {
         return QString();
@@ -284,11 +300,22 @@ QString CPiAgentRunner::NpmGlobalCliPath() {
     }
     const QString sCli = QDir::fromNativeSeparators(sRoot)
         + QStringLiteral("/@earendil-works/pi-coding-agent/dist/cli.js");
-    if (!QFile::exists(sCli)) {
-        return QString();
+    if (QFile::exists(sCli)) {
+        s_sPiNpmCliCache = QDir::toNativeSeparators(sCli);
+        return s_sPiNpmCliCache;
     }
-    s_sPiNpmCliCache = QDir::toNativeSeparators(sCli);
-    return s_sPiNpmCliCache;
+    // 2026.10.10 兜底：npm 默认全局目录（%APPDATA%\npm）直接查——npm root -g
+    //   探测失败/超时、或 prefix 指向别处而包留在默认位置时仍有解（dell 实害形态）。
+    const QString sAppData = qEnvironmentVariable("APPDATA");
+    if (!sAppData.isEmpty()) {
+        const QString sCli2 = QDir::fromNativeSeparators(sAppData)
+            + QStringLiteral("/npm/node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+        if (QFile::exists(sCli2)) {
+            s_sPiNpmCliCache = QDir::toNativeSeparators(sCli2);
+            return s_sPiNpmCliCache;
+        }
+    }
+    return QString();
 }
 
 // —— 2026.09 版本管理：Pi 安装形态与本地版本（头文件注释为准） ——
@@ -641,7 +668,7 @@ void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
 
     // 环境：继承 + 按 provider 注入 API key（NFR-4：不进命令行、不打日志）。
     //   2026.08.20 激活自定义条目时旁路 env 注入（密钥在 models.json 的 provider 配置里）。
-    QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment oEnv = CAgentRunnerBase::MergedPathEnvironment();
     // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
     InjectAskEnv(oEnv);
     // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
@@ -734,6 +761,10 @@ void CPiAgentRunner::Stop() {
         m_pStallTimer->stop();
     }
     if (m_pProc->state() != QProcess::NotRunning) {
+        // 2026.10.15 树杀（用户实害：AutoCode 退出后 pi cli.js 及其辅助 python 残留）：
+        //   先 taskkill /T /F 收整树（含 agent 跑起来的孙进程），m_pProc->kill 兼容收尾。
+        const quint64 uPid = static_cast<quint64>(m_pProc->processId());
+        KillProcTree(uPid);
         m_pProc->kill();
         m_pProc->waitForFinished(3000);
     }
@@ -1205,6 +1236,15 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
             sTail = sTail.left(800) + QStringLiteral("…");
         }
         sMsg += QStringLiteral("；stderr 尾部：%1").arg(sTail);
+        // 2026.10.10 依赖缺失识别（dell 实害：npm 全局包残缺装——pi-ai 引
+        //   partial-json 解析不到，进程秒崩 exit 1）：给重装指引而非配置排查。
+        if (sTail.contains(QStringLiteral("ERR_MODULE_NOT_FOUND"))
+            || sTail.contains(QStringLiteral("Cannot find package"))) {
+            sMsg += QStringLiteral(
+                "\n提示：PIAgent 安装不完整（依赖缺失，常见于装包中断/旧环境残骸）。"
+                "处理：重装即可修复——「后端版本管理 → 更新 PIAgent」，或 cmd 运行 "
+                "npm install -g @earendil-works/pi-coding-agent。");
+        }
     }
     sMsg += QStringLiteral("\n处理：检查 PiAgent 根目录/provider/model 与 API key 配置"
                            "（设置 → PiAgent 参数）；或重跑「安装 PIAgent…」。");

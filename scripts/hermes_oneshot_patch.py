@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AutoCode Hermes oneshot 事件补丁敷设器 v5（软编码源，2026.09.04 v2.0.117）。
+"""AutoCode Hermes oneshot 事件补丁敷设器 v6（软编码源，2026.09.04 v2.0.117 起，2026-10-16 v6）。
 
 用法：python hermes_oneshot_patch.py <HermesHome>
       （缺省回落 HERMES_HOME 环境变量）
@@ -14,16 +14,22 @@
   v3：tool.started 带脱敏参数 preview / tool.completed 带耗时/错误/结果 /
       think（思考流）
   v4：中间段文本以 {"type":"assistant"} 整段上抛（pi/claude 式阶段叙述块）
-  v5（新增）：`-z @<file>` 提示词文件展开——Windows CreateProcess 命令行
-      32767 字符上限（AutoCode 回灌缓存轻易超限，"文件名或扩展名太长"启动
+  v5：`-z @<file>` 提示词文件展开——Windows CreateProcess 命令行
+      32767 字符上限（AutoCode 回灌缓存轻易超限，「文件名或扩展名太长」启动
       失败）；AutoCode 长提示词写 UTF-8 临时文件传 @path，本补丁在
       run_oneshot 入口展开；文件缺失保持原文（字面 @ 开头提示词不受影响）。
+  v6（新增）：tool.started 附带 {"type":"ctx","fill":N} 占用快照（取
+      agent._last_turn_usage.prompt_tokens——每次 provider 响应后刷新，
+      tool.started 时恰为最新响应的在窗 token）。修实害：v5 前只有终局
+      result 携 usage，且值是本轮各请求累计和（非在窗占用），AutoCode 上下文条
+      整轮无实时数据、轮末又被超窗钳制成「—」（pdfplumber「修界面交互缺陷」
+      Hermes 助手 2417 块 ctxFill 恒 -1 实锤）。
 
 软编码约定：本文件是补丁的唯一正本（随 exe 部署在 install_env.bat 同级），
 改补丁只需改本文件、无需重编 AutoCode；由 install_env.bat /hermes-patch 调用
 （程序侧在选择了 Hermes 后端保存时与 StartStage 兜底时自动执行）。
 
-幂等/升级：v4→v5 / v3→v5 / v2→v5 / v1→v5 / 全新敷设 / 已 v5 跳过；锚点失配
+幂等/升级：v5→v6 / v4→v6 / v3→v6 / v2→v6 / v1→v6 / 全新敷设 / 已 v6 跳过；锚点失配
 （上游改版）不写入、exit 1（调用方安全回退静默形态）。
 """
 import os
@@ -35,6 +41,7 @@ MARKER_V2 = "AutoCode events patch v2"
 MARKER_V3 = "AutoCode events patch v3"
 MARKER_V4 = "AutoCode events patch v4"
 MARKER_V5 = "AutoCode events patch v5"
+MARKER_V6 = "AutoCode events patch v6"
 
 V4_HOOK = '''        # --- AutoCode events patch v4: interim text + rich process events ---
         # v4: interim segment text emitted as {"type":"assistant"} when a tool
@@ -74,6 +81,24 @@ V4_HOOK = '''        # --- AutoCode events patch v4: interim text + rich process
                     _autocode_events_write({
                         "type": "tool", "tool": str(name),
                         "preview": str(preview or "")[:160]})
+                    # --- AutoCode events patch v6: live context occupancy ---
+                    # agent._last_turn_usage is refreshed after every provider
+                    # response (turn_usage.record_response_usage); tool.started
+                    # fires right after the response that decided to call this
+                    # tool, so its prompt_tokens is the current in-window fill
+                    # (input+cacheRead+cacheWrite as fallback).
+                    try:
+                        _ud = getattr(agent, "_last_turn_usage", None) or {}
+                        _fill = int(_ud.get("prompt_tokens") or 0)
+                        if _fill <= 0:
+                            _fill = (int(_ud.get("input_tokens") or 0)
+                                     + int(_ud.get("cache_read_tokens") or 0)
+                                     + int(_ud.get("cache_write_tokens") or 0))
+                        if _fill > 0:
+                            _autocode_events_write({"type": "ctx", "fill": _fill})
+                    except Exception:
+                        pass
+                    # --- end AutoCode events patch v6 ---
                 elif event == "tool.completed":
                     _autocode_events_write({
                         "type": "tooldone", "tool": str(name),
@@ -213,6 +238,31 @@ def with_v5(s: str) -> str:
     return s[:tail_pos] + V5_PROMPT_EXPAND + s[tail_pos:]
 
 
+# v6 升级锚：v4 钩子内 tool.started 的 tool 事件发射块（v4/v5 敷设产物中唯一）
+V6_ANCHOR = ('                    _autocode_events_write({\n'
+             '                        "type": "tool", "tool": str(name),\n'
+             '                        "preview": str(preview or "")[:160]})\n')
+
+# v6 块文本：直接从 V4_HOOK 内嵌副本提取（单一事实源——升级插入与全新敷设字节一致）
+_V6_START = "# --- AutoCode events patch v6"
+_V6_END = "# --- end AutoCode events patch v6 ---"
+_i6 = V4_HOOK.index(_V6_START)
+_j6 = V4_HOOK.index(_V6_END, _i6) + len(_V6_END)
+V6_CTX_BLOCK = V4_HOOK[_i6:_j6] + "\n"
+
+
+def with_v6(s: str) -> str:
+    """v5→v6：tool.started 后补发 ctx 占用快照（幂等；v6 块文本与 V4_HOOK 内嵌一致）。"""
+    if MARKER_V6 in s:
+        return s
+    if s.count(V6_ANCHOR) != 1:
+        print(f"v6 upgrade anchor mismatch: {s.count(V6_ANCHOR)} "
+              "(upstream oneshot.py revised?)")
+        sys.exit(1)
+    i = s.find(V6_ANCHOR) + len(V6_ANCHOR)
+    return s[:i] + V6_CTX_BLOCK + s[i:]
+
+
 def install_fresh(src: str) -> str:
     """全新敷设（无任何标记的原始上游文件）。"""
     A1 = "from hermes_cli.fallback_config import get_fallback_chain\n"
@@ -301,19 +351,21 @@ def main() -> int:
     except OSError as exc:
         print(f"cannot read {p}: {exc}")
         return 1
-    if MARKER_V5 in src:
-        print("already patched (v5)")
+    if MARKER_V6 in src:
+        print("already patched (v6)")
         return 0
-    if MARKER_V4 in src:
-        out, s_verb = with_v5(src), "upgraded v4 -> v5"
+    if MARKER_V5 in src:
+        out, s_verb = with_v6(src), "upgraded v5 -> v6"
+    elif MARKER_V4 in src:
+        out, s_verb = with_v6(with_v5(src)), "upgraded v4 -> v6"
     elif MARKER_V3 in src:
-        out, s_verb = with_v5(upgrade_v3(src)), "upgraded v3 -> v5"
+        out, s_verb = with_v6(with_v5(upgrade_v3(src))), "upgraded v3 -> v6"
     elif MARKER_V2 in src:
-        out, s_verb = with_v5(upgrade_v2(src)), "upgraded v2 -> v5"
+        out, s_verb = with_v6(with_v5(upgrade_v2(src))), "upgraded v2 -> v6"
     elif MARKER_V1 in src:
-        out, s_verb = with_v5(upgrade_v1(src)), "upgraded v1 -> v5"
+        out, s_verb = with_v6(with_v5(upgrade_v1(src))), "upgraded v1 -> v6"
     else:
-        out, s_verb = install_fresh(src), "patched OK (v5)"
+        out, s_verb = install_fresh(src), "patched OK (v6)"
     s_tmp = p + ".ac-tmp"
     with open(s_tmp, "w", encoding="utf-8", newline="") as f:
         f.write(out)

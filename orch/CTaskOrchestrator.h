@@ -79,6 +79,11 @@ public:
     //   编号子任务数/点名源文件数/重活关键词/文本长度估算轮次预算——只升不降
     //   （a_iBaseTurns 为用户设的底线），封顶 200。公开静态供回归测试。
     static int EstimateAdhocTurns(const QString& a_sUserText, int a_iBaseTurns);
+    // 2026-10-09 触顶历史感知轮次预算（Compositer 实害：半月 77 次触顶、用户被迫反复
+    //   手发「继续」——「继续」二字评估器称不出真实工作量）：上一轮撞上限后，下轮
+    //   预算 = max(评估值, 上轮预算×1.5)，封顶 200（与 [Adhoc] MaxTurns 钳位上限同源）；
+    //   正常完成一轮后自动回落（iHitLimitStreak 清零）。
+    static int TurnsBudgetAfterLimitHit(int a_iEstimate, int a_iPrevBudget);
     // 2026.09.26 专家助手深度模式纯函数（公开静态供回归测试）：
     //   ParseDeepVerdict 解析验证轮结论：1=PASS / 0=FAIL（a_pReasons 出失败原因，
     //   仅当行） / -1=无判定行（FAIL 优先判定，防原因文本里出现 pass 字样误判）。
@@ -98,6 +103,10 @@ public:
     //   -1=按 config.ini [Adhoc] ExpertAssistant（缺省）；0/1=强制关/开。
     //   tests 用它锁定纯对话/深度链行为，不依赖 exe 同级 config.ini 的机器状态。
     static void SetAdhocDeepOverride(int a_iMode);
+    // 2026.10.14 纯文本决策解析（Tier1 行锚定 → Tier2 尾部词扫描 → Tier3 默认通过，
+    //   无状态）：从 ParseReviewDecision 抽出，公开静态供单测直接构造现场文本回归
+    //   （Test 阶段假驳回无限回炉，详见 test_verify_flow testParseDecisionText）。
+    static EReviewDecision ParseDecisionText(const QString& a_sText);
     // 2026.09.20 未发送排队指令的删除/改写（面板暂存框编辑入口，按原文本匹配首个）：
     //   返回是否命中（未入队/已被消费/新文本为空 → false，面板侧自行保持一致）。
     bool RemoveQueuedAdhoc(const QString& a_sAsstId, const QString& a_sText);
@@ -109,6 +118,12 @@ public:
     //   空 = 编排器内部续发——排队指令/max-turns 续跑，沿用缓存并轮内追加）。
     void SubmitAdhoc(const QString& a_sAsstId, const QString& a_sText, int a_iPerm = PermAuto,
                      const QString& a_sTaskId = QString(), const QStringList* a_pTranscript = nullptr);
+    // 2026.10.12 排队指令延迟排空（修「指令搁浅」，见实现注释）；2026-10-16 轮末
+    //   排空/退净窗口提交同口径接入，tick 见实现注释。
+    struct SAdhocSession;   // 前向声明（定义在下方私有节，引用参数仅需先知类型）
+    void DeferredDrainPendingInjects(SAdhocSession& a_S);
+    void DrainPendingTick(const QString& a_sId, const QStringList& a_aBatch,
+                          int a_iPerm, const QString& a_sTaskId);
     // 撤销指定助手最后一条提问（fork-session sid 链 O(1) 回退，#4）。
     void UndoAdhoc(const QString& a_sAsstId);
     // 手动压缩指定助手上下文（摘要→开新会话重播种，#3）。
@@ -140,7 +155,7 @@ public:
     //   生成「≤10 汉字名称 + 一句说明」（说明进 Tab tooltip，随 assistant.json 持久化）。
     //   借用该助手自己的会话（fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲
     //   会话；全忙/无会话返回 false（调用方提示）。结果经 sigAsstAutoNameDone 回填。
-    bool AutoNameAsstNow(const QString& a_sAsstId, const QString& a_sPrompts);
+    bool AutoNameAsstNow(QString a_sAsstId, QString a_sPrompts);   // 2026.10.11 值传：防链上结构体释放后引用悬垂（172129 崩溃）
 
     // 2026-10-08 提示词超限提炼：面板发送闸门（占比/token 双约束取小）判定超限后
     //   上抛到这里。起一次性只读提炼轮（fork 分支不动用户会话栈），提炼稿回投
@@ -425,6 +440,10 @@ private:
         //   完成后进行」同语义）。
         bool                  bAutoNameWait = false;
         QString               sAutoNameWaitPrompts;      // 排队时刻的命名素材快照
+        // 2026-10-09 任务命名瞬态崩溃重试位（pdfplumber 实害：命名轮 pi RPC 进程
+        //   流式输出中 libuv 断言 fail-fast 崩溃——非配置错误，重试一次即恢复）。
+        //   失败分支置位重试，成功命名/用户新提问（SubmitAdhoc）时清零。
+        bool                  bNameRetryUsed = false;
         QString               sPendingPrompt;  // Submitting 模式当前 prompt（压栈用）
         QString               sSummary;        // CompactSummarize 产出、CompactReseed 投递
         QString               sLastTaskId;     // 最近一次 Submit 的任务档 id（续发记忆沿用）
@@ -434,6 +453,10 @@ private:
         //   启发式估算——编号子任务/点名文件/重活关键词/文本长度；0=未设回退全局基值）。
         //   续跑/纠偏/压缩重发沿用同一预算（同一条提问的工作量不变）。
         int                   iTurnsBudget = 0;
+        // 2026-10-09 触顶历史感知（Compositer 实害：半月 77/78 轮触顶、用户被迫反复
+        //   手发「继续」）：连续撞轮次上限的轮计数——SubmitAdhoc 依据它把下轮预算
+        //   阶梯上调（上轮×1.5 封顶 200，「继续」类短指令同样受益）；正常完成清零。
+        int                   iHitLimitStreak = 0;
         QStringList           aPendingInjects; // 同助手运行中排队指令（本轮结束自动续发）
         qint64                iLiveIn  = 0;    // 2026.09.05 本轮实时计量（per-会话：并发助手各自累计，
         qint64                iLiveOut = 0;    //   收尾 0/0 回退归集 + 页内「本轮 ↑↓」显示）

@@ -1,5 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M5 16 H27" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round"/>
-  <path d="M11 5 V12 M7.8 8.8 L11 12 L14.2 8.8" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M21 27 V20 M17.8 23.2 L21 20 L24.2 23.2" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 压缩：双向内压 -->
+  <path d="M12 3.8 V10" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M8.6 7 L12 10.4 L15.4 7" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 20.2 V14" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M8.6 17 L12 13.6 L15.4 17" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M6 12 H18" stroke="#2563EB" stroke-width="1.6" stroke-linecap="round" stroke-opacity="0.5"/>
 </svg>

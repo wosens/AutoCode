@@ -1,11 +1,13 @@
-﻿#include "CExecutionPanel.h"
+#include "CExecutionPanel.h"
 #include "ui/CMenuIcon.h"
 #include "ui/CAsstTabBar.h"   // 2026-09-22 多行 Tab 栏（自 HarnessAgent/CAgentTabBar 迁移）
 #include "../agent/CAgentRunnerFactory.h"   // 2026.09.02 Assistant 块拍摄产出后端（说话人标签）
+#include "../agent/CClaudeRunner.h"   // 2026-10-14 ContextLimitForModel 委托 ContextWindowForModel（单点口径）
 
 #include <functional>
 #include <utility>
 #include <algorithm>
+#include <QPair>   // 2026.10.15 阶段产物另存为收集列表（Qt6 QPair=std::pair，显式引入）
 
 #include <QLabel>
 #include "ui/CTipStyle.h"   // 2026.09.13 自建条目 tip 窗的富文本换行
@@ -43,6 +45,8 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMenu>
+#include <QFileDialog>   // 2026.10.15 阶段产物另存为（单选存文件/多选存目录）
+#include <QFile>         // 2026.10.15 产物复制落盘
 #include <QActionGroup>   // 2026-10-05 右键「选择模型」子菜单互斥勾选组
 #include <QPoint>
 #include <QInputDialog>
@@ -56,6 +60,8 @@
 #include "ui/CArtifactView.h"
 #include "ui/CMessageView.h"
 #include "ui/CMessageBlock.h"
+#include "ui/CChatModel.h"      // 2026-10-17 自绘三期 ModelView 引擎
+#include "ui/CChatListView.h"   // 同上
 #include "ui/CFilePreviewWidget.h"
 #include "core/CTaskInfo.h"
 #include "core/CStageMachine.h"
@@ -338,7 +344,7 @@ CExecutionPanel::~CExecutionPanel() {
     m_pCurStream = nullptr;
 }
 
-CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
+CExecutionPanel::CExecutionPanel(QWidget* a_pParent, bool a_bEngineMV)
     : QWidget(a_pParent) {
     // 统一 11pt 字体辅助（#7）：列表/表头/输入框/按钮显式设点数，不依赖样式继承。
     auto setPt11 = [](QWidget* a_pW) {
@@ -374,7 +380,23 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     // 对话流（Claude Code 风格：Markdown 助手块 + 可折叠工具卡 + 事件徽章）。
     //   2026.09.03 到顶补建/丢块同步等接线由各流 CStreamPresenter::Bind 负责
     //   （任务流=EnsureStream 创建时；助手流=CreateAsstTab 建视图时），面板不再直连。
-    m_pView = new CMessageView(this);
+    // 2026-10-17 自绘三期双引擎灰度（[View] Engine，缺省 Legacy）：构造时快照引擎
+    //   选择（CMainWindow 读配置传入构造参数），任务/助手页建视图二选一——
+    //   Legacy=CMessageView 卡片流（现路径不动）；ModelView=CChatModel+CChatListView
+    //   自绘链（doc/对话流视图自绘改造方案.md，虚拟化只画可视区、滚动零子 widget、
+    //   载档 O(N) 纯数据投影）。切设置后已建页不重建（重开 Tab/重启生效）。
+    m_bEngineMV = a_bEngineMV;
+    if (m_bEngineMV) {
+        m_pView2 = new CChatListView(this);
+        m_pChatModel = new CChatModel(m_pView2);   // 模型归视图 parent 链（任务侧共享一对）
+        {
+            QFont fView = m_pView2->font();
+            fView.setPointSize(11);
+            m_pView2->ApplyFont(fView);   // 字体先于条目入池（度量/估高同源）
+        }
+    } else {
+        m_pView = new CMessageView(this);
+    }
 
     // 日志 / 阶段产物 / 助手 三页 Tab（2026-09-22 换多行 Tab 栏：宽度不足自动换行，
     //   助手多时不再出滚动箭头；setTabBar 必须在加页前调用）
@@ -384,13 +406,19 @@ CExecutionPanel::CExecutionPanel(QWidget* a_pParent)
     m_pAsstBar->SetPageResolver([this](int a_iIndex) -> QWidget* {
         return m_pTabs->widget(a_iIndex);   // 2026-10-02 外档粗体绘制反查页
     });
-    m_pTabs->addTab(m_pView, QStringLiteral("日志"));
+    m_pTabs->addTab(TaskLogWidget(), QStringLiteral("日志"));
 
     // —— Tab2：阶段产物（左列阶段清单 + 右栏 Markdown 渲染）——
     auto* pOutSplit = new QSplitter(Qt::Horizontal, m_pTabs);
     m_pOutputs = new QListWidget(pOutSplit);
     m_pOutputs->setMinimumWidth(160);
     setPt11(m_pOutputs);
+    // 2026.10.15 多选（Ctrl/Shift）+ 右键「另存为」：多选时只能选目录、文件名自动用
+    //   阶段中文名（plan.md → 计划.md）；单选另存可改文件名（缺省同样中文名）。
+    m_pOutputs->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_pOutputs->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pOutputs, &QWidget::customContextMenuRequested,
+            this, &CExecutionPanel::OnOutputsContextMenu);
     m_pArtifactView = new CArtifactView(pOutSplit);
     pOutSplit->addWidget(m_pOutputs);
     pOutSplit->addWidget(m_pArtifactView);
@@ -888,6 +916,7 @@ void CExecutionPanel::LoadStageOutputs(CTaskInfo* a_pTask) {
         auto* pItem = new QListWidgetItem(
             QStringLiteral("%1  (%2)").arg(pDef->sNameZh, pDef->sOutput), m_pOutputs);
         pItem->setData(Qt::UserRole, sPath);
+        pItem->setData(Qt::UserRole + 1, pDef->sNameZh);   // 2026.10.15 另存为缺省中文名用
     }
     if (m_pOutputs->count() > 0) {
         m_pOutputs->setCurrentRow(0);   // 触发 OnOutputSelected 显示首份产物
@@ -950,6 +979,138 @@ void CExecutionPanel::OnStagesContextMenu(const QPoint& a_stPos) {
     }
 }
 
+// 2026.10.15 阶段产物另存缺省中文名：条目阶段中文名（LoadStageOutputs 存 UserRole+1）
+//   + 原后缀（plan.md → 计划.md，用户需求）；无阶段名的异常条目兑底回退原文件名。
+QString CExecutionPanel::OutputSaveName(const QListWidgetItem* a_pItem) const {
+    if (a_pItem == nullptr) {
+        return QString();
+    }
+    const QString sPath = a_pItem->data(Qt::UserRole).toString();
+    const QString sZh = a_pItem->data(Qt::UserRole + 1).toString();
+    const QString sSuffix = QFileInfo(sPath).suffix();
+    if (sZh.isEmpty()) {
+        return QFileInfo(sPath).fileName();
+    }
+    return sSuffix.isEmpty()
+        ? sZh
+        : sZh + QLatin1Char('.') + sSuffix;
+}
+
+void CExecutionPanel::OnOutputsContextMenu(const QPoint& a_stPos) {
+    // 右键命中未选中项 → 置为当前（单选语义，Windows 清单惯例；同 CRecentProjectsDialog）。
+    if (auto* pHit = m_pOutputs->itemAt(a_stPos)) {
+        if (!pHit->isSelected()) {
+            m_pOutputs->setCurrentItem(pHit);
+        }
+    }
+    const QList<QListWidgetItem*> aSel = m_pOutputs->selectedItems();
+    if (aSel.isEmpty()) {
+        return;   // 空白处右键不弹菜单
+    }
+    QMenu menu(this);
+    QAction* pActSave = menu.addAction(MenuIcon(QStringLiteral("ow-saveas")),
+                                       QStringLiteral("另存为"));
+    QAction* pSel = menu.exec(m_pOutputs->viewport()->mapToGlobal(a_stPos));
+    if (pSel != pActSave) {
+        return;
+    }
+
+    // 收集（源绝对路径, 缺省中文名）按列表序去重——同路径产物（如代码审查/测试共写
+    //   的 cr.md 双条目）只存一份；UserRole 空路径跳过。
+    QList<QPair<QString, QString>> aItems;
+    QSet<QString> aSeen;
+    for (QListWidgetItem* pIt : aSel) {
+        const QString sSrc = pIt->data(Qt::UserRole).toString();
+        if (sSrc.isEmpty() || aSeen.contains(sSrc)) {
+            continue;
+        }
+        aSeen.insert(sSrc);
+        aItems.append({sSrc, OutputSaveName(pIt)});
+    }
+    if (aItems.isEmpty()) {
+        return;
+    }
+
+    if (aItems.size() == 1) {
+        // 单选：可改文件名（缺省中文名），QFileDialog 自带覆盖确认。
+        // 2026.10.15 缺省目录记住上次保存位置（首次=操作系统缺省）：
+        //   dir 参数 = 上次目录 + 缺省文件名（定位目录且预填文件名）。
+        const QString sStart = m_sLastArtifactSaveDir.isEmpty()
+            ? aItems.first().second
+            : m_sLastArtifactSaveDir + QLatin1Char('/') + aItems.first().second;
+        const QString sDst = QFileDialog::getSaveFileName(
+            this, QStringLiteral("另存为"), sStart,
+            QStringLiteral("Markdown 文档 (*.md);;所有文件 (*.*)"));
+        if (sDst.isEmpty()) {
+            return;   // 用户取消
+        }
+        QFile::remove(sDst);   // 确认覆盖后先删旧（QFile::copy 不覆盖）
+        if (QFile::copy(aItems.first().first, sDst)) {
+            m_sLastArtifactSaveDir = QFileInfo(sDst).absolutePath();   // 记住本次目录
+            return;   // 成功静默（资源管理器口径）
+        }
+        QMessageBox::warning(this, QStringLiteral("另存为"),
+                             QStringLiteral("保存失败：%1").arg(sDst));
+        return;
+    }
+
+    // 多选（≥2）：只能选目录，文件名自动用阶段中文名（plan.md → 计划.md）；
+    //   与目录已有文件或本轮已写文件同名时自动加序号（计划(2).md）。落盘核心在
+    //   SaveOutputsToDir（静态，可测）。
+    const QString sDir = QFileDialog::getExistingDirectory(
+        this, QStringLiteral("选择保存目录（%1 个文件）").arg(aItems.size()),
+        m_sLastArtifactSaveDir);   // 2026.10.15 缺省上次目录（空=系统缺省）
+    if (sDir.isEmpty()) {
+        return;   // 用户取消
+    }
+    QStringList aFail;
+    const int iOk = SaveOutputsToDir(aItems, sDir, &aFail);
+    if (aFail.isEmpty()) {
+        m_sLastArtifactSaveDir = sDir;   // 2026.10.15 记住本次目录
+        QMessageBox::information(this, QStringLiteral("另存为"),
+            QStringLiteral("已保存 %1 个文件到：\n%2").arg(iOk).arg(sDir));
+    } else {
+        QMessageBox::warning(this, QStringLiteral("另存为"),
+            QStringLiteral("成功 %1 个，失败 %2 个：\n%3")
+                .arg(iOk)
+                .arg(aFail.size())
+                .arg(aFail.join(QLatin1Char('\n'))));
+    }
+}
+
+int CExecutionPanel::SaveOutputsToDir(const QList<QPair<QString, QString>>& aItems,
+                                      const QString& a_sDir, QStringList* a_pFail) {
+    if (a_pFail != nullptr) {
+        a_pFail->clear();
+    }
+    int iOk = 0;
+    QSet<QString> aUsed;   // 本轮已用目标名（小写键；Windows 文件名不区分大小写）
+    for (const QPair<QString, QString>& stIt : aItems) {
+        QString sName = stIt.second;
+        const QString sDstBase = a_sDir + QLatin1Char('/') + sName;
+        if (aUsed.contains(sName.toLower()) || QFile::exists(sDstBase)) {
+            const QString sBase = QFileInfo(sName).completeBaseName();
+            const QString sSuffix = QFileInfo(sName).suffix();
+            for (int i = 2; ; ++i) {
+                sName = sSuffix.isEmpty()
+                    ? QStringLiteral("%1(%2)").arg(sBase).arg(i)
+                    : QStringLiteral("%1(%2).%3").arg(sBase).arg(i).arg(sSuffix);
+                const QString sTry = a_sDir + QLatin1Char('/') + sName;
+                if (!aUsed.contains(sName.toLower()) && !QFile::exists(sTry)) {
+                    break;
+                }
+            }
+        }
+        aUsed.insert(sName.toLower());
+        if (QFile::copy(stIt.first, a_sDir + QLatin1Char('/') + sName)) {
+            ++iOk;
+        } else if (a_pFail != nullptr) {
+            *a_pFail << sName;
+        }
+    }
+    return iOk;
+}
+
 void CExecutionPanel::RefreshTask(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr || a_pTask->Id() != m_sCurId) {
         return;
@@ -965,6 +1126,12 @@ void CExecutionPanel::RefreshTask(CTaskInfo* a_pTask) {
         }
     }
     const EStage eCur = a_pTask->CurrentStage();
+    // 2026.10.14 回炉后进度点之后的阶段不标「完成」：评审/测试驳回会把流程退回
+    //   前面阶段重跑，其后已 ok 的阶段即将重跑；旧逻辑「历史任一次 ok 即绿勾」会让
+    //   用户误以为流程已收尾（如测试亮勾但任务仍在跑）。未整体收尾的任务一律以
+    //   当前进度点为界，之后的 ok 视为已被回炉作废，回落待执行。
+    const bool bTaskDone = (a_pTask->Status() == ETaskStatus::Done);
+    const int  iCurIdx   = aFlow.indexOf(eCur);
 
     QVector<CStageBar::SNode> aNodes;
     for (const EStage eStage : aFlow) {
@@ -972,10 +1139,11 @@ void CExecutionPanel::RefreshTask(CTaskInfo* a_pTask) {
         const QString sName = pDef ? pDef->sNameZh : QString::number(static_cast<int>(eStage));
 
         CStageBar::EState eSt = CStageBar::EState::Pending;
-        if (aDone.contains(eStage) || a_pTask->Status() == ETaskStatus::Done) {
+        if (bTaskDone) {
             eSt = CStageBar::EState::Done;
         } else if (eStage == eCur) {
-            // 2026.08.15 当前阶段按任务执行时状态标注（历史任务回看不再清一色「待执行」）。
+            // 2026.08.15 当前阶段按任务执行时状态标注（历史任务回看不再清一色「待执行」）；
+            //   2026.10.14 同阶段迭代重跑（回炉目标本身）也按实时状态显示，不再沿用历史绿勾。
             switch (a_pTask->Status()) {
                 case ETaskStatus::Running:
                     eSt = CStageBar::EState::Running;   break;
@@ -987,6 +1155,9 @@ void CExecutionPanel::RefreshTask(CTaskInfo* a_pTask) {
                 default:   // Pending：尚未启动，当前阶段也只是待执行
                     eSt = CStageBar::EState::Pending;   break;
             }
+        } else if (aDone.contains(eStage)
+                   && !(iCurIdx >= 0 && aFlow.indexOf(eStage) > iCurIdx)) {
+            eSt = CStageBar::EState::Done;
         }
         CStageBar::SNode stN;
         stN.iStage = static_cast<int>(eStage);   // 右键「再次执行」路由用
@@ -1041,7 +1212,13 @@ void CExecutionPanel::SetCurrentTask(CTaskInfo* a_pTask) {
 
     if (a_pTask != nullptr) {
         m_pCurStream = EnsureStream(a_pTask->Id());
-        m_pCurStream->Bind(m_pView);
+        // 2026-10-17 双引擎绑定分支：ModelView 挂 (共享模型, 共享自绘视图)；
+        //   Legacy 挂共享卡片视图（原路径不动）。Bind 内均先 Unbind 旧流。
+        if (m_bEngineMV && m_pView2 != nullptr && m_pChatModel != nullptr) {
+            m_pCurStream->Bind(m_pChatModel, m_pView2);
+        } else {
+            m_pCurStream->Bind(m_pView);
+        }
         RebuildView();
         RefreshTask(a_pTask);
     } else {
@@ -1063,7 +1240,7 @@ void CExecutionPanel::SetCurrentTask(CTaskInfo* a_pTask) {
     //   移除/删除任务后不再停在已清空的任务日志页）。无激活助手（异常态）保持原页。
     //   新建任务路径由调用方收尾 ShowActiveAssistantPage 覆盖（用户下一步是与助手对话）。
     if (a_pTask != nullptr) {
-        m_pTabs->setCurrentWidget(m_pView);   // m_pView=「日志」页（任务对话流）
+        m_pTabs->setCurrentWidget(TaskLogWidget());   // 任务对话流页（双引擎出口）
     } else {
         ShowActiveAssistantPage();
     }
@@ -1082,7 +1259,7 @@ void CExecutionPanel::RestoreArtifactsSplit(const QByteArray& a_stState) {
 }
 
 void CExecutionPanel::ShowTaskLogPage() {
-    m_pTabs->setCurrentWidget(m_pView);   // m_pView=「日志」页（任务对话流）
+    m_pTabs->setCurrentWidget(TaskLogWidget());   // 任务对话流页（双引擎出口）
 }
 
 void CExecutionPanel::SetTaskTabsVisible(bool a_bShow) {
@@ -1093,7 +1270,7 @@ void CExecutionPanel::SetTaskTabsVisible(bool a_bShow) {
         return;
     }
     bool bChanged = false;
-    QWidget* apPages[] = { m_pView, m_pArtifactsPage };
+    QWidget* apPages[] = { TaskLogWidget(), m_pArtifactsPage };
     for (QWidget* pPage : apPages) {
         if (pPage == nullptr) {
             continue;
@@ -1111,10 +1288,11 @@ void CExecutionPanel::SetTaskTabsVisible(bool a_bShow) {
 }
 
 bool CExecutionPanel::TaskLogTabVisible() const {
-    // 2026-10-03 观察口：日志页在 Tab 栏可见与否（测试/诊断用）。
-    return m_pTabs != nullptr && m_pView != nullptr
-        && m_pTabs->indexOf(m_pView) >= 0
-        && m_pTabs->tabBar()->isTabVisible(m_pTabs->indexOf(m_pView));
+    // 2026-10-03 观察口：日志页在 Tab 栏可见与否（测试/诊断用；双引擎出口）。
+    QWidget* pLog = TaskLogWidget();
+    return m_pTabs != nullptr && pLog != nullptr
+        && m_pTabs->indexOf(pLog) >= 0
+        && m_pTabs->tabBar()->isTabVisible(m_pTabs->indexOf(pLog));
 }
 
 void CExecutionPanel::ShowActiveAssistantPage() {
@@ -1282,7 +1460,7 @@ void CExecutionPanel::RebuildAdhocView() {
 void CExecutionPanel::RebuildAsstView(const QString& a_sId) {
     // 2026.08.23 按指定助手重建（多助手各自独立控件；加载后逐个预建，切换 Tab 即时呈现）。
     SAsst* pAsst = AsstById(a_sId);
-    if (pAsst == nullptr || pAsst->bClosed || pAsst->pView == nullptr) {
+    if (pAsst == nullptr || pAsst->bClosed || !AsstViewBuilt(*pAsst)) {
         return;
     }
     // 完成回调：激活助手刷新提示词下拉索引（FR-3）；其余助手无钩子。
@@ -1503,7 +1681,7 @@ void CExecutionPanel::RefreshQueueBox(const QString& a_sId) {
     SAsst* pAsst = AsstById(a_sId);
     if (pAsst == nullptr || pAsst->pQueueBox == nullptr
             || pAsst->pQueueHead == nullptr || pAsst->pQueueList == nullptr
-            || pAsst->pQueueBtn == nullptr || pAsst->pView == nullptr) {
+            || pAsst->pQueueBtn == nullptr || !AsstViewBuilt(*pAsst)) {
         return;
     }
     const bool bEmpty = pAsst->aStaged.isEmpty();
@@ -1592,8 +1770,9 @@ void CExecutionPanel::RefreshQueueBox(const QString& a_sId) {
     const int iW = qMax(pAsst->pQueueBox->sizeHint().width(), 160);
     const int iH = pAsst->pQueueBox->sizeHint().height();
     pAsst->pQueueBox->resize(iW, iH);
-    pAsst->pQueueBox->move(pAsst->pView->width() - iW - 11,
-                           pAsst->pView->height() - iH - 8);
+    QWidget* pView = AsstViewWidget(*pAsst);   // 2026-10-17 双引擎出口
+    pAsst->pQueueBox->move(pView->width() - iW - 11,
+                           pView->height() - iH - 8);
     pAsst->pQueueBox->raise();
 }
 
@@ -1672,8 +1851,23 @@ void CExecutionPanel::OnAdhocFinished(const QString& a_sAsstId) {
             if (iFlushGate > 0 && PromptTokenEstimate(sSend) > iFlushGate) {
                 emit sigAsstRefinePrompt(a_sAsstId, sSend, iFlushGate, iSendPerm);
             } else {
-                SetAsstRunning(a_sAsstId, true);   // 先复位运行态再提交（同步失败链收尾归零口径不变）
-                emit sigAdhocSubmit(a_sAsstId, sSend, iSendPerm);
+                // 2026.10.12 修「命名后首条指令丢失」（另机实害：自动命名成功但后续指令
+                //   不执行——补发链同步调 SubmitAdhoc 撞上命名轮进程退净窗口（result 到
+                //   即 sigFinished，claude 要等 EOF 才退），IsRunning()=true 误判「忙」入队
+                //   aPendingInjects，而命名收尾分支不排空队列 → 指令搁浅 + 面板孤儿态被
+                //   看门狗收割）：改延迟 1.5s 补发，等 runner 真正空闲再投；期间新一轮
+                //   命名挂起重置（bSendAfterAutoName）则交新链，用户手动发新指令则本条
+                //   入其队列由该轮正常排空。
+                const QString sSendSnap = sSend;
+                QTimer::singleShot(1500, this,
+                    [this, a_sAsstId, sSendSnap, iSendPerm]() {
+                        SAsst* p = AsstById(a_sAsstId);
+                        if (p == nullptr || p->bSendAfterAutoName) {
+                            return;   // 新命名挂起链接管
+                        }
+                        SetAsstRunning(a_sAsstId, true);   // 同步失败链收尾归零口径不变
+                        emit sigAdhocSubmit(a_sAsstId, sSendSnap, iSendPerm);
+                    });
             }
         }
     }
@@ -1731,7 +1925,12 @@ void CExecutionPanel::MaybeAutoNameOnFinish(const QString& a_sAsstId) {
         return;   // 没收到过提示词：无素材（理论不到这，收尾必有提问；防御）
     }
     pAsst->bAutoNameTried = true;   // 先置位再发射：发射链同步（无重入风险，防御式置位）
-    emit sigAsstAutoRename(pAsst->sId, sMaterial);
+    // 2026.10.11 崩溃修复（172129 dump 实证）：pAsst->sId 是数组结构体成员的引用，
+    //   直连信号链（OnAsstAutoRename→AutoNameAsstNow）全程传引用，链上 sigAdhocEvent
+    //   同步槽可重排/销毁助手数组 → 链内再读 a_sAsstId 即读已释放内存（QString 拷贝
+    //   构造 AV）。发射前先拷贝 owned 值，链上任何时点解引用都安全。
+    const QString sIdOwned = pAsst->sId;
+    emit sigAsstAutoRename(sIdOwned, sMaterial);
 }
 
 QString CExecutionPanel::BuildAsstAutoNameMaterial(SAsst* a_pAsst) const {
@@ -1820,7 +2019,9 @@ void CExecutionPanel::SetAdhocContext(const QString& a_sAsstId, qint64 a_iFill) 
 void CExecutionPanel::ShowContextMenu(const QString& a_sAsstId, const QPoint& a_stGlobalPos) {
     // 2026.08.29 上下文进度条菜单（右键 customContextMenuRequested 弹出；
     //   2026.09.11 左键单击入口已按用户要求取消，右键为唯一入口）：
-    //   立即压缩（编排器「摘要→重播种」两步）+ 设置上下文窗口上限。
+    //   立即压缩（编排器「摘要→重播种」两步）+ 选择模型。
+    //   2026-10-15 「设置上下文大小」已删：与模型条目/自动探测的上下文窗口重复且互不关联，
+    //   窗口口径 = 模型条目 iCtx 优先、名字探测兑底（ContextWindowForModel 单点）。
     //   2026.09.05 per-助手：菜单作用于目标助手自己的会话/进度条。
     SAsst* pAsst = AsstById(a_sAsstId);
     if (pAsst == nullptr || pAsst->pBtnContext == nullptr) {
@@ -1828,13 +2029,11 @@ void CExecutionPanel::ShowContextMenu(const QString& a_sAsstId, const QPoint& a_
     }
     // 2026.09.09 崩溃加固：exec() 为模态事件循环，期间用户可增删/关闭助手令 pAsst
     //   悬空——链前快照基准值，链后不再解引用 pAsst。
-    const qint64 iLimitBase = AsstContextLimit(*pAsst);
     QMenu stMenu(pAsst->pBtnContext);
     QAction* pActCompact = stMenu.addAction(MenuIcon(QStringLiteral("ow-compress")), QStringLiteral("立即压缩上下文"));
     // 该助手运行中置灰「立即压缩」（压缩作用于空闲会话，运行中由任务编排自行管理）；
-    //   bRunning 在 exec() 前取快照，模态循环内不解引用 pAsst（同下方 iLimitBase 口径）。
+    //   bRunning 在 exec() 前取快照，模态循环内不解引用 pAsst。
     pActCompact->setEnabled(!pAsst->bRunning);
-    QAction* pActSet = stMenu.addAction(MenuIcon(QStringLiteral("ow-size")), QStringLiteral("设置上下文大小…"));
     // 2026-10-07 子菜单「选择模型」改为对话级覆盖（用户需求：不改缺省模型配置，仅
     //   本对话换模型）：列共享模型表全部条目，勾选 = 该助手生效模型（覆盖优先，无
     //   覆盖 = 全局当前项）；点选 = 设置/更换本助手覆盖（ApplyAsstModelOverride 落
@@ -1842,7 +2041,7 @@ void CExecutionPanel::ShowContextMenu(const QString& a_sAsstId, const QPoint& a_
     //   已设覆盖时首项「跟随全局设置…」一键清除。全局四张节/静态激活零改动——设置页
     //   仍是全局切换的唯一入口。claude 粘性助手不参与共享表（模型自报）不出子菜单。
     //   共享表未配置（空）时置灰提示去设置页；动作只捕 id/下标不捕 pAsst（exec 模态
-    //   循环期间助手可被增删，同 iLimitBase 快照口径）。
+    //   循环期间助手可被增删，同 bRunning 快照口径）。
     const QString sSnapId = a_sAsstId;
     const QString sSnapBe = pAsst->sBackend;
     // 2026-10-08 claude 后端同样开放（用户需求：设置里选的模型 claude 也能用；
@@ -1892,27 +2091,58 @@ void CExecutionPanel::ShowContextMenu(const QString& a_sAsstId, const QPoint& a_
         }
     }
     QAction* pSel = stMenu.exec(a_stGlobalPos);
-    if (pSel == pActSet) {
-        // 设置模型上下文窗口上限（千 token），覆盖按模型自动探测；持久化到 config.ini。
-        bool bOk = false;
-        const int iK = QInputDialog::getInt(
-            this, QStringLiteral("设置上下文大小"),
-            QStringLiteral("上下文窗口上限（千 token，范围 4~2000）："),
-            static_cast<int>(qBound(qint64(4), iLimitBase / 1000, qint64(2000))),
-            4, 2000, 1, &bOk);
-        if (bOk && iK > 0) {
-            SetUserContextLimit(static_cast<qint64>(iK) * 1000);
-            emit sigAdhocContextLimitChanged(m_iUserContextLimit);
-        }
-    } else if (pSel == pActCompact) {
+    if (pSel == pActCompact) {
         emit sigAdhocCompact(a_sAsstId);
     }
 }
 
-// 2026.09.05 该助手窗口分母：用户设的全局上限优先，未设按该助手最近模型探测。
+// 该助手窗口分母：对话级覆盖 → 按覆盖条目模型取窗口（stModelOv 随档持久化，
+//   而 sModel 不落档——重启后仅覆盖助手有值）；否则按该助手最近所用模型。
+//   取值口径（2026-10-14/15）：共享模型表条目 iCtx 优先、名字探测兑底。
+//   2026-10-16 空模型兜底：推送之后新建的助手（「+」/新建任务）尚未跑过一轮，
+//   sModel 为空且等不到 SetSharedModels 再推送——直接探测空名走未知模型 200K
+//   兑底，用户条目明明设了 1M（如 glm-5.3）新建助手却显示 200K。兑底取共享表
+//   当前激活条目（未填 Ctx 再按条目模型名探测），claude 后端同认——但仅限跟随
+//   开关开且条目 anthropic-messages 兼容（SharedActiveEntryForBackend 与 runner
+//   env 注入条件镜像：该条件成立时下一轮实际即用此条目，不张冠李戴；否则 claude
+//   走自身配置，仍保持 200K 兑底）。
 qint64 CExecutionPanel::AsstContextLimit(const SAsst& a_stAsst) const {
-    return (m_iUserContextLimit > 0) ? m_iUserContextLimit
-                                     : ContextLimitForModel(a_stAsst.sModel);
+    const QString sModel = a_stAsst.bModelOv
+        ? a_stAsst.stModelOv.sModelId : a_stAsst.sModel;
+    if (!sModel.trimmed().isEmpty()) {
+        return ContextLimitForModel(sModel);
+    }
+    if (const SDshModelEntry* pE = SharedActiveEntryForBackend(a_stAsst.sBackend)) {
+        if (pE->iCtx > 0) {
+            return pE->iCtx;
+        }
+        if (!pE->sModelId.trimmed().isEmpty()) {
+            return ContextLimitForModel(pE->sModelId);   // 条目未填 Ctx → 名字探测
+        }
+    }
+    return ContextLimitForModel(sModel);   // 兑底（空名 → 200K）
+}
+
+// 2026-10-16 见头文件注释：非 claude 后端固定路由激活条目恒认；claude 后端镜像
+//   CClaudeRunner::StartStage env 注入条件（跟随开关 + anthropic-messages 兼容）。
+const SDshModelEntry* CExecutionPanel::SharedActiveEntryForBackend(
+    const QString& a_sBackend) const {
+    if (m_iSharedActiveModel < 0 || m_iSharedActiveModel >= m_aSharedModels.size()) {
+        return nullptr;
+    }
+    const SDshModelEntry* pE = &m_aSharedModels.at(m_iSharedActiveModel);
+    const QString sEffBackend = a_sBackend.isEmpty()
+        ? CAgentRunnerFactory::BackendName() : a_sBackend;
+    if (sEffBackend == QStringLiteral("claude")) {
+        if (!CClaudeRunner::FollowSharedModels()) {
+            return nullptr;   // 跟随关：claude 走自身配置，激活条目不代表下一轮
+        }
+        const QString sApi = pE->sApi.trimmed().toLower();
+        if (!sApi.isEmpty() && sApi != QLatin1String("anthropic-messages")) {
+            return nullptr;   // 条目非兼容：StartStage 不注入，同上不认
+        }
+    }
+    return pE;
 }
 
 // 2026-10-07 显示口径：模型名去掉前面的 provider/进程名前缀（pi/DSH/Codex 回报的
@@ -1964,17 +2194,16 @@ void CExecutionPanel::UpdateContextButton(const SAsst& a_stAsst) {
         "QProgressBar::chunk { background: %1; }")
         .arg(bRed ? QStringLiteral("#ef4444") : QStringLiteral("#22c55e")));
     // 2026-10-05 本体显示当前模型名（用户需求）：优先该助手最近实际所用/刚切换的目标
-    //   模型（sModel）；未跑过一轮且非 claude 后端 → 共享表当前条目（下一轮即将用的，
-    //   主窗口 SetSharedModels 推送）；claude 后端未回报前未知 → 回落百分比（避免张冠李戴）。
+    //   模型（sModel）；未跑过一轮 → 共享表当前条目（下一轮即将用的，主窗口
+    //   SetSharedModels 推送）——claude 后端 2026-10-16 起同认，但仅跟随开关开且
+    //   条目 anthropic-messages 兼容（SharedActiveEntryForBackend 与注入条件镜像）；
+    //   否则未回报前未知 → 回落百分比（避免张冠李戴）。
     // 2026-10-07 对话级覆盖最高优先（右键「选择模型」仅本助手生效，下一轮即用）。
     QString sBarModel = DisplayModelName(
         a_stAsst.bModelOv ? a_stAsst.stModelOv.sModelId : sModel);
     if (sBarModel.isEmpty()) {
-        const QString sEffBackend = a_stAsst.sBackend.isEmpty()
-            ? CAgentRunnerFactory::BackendName() : a_stAsst.sBackend;
-        if (sEffBackend != QStringLiteral("claude")
-            && m_iSharedActiveModel >= 0 && m_iSharedActiveModel < m_aSharedModels.size()) {
-            sBarModel = m_aSharedModels.at(m_iSharedActiveModel).sModelId;
+        if (const SDshModelEntry* pE = SharedActiveEntryForBackend(a_stAsst.sBackend)) {
+            sBarModel = pE->sModelId;
         }
     }
     if (!sBarModel.isEmpty()) {
@@ -2011,14 +2240,14 @@ void CExecutionPanel::UpdateContextButton(const SAsst& a_stAsst) {
     // 2026.08.29 可发现性：tooltip 注明菜单入口（此前从不提示，右键入口形同虚设）。
     //   2026.09.11 入口提示只写右键（左键菜单已取消）；仅文案变化时才 setToolTip
     //   （流式期间高频刷新，否则悬停中的 tooltip 会被反复重置导致显示闪烁）。
-    sTip += QStringLiteral("\n右键：立即压缩上下文 / 设置上下文大小 / 选择模型");
+    sTip += QStringLiteral("\n右键：立即压缩上下文 / 选择模型");
     if (pBar->toolTip() != sTip) {
         pBar->setToolTip(sTip);
     }
 }
 
 void CExecutionPanel::OnAdhocModel(const QString& a_sAsstId, const QString& a_sModel) {
-    // 该助手本轮所用模型名 → 更新其快照 + 上下文窗口分母（用户设了上限则覆盖探测）。
+    // 该助手本轮所用模型名 → 更新其快照 + 上下文窗口分母（按模型自动探测）。
     //   2026.09.05 per-助手：直接刷该助手页内进度条（无需激活判断）。
     SAsst* pOwner = AsstById(a_sAsstId);
     if (pOwner == nullptr) {
@@ -2026,15 +2255,6 @@ void CExecutionPanel::OnAdhocModel(const QString& a_sAsstId, const QString& a_sM
     }
     pOwner->sModel = a_sModel;
     UpdateContextButton(*pOwner);
-}
-
-void CExecutionPanel::SetUserContextLimit(qint64 a_iLimit) {
-    // 用户右键设的窗口上限：>0 生效（覆盖按模型探测），0/负=回退自动探测；改后即时刷新
-    //   各助手页内的进度条（2026.09.05 per-助手：全局配置，逐助手重算分母）。
-    m_iUserContextLimit = a_iLimit > 0 ? a_iLimit : 0;
-    for (const SAsst& st : std::as_const(m_aAssts)) {
-        UpdateContextButton(st);
-    }
 }
 
 void CExecutionPanel::SetPromptLimits(int a_iCtxPct, int a_iTokMax) {
@@ -2046,8 +2266,9 @@ void CExecutionPanel::SetPromptLimits(int a_iCtxPct, int a_iTokMax) {
 
 int CExecutionPanel::PromptGateLimit(const SAsst& a_stAsst) const {
     // 2026-10-08 发送闸门有效限额：min(窗口×占比%, token 上限)；两项都关（0）或窗口
-    //   未知 → 0 = 不拦截。窗口优先用户右键覆盖，未设按模型名探测（ContextLimitForModel
-    //   对未知模型回退 200K，新助手无 sModel 同样 200K——闸门始终有分母）。
+    //   未知 → 0 = 不拦截。窗口口径同 AsstContextLimit（共享表条目 iCtx 优先、名字探测
+    //   兑底；2026-10-16 起新助手空模型亦回退共享表激活条目——claude 后端限跟随开关开
+    //   且条目兼容（SharedActiveEntryForBackend），闸门分母随条目 Ctx 走）。
     qint64 iLimit = 0;
     if (m_iPromptCtxPct > 0) {
         const qint64 iCtx = AsstContextLimit(a_stAsst);
@@ -2122,21 +2343,50 @@ void CExecutionPanel::SetSharedModels(const QList<SDshModelEntry>& a_aModels, in
     // 2026-10-05 主窗口推送共享模型表（启动/热重载/设置保存/右键切换后回推）：
     //   记表供右键「选择模型」菜单与进度条模型名兜底；非 claude 助手的模型名随当前项
     //   即时刷新（下一轮即用新模型，展示口径先行；claude 后端模型自报，不参与共享表）。
+    //   2026.10.15 设置页改模型「名称」同步：已有对话级覆盖的助手，覆盖快照按身份
+    //   （URL+Api+ModelId，不含显示名）匹配新表，命中则整条刷新（sDisp 换新显示名 →
+    //   进度条/菜单即时新名，iCtx/iMaxTok 变更也顺带跟上）并重新落盘+同步编排器会话；
+    //   不命中（接入点/模型 id 被改，身份已变）保持旧快照——右键菜单首项自然提示
+    //   「已不在列表」。
     m_aSharedModels = a_aModels;
     m_iSharedActiveModel = a_iActive;
     QString sNewModel;
     if (a_iActive >= 0 && a_iActive < a_aModels.size()) {
         sNewModel = a_aModels.at(a_iActive).sModelId;
     }
+    QStringList aOvRefreshed;   // 覆盖快照被本次推送刷新的助手（重新落盘+同步编排器）
     for (int i = 0; i < m_aAssts.size(); ++i) {
         SAsst& st = m_aAssts[i];
         const QString sEffBackend = st.sBackend.isEmpty()
             ? CAgentRunnerFactory::BackendName() : st.sBackend;
-        if (sEffBackend != QStringLiteral("claude") && !st.bModelOv
+        if (st.bModelOv) {
+            const int iOvIdx = SharedModelIndexByIdentity(a_aModels, st.stModelOv);
+            if (iOvIdx >= 0) {
+                const SDshModelEntry& stNew = a_aModels.at(iOvIdx);
+                // 身份相同但展示/参数字段有变才刷新（幂等防抖：无变化不重落盘）。
+                if (st.stModelOv.sDisp != stNew.sDisp
+                        || st.stModelOv.sApiKey != stNew.sApiKey
+                        || st.stModelOv.iCtx != stNew.iCtx
+                        || st.stModelOv.iMaxTok != stNew.iMaxTok) {
+                    st.stModelOv = stNew;
+                    aOvRefreshed.append(st.sId);
+                }
+            }
+        } else if (sEffBackend != QStringLiteral("claude")
             && !sNewModel.isEmpty() && st.sModel != sNewModel) {
             st.sModel = sNewModel;   // 进度条模型名即时跟上切换（实际下一轮生效）
         }
         UpdateContextButton(st);   // 2026-10-07 有覆盖的助手显示自己的覆盖模型不被冲掉
+    }
+    // 覆盖快照刷新后：同步编排器会话快照 + 落盘（assistant.json modelOv 键），
+    //   口径同 ApplyAsstModelOverride 链尾（信号仅带 id/快照，无 pAsst 悬垂风险）。
+    for (const QString& sId : aOvRefreshed) {
+        const SAsst* pAsst = AsstById(sId);
+        const SDshModelEntry stE = (pAsst != nullptr) ? pAsst->stModelOv : SDshModelEntry();
+        emit sigAsstModelOverride(sId, stE, true);
+    }
+    if (!aOvRefreshed.isEmpty()) {
+        emit sigAsstLayoutChanged();
     }
 }
 
@@ -2165,16 +2415,10 @@ void CExecutionPanel::UpdateTaskInjectState() {
 }
 
 qint64 CExecutionPanel::ContextLimitForModel(const QString& a_sModel) {
-    // 按模型名粗分上下文窗口（token）；未命中回退 200K。具体窗口以模型官方规格为准，
-    // 按钮 tooltip 会显示真实模型名供核对（新模型可在此补充映射）。
-    const QString s = a_sModel.toLower().trimmed();
-    if (s.contains(QStringLiteral("glm"))) {
-        return 128000;   // GLM-4.x 系列（按公开规格 128K）
-    }
-    if (s.contains(QStringLiteral("claude"))) {
-        return 200000;   // Claude Sonnet/Opus/Haiku 4 系列（公开 200K）
-    }
-    return 200000;   // 未知模型回退
+    // 2026-10-14 单点统一：委托 CClaudeRunner::ContextWindowForModel（共享模型表
+    //   条目 iCtx 优先、名字探测兑底）——本函数原为同逻辑的 UI 副本，两处口径
+    //   不一致致用户条目设 1M、主界面进度条仍显示 128K。
+    return CClaudeRunner::ContextWindowForModel(a_sModel);
 }
 
 void CExecutionPanel::UpdateAdhocInputState(const QString& a_sAsstId) {
@@ -2262,6 +2506,43 @@ void CExecutionPanel::AppendToAdhocInput(const QString& a_sText) {
     stCur.movePosition(QTextCursor::End);
     pAsst->pInput->setTextCursor(stCur);
     pAsst->pInput->setFocus();
+}
+
+// 2026-10-09 孤儿看门狗自愈配套（主窗口 OnAdhocHealthCheck 调）：解除首条命名挂起
+//   并把暂存指令退回输入框。背景：首条提示词「先改名后执行」链中 bSendAfterAutoName
+//   置位后靠 OnAdhocFinished 补发——若该轮结束信号丢失（孤儿场景），挂起位与暂存
+//   队列永无人消费：后续所有发送只暂存不提交（另机实测死锁），必须在此一并解除。
+void CExecutionPanel::AdhocOrphanHeal(const QString& a_sAsstId) {
+    SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr) {
+        return;
+    }
+    if (!pAsst->bSendAfterAutoName && pAsst->aStaged.isEmpty()) {
+        return;   // 无挂起态：无事可做
+    }
+    pAsst->bSendAfterAutoName = false;
+    pAsst->iSendAfterPerm     = 0;
+    QStringList aBack;
+    for (const QPair<QString, QString>& stP : pAsst->aStaged) {
+        if (!stP.second.trimmed().isEmpty()) {
+            aBack << stP.second;
+        }
+    }
+    pAsst->aStaged.clear();
+    pAsst->bQueueExpanded = false;
+    RefreshQueueBox(a_sAsstId);
+    if (pAsst->pInput != nullptr && !aBack.isEmpty()) {
+        // 退回输入框（多条合并，同「提交被拒退回」口径）；已有未发文本时追加在后。
+        const QString sCur = pAsst->pInput->toPlainText();
+        const QString sAll = aBack.join(QStringLiteral("\n\n"));
+        pAsst->pInput->setPlainText(sCur.isEmpty() ? sAll
+                                                   : sCur + QStringLiteral("\n\n") + sAll);
+        QTextCursor cur = pAsst->pInput->textCursor();
+        cur.movePosition(QTextCursor::End);
+        pAsst->pInput->setTextCursor(cur);
+        const int iMaxLines = pAsst->pInput->property("acMaxLines").toInt();
+        AdjustInputHeight(pAsst->pInput, iMaxLines > 0 ? iMaxLines : 10);
+    }
 }
 
 void CExecutionPanel::SetAsstRunning(const QString& a_sAsstId, bool a_bRunning) {
@@ -2616,16 +2897,19 @@ void CExecutionPanel::RebuildPromptList() {
 
 void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
     // FR-3：点击下拉中某条提示词 → 把对应 User 提问块滚到助手日志最顶 + 横纵滚动条归零。
-    // 反向分页：目标块可能早于前沿尚未建件 → 流内 EnsureCoverage 分轮补建后滚动到位。
+    // 反向分页：目标块可能早于前沿尚未建件 → 流内 EnsureCoverage 补建后滚动到位。
+    //   2026-10-15 远距离目标改整窗跳建（弃件+目标处建 ~200 块，O(窗口) 即时响应，
+    //   不再逐轮前插建完全部中间件）；窗口尾之后的块滚到底再分轮补建。
     SAsst* pAsst = ActiveAsst();
-    if (pAsst == nullptr || pAsst->pView == nullptr) {
+    if (pAsst == nullptr || !AsstViewBuilt(*pAsst)) {
         return;
     }
     // 切到该助手 Tab，确保用户看到滚动结果。
     m_pTabs->setCurrentWidget(pAsst->pPage);
-    CMessageView* pView = pAsst->pView;   // 流回调时捕获视图（不捕获 SAsst 指针，防搬移悬垂）
-    AsstStream(*pAsst)->EnsureCoverage(a_iBlockIdx, [pView](CMessageBlock* a_pBlock) {
-        if (a_pBlock != nullptr) {
+    CMessageView* pView = pAsst->pView;   // 流回调时捕获视图（不捕获 SAsst 指针，防搬移悬垂；
+                                          //   ModelView 引擎下为 null——EnsureCoverage 走 JumpToItem，
+    AsstStream(*pAsst)->EnsureCoverage(a_iBlockIdx, [pView](CMessageBlock* a_pBlock) {   //   回调参数=nullptr 自然跳过）
+        if (a_pBlock != nullptr && pView != nullptr) {
             pView->ScrollBlockToTop(a_pBlock);
         }
     });
@@ -2663,7 +2947,8 @@ void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab, 
 void CExecutionPanel::CreatePromptButton(SAsst& a_stAsst) {
     // FR-3：助手日志右上角半透明提示词按钮（24x24，默认 50% 透明，hover 全不透明）。
     //   2026.08.22 多助手：按钮 parent=该助手视图，随视图显隐；浮层单实例共用。
-    QToolButton* pBtn = new QToolButton(a_stAsst.pView);   // parent = 助手视图，叠在其右上角
+    //   2026-10-17 双引擎：parent 统一走 AsstViewWidget（Legacy=pView/ModelView=pView2）。
+    QToolButton* pBtn = new QToolButton(AsstViewWidget(a_stAsst));   // parent = 助手视图，叠在其右上角
     a_stAsst.pBtnPrompts = pBtn;
     pBtn->setText(QStringLiteral("≡"));   // 列表图标占位
     pBtn->setFixedSize(24, 24);
@@ -2681,7 +2966,7 @@ void CExecutionPanel::CreatePromptButton(SAsst& a_stAsst) {
     // hover（进入/离开按钮）→ 显示/隐藏提示词下拉浮层；视图 resize/show/hide → 按钮贴右上角。
     pBtn->installEventFilter(this);
     // 2026.08.23 提示词按钮正下方补一个「↓」按钮：点击将该助手日志滚动到最底。
-    QToolButton* pBtnBottom = new QToolButton(a_stAsst.pView);   // parent 同助手视图
+    QToolButton* pBtnBottom = new QToolButton(AsstViewWidget(a_stAsst));   // parent 同助手视图（双引擎出口）
     a_stAsst.pBtnBottom = pBtnBottom;
     pBtnBottom->setText(QStringLiteral("↓"));
     pBtnBottom->setFixedSize(24, 24);
@@ -2699,16 +2984,22 @@ void CExecutionPanel::CreatePromptButton(SAsst& a_stAsst) {
     const QString sAsstId = a_stAsst.sId;
     connect(pBtnBottom, &QToolButton::clicked, this, [this, sAsstId]() {
         SAsst* pA = AsstById(sAsstId);
-        if (pA != nullptr && pA->pView != nullptr) {
-            pA->pView->ScrollToBottomRobust();
+        if (pA != nullptr && AsstViewBuilt(*pA)) {
+            // 2026-10-17 双引擎：ModelView 单次滚底（布局即时）；Legacy 多帧滚底
+            //   （Markdown 高度异步收敛，ScrollToBottomRobust 分帧确保真正到底）。
+            if (pA->pView2 != nullptr) {
+                pA->pView2->ScrollToBottom();
+            } else {
+                pA->pView->ScrollToBottomRobust();
+            }
         }
     });
-    a_stAsst.pView->installEventFilter(this);
+    AsstViewWidget(a_stAsst)->installEventFilter(this);
 
     // 2026.09.18 运行中暂存提示词折叠框（日志区右下角）：运行中发送的提示词先进这里，
     //   实际开始处理才渲染为正式用户块。缺省折叠只显示第一条；左侧 8×8 展开/折叠
     //   按钮（qbox/q-expand ▸ / q-collapse ▾）切换全部显示。无暂存时隐藏。
-    QFrame* pQBox = new QFrame(a_stAsst.pView);
+    QFrame* pQBox = new QFrame(AsstViewWidget(a_stAsst));   // 2026-10-17 双引擎出口
     pQBox->setObjectName(QStringLiteral("queueBox"));
     pQBox->setStyleSheet(QStringLiteral(
         "QFrame#queueBox { background: rgba(255,255,255,235);"
@@ -2969,10 +3260,11 @@ bool CExecutionPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
     if (a_pEvent->type() == QEvent::Resize || a_pEvent->type() == QEvent::Show ||
         a_pEvent->type() == QEvent::Hide) {
         for (SAsst& st : m_aAssts) {
-            if (a_pWatched == st.pView && st.pBtnPrompts != nullptr) {
+            QWidget* pView = AsstViewWidget(st);   // 2026-10-17 双引擎出口（null=未建）
+            if (pView != nullptr && a_pWatched == pView && st.pBtnPrompts != nullptr) {
                 const bool bCurTab =
                     (m_pTabs != nullptr && m_pTabs->currentWidget() == st.pPage);
-                const int iX = st.pView->width() - st.pBtnPrompts->width() - 11;   // 左移 5px 避让竖直滚动条
+                const int iX = pView->width() - st.pBtnPrompts->width() - 11;   // 左移 5px 避让竖直滚动条
                 const int iY = 6;
                 st.pBtnPrompts->move(iX, iY);
                 st.pBtnPrompts->setVisible(bCurTab && a_pEvent->type() != QEvent::Hide);
@@ -2985,8 +3277,8 @@ bool CExecutionPanel::eventFilter(QObject* a_pWatched, QEvent* a_pEvent) {
                 // 2026.09.18 暂存折叠框随视图尺寸钉在右下角（无暂存时 RefreshQueueBox 已隐藏）。
                 if (st.pQueueBox != nullptr && !st.aStaged.isEmpty()) {
                     st.pQueueBox->move(
-                        st.pView->width() - st.pQueueBox->width() - 11,
-                        st.pView->height() - st.pQueueBox->height() - 8);
+                        pView->width() - st.pQueueBox->width() - 11,
+                        pView->height() - st.pQueueBox->height() - 8);
                     st.pQueueBox->setVisible(bCurTab && a_pEvent->type() != QEvent::Hide);
                     st.pQueueBox->raise();
                 }
@@ -3154,14 +3446,18 @@ QList<CExecutionPanel::SAsst> CExecutionPanel::TakeRunningForReload()
     for (int i = m_aAssts.size() - 1; i >= 0; --i) {
         SAsst& st = m_aAssts[i];
         if (!st.bClosed && st.bRunning) {
-            if (st.pPage != nullptr) {
-                const int iIdx = m_pTabs->indexOf(st.pPage);
-                if (iIdx >= 0) {
-                    m_pTabs->removeTab(iIdx);
-                }
-                st.pPage->deleteLater();
+            // 2026-10-11 幽灵助手+UAF 崩溃修复：摘页改走 RemoveAsstPageSafe（预切走+
+            //   守卫）——旧版裸 removeTab 摘当前页时「+」页被自动激活，OnAsstAddClicked
+            //   嵌套新增助手既落幽灵档又重分配 m_aAssts 使本行 SAsst& st 悬垂（deleteLater
+            //   读已释放 pPage，dump 实证 this=-9 崩溃）。页指针先入局部，拆除后不再经 st 取。
+            QWidget* pPage = st.pPage;
+            if (pPage != nullptr) {
+                RemoveAsstPageSafe(pPage);
+                pPage->deleteLater();
                 st.pPage = nullptr;
                 st.pView = nullptr;
+                st.pView2 = nullptr;   // 2026-10-17 ModelView 视图随页销毁（pModel 为其子对象同灭）
+                st.pModel = nullptr;
                 st.pInput = nullptr;
                 st.pComboPerm = nullptr;
                 st.pBtnContext = nullptr;
@@ -3212,12 +3508,12 @@ void CExecutionPanel::RemoveAsstEntry(const QString& a_sAsstId)
             continue;
         }
         SAsst& st = m_aAssts[i];
-        if (st.pPage != nullptr) {
-            const int iIdx = m_pTabs->indexOf(st.pPage);
-            if (iIdx >= 0) {
-                m_pTabs->removeTab(iIdx);
-            }
-            st.pPage->deleteLater();
+        // 2026-10-11 幽灵助手+UAF 崩溃修复：摘页改走 RemoveAsstPageSafe（见其函数体注释；
+        //   幽灵页恰为当前页时旧版裸 removeTab 会触发「+」页幽灵新增助手）。
+        QWidget* pPage = st.pPage;
+        if (pPage != nullptr) {
+            RemoveAsstPageSafe(pPage);
+            pPage->deleteLater();
         }
         m_aAssts.removeAt(i);
     }
@@ -3234,16 +3530,57 @@ void CExecutionPanel::DropAsstEntries(const QStringList& a_aIds)
                 continue;
             }
             SAsst& st = m_aAssts[i];
-            if (st.pPage != nullptr) {
-                const int iIdx = m_pTabs->indexOf(st.pPage);
-                if (iIdx >= 0) {
-                    m_pTabs->removeTab(iIdx);
-                }
-                st.pPage->deleteLater();
+            // 2026-10-11 幽灵助手+UAF 崩溃修复：摘页改走 RemoveAsstPageSafe（见其函数体
+            //   注释）——档重载去重摘的多为刚激活的文件版当前页，裸 removeTab 必触发
+            //   「+」页幽灵新增（用户 pdfplumber 档里凭空多出的空助手即此路径落档）。
+            QWidget* pPage = st.pPage;
+            if (pPage != nullptr) {
+                RemoveAsstPageSafe(pPage);
+                pPage->deleteLater();
             }
             m_aAssts.removeAt(i);
         }
     }
+}
+
+void CExecutionPanel::RemoveAsstPageSafe(QWidget* a_pPage)
+{
+    // 2026-10-11 幽灵助手 + UAF 崩溃修复（pdfplumber 实害，dump AutoCode_20261011_041512_28592）:
+    //   TakeRunningForReload / DropAsstEntries / RemoveAsstEntry（2026-10-02 跨档幽灵三路径）
+    //   此前裸调 removeTab——摘掉「当前」助手页时 Qt 自动激活相邻「+」占位页，
+    //   OnAsstTabCurrentChanged 无守卫可辨程序性激活，误判为用户点「+」→ OnAsstAddClicked
+    //   幽灵新增空助手（ownerKey=切换中视图 → 同步 SaveAssistantState 落档，任务档里凭空多
+    //   出空助手1/助手2；极端时序下视图组全量覆写还会把运行中助手挤出档）；嵌套
+    //   m_aAssts.append 更会重分配 QList，外层循环持有的 SAsst& 悬垂 → st.pPage 读已释放
+    //   内存 → deleteLater(this=-9) 崩溃。防护同 RemoveAsstTab 之根（预切走当前页）+
+    //   ClearAsstTabs 之守卫（拆除期忽略程序性 currentChanged），双保险：预切页不存在时
+    //   （如唯一助手页被摘）守卫仍兑底。
+    if (a_pPage == nullptr) {
+        return;
+    }
+    const bool bCur = (m_pTabs->currentWidget() == a_pPage);
+    m_bAsstTabsResetting = true;
+    if (bCur) {
+        // 预切到另一个打开的助手页，无则日志页（同 RemoveAsstTab 根）。
+        QWidget* pNext = nullptr;
+        for (const SAsst& st : m_aAssts) {
+            if (!st.bClosed && st.pPage != nullptr && st.pPage != a_pPage) {
+                pNext = st.pPage;
+                break;
+            }
+        }
+        m_pTabs->setCurrentWidget(pNext != nullptr ? pNext : TaskLogWidget());
+        if (pNext != nullptr) {
+            if (SAsst* pNextAsst = AsstByPage(pNext)) {
+                m_sActiveAsst = pNextAsst->sId;   // 守卫期 currentChanged 被忽略：激活 id 手动同步
+            }
+        }
+    }
+    const int iIdx = m_pTabs->indexOf(a_pPage);
+    if (iIdx >= 0) {
+        m_pTabs->removeTab(iIdx);
+    }
+    m_bAsstTabsResetting = false;
 }
 
 bool CExecutionPanel::AsstForeignById(const QString& a_sAsstId, QString* a_psOwnerKey) const
@@ -3442,7 +3779,7 @@ void CExecutionPanel::ClearAsstTabs() {
     // 即「点击任务卡死」的根因）。
     m_bAsstTabsResetting = true;
     for (int i = m_aAssts.size() - 1; i >= 0; --i) {
-        if (m_aAssts[i].pView != nullptr) {
+        if (AsstViewBuilt(m_aAssts[i])) {
             RemoveAsstTab(m_aAssts[i]);
         }
     }
@@ -3491,7 +3828,11 @@ void CExecutionPanel::ClearAllBlocks() {
     if (m_pChatSaveTimer != nullptr) {
         m_pChatSaveTimer->stop();
     }
-    m_pView->Clear();   // 双保险（Unbind 已清；保险无块残留）
+    if (m_pView != nullptr) {
+        m_pView->Clear();   // 双保险（Unbind 已清；保险无块残留；ModelView 下为 null）
+    } else if (m_pChatModel != nullptr) {
+        m_pChatModel->ClearDisplay();   // 2026-10-17 ModelView：共享模型空白化（同语义）
+    }
     ResetAssistants();
 }
 
@@ -3569,7 +3910,8 @@ void CExecutionPanel::UpdateTabCloseButtons() {
     }
     for (int i = 0; i < m_pTabs->count(); ++i) {
         QWidget* pW = m_pTabs->widget(i);
-        const bool bKnownNonAsst = (pW == m_pView || pW == m_pArtifactsPage ||
+        const bool bKnownNonAsst = (pW == m_pView || pW == m_pView2
+                                    || pW == m_pArtifactsPage ||
                                     pW == m_pFileView || pW == m_pAddTabPage);
         if (bKnownNonAsst) {
             m_pTabs->tabBar()->setTabButton(i, QTabBar::RightSide, nullptr);
@@ -3591,8 +3933,8 @@ void CExecutionPanel::UpdateTabCloseButtons() {
     // 分区顺序整队：[日志][阶段产物][打开助手（按当前 Tab 相对顺序）][+][其余（文件预览）]。
     if (m_pTabs->indexOf(m_pAddTabPage) >= 0) {   // 仅助手存在时整队
         QList<QWidget*> aOrder;
-        if (m_pView != nullptr && m_pTabs->indexOf(m_pView) >= 0) {
-            aOrder.append(m_pView);
+        if (TaskLogWidget() != nullptr && m_pTabs->indexOf(TaskLogWidget()) >= 0) {
+            aOrder.append(TaskLogWidget());
         }
         if (m_pArtifactsPage != nullptr && m_pTabs->indexOf(m_pArtifactsPage) >= 0) {
             aOrder.append(m_pArtifactsPage);
@@ -3637,7 +3979,7 @@ CExecutionPanel::SAsst* CExecutionPanel::AsstByPage(QWidget* a_pPage) {
     return nullptr;
 }
 
-CMessageView* CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
+void CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
     // 建助手页（容器 = 日志视图 + 输入栏 + 统计栏）+ 右上角提示词按钮 + 插 Tab
     // （默认插在最后一个助手 Tab 右侧）。2026.09.05 per-助手控件：Tab 页本体是 pPage
     // 容器，输入框/按钮/统计标签全部随页生灭，切换 Tab 即切换整套实例。
@@ -3655,7 +3997,6 @@ CMessageView* CExecutionPanel::CreateAsstTab(SAsst& a_stAsst, int a_iPos) {
     m_pTabs->insertTab(iIdx, a_stAsst.pPage, AsstTabText(a_stAsst));   // 标题恒纯名；运行闪点统一 SyncAsstTabDot
     UpdateTabCloseButtons();
     SyncAsstTabDot(a_stAsst, m_pTabs->indexOf(a_stAsst.pPage));   // 2026.09.19 新建/重开的助手 Tab 若已在跑立即画闪点
-    return a_stAsst.pView;
 }
 
 // 2026.09.05 per-助手控件组建页（用户需求：提示词/发送按钮/统计信息全部放助手 Tab 页内，
@@ -3669,15 +4010,30 @@ void CExecutionPanel::CreateAsstWidgets(SAsst& a_stAsst) {
     pV->setSpacing(4);
 
     // —— 日志视图（占主体）——
-    a_stAsst.pView = new CMessageView(a_stAsst.pPage);
-    // 2026.09.03 流呈现器接管接线（到顶补建/丢块同步等在流内，与任务日志同码）：
-    //   建视图即绑流（重开助手复绑同一流，Bind 内先解旧）；字体设置在绑后不影响。
-    AsstStream(a_stAsst)->Bind(a_stAsst.pView);
-    QFont fView = a_stAsst.pView->font();
-    fView.setPointSize(11);
-    a_stAsst.pView->setFont(fView);
+    // 2026-10-17 自绘三期双引擎：ModelView=CChatListView+独占 CChatModel（模型归
+    //   视图 parent 链，随 pPage 生灭）；Legacy=CMessageView（原路径不动）。建视图
+    //   即绑流（重开助手复绑同一流，Bind 内先解旧）；字体设置在绑后不影响。
+    QWidget* pAsstView = nullptr;
+    if (m_bEngineMV) {
+        a_stAsst.pView2 = new CChatListView(a_stAsst.pPage);
+        a_stAsst.pModel = new CChatModel(a_stAsst.pView2);
+        {
+            QFont fView = a_stAsst.pView2->font();
+            fView.setPointSize(11);
+            a_stAsst.pView2->ApplyFont(fView);   // 字体先于条目入池（度量/估高同源）
+        }
+        AsstStream(a_stAsst)->Bind(a_stAsst.pModel, a_stAsst.pView2);
+        pAsstView = a_stAsst.pView2;
+    } else {
+        a_stAsst.pView = new CMessageView(a_stAsst.pPage);
+        AsstStream(a_stAsst)->Bind(a_stAsst.pView);
+        QFont fView = a_stAsst.pView->font();
+        fView.setPointSize(11);
+        a_stAsst.pView->setFont(fView);
+        pAsstView = a_stAsst.pView;
+    }
     CreatePromptButton(a_stAsst);
-    pV->addWidget(a_stAsst.pView, 1);
+    pV->addWidget(pAsstView, 1);
 
     // —— 输入栏：输入框 + 权限下拉 + 上下文进度条 + 发送 + 撤销 ——
     auto* pBar = new QHBoxLayout();
@@ -3845,8 +4201,7 @@ void CExecutionPanel::RemoveAsstTab(SAsst& a_stAsst) {
                 break;
             }
         }
-        m_pTabs->setCurrentWidget(pNext != nullptr ? pNext
-                                                   : static_cast<QWidget*>(m_pView));
+        m_pTabs->setCurrentWidget(pNext != nullptr ? pNext : TaskLogWidget());
     }
     const int iIdx = m_pTabs->indexOf(a_stAsst.pPage);
     if (iIdx >= 0) {
@@ -3863,6 +4218,8 @@ void CExecutionPanel::RemoveAsstTab(SAsst& a_stAsst) {
     delete a_stAsst.pPage;   // 页容器销毁 = 日志视图/输入栏/统计栏/浮层按钮整组释放
     a_stAsst.pPage       = nullptr;
     a_stAsst.pView       = nullptr;
+    a_stAsst.pView2      = nullptr;   // 2026-10-17 ModelView 视图/模型随页销毁
+    a_stAsst.pModel      = nullptr;
     a_stAsst.pBtnPrompts = nullptr;
     a_stAsst.pBtnBottom  = nullptr;
     a_stAsst.pQueueBox   = nullptr;   // 2026.09.18 暂存折叠框随页销毁（重开重建；暂存队列非持久化，随行作废）
@@ -4132,9 +4489,35 @@ void CExecutionPanel::OnAsstTabRenamed(int a_iIdx) {
         return;   // 2026-10-02 外档幽灵：改名回归属任务下做（防跨档写脏名）
     }
     bool bOk = false;
-    const QString sName = QInputDialog::getText(this, QStringLiteral("重命名助手"),
-        QStringLiteral("助手名："), QLineEdit::Normal, pAsst->sName, &bOk)
-        .trimmed();
+    QString sName;
+    {
+        // 2026-10-16 静态 getText 改构造式 QInputDialog：几何持久化（弹出前恢复、
+        //   关后回填——主窗口 [Layout] RenameDlgGeo 落盘，拖动/改大小下次原位重现；
+        //   注：QInputDialog 显示时布局锁定高度=内容自适应高，可持久化面=位置+宽度）。
+        //   字体显式 11pt（正文+按钮，同移除根节点弹窗口径，不依赖继承）。
+        QInputDialog stDlg(this);
+        stDlg.setWindowTitle(QStringLiteral("重命名助手"));
+        stDlg.setLabelText(QStringLiteral("助手名："));
+        stDlg.setTextValue(pAsst->sName);
+        stDlg.setInputMode(QInputDialog::TextInput);   // 同旧 QLineEdit::Normal 回显
+        if (!m_stRenameDlgGeo.isEmpty()) {
+            stDlg.restoreGeometry(m_stRenameDlgGeo);
+        }
+        {
+            QFont fDlg = stDlg.font();
+            fDlg.setPointSize(11);
+            stDlg.setFont(fDlg);
+            const auto aBtns = stDlg.findChildren<QAbstractButton*>();
+            for (QAbstractButton* pB : aBtns) {
+                QFont fB = pB->font();
+                fB.setPointSize(11);
+                pB->setFont(fB);
+            }
+        }
+        bOk = (stDlg.exec() == QDialog::Accepted);
+        m_stRenameDlgGeo = stDlg.saveGeometry();   // 确认/取消均回填（位置记忆不应因取消丢失）
+        sName = stDlg.textValue().trimmed();
+    }
     if (!bOk || sName.isEmpty() || sName == pAsst->sName) {
         return;
     }
@@ -4240,8 +4623,13 @@ void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
     m_sActiveAsst = pAsst->sId;
     // 首次切到该助手（或其视图件尚未建）→ 按数据重建其视图（恢复档时惰性补建）。
     //   2026.09.03 件状态在流内：未建流/无件 且有数据 → 重建（旧：aWidgets 空且 aBlocks 非空）。
-    const bool bNeedsBuild = (pAsst->pView != nullptr)
-        && (!pAsst->pStream || (pAsst->pStream->WidgetCount() == 0 && pAsst->pStream->Count() > 0));
+    //   2026-10-17 双引擎：ModelView 用 Projected()（数据已投影进模型）判定——
+    //   WidgetCount 恒 0 不再是「未建」信号。
+    const bool bNeedsBuild = AsstViewBuilt(*pAsst)
+        && (!pAsst->pStream
+            || (pAsst->pStream->ModelView()
+                ? (!pAsst->pStream->Projected() && pAsst->pStream->Count() > 0)
+                : (pAsst->pStream->WidgetCount() == 0 && pAsst->pStream->Count() > 0)));
     if (bNeedsBuild) {
         RebuildAdhocView();
     } else {
@@ -4252,30 +4640,32 @@ void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
     //   m_iContextLimit 三面板级镜像已删）；提示词下拉列表已在上方 if/else 按新激活
     //   助手重建（RebuildAsstView 内部亦会 RebuildPromptList）。
     // FR-3：各助手右上角提示词按钮可见性（仅当前页的按钮显示并贴右上角）。
+    QWidget* pCurView = AsstViewWidget(*pAsst);   // 2026-10-17 双引擎出口（当前页视图）
     for (SAsst& st : m_aAssts) {
-        if (st.pBtnPrompts != nullptr && st.pView != nullptr) {
-            const bool bCur = (st.pView == pAsst->pView);
+        QWidget* pView = AsstViewWidget(st);
+        if (st.pBtnPrompts != nullptr && pView != nullptr) {
+            const bool bCur = (pView == pCurView);
             st.pBtnPrompts->setVisible(bCur);
             if (bCur) {
-                st.pBtnPrompts->move(st.pView->width() - st.pBtnPrompts->width() - 11, 6);
+                st.pBtnPrompts->move(pView->width() - st.pBtnPrompts->width() - 11, 6);
                 st.pBtnPrompts->raise();
             }
             if (st.pBtnBottom != nullptr) {
-                const bool bCurB = (st.pView == pAsst->pView);
+                const bool bCurB = (pView == pCurView);
                 st.pBtnBottom->setVisible(bCurB);
                 if (bCurB) {
-                    st.pBtnBottom->move(st.pView->width() - st.pBtnBottom->width() - 11, 6 + 24 + 2);
+                    st.pBtnBottom->move(pView->width() - st.pBtnBottom->width() - 11, 6 + 24 + 2);
                     st.pBtnBottom->raise();
                 }
             }
             // 2026.09.18 暂存折叠框：仅当前页显示，钉右下角。
             if (st.pQueueBox != nullptr && !st.aStaged.isEmpty()) {
-                const bool bCurQ = (st.pView == pAsst->pView);
+                const bool bCurQ = (pView == pCurView);
                 st.pQueueBox->setVisible(bCurQ);
                 if (bCurQ) {
                     st.pQueueBox->move(
-                        st.pView->width() - st.pQueueBox->width() - 11,
-                        st.pView->height() - st.pQueueBox->height() - 8);
+                        pView->width() - st.pQueueBox->width() - 11,
+                        pView->height() - st.pQueueBox->height() - 8);
                     st.pQueueBox->raise();
                 }
             }

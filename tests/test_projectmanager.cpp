@@ -3,6 +3,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QCoreApplication>
+#include <QJsonDocument>   // 2026-10-17 在席信号用例（手写带 procStartMs 的锁档）
+#include <QJsonObject>
 #include <QTemporaryDir>   // 2026.09.09 v2.1.143 任务级配置覆盖用例
 #include <QHeaderView>     // 2026.09.11 模型表列宽用例
 #include <QCheckBox>
@@ -13,6 +15,7 @@
 #include <QMainWindow>       // 2026.09.26 设置对话框几何漂移用例（父窗口）
 
 #include <windows.h>       // WritePrivateProfileStringW（坏档构造，与生产代码同通道）
+#include <tlhelp32.h>    // 2026-10-17 在席锁受保护进程 PID 复用用例（快照枚举 svchost）
 
 #include "project/CProjectManager.h"
 #include "ui/CSettingsDialog.h"
@@ -567,6 +570,159 @@ private slots:
             f.close();
         }
         QVERIFY(!CProjectManager::IsProjectHeldByOther(sProj));
+    }
+
+    // 2026-10-17 在席锁受保护进程 PID 复用误报回归（实害：机器重启残留锁 pid 被
+    //   LocalSystem svchost 复用，OpenProcess 恒 ACCESS_DENIED，旧版"保守当活"
+    //   误报「工程已被其他实例打开」）：快照查名 兑底 + 死进程快照不命中 +
+    //   真实受保护 svchost 持锁应判陈旧不阻断。
+    void testProjectInstanceLockProtectedPidReuse() {
+        // ① 快照能查到活进程（自己）的映像名。
+        QString sName;
+        QVERIFY(CProjectManager::SnapshotImageNameOfPid(
+                    static_cast<qint64>(::GetCurrentProcessId()), &sName));
+        QVERIFY2(sName.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive),
+                 qPrintable(sName));
+        // ② 已退出进程 → 快照不命中（短命子进程退干净后查）。 
+        {
+            QProcess stProc;
+            stProc.start(QStringLiteral("cmd.exe"), {QStringLiteral("/c"), QStringLiteral("exit")});
+            QVERIFY2(stProc.waitForStarted(), "短命子进程启动失败");
+            const qint64 iPid = static_cast<qint64>(stProc.processId());
+            stProc.waitForFinished(5000);
+            QTest::qSleep(300);   // 退出后句柄清理小窗口
+            QVERIFY(!CProjectManager::SnapshotImageNameOfPid(iPid, nullptr));
+        }
+        // ③ 真实场景复现：找一个 OpenProcess 拒绝访问的 svchost（LocalSystem 服务），
+        //    把它的 pid 写进锁 → 修复后应判陈旧不阻断（旧版恒误报在席）。
+        //    本机/Admin 提权环境可能全部能打开 → QSKIP（逻辑已被 ①② 覆盖）。
+        {
+            qint64 iSvcPid = 0;
+            HANDLE hSnap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W stPe = {};
+                stPe.dwSize = sizeof(stPe);
+                BOOL bOk = ::Process32FirstW(hSnap, &stPe);
+                while (bOk && iSvcPid == 0) {
+                    if (QString::fromWCharArray(stPe.szExeFile)
+                            .compare(QStringLiteral("svchost.exe"), Qt::CaseInsensitive) == 0) {
+                        HANDLE hTry = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                                    stPe.th32ProcessID);
+                        if (hTry == nullptr && ::GetLastError() == ERROR_ACCESS_DENIED) {
+                            iSvcPid = stPe.th32ProcessID;
+                        } else if (hTry != nullptr) {
+                            ::CloseHandle(hTry);
+                        }
+                    }
+                    bOk = ::Process32NextW(hSnap, &stPe);
+                }
+                ::CloseHandle(hSnap);
+            }
+            if (iSvcPid == 0) {
+                QSKIP("本环境找不到拒绝访问的 svchost（提权态），跳过真场景复现段");
+            }
+            CProjectManager::SProjectLock st;
+            st.iPid = iSvcPid;
+            st.sExe = QStringLiteral("E:/x/AutoCode1.exe");
+            st.sStarted = QStringLiteral("2026-10-17 11:46:39");
+            QVERIFY(!CProjectManager::IsLockHolderAlive(st));   // svchost ≠ AutoCode* → 陈旧
+        }
+    }
+
+    // 2026-10-17 v4.4.387 在席信号（内核对象层）+ 创建时刻交叉验证回归：
+    //   信号生死随进程（Hold/Drop/他实例持有判定）、信号单独在席（无锁文件）、
+    //   自 pid 豁免、procStartMs 匹配/不匹配/缺失三态。
+    void testProjectSeatEventLock() {
+        CProjectManager stPm;
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path();
+
+        // ① 无持有者 → 不在席。
+        QVERIFY(!CProjectManager::ProbeProjectSeatEvent(sProj));
+        QVERIFY(!CProjectManager::IsProjectHeldByOther(sProj));
+        // 路径规范化：大小写/斜杠差异同名。
+        const QString sName = CProjectManager::ProjectSeatEventName(sProj);
+        QVERIFY(!sName.isEmpty());
+        QCOMPARE(CProjectManager::ProjectSeatEventName(sProj.toUpper()), sName);
+
+        // ② 本实例持有/释放；他实例（第二个 CProjectManager）持有冲突。
+        QVERIFY(stPm.HoldProjectSeatEvent(sProj));
+        QVERIFY(CProjectManager::ProbeProjectSeatEvent(sProj));
+        {
+            CProjectManager stPm2;
+            QVERIFY(!stPm2.HoldProjectSeatEvent(sProj));   // 他实例已持→不夺占
+            QVERIFY(CProjectManager::ProbeProjectSeatEvent(sProj));
+        }
+        // 自 pid 规则：自己持信号+自己写的锁 → 不算他实例在席。
+        CProjectManager::WriteProjectLock(sProj);
+        QVERIFY(!CProjectManager::IsProjectHeldByOther(sProj));
+        stPm.DropProjectSeatEvent();
+        QVERIFY(!CProjectManager::ProbeProjectSeatEvent(sProj));
+        // 写锁往返含 procStartMs（本进程创建时刻，±5 分钟内）。
+        CProjectManager::SProjectLock st;
+        QVERIFY(CProjectManager::ReadProjectLock(sProj, &st));
+        QVERIFY(st.iProcStartMs > 0);
+        QVERIFY(qAbs(st.iProcStartMs - QDateTime::currentMSecsSinceEpoch()) < 5 * 60 * 1000);
+        CProjectManager::ReleaseProjectLock(sProj);
+
+        // ③ 信号单独在席（模拟另一新实例：手建同名 Event，无锁文件）→ 拦 + 通用描述。
+        {
+            HANDLE hEvt = ::CreateEventW(nullptr, TRUE, TRUE,
+                reinterpret_cast<const wchar_t*>(sName.utf16()));
+            QVERIFY(hEvt != nullptr);
+            QString sDesc;
+            QVERIFY(CProjectManager::IsProjectHeldByOther(sProj, &sDesc));
+            QVERIFY(sDesc.contains(QStringLiteral("在席信号")));
+            ::CloseHandle(hEvt);
+            QVERIFY(!CProjectManager::IsProjectHeldByOther(sProj));   // 信号消失即不在席（进程消亡同理）
+        }
+
+        // ④ procStartMs 交叉验证（伪 AutoCode 进程持锁，无信号→回退 PID 判活）：
+        const QString sFake = oTmp.path() + QStringLiteral("/AutoCodeFake.exe");
+        QVERIFY(QFile::copy(QStringLiteral("C:/Windows/System32/ping.exe"), sFake));
+        QProcess stProc;
+        stProc.start(sFake, {QStringLiteral("-n"), QStringLiteral("30"), QStringLiteral("127.0.0.1")});
+        QVERIFY2(stProc.waitForStarted(), "伪 AutoCode 进程启动失败");
+        const qint64 iPid = static_cast<qint64>(stProc.processId());
+        auto fnWriteLock = [this, &sProj, iPid, &sFake](qint64 a_iProcStartMs) {
+            QFile f(CProjectManager::ProjectLockPath(sProj));
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            QJsonObject o;
+            o["pid"] = static_cast<double>(iPid);
+            o["exe"] = sFake;
+            o["started"] = QStringLiteral("2026-10-17 00:00:00");
+            if (a_iProcStartMs >= 0) {
+                o["procStartMs"] = static_cast<double>(a_iProcStartMs);
+            }
+            f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+            f.close();
+        };
+        // 实际创建时刻 → 在席（同名 AutoCode 进程身份匹配）。
+        const qint64 iFakeStart = [iPid]() {
+            HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                     static_cast<DWORD>(iPid));
+            if (h == nullptr) { return qlonglong(0); }
+            FILETIME fc = {}, fe = {}, fk = {}, fu = {};
+            const BOOL bOk = ::GetProcessTimes(h, &fc, &fe, &fk, &fu);
+            ::CloseHandle(h);
+            if (!bOk) { return qlonglong(0); }
+            ULARGE_INTEGER ul = {};
+            ul.LowPart = fc.dwLowDateTime;
+            ul.HighPart = fc.dwHighDateTime;
+            return static_cast<qint64>((ul.QuadPart - 116444736000000000ULL) / 10000ULL);
+        }();
+        QVERIFY(iFakeStart > 0);
+        fnWriteLock(iFakeStart);
+        QVERIFY(CProjectManager::IsProjectHeldByOther(sProj));
+        // 创建时刻不一致（同名 AutoCode 进程复用 PID 的前任残留锁）→ 陈旧不拦。
+        fnWriteLock(iFakeStart + 3600 * 1000);
+        QVERIFY(!CProjectManager::IsProjectHeldByOther(sProj));
+        // 旧档无 procStartMs → 跳过交叉验证仅按进程名（向后兼容）。
+        fnWriteLock(-1);
+        QVERIFY(CProjectManager::IsProjectHeldByOther(sProj));
+        stProc.kill();
+        stProc.waitForFinished(3000);
     }
 
     // 2026.09.10 公共模型配置：MergeSharedModelTables 合并规则回归——基底选择/新身份

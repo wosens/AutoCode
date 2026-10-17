@@ -267,6 +267,40 @@ QString ReadHermesAgentEffort(const QStringList& a_aLines) {
     return QString();
 }
 
+// 游离 effort 行检测（2026.10.14 SmartStore 实锤）：历史 bug 把键追加到文件尾
+//   最后一个段里，与 agent 段内真键并存时 YAML duplicate key 硬错（ruamel 严格
+//   解析 → hermes 拒启退出 code 2）；且读-比-短路只看 agent 段，短路后游离行永不
+//   被清。判定口径：agent 段之外、非注释、恰好 2 格缩进、值为 effort 词表之一
+//   （词表只有 AutoCode 会写，hermes 模板自身无此形态键）。命中即强制走写管清理。
+//   2026.10.14 二次实锤（ac_bench 实测 hermes 拒启 exit 2）：现场另见「前缀脏字母」
+//   变体（mreasoning_effort/dreasoning_effort 等，来源未定——已知 AutoCode 各版
+//   写入器均只产 canonical 键，不排除并发写/外部工具损伤）。游离行判定与清理同步
+//   放宽：键名前容忍单个字母，避免脏行残留导致 YAML「mapping values are not
+//   allowed here」（文件尾游离行紧跟顶级标量时）永拒启。
+bool HasStrayHermesEffortLines(const QStringList& a_aLines) {
+    static const QRegularExpression reEffStray(
+        QStringLiteral("^\\s{2}[A-Za-z]?reasoning_effort\\s*:\\s*"
+                       "(false|minimal|low|medium|high|ultra)\\s*$"));
+    bool bInAgent = false;
+    for (const QString& sLine : a_aLines) {
+        if (IsTopLevelKeyLine(sLine)) {
+            bInAgent = sLine.startsWith(QStringLiteral("agent"));
+            continue;
+        }
+        if (bInAgent) {
+            continue;
+        }
+        const QString sT = sLine.trimmed();
+        if (sT.isEmpty() || sT.startsWith(QLatin1Char('#'))) {
+            continue;
+        }
+        if (reEffStray.match(sLine).hasMatch()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // 写：agent: 段内 reasoning_effort 键 upsert（a_sEffort 空 = 删键回 hermes 默认；
 //   false/minimal..ultra 原词写入）。段缺 = 文末追加 agent: + 缩进键；段在 = 沿用
 //   段内首个保留行缩进插入/替换，多余同名键删除（同 model 段防后位覆盖口径）。
@@ -298,17 +332,42 @@ QString BuildHermesAgentEffortText(const QStringList& a_aLines, const QString& a
     }
     QStringList aOut;
     bool bDone = false;
+    // 2026.10.14 同步 HasStrayHermesEffortLines 的前缀脏字母宽容（mreasoning/
+    //   dreasoning 等变体：段内真键后紧随的脏行同样会 duplicate key 拒启）。
+    static const QRegularExpression reEffStray(
+        QStringLiteral("^\\s{2}[A-Za-z]?reasoning_effort\\s*:\\s*"
+                       "(false|minimal|low|medium|high|ultra)\\s*$"));
+    static const QRegularExpression reEffKey(
+        QStringLiteral("^[A-Za-z]?reasoning_effort\\b"));
     for (int i = 0; i < a_aLines.size(); ++i) {
         const bool bInSeg = (iAgent >= 0 && i > iAgent && i < iSegEnd);
         const QString sT = a_aLines.at(i).trimmed();
-        if (bInSeg && sT.startsWith(QStringLiteral("reasoning_effort"))) {
+        // 段内旧键删除：canonical 键 + 单字母前缀脏变体一并清（统一由下方插入位
+        //   重写唯一 canonical 行，防后位覆盖/duplicate key）。
+        if (bInSeg && reEffKey.match(sT).hasMatch()) {
             if (!bDone && !a_sEffort.isEmpty()) {
                 aOut << sIndent + QStringLiteral("reasoning_effort: ") + a_sEffort;
                 bDone = true;
             }
             continue;
         }
+        // 2026.10.14 游离行清理：agent 段之外的 2 格缩进 effort 键行（历史 bug
+        //   追加产物）无条件删除——与 agent 段内真键并存时 YAML duplicate key
+        //   硬错（hermes 拒启）。
+        if (!bInSeg && reEffStray.match(a_aLines.at(i)).hasMatch()) {
+            continue;
+        }
         aOut << a_aLines.at(i);
+        // 2026.10.14 写入位置修复（SmartStore 实锤）：原先走到函数尾统一 aOut <<
+        //   追加——键落在文件尾最后一个段（updates:）里而非 agent 段内，下次
+        //   ReadHermesAgentEffort 只读 agent 段仍取空 → 再追加一行，每次触发写
+        //   配置累积 +1（实测 15 行重复键）。改为紧跟 agent: 行插入（YAML 键序
+        //   无关，段内缩进键合法）；a_sEffort 空（删键）时段内旧行已由上方
+        //   continue 清除，不再插入。段缺仍走文末追加 agent: + 键的原路径。
+        if (!bDone && !a_sEffort.isEmpty() && i == iAgent) {
+            aOut << sIndent + QStringLiteral("reasoning_effort: ") + a_sEffort;
+            bDone = true;
+        }
     }
     if (!bDone && !a_sEffort.isEmpty()) {
         if (iAgent < 0) {
@@ -495,8 +554,11 @@ bool CHermesRunner::EnsureHermesHomeConfig(const QString& a_sYamlPath,
     //   空值 = 删键（回 hermes 默认），false = 显式禁用，minimal..ultra 原词。
     const QString sEffort = s_sHermesEffort;
     const QStringList aLines = sTxt.split(QLatin1Char('\n'));
+    // 2026.10.14 游离行检查：历史 bug 把 effort 键追加到文件尾段里，若只看 agent
+    //   段内值相等就短路，游离行永不清理（其它机器已带脏数据，首次写管时一并清除）。
     if (ReadHermesModelKeys(aLines) == oTargets
-        && ReadHermesAgentEffort(aLines) == sEffort) {
+        && ReadHermesAgentEffort(aLines) == sEffort
+        && !HasStrayHermesEffortLines(aLines)) {
         return true;
     }
     const QString sNew = BuildHermesAgentEffortText(
@@ -543,10 +605,10 @@ bool OneshotHasEventPatch(const QString& a_sPyPath) {
     }
     // 2026.09.03 v2.0.108 检 v2 标记；v2.0.109 升 v3；v2.0.114 升 v4（v4 增
     //   中间段文本按 assistant 消息上抛）；v2.0.117 升 v5（-z @<file> 提示词
-    //   展开——Windows 命令行 32767 上限）。只含旧版标记视为未敷设——
-    //   EnsureHermesOneshotPatch 重调 bat，敷设器自动原地升级。
+    //   展开）；2026-10-16 升 v6（tool.started 附 ctx 占用快照——上下文条实时刷新）。
+    //   只含旧版标记视为未敷设——EnsureHermesOneshotPatch 重调 bat，敷设器自动原地升级。
     const bool bHit = QString::fromUtf8(fPy.readAll())
-                          .contains(QStringLiteral("AutoCode events patch v5"));
+                          .contains(QStringLiteral("AutoCode events patch v6"));
     fPy.close();
     return bHit;
 }
@@ -910,7 +972,7 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
     // 环境注入（FR8）：四个变量按独立键无条件注入（不继承宿主值——宿主可能是
     //   GBK 控制台环境，继承会把子进程 Python IO 拽回 ANSI 导致输出乱码）；
     //   HERMES_* 与 ~/.hermes 双保险（密钥绝不进命令行/日志）。
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = CAgentRunnerBase::MergedPathEnvironment();
     // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
     InjectAskEnv(env);
     env.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
@@ -954,14 +1016,14 @@ void CHermesRunner::StartStage(const QString& a_sWorkDir,
             //   时 CMainWindow 已触发，此处兜底 hermes 更新后的重敷）；失败仅提示
             //   不阻断：回退上游静默形态，回复照常、用量缺省 0。
             if (!EnsureHermesOneshotPatch(sHome)) {
-                // 2026.09.08 v2.1.126 失败原因自含：敷设后复检仍非 v5 多为 exe 侧
+                // 2026.09.08 v2.1.126 失败原因自含：敷设后复检仍非 v6 多为 exe 侧
                 //   hermes_oneshot_patch.py 旧版（01.更新程序.bat v2.1.126 起同步该文件，
-                //   旧副本不同步 → 部署标记永远到不了 v5，每轮重敷设且缺 @file 投递
+                //   旧副本不同步 → 部署标记永远到不了 v6，每轮重敷设且缺 @file 投递
                 //   展开——长 prompt>12000 字符会以 "@<路径>" 原文喂给模型）。
                 emit sigInfo(QStringLiteral(
-                    "[hermes] oneshot 事件补丁未敷设到 v5（install_env.bat /hermes-patch"
-                    "未成功，或 exe 同级 hermes_oneshot_patch.py 为旧版），本轮可能无工具/用量事件；"
-                    "长提示词投递也可能异常——请从完整程序目录更新该 py 后重试。"));
+                    "[hermes] oneshot 事件补丁未敷设到 v6（install_env.bat /hermes-patch"
+                    "未成功，或 exe 同级 hermes_oneshot_patch.py 为旧版），本轮可能无工具/用量/"
+                    "上下文事件；长提示词投递也可能异常——请从完整程序目录更新该 py 后重试。"));
             }
             env.insert(QStringLiteral("HERMES_ONESHOT_EVENTS"), QStringLiteral("1"));
             // v2.0.105 方案 A：部署根记入 wal 心跳旁路（CheckStall 巡检用）。
@@ -1040,6 +1102,10 @@ void CHermesRunner::Stop() {
     m_bFinished = true;
     m_pStallTimer->stop();
     if (m_pProc->state() != QProcess::NotRunning) {
+        // 2026.10.15 树杀（用户实害：关闭 AutoCode 后 -z 主进程 + hermes_kernel 孙进程
+        //   双双残留）：taskkill /T /F 收整树，m_pProc->kill 兼容收尾。
+        const quint64 uPid = static_cast<quint64>(m_pProc->processId());
+        KillProcTree(uPid);
         m_pProc->kill();
         m_pProc->waitForFinished(3000);
     }
@@ -1198,13 +1264,25 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
                          + o.value(QStringLiteral("tool")).toString());
         return;
     }
+    if (sType == QStringLiteral("ctx")) {
+        // 2026-10-16 v6 补丁：tool.started 附带的在窗占用快照（prompt_tokens——
+        //   agent._last_turn_usage 每次响应后刷新，tool.started 时恰为最新值）。
+        //   修实害：v5 前仅终局 result 携 usage 且是本轮累计和（非占用），上下文条
+        //   整轮无实时数据、轮末又被超窗钳成「—」；现在逐工具实时刷（去重）。
+        const qint64 iFill = static_cast<qint64>(o.value(QStringLiteral("fill")).toDouble());
+        if (iFill > 0 && iFill != m_iLastContextFill) {
+            m_iLastContextFill = iFill;
+            emit sigContextFill(iFill);
+        }
+        return;
+    }
     if (sType == QStringLiteral("result")) {
         m_sLastSubtype = o.value(QStringLiteral("subtype")).toString();
         const QString sSid = o.value(QStringLiteral("sessionId")).toString();
         if (!sSid.isEmpty()) {
             m_sLastSessionId = sSid;
         }
-        ApplyUsage(o.value(QStringLiteral("usage")).toObject());
+        ApplyUsage(o.value(QStringLiteral("usage")).toObject(), true);
         // 2026.09.03 v2.0.103 exe 形态事件补丁上报的真实 API 请求数（exe 形态
         //   无逐条 assistant 事件，基类口径的清点不可用；无此键不覆盖）。
         const int iApiCalls = static_cast<int>(o.value(QStringLiteral("apiCalls")).toInt());
@@ -1221,7 +1299,7 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
     emit sigInfo(QString::fromUtf8(a_sLine));
 }
 
-void CHermesRunner::ApplyUsage(const QJsonObject& oUsage) {
+void CHermesRunner::ApplyUsage(const QJsonObject& oUsage, bool a_bFromResult) {
     // usage 分量（累计口径同 pi）：input/cacheRead/cacheWrite/output；缺字段容错为 0。
     const qint64 iIn   = static_cast<qint64>(oUsage.value(QStringLiteral("input")).toDouble());
     const qint64 iCRd  = static_cast<qint64>(oUsage.value(QStringLiteral("cacheRead")).toDouble());
@@ -1233,7 +1311,17 @@ void CHermesRunner::ApplyUsage(const QJsonObject& oUsage) {
     m_iSumCacheWriteTok+= iCWr;
     m_iSumOutTok       += iOut;
     const qint64 iFill = iIn + iCRd + iCWr;   // 上下文占用（三输入项之和，同 claude 口径）
-    if (iFill > 0) {
+    // 2026-10-16 占用口径分路：assistant 事件（形态 A 桩/Node）携单请求 usage → 值即
+    //   在窗占用，直接上抛；result 事件（exe 形态 v5 前唯一 usage 源）携本轮各请求
+    //   累计和 → 远大于真实在窗占用，直接上抛必被面板超窗钳成「—」（实害：
+    //   pdfplumber Hermes 助手 ctxFill 恒 -1）。改为兑底：本轮尚无更精细占用
+    //   （无 ctx 快照/无 assistant usage）才按累计和上抛——旧补丁未升级时行为不变。
+    if (a_bFromResult) {
+        if (iFill > 0 && m_iLastContextFill <= 0) {
+            m_iLastContextFill = iFill;
+            emit sigContextFill(iFill);
+        }
+    } else if (iFill > 0) {
         m_iLastContextFill = iFill;
         emit sigContextFill(iFill);
     }

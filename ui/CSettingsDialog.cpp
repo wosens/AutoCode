@@ -1,6 +1,8 @@
-﻿#include "CSettingsDialog.h"
+#include "CSettingsDialog.h"
 
 #include <QAbstractItemModel>
+#include <QAbstractItemView>   // 2026.10.15 模型列表双击就地编辑 EditTriggers
+#include <QStyledItemDelegate>   // 2026.10.15 API 类型列下拉 delegate
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -125,6 +127,36 @@ static void RestoreModelColWidths(CProjectManager* a_pPm, QTreeWidget* a_pTree,
     }
 }
 
+// 2026.10.15 模型列表「API 类型」列就地编辑下拉（候选同 CDshModelEditDialog 的
+//   m_pEditApi；旧档自由文本值不在候选时动态补入，与对话框同语义）。
+class CModelApiColDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    QWidget* createEditor(QWidget* a_pParent, const QStyleOptionViewItem&,
+                          const QModelIndex&) const override {
+        auto* pBox = new QComboBox(a_pParent);
+        pBox->addItems(QStringList()
+            << QStringLiteral("anthropic-messages")
+            << QStringLiteral("openai-completions")
+            << QStringLiteral("openai-responses")
+            << QStringLiteral("google-generative-ai")
+            << QStringLiteral("google-vertex"));
+        return pBox;
+    }
+    void setEditorData(QWidget* a_pEditor, const QModelIndex& a_stIdx) const override {
+        auto* pBox = static_cast<QComboBox*>(a_pEditor);
+        const QString sCur = a_stIdx.data(Qt::EditRole).toString();
+        if (pBox->findText(sCur) < 0) {
+            pBox->addItem(sCur);   // 旧档自由文本（如 chat）动态补入
+        }
+        pBox->setCurrentText(sCur);
+    }
+    void setModelData(QWidget* a_pEditor, QAbstractItemModel* a_pModel,
+                      const QModelIndex& a_stIdx) const override {
+        a_pModel->setData(a_stIdx, static_cast<QComboBox*>(a_pEditor)->currentText(),
+                          Qt::EditRole);
+    }
+};
 // 2026.08.18 自定义大模型条目编辑对话框（无 Q_OBJECT：纯表单 + exec/lambda 连接，
 //   不进 moc/构建系统）。校验：模型 ID / 接入点必填（空则拦截 accept 并提示）；
 //   其余空值在 Entry() 回默认（API 类型→anthropic-messages，显示名→模型 ID）。
@@ -343,6 +375,8 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     // 2026.09.23 资源管理器隐藏目录：预填生效清单（缺键=内置默认，用户在此基础上增删）。
     const QString sDefExplHidden = (a_pPm != nullptr) ? a_pPm->LoadExplorerHiddenDirs()
                                                       : CProjectManager::DefaultExplorerHiddenDirs();
+    // 2026-10-17 对话日志渲染引擎预填（[View] Engine；缺省/非法值→旧版=索引 0）。
+    const QString sDefViewEngine = CProjectManager::LoadViewEngine();
     // 2026-09-26 内置测试沙箱默认值（[Sandbox]）。
     const bool bDefSbxEnable = (a_pPm != nullptr) ? a_pPm->LoadSandboxEnable() : true;
     const bool bDefSbxAuto   = (a_pPm != nullptr) ? a_pPm->LoadSandboxAutoGhost() : true;
@@ -494,8 +528,9 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
         m_pSpinClaudeThinkTok->setValue((a_pPm != nullptr) ? a_pPm->LoadClaudeMaxThinkTok() : 0);
     }
     m_pSpinCompactPct->setValue(iDefPct);
-    // 2026.09.27 「上下文窗口上限」设置项已删：未设时按模型自动探测；手工覆盖
-    //   入口保留在助手上下文进度条右键「设置上下文大小…」（同一 [Adhoc] ContextLimit）。
+    // 2026.09.27 「上下文窗口上限」设置项已删：未设时按模型自动探测。
+    //   2026-10-15 右键「设置上下文大小」也已删（同一 [Adhoc] ContextLimit 键废弃）：
+    //   上下文窗口唯一来源 = 按模型自动探测，保证单点设置全程统一。
     m_pSpinMaxTurns->setValue(iDefAdhocTurns);
     m_pChkMaxTurnsAuto->setChecked(bDefAdhocTurnsAuto);
     // 2026-10-08 提示词长度闸门回填。
@@ -510,6 +545,11 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pEditScanDirs->setText(sDefScan);
     m_pEditBackupDirs->setText(sDefBackup);
     m_pEditExplHidden->setText(sDefExplHidden);
+    if (m_pComboViewEngine != nullptr) {
+        // 2026-10-17 引擎预填：ModelView 严格等值 → 索引 1，其余（缺省/非法）→ 0。
+        m_pComboViewEngine->setCurrentIndex(
+            CProjectManager::IsModelViewEngine(sDefViewEngine) ? 1 : 0);
+    }
     // 2026-09-26 内置测试沙箱回填。
     m_pChkSbxEnable->setChecked(bDefSbxEnable);
     m_pChkSbxAuto->setChecked(bDefSbxAuto);
@@ -839,9 +879,9 @@ void CSettingsDialog::SetupUi() {
     pFormDsh->addRow(QStringLiteral("计费单价($/M)："), pRowPrice);
 
     // —— 评审 / 助手（2026.09.27 数值三项合并一行；两开关合并一行）——
-    //   「上下文窗口上限」设置行已删：自动压缩阈值与上下文进度条分母在未设时均按
-    //   模型自动探测（各后端模型表自带窗口）；手工覆盖入口保留在助手上下文进度条
-    //   右键「设置上下文大小…」（同一 [Adhoc] ContextLimit 键，已存值继续生效）。
+    //   「上下文窗口上限」设置行已删：自动压缩阈值与上下文进度条分母均按
+    //   模型自动探测（各后端模型表自带窗口；2026-10-15 右键「设置上下文大小」
+    //   手工覆盖入口也已删，[Adhoc] ContextLimit 键废弃——窗口唯一来源 = 模型探测）。
     auto* pGroupReview = new QGroupBox(QStringLiteral("评审与助手"), this);
     auto* pLayReviewCol = new QVBoxLayout(pGroupReview);
     auto* pRowReview = new QHBoxLayout();
@@ -927,6 +967,25 @@ void CSettingsDialog::SetupUi() {
         "（CJK 字符≈1、其余≈1/3），与模型实际计量存在小偏差"));
     fnAddPair(pRowPromptLimit, QStringLiteral("提示词 token 上限："), m_pSpinPromptTokMax);
     pRowPromptLimit->addStretch(1);
+
+    // —— 对话日志渲染引擎（2026-10-17 自绘三期双引擎灰度，[View] Engine）——：
+    //    Legacy=CMessageView 卡片流（缺省）；ModelView=Model/View 自绘链（虚拟化
+    //    只画可视区，滚动零子 widget，长会话载档 O(N) 纯数据投影）。建视图时读取、
+    //    已建页不重建（保存后重开会话 Tab 或重启生效）。
+    auto* pRowViewEngine = new QHBoxLayout();
+    pLayReviewCol->addLayout(pRowViewEngine);
+    m_pComboViewEngine = new QComboBox(pGroupReview);
+    m_pComboViewEngine->addItem(QStringLiteral("旧版（卡片流）"));
+    m_pComboViewEngine->addItem(QStringLiteral("新版（自绘，长会话更流畅）"));
+    m_pComboViewEngine->setToolTip(QStringLiteral(
+        "任务/助手日志的渲染引擎（[View] Engine，默认旧版）：\n"
+        "旧版（卡片流）：每条消息一个控件块（现状），短会话最稳妥；\n"
+        "新版（自绘）：Model/View 虚拟化——只绘制可视区、滚动全程零消息子控件、\n"
+        "正文排版按视口带惰性材化（长会话载档/跳转显著提速，交互等价：折叠展开、\n"
+        "双击助手消息拖选复制、链接单击打开）。\n"
+        "切换保存后对新建立的会话页生效（重开助手 Tab / 重启程序全部生效）"));
+    fnAddPair(pRowViewEngine, QStringLiteral("日志渲染引擎："), m_pComboViewEngine);
+    pRowViewEngine->addStretch(1);
 
     // —— 目录排除（2026-10-08 指纹扫描/资源管理器两项合一行，备份恢复默认值最长保持整行）——
     auto* pGroupDirs = new QGroupBox(QStringLiteral("目录排除"), this);
@@ -1108,9 +1167,16 @@ void CSettingsDialog::SetupUi() {
         "开关后也用本表。正本存 exe 同级 config.ini 的 [DshModels]/[PiModels]/\n"
         "[CodexModels]/[HermesModels] 四节同内容）。\n"
         "「当前」列打 ● 的条目生效（各后端参数页的 Provider/模型固定路由不参与）。\n"
-        "双击条目可直接编辑；列宽拖表头分隔线可调，自动记忆（双击分隔线自适应内容）"));
-    connect(m_pTreeDshModels, &QTreeWidget::itemDoubleClicked,
-            this, [this](QTreeWidgetItem*, int) { OnDshModelEdit(); });
+        "双击单元格就地编辑（完整表单含密钥用「编辑…」按钮）；列宽拖表头分隔线可调，自动记忆（双击分隔线自适应内容）"));
+    // 2026.10.15 双击单元格就地编辑（用户需求）：双击列 0~5 直接在单元格内改值，
+    //   itemChanged 落回数据（见 OnDshModelItemChanged）；「当前」列（6）与空表占位
+    //   行不可编辑。完整表单（含密钥）仍走「编辑…」按钮弹对话框——两条入口并存。
+    m_pTreeDshModels->setEditTriggers(QAbstractItemView::DoubleClicked
+                                      | QAbstractItemView::EditKeyPressed);
+    connect(m_pTreeDshModels, &QTreeWidget::itemChanged,
+            this, &CSettingsDialog::OnDshModelItemChanged);
+    // API 类型列（2）候选固定（对话框同款下拉）：就地编辑也用下拉，防自由敲错。
+    m_pTreeDshModels->setItemDelegateForColumn(2, new CModelApiColDelegate(this));
     // 选中行变化只刷新按钮态（RefreshDshModelList 内部 blockSignals 重建，无重入）
     connect(m_pTreeDshModels, &QTreeWidget::currentItemChanged,
             this, [this](QTreeWidgetItem*, QTreeWidgetItem*) { RefreshDshModelList(); });
@@ -1184,7 +1250,7 @@ void CSettingsDialog::SetupUi() {
     m_pBtnInstallPiNpm = new QPushButton(QStringLiteral("联网安装（npm）"), pRowPiState);
     m_pBtnInstallPiNpm->setToolTip(QStringLiteral(
         "以管理员权限联网安装：npm install -g @earendil-works/pi-coding-agent"
-        "（需本机已装 Node.js 与 npm，且能访问 npm 源）。\n"
+        "（未装 Node.js 时窗口内自动先装；继承 PATH 过旧时自动刷新，无需重启软件）。\n"
         "装完点「重新检测」：cli.js 从 npm 全局目录解析，PIAgent 根目录可留空"));
     connect(m_pBtnInstallPiNpm, &QPushButton::clicked, this, [this]() { OnInstallPiNpm(); });
     pLayPiState->addWidget(m_pLblPiState, 1);
@@ -1673,6 +1739,9 @@ void CSettingsDialog::RefreshDshModelList() {
         pItem->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(5, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(6, Qt::AlignCenter);
+        // 2026.10.15 双击就地编辑：整行开放编辑位；「当前」列（6）的写回遮蔽在
+        //   OnDshModelItemChanged（非法/标记列一律回显原值），占位行不加编辑位。
+        pItem->setFlags(pItem->flags() | Qt::ItemIsEditable);
         m_pTreeDshModels->addTopLevelItem(pItem);
     }
     if (m_aDshModels.isEmpty()) {
@@ -1762,6 +1831,43 @@ void CSettingsDialog::OnDshModelEdit() {
     m_aDshModels[iRow] = dlg.Entry();
     ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateDshEnabled();
+}
+
+// 2026.10.15 条目→单元格规范显示文本（itemChanged 回显/校验回退共用）。
+static QString ModelCellText(const SDshModelEntry& a_stE, int a_iCol) {
+    switch (a_iCol) {
+        case 0:  return a_stE.sDisp;
+        case 1:  return a_stE.sBaseURL;
+        case 2:  return a_stE.sApi;
+        case 3:  return a_stE.sModelId;
+        case 4:  return QString::number(a_stE.iCtx);
+        case 5:  return QString::number(a_stE.iMaxTok);
+        default: return QString();
+    }
+}
+
+// 2026.10.15 模型列表双击就地编辑的落库口（itemChanged）：列→字段映射 + 校验回退。
+//   口径对齐 CDshModelEditDialog::Entry() 兑底：显示名空→回退模型 ID；模型 ID 不可空
+//   （空回退旧值）；上下文/最大输出非正整数回退旧值（单元格重显）；API 列值经下拉
+//   delegate 约束（旧档自由文本动态补入）。非法回退的 setText 会再触发一次本槽——
+//   此时字段已等于旧值且与单元格一致，走「无变化」分支返回，天然无重入。
+void CSettingsDialog::OnDshModelItemChanged(QTreeWidgetItem* a_pItem, int a_iCol) {
+    if (a_pItem == nullptr || m_pTreeDshModels == nullptr) {
+        return;
+    }
+    const int iRow = m_pTreeDshModels->indexOfTopLevelItem(a_pItem);
+    if (iRow < 0 || iRow >= m_aDshModels.size()) {
+        return;   // 空表占位行（无编辑位，防御）
+    }
+    const SDshModelEntry stOld = m_aDshModels.at(iRow);
+    SDshModelEntry stNew = stOld;
+    // 列→字段映射 + 校验回退（纯函数，单测直调；口径注释见 CModelEntry.h）。
+    if (!ApplyModelCellEdit(&stNew, a_iCol, a_pItem->text(a_iCol))) {
+        a_pItem->setText(a_iCol, ModelCellText(stNew, a_iCol));   // 非法/无变化：重显规范值即返
+        return;
+    }
+    m_aDshModels[iRow] = stNew;
+    ShareModelsFromPage(0);   // 同步其余三页副本 + 重建列表（对齐/规范值重显）
 }
 
 void CSettingsDialog::OnDshModelDel() {
@@ -1926,10 +2032,21 @@ void CSettingsDialog::UpdatePiEnabled() {
 void CSettingsDialog::OnInstallPiNpm() {
     // 2026.08.20 联网安装：提权 npm install -g（npm.cmd 需管理员写全局 node_modules；
     //   cmd /k 保持窗口看进度）。装完点「重新检测」→ NpmGlobalCliPath 命中即可用。
+    // 2026.10.10 改走 install_env.bat /pi-npm：旧直连 `cmd /k npm install -g` 经
+    //   runas 提权后继承的是 AutoCode 进程启动时的环境（本机刚装完 Node 未重启
+    //   主程序时 PATH 里没有 nodejs/npm），异地新机必报「'npm' 不是内部或外部
+    //   命令」。/pi-npm 模式在窗口内自愈：:RefreshPath 读注册表 PATH（含刚装的
+    //   Node）→ :DETECT 缺 Node 时自动补装 → 配镜像源 → npm 全局安装。脚本
+    //   缺失时退回旧直连（依赖本机 PATH 已含 npm）。
+    const QString sScript = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/install_env.bat");
+    const QString sCmd = QFile::exists(sScript)
+        ? QStringLiteral("/k \"") + QDir::toNativeSeparators(sScript)
+              + QStringLiteral("\" /pi-npm")
+        : QStringLiteral("/k npm install -g @earendil-works/pi-coding-agent");
     const HINSTANCE hInst = ShellExecuteW(nullptr, L"runas", L"cmd.exe",
-        QStringLiteral("/k npm install -g @earendil-works/pi-coding-agent")
-            .toStdWString().c_str(),
-        nullptr, SW_SHOWNORMAL);
+                                           sCmd.toStdWString().c_str(),
+                                           nullptr, SW_SHOWNORMAL);
     if (reinterpret_cast<INT_PTR>(hInst) <= 32) {
         QMessageBox::warning(this, QStringLiteral("PIAgent"),
             QStringLiteral("未能以管理员权限启动 npm 安装（UAC 被取消或被拒）。"));
@@ -2011,7 +2128,16 @@ void CSettingsDialog::DetectPiInstalled(bool a_bSilent) {
         m_pBtnInstallPi->setEnabled(!m_bPiInstalled);   // 装好后置灰，主路径回归「重新检测」
     }
     if (m_pBtnInstallPiNpm != nullptr) {
-        m_pBtnInstallPiNpm->setEnabled(!m_bPiInstalled);
+        // 2026.10.10 恒可用（dell 实害：npm 包残缺装——cli.js 在被测为「已安装 ✓」、
+        //   两个安装按钮全灰，残缺包无法经 UI 重装修复；npm 安装幂等，重装即修复，
+        //   tooltip 补已装场景的重装语义）。
+        m_pBtnInstallPiNpm->setEnabled(true);
+        m_pBtnInstallPiNpm->setToolTip(QStringLiteral(
+            "以管理员权限联网安装：npm install -g @earendil-works/pi-coding-agent"
+            "（未装 Node.js 时窗口内自动先装；继承 PATH 过旧时自动刷新，无需重启软件；"
+            "需能访问 npm 源）。\n"
+            "装完点「重新检测」：cli.js 从 npm 全局目录解析，PIAgent 根目录可留空。\n"
+            "已安装时点此 = 重装/修复（依赖缺失、报 ERR_MODULE_NOT_FOUND 时用此修复）"));
     }
     UpdatePiEnabled();
     if (!a_bSilent) {
@@ -2268,6 +2394,12 @@ QString CSettingsDialog::BackupExcludeDirs() const {
 
 QString CSettingsDialog::ExplorerHiddenDirs() const {
     return m_pEditExplHidden != nullptr ? m_pEditExplHidden->text().trimmed() : QString();
+}
+
+QString CSettingsDialog::ViewEngine() const {
+    // 2026-10-17 对话日志渲染引擎（[View] Engine）——两态归一化（"Legacy"/"ModelView"）。
+    return (m_pComboViewEngine != nullptr && m_pComboViewEngine->currentIndex() == 1)
+        ? QStringLiteral("ModelView") : QStringLiteral("Legacy");
 }
 
 // —— 内置测试沙箱（2026-09-26；未创建控件时兜底默认值）——

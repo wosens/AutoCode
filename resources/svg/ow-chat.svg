@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M5 9.5 Q5 7 7.5 7 H21.5 Q24 7 24 9.5 V17 Q24 19.5 21.5 19.5 H12 L7 24 V19.5 Q5 19.4 5 17 Z" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M22 25.5 H28 M25 22.5 V28.5" stroke="#27ae60" stroke-width="2.4" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 添加到聊天框：气泡 + 加号 -->
+  <path d="M4 6.8 Q4 4.5 6.3 4.5 H17.7 Q20 4.5 20 6.8 V14.2 Q20 16.5 17.7 16.5 H11.6 L7.5 20.3 V16.5 H6.3 Q4 16.5 4 14.2 Z" stroke="#2563EB" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M12 7.8 V12.6 M9.6 10.2 H14.4" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round"/>
 </svg>

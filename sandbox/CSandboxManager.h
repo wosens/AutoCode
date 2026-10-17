@@ -52,6 +52,16 @@ public:
     //   而本实例的进程树出身判定认不出「已退出实例的后代」→ 永不再收纳，用户桌面
     //   被测试窗口打扰（Compositer 工程实测：16:14 实例重启后窗口一直裸奔）。
     //   对策：窗口进程 exe 在当前工程目录内 → 重新入册保持隐形；无关残留照旧还原。
+//   2026-10-14 断链兜底（Compositer 工程实测「测试窗口一直弹出」根因）：Agent 用
+//   powershell Start-Process / cmd start 等中间人方式启动被测程序，中间 shell
+//   执行完立即退出，被测程序主窗口弹出时父进程已死——IsDescendantOf 沿 ppid
+//   爬链第一跳即断，TreePid 判否 → 不收纳，窗口正常可见弹到用户桌面还抢焦点。
+//   双对策：① ConsiderWindowImpl 树判定失败后按「exe 在工程根内、进程新建且
+//   父已死」兑底收纳（IsProjectTestPid；2026-10-16 条件③收紧：父活着（explorer
+//   双击/QuickTool/托盘等任意启动器）一律不兑底，修用户经 QuickTool 打开
+//   HarnessAgent 被误幽灵化「窗口消失」）；② 新增 sandbox launch 命令
+//   （LaunchAut）：主进程亲自 CreateProcess + AddManualRootPid 登记根，进程链
+//   永不断（提示词铁律同步禁断链启动方式）。
     void SetProjectRoot(const QString& a_sRoot);   // 打开/切换工程时刷新
     void ReadoptProjectWindows();                  // 扫描带标记窗口，工程内的续收纳
 
@@ -119,6 +129,13 @@ public:
 
 private:
     bool ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal);   // a_bFinal=true=宽限期满终判
+    // 2026-10-14 断链兑底判定：树外窗口进程 exe 在当前工程根目录内、进程为新建
+    //   （<10 分钟）且父进程已死（断链；2026-10-16 收紧：父活着=用户经任意启动器
+    //   主动打开，不兑底）→ 视为 Agent 启动的被测工程产物。须在 TreePid 之后调
+    //   （复用其刚刷新的 pid→创建时刻表；自带 500ms 防陈旧重建守卫）。
+    bool IsProjectTestPid(DWORD a_dwPid);
+    // 2026-10-14 sandbox launch：主进程 CreateProcess 启动被测程序并登记手工根。
+    bool LaunchAut(const QJsonObject& a_oArgs, QString& a_sOut);
     void RestoreEntriesOfPid(DWORD a_dwPid);               // 登记豁免时回扫还原（兑底网）
     void RestoreEntriesOfPidLocked(DWORD a_dwPid);         // 持锁实现（tryLock 外壳内部用）
     void GhostAndTrack(HWND a_hWnd);
@@ -145,6 +162,7 @@ private:
     bool                       m_bRecOn = true;        // 运行期录像开关（record_on/off）
     QTimer                     m_tSweep;
     QHash<DWORD, DWORD>        m_oParentMap;           // pid→ppid 快照（500ms 缓存）
+    QHash<DWORD, qint64>        m_oParentCreated;       // 2026-10-14 pid→创建时刻（PID 复用防护，见 CSandboxCore.h）
     qint64                     m_iMapBuiltMs = 0;
     QSet<DWORD>                m_aManualRoots;         // 测试/特殊场景手工根
 

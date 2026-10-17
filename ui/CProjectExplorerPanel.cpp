@@ -87,7 +87,10 @@ const QStringList& CProjectExplorerPanel::HiddenDirs() {
 }
 
 // 本地递归目录拷贝（QDir::copyRecursively 在部分 Qt6 构建中可见性不稳，自实现以保稳）。
-static bool CopyDirRecursively(const QString& a_sSrc, const QString& a_sDst) {
+// 2026.10.16 a_bOverwrite=true（粘贴「覆盖」档）：目标同名文件先删再拷——目录合并语义
+//   （目标独有文件保留、同名文件被源替换），不整树推倒重来。
+static bool CopyDirRecursively(const QString& a_sSrc, const QString& a_sDst,
+                               bool a_bOverwrite = false) {
     const QDir stSrc(a_sSrc);
     if (!stSrc.exists()) {
         return false;
@@ -98,14 +101,19 @@ static bool CopyDirRecursively(const QString& a_sSrc, const QString& a_sDst) {
     // 子目录递归
     const QStringList aDirs = stSrc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
     for (const QString& sSub : aDirs) {
-        if (!CopyDirRecursively(stSrc.filePath(sSub), QDir(a_sDst).filePath(sSub))) {
+        if (!CopyDirRecursively(stSrc.filePath(sSub), QDir(a_sDst).filePath(sSub),
+                                a_bOverwrite)) {
             return false;
         }
     }
     // 文件拷贝
     const QStringList aFiles = stSrc.entryList(QDir::Files);
     for (const QString& sFile : aFiles) {
-        if (!QFile::copy(stSrc.filePath(sFile), QDir(a_sDst).filePath(sFile))) {
+        const QString sOne = QDir(a_sDst).filePath(sFile);
+        if (a_bOverwrite && QFile::exists(sOne) && !QFile::remove(sOne)) {
+            return false;
+        }
+        if (!QFile::copy(stSrc.filePath(sFile), sOne)) {
             return false;
         }
     }
@@ -1144,7 +1152,32 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
         LaunchOpenWithCommand(pSel->data().toString(), sSel);
         return;
     }
-    if      (pSel == pActRemoveRoot) { RemoveExtraRoot(sRootAtRow); }
+    if (pSel == pActRemoveRoot) {
+        // 2026-10-16 移除根节点二次确认（防误删；RemoveExtraRoot 保持纯逻辑供单测直调，
+        //   确认弹窗只在 UI 入口）：默认 No，回车/Esc 不误触；文案重申仅移出树不动磁盘。
+        //   2026-10-16 弹窗字体显式 11pt（正文+按钮，同 CMainWindow::ExecQuestion 口径）：
+        //   不依赖继承（部分风格/路径下按钮不跟随 box 字体，工程内已有先例注释）。
+        const QString sRootName = QFileInfo(sRootAtRow).fileName();
+        QMessageBox stBox(QMessageBox::Question, QStringLiteral("移除根节点"),
+            QStringLiteral("确认把根节点「%1」从资源管理器树中移除？\n"
+                           "（仅移出树，磁盘目录与文件不受影响；可随时重新添加）")
+                .arg(sRootName),
+            QMessageBox::Yes | QMessageBox::No, this);
+        stBox.setDefaultButton(QMessageBox::No);
+        {
+            QFont fBox = stBox.font();
+            fBox.setPointSize(11);
+            stBox.setFont(fBox);
+            for (QAbstractButton* pB : stBox.buttons()) {
+                QFont fB = pB->font();
+                fB.setPointSize(11);
+                pB->setFont(fB);
+            }
+        }
+        if (stBox.exec() == QMessageBox::Yes) {
+            RemoveExtraRoot(sRootAtRow);
+        }
+    }
     else if (pSel == pActExplorer) { OpenInExplorer(); }
     else if (pSel == pActCut)      { DoCut(); }
     else if (pSel == pActCopy)     { DoCopy(); }
@@ -1638,9 +1671,13 @@ QStringList CProjectExplorerPanel::ReadFileClipboard(bool* a_pbCut) {
 }
 
 CProjectExplorerPanel::ETransfer CProjectExplorerPanel::TransferItem(
-        const QString& a_sSrc, const QString& a_sDstDir, bool a_bMove) {
+        const QString& a_sSrc, const QString& a_sDstDir, bool a_bMove,
+        bool a_bOverwrite) {
     // 2026.09.19 剪切/粘贴单项落盘（与树内拖拽同语义，拖拽路径收敛于此）：
     //   同名自动 " (n)"；移动禁落源自身/子树；跨盘 rename 失败退复制+删源。
+    // 2026.10.16 a_bOverwrite（粘贴同名弹窗「覆盖」档）：文件先删目标再落；
+    //   目录合并——目标独有文件保留、同名文件被源替换（移动撞已存在目录 rename
+    //   必败 → 自然退到 CopyDirRecursively(覆盖)+删源分支）。
     const QFileInfo stSrc(a_sSrc);
     if (!stSrc.exists()) {
         return XferSkip;
@@ -1655,17 +1692,24 @@ CProjectExplorerPanel::ETransfer CProjectExplorerPanel::TransferItem(
         if (QDir::cleanPath(sDst) == sSrcC) {
             return XferSkip;   // 复制到自身原位置：忽略
         }
-        const QString sUnique = UniqueDstPath(sDst);
-        if (sUnique.isEmpty()) {
-            return XferFail;
+        if (a_bOverwrite) {
+            // 覆盖档：文件删目标后按常规路径落盘；目录不删整树，留待下方合并覆盖。
+            if (!stSrc.isDir() && !QFile::remove(sDst)) {
+                return XferFail;
+            }
+        } else {
+            const QString sUnique = UniqueDstPath(sDst);
+            if (sUnique.isEmpty()) {
+                return XferFail;
+            }
+            sDst = sUnique;
         }
-        sDst = sUnique;
     }
     bool bOk = false;
     if (a_bMove) {
         bOk = QFile::rename(a_sSrc, sDst);
         if (!bOk) {
-            bOk = stSrc.isDir() ? CopyDirRecursively(a_sSrc, sDst)
+            bOk = stSrc.isDir() ? CopyDirRecursively(a_sSrc, sDst, a_bOverwrite)
                                 : QFile::copy(a_sSrc, sDst);
             if (bOk) {
                 if (stSrc.isDir()) {
@@ -1676,7 +1720,7 @@ CProjectExplorerPanel::ETransfer CProjectExplorerPanel::TransferItem(
             }
         }
     } else {
-        bOk = stSrc.isDir() ? CopyDirRecursively(a_sSrc, sDst)
+        bOk = stSrc.isDir() ? CopyDirRecursively(a_sSrc, sDst, a_bOverwrite)
                             : QFile::copy(a_sSrc, sDst);
     }
     return bOk ? XferOk : XferFail;
@@ -1713,6 +1757,8 @@ void CProjectExplorerPanel::DoPaste() {
     //   否则复制。系统板无文件时退内部快照（写板失败时的兑底，仅本程序内有效）。
     //   逐项语义与拖拽一致：同名 " (n)" 编号、目录禁入自身子树、跨盘移动退复制+删源；
     //   剪切粘贴完成后清板（一次性，Explorer 同款）。
+    // 2026.10.16 同名冲突先弹窗（覆盖/自动重命名/取消，见下方预扫段），静默编号
+    //   不再是无提示的缺省结果。
     if (m_sRootDir.isEmpty()) {
         return;
     }
@@ -1739,10 +1785,50 @@ void CProjectExplorerPanel::DoPaste() {
     if (!IsUnderRoot(sDstDir)) {
         return;
     }
+    // 2026.10.16 同名冲突预扫（落盘前整体过一遍）：命中才弹窗让用户定夺，选择对整批
+    //   生效——「覆盖」替换目标同名文件（目录合并）、「自动重命名」保留两者（"名称
+    //   (n)"，即原静默行为）、「取消」整批不动。无冲突保持零弹窗原体验。
+    QStringList aConflicts;
+    for (const QString& sSrc : aSrcs) {
+        const QFileInfo stSrc(sSrc);
+        if (!stSrc.exists()) {
+            continue;
+        }
+        const QString sDst = QDir(sDstDir).filePath(stSrc.fileName());
+        if (QFileInfo::exists(sDst)
+            && QDir::cleanPath(sDst) != QDir::cleanPath(sSrc)) {
+            aConflicts << stSrc.fileName();
+        }
+    }
+    bool bOverwrite = false;
+    if (!aConflicts.isEmpty()) {
+        QString sList = aConflicts.join(QStringLiteral("、"));
+        if (aConflicts.size() > 10) {
+            sList = aConflicts.first(10).join(QStringLiteral("、"))
+                  + QStringLiteral(" …等 %1 项").arg(aConflicts.size());
+        }
+        QMessageBox stBox(QMessageBox::Warning, QStringLiteral("粘贴确认"),
+            QStringLiteral("目标位置已存在同名项目：\n%1\n\n"
+                            "「覆盖」将替换已有文件（目录为合并覆盖）；\n"
+                            "「自动重命名」保留两者（名称 (n)）。")
+                .arg(sList),
+            QMessageBox::NoButton, this);
+        QPushButton* pBtnOver = stBox.addButton(QStringLiteral("覆盖(&O)"),
+                                                QMessageBox::DestructiveRole);
+        QPushButton* pBtnKeep = stBox.addButton(QStringLiteral("自动重命名(&R)"),
+                                                QMessageBox::YesRole);
+        stBox.addButton(QStringLiteral("取消(&C)"), QMessageBox::RejectRole);
+        stBox.exec();
+        if (stBox.clickedButton() == pBtnOver) {
+            bOverwrite = true;
+        } else if (stBox.clickedButton() != pBtnKeep) {
+            return;   // 取消/关闭：整批不落盘（预扫先行，此时尚未动任何文件）
+        }
+    }
     int iDone = 0, iFailed = 0;
     QStringList aFailed;
     for (const QString& sSrc : aSrcs) {
-        const ETransfer eRet = TransferItem(sSrc, sDstDir, bCut);
+        const ETransfer eRet = TransferItem(sSrc, sDstDir, bCut, bOverwrite);
         if (eRet == XferOk) {
             ++iDone;
         } else if (eRet == XferFail) {

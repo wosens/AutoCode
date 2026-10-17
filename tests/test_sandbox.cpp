@@ -11,7 +11,11 @@
 //     (1.2s) 满才收纳；对已收纳窗口登记兑底网立即还原；
 //  ⑦ MP4 录像：CSandboxRecorder 跑 2 秒产出非空 mp4（ftyp 头）；
 //  ⑧ 跨实例续收纳：退出还原留 adopt 标记 → 继任实例 Start 对工程内窗口续收纳，
-//     工程外清标记；用户主动还原清标记；add 收编崩溃残留。
+//     工程外清标记；用户主动还原清标记；add 收编崩溃残留；标记超龄不再自动收
+//     （修用户软件窗口反复消失/出现）；收纳者是活实例时互斥不越权（2026-10-09）；
+//  ⑨ 2026-10-16 断链兜底收紧：IsParentAlive 纯逻辑（父活任意进程/断链/本体缺席）
+//     + 工程根内新进程「父活（QuickTool 形态）不收纳 / 父死（cmd start 断链）收纳」
+//     两组真窗实测（修 QuickTool 打开 HarnessAgent 被误幽灵化）。
 // 需要真实 Win32 窗口：不进 offscreen 清单；无桌面会话环境自动 QSKIP。
 // 2026.09.27 测试宿主窗口一律屏外定位（见 CHost 构造注释）：ctest 全量回归频繁
 // 执行本用例，此前窗口在屏内会闪现用户桌面（"沙箱宿主"字样，用户反馈）。
@@ -25,8 +29,13 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QProcess>        // 2026-10-09 NotepadNotGhosted：受保护应用实测
+#include <QStandardPaths>  // 2026-10-09 ProtectedAppPath：TEMP 路径断言
+#include <QDir>            // 2026-10-16 断链兜底实测：cmd start 参数原生分隔符
 #include <functional>
 #include <windows.h>
+#include <tlhelp32.h>   // 2026-10-09 场景 F：找 explorer pid 伪活实例（需 windows.h 后置）
+#include <shobjidl_core.h>   // 2026-10-16 MakeShortcut：IShellLinkW 建 .lnk（windows.h 后置）
 
 #include "sandbox/CSandboxCore.h"
 #include "sandbox/CSandboxManager.h"
@@ -101,6 +110,93 @@ static BOOL CALLBACK FindWndByPidProc(HWND a_hWnd, LPARAM) {
     return TRUE;
 }
 
+// 2026-10-16 断链兜底实测：按「窗口进程 exe 规范化全路径」精确找窗（临时工程根
+//   内的 notepad 副本——与真实被测程序同形态：exe 在工程根内、非保护路径）。
+//   规范化（canonicalFilePath）解析 QTemporaryDir 的 8.3 短名（ADMINI~1）到
+//   全长真实路径，与 QueryFullProcessImageNameW 口径一致才能对上。
+QString g_sFindExePath;
+static BOOL CALLBACK FindWndByExeProc(HWND a_hWnd, LPARAM) {
+    if (!IsWindowVisible(a_hWnd) || GetAncestor(a_hWnd, GA_ROOT) != a_hWnd
+            || GetWindowTextLengthW(a_hWnd) <= 0) {
+        return TRUE;
+    }
+    DWORD dwPid = 0;
+    GetWindowThreadProcessId(a_hWnd, &dwPid);
+    if (dwPid == GetCurrentProcessId()) {
+        return TRUE;   // 排除测试宿主自身窗口
+    }
+    const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(dwPid)).toLower();
+    if (sExe == g_sFindExePath) {
+        g_hFoundChild = a_hWnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// 2026-10-16 ProjectFallbackUserLaunchNotGhosted：把测试 exe + Qt 最小运行集
+//   （Core/Gui/Widgets/Test、platforms\qwindows.dll、opengl32sw.dll）复制进目标
+//   目录——explorer 启动的子进程环境无本工程 PATH，须目录内自足。
+bool DeploySelfHost(const QString& a_sDir) {
+    const QString sDllSrc = QDir(QCoreApplication::applicationDirPath())
+                                .absoluteFilePath(QStringLiteral(".."));
+    const QStringList aFiles = {
+        QStringLiteral("Qt6Core.dll"), QStringLiteral("Qt6Gui.dll"),
+        QStringLiteral("Qt6Widgets.dll"), QStringLiteral("Qt6Test.dll"),
+        QStringLiteral("opengl32sw.dll"),
+    };
+    if (!QDir().mkpath(a_sDir + QStringLiteral("/platforms"))) {
+        return false;
+    }
+    // exe 与 Qt DLL 分居两目录（exe=本进程文件；DLL=输出根），分列来源。
+    if (!QFile::copy(QCoreApplication::applicationFilePath(),
+                     a_sDir + QLatin1Char('/') + QFileInfo(
+                         QCoreApplication::applicationFilePath()).fileName())) {
+        return false;
+    }
+    // Qt DLL/平台插件尽力而为：拷成更稳（目录内自足）；失败不致命——explorer
+    //   环境的用户 PATH 常含 Qt bin（本机即如此，实测无部署亦能起窗）。
+    for (const QString& s : aFiles) {
+        QFile::copy(sDllSrc + QLatin1Char('/') + s, a_sDir + QLatin1Char('/') + s);
+    }
+    QFile::copy(sDllSrc + QStringLiteral("/platforms/qwindows.dll"),
+                a_sDir + QStringLiteral("/platforms/qwindows.dll"));
+    return true;
+}
+
+// 2026-10-16 ProjectFallbackUserLaunchNotGhosted：建 .lnk（带参数）供 explorer
+//   打开——目标进程由长驻 explorer 实例启动（父活、非本树），用户双击同构。
+bool MakeShortcut(const QString& a_sExe, const QString& a_sArgs, const QString& a_sLnk) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool bNeedUninit = SUCCEEDED(hr);
+    IShellLinkW* pLnk = nullptr;
+    IPersistFile* pFile = nullptr;
+    bool bOk = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW, reinterpret_cast<void**>(&pLnk)))) {
+        pLnk->SetPath(reinterpret_cast<const wchar_t*>(a_sExe.utf16()));
+        pLnk->SetArguments(reinterpret_cast<const wchar_t*>(a_sArgs.utf16()));
+        if (SUCCEEDED(pLnk->QueryInterface(IID_IPersistFile,
+                                           reinterpret_cast<void**>(&pFile)))) {
+            bOk = SUCCEEDED(pFile->Save(
+                reinterpret_cast<const wchar_t*>(a_sLnk.utf16()), TRUE));
+            pFile->Release();
+        }
+        pLnk->Release();
+    }
+    if (bNeedUninit) {
+        CoUninitialize();
+    }
+    return bOk;
+}
+
+// 2026-10-16 收尾：树杀子宿主进程（taskkill /T /F，与 CAgentRunnerBase 同口径；
+//   child-host 的 app.exec() 不会自退）。
+void KillPidTree(DWORD a_dwPid) {
+    QProcess::execute(QStringLiteral("taskkill"),
+                      { QStringLiteral("/PID"), QString::number(a_dwPid),
+                        QStringLiteral("/T"), QStringLiteral("/F") });
+}
+
 } // namespace
 
 class TestSandbox : public QObject {
@@ -111,6 +207,249 @@ private slots:
         if (QGuiApplication::platformName() != QLatin1String("windows")) {
             QSKIP("需要真实 Win32 窗口（windows 平台）");
         }
+    }
+
+    // 2026-10-09 收纳范围收紧：受保护应用路径判定单元断言。
+    void ProtectedAppPath() {
+        // 系统/公共应用目录 → 保护（不收纳）。
+        QVERIFY(sbx::IsProtectedAppPath(
+            qEnvironmentVariable("SystemRoot") + QStringLiteral("\\notepad.exe")));
+        QVERIFY(sbx::IsProtectedAppPath(
+            qEnvironmentVariable("ProgramFiles") + QStringLiteral("\\Mozilla Firefox\\firefox.exe")));
+        QVERIFY(sbx::IsProtectedAppPath(
+            qEnvironmentVariable("ProgramFiles(x86)") + QStringLiteral("\\Microsoft\\Edge\\msedge.exe")));
+        QVERIFY(sbx::IsProtectedAppPath(
+            qEnvironmentVariable("LocalAppData") + QStringLiteral("\\Microsoft\\WindowsApps\\Notepad.exe")));
+        // 大小写/斜杠方向不敏感。
+        QString sWin = qEnvironmentVariable("SystemRoot");
+        sWin.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        QVERIFY(sbx::IsProtectedAppPath(sWin.toUpper() + QStringLiteral("/NOTEPAD.EXE")));
+        // 前缀近邻陷阱：目录名恰好以保护根开头不算保护（C:\Windows98 不是 C:\Windows）。
+        QVERIFY(!sbx::IsProtectedAppPath(
+            qEnvironmentVariable("SystemRoot") + QStringLiteral("98\\tool.exe")));
+        // 工程/临时/用户目录 → 非保护（正常收纳范围）。
+        QVERIFY(!sbx::IsProtectedAppPath(QCoreApplication::applicationFilePath()));
+        QVERIFY(!sbx::IsProtectedAppPath(
+            QStandardPaths::writableLocation(QStandardPaths::TempLocation) + QStringLiteral("\\x.exe")));
+        QVERIFY(!sbx::IsProtectedAppPath(QString()));
+    }
+
+    // 2026-10-14 PID 复用防护（TuKan 误收养实害）：孤儿进程的真父退出后父 PID
+    //   被 Agent 树内新进程复用——旧版仅凭 pid→ppid 快照判归属，链上无出生
+    //   校验，会把孤儿误认成复用者（进而 Agent 树）的后代而幽灵化。纯哈希
+    //   单测覆盖三分支：复用判伪 / 合法链放行 / 创建时刻不可得回退旧行为。
+    void PidReuseAncestry() {
+        const qint64 iT0 = 1770000000000LL;   // 任意基准时刻
+        const DWORD dwRoot = 100, dwHolder = 200, dwChild = 300, dwMid = 400;
+        QHash<DWORD, DWORD> aMap;
+        QHash<DWORD, qint64> aCreated;
+        // 场景①：子(300) 于 T0 出生，真父(旧 200) 已死；PID 200 被树内新进程
+        //   复用（T0+5min 出生）→ 链 300→200→100 判伪，不得认定是 root 后代。
+        aMap = { {dwChild, dwHolder}, {dwHolder, dwRoot} };
+        aCreated = { {dwChild, iT0}, {dwHolder, iT0 + 5 * 60 * 1000}, {dwRoot, iT0 - 60 * 60 * 1000} };
+        QVERIFY(!sbx::IsDescendantOf(dwChild, dwRoot, aMap, aCreated));
+        // 场景②：合法链（父恒早于子出生）→ 放行（含多跳）。
+        aMap = { {dwChild, dwMid}, {dwMid, dwRoot} };
+        aCreated = { {dwChild, iT0 + 2000}, {dwMid, iT0 + 1000}, {dwRoot, iT0} };
+        QVERIFY(sbx::IsDescendantOf(dwChild, dwRoot, aMap, aCreated));
+        QVERIFY(sbx::IsDescendantOf(dwMid, dwRoot, aMap, aCreated));
+        // 场景③：任一端创建时刻不可得（0：保护进程/权限）→ 回退旧行为不误伤。
+        aCreated = { {dwChild, 0}, {dwMid, iT0 + 1000}, {dwRoot, 0} };
+        QVERIFY(sbx::IsDescendantOf(dwChild, dwRoot, aMap, aCreated));
+        // 场景④：空时刻表（旧签名缺省参）→ 完全旧行为。
+        QVERIFY(sbx::IsDescendantOf(dwChild, dwRoot, aMap));
+        // 场景⑤：链后段复用同样判伪（300→mid 合法，mid 的父 200 是复用者）。
+        aMap = { {dwChild, dwMid}, {dwMid, dwHolder}, {dwHolder, dwRoot} };
+        aCreated = { {dwChild, iT0 + 3000}, {dwMid, iT0 + 2000},
+                     {dwHolder, iT0 + 5 * 60 * 1000}, {dwRoot, iT0} };
+        QVERIFY(!sbx::IsDescendantOf(dwChild, dwRoot, aMap, aCreated));
+        // 场景⑥：活表自检（真实系统快照含创建时刻且非空）。
+        QHash<DWORD, DWORD> aLiveMap;
+        QHash<DWORD, qint64> aLiveCreated;
+        QVERIFY(sbx::BuildParentMap(aLiveMap, aLiveCreated));
+        QVERIFY(aLiveMap.size() == aLiveCreated.size());
+        QVERIFY(aLiveCreated.contains(GetCurrentProcessId()));
+        QVERIFY(aLiveCreated.value(GetCurrentProcessId()) > 0);   // 自身时刻可得
+        // 自身 → 自身直接命中。
+        QVERIFY(sbx::IsDescendantOf(GetCurrentProcessId(), GetCurrentProcessId(),
+                                   aLiveMap, aLiveCreated));
+    }
+
+    // 2026-10-16 断链兜底收紧（IsProjectTestPid 条件③）：由「父非 explorer」改
+    //   「父已死才兑底」——用户经 QuickTool/托盘等任何非 explorer 启动器打开的
+    //   工程内程序不得幽灵化（实害：QuickTool 打开 HarnessAgent.exe → 窗口
+    //   alpha=1+点击穿透+无任务栏，「消失」但进程存活）。IsParentAlive 纯哈希
+    //   单测覆盖：父活（任意进程，含 explorer）/ 断链（父不在表）/ 本体缺席竞态。
+    void ParentAliveFallback() {
+        const DWORD dwSelf = 300, dwQuickTool = 200, dwDeadParent = 250, dwExplorer = 101;
+        // 场景①：父活着且非 explorer（QuickTool 等启动器）→ 兜底必须关。
+        QHash<DWORD, DWORD> aMap = { {dwSelf, dwQuickTool}, {dwQuickTool, 100} };
+        QVERIFY(sbx::IsParentAlive(dwSelf, aMap));
+        // 场景②：断链——快照记录的父 pid 已不在表（父死，Agent 中间 shell 秒退）→ 允许兜底。
+        aMap = { {dwSelf, dwDeadParent} };
+        QVERIFY(!sbx::IsParentAlive(dwSelf, aMap));
+        // 场景③：本体不在表（快照早于进程创建的竞态）→ 按断链口径（上层年龄闸把关）。
+        QVERIFY(!sbx::IsParentAlive(999, aMap));
+        // 场景④：explorer 父照常判活（并入「父活一律不兜底」统一口径，行为不回归）。
+        aMap = { {dwSelf, dwExplorer}, {dwExplorer, 100} };
+        QVERIFY(sbx::IsParentAlive(dwSelf, aMap));
+        // 场景⑤：活表自检——自身父（ctest/测试宿主）必在表，判活。
+        QHash<DWORD, DWORD> aLiveMap;
+        QHash<DWORD, qint64> aLiveCreated;
+        QVERIFY(sbx::BuildParentMap(aLiveMap, aLiveCreated));
+        QVERIFY(sbx::IsParentAlive(GetCurrentProcessId(), aLiveMap));
+    }
+
+    // 2026-10-16 断链兜底收紧实测①（用户启动形态）：把测试 exe 连同 Qt 最小
+    //   运行集部署进临时工程根（explorer 启动的子进程无本工程 PATH，须自足），
+    //   .lnk（带 --sandbox-child-host 参数）交 explorer 打开 → 目标进程父 =
+    //   长驻 explorer（活、非本树）→ 走「父活不兜底」分支：不得收纳。
+    //   注：QuickTool 形态（活父且非 explorer）无法从树内伪造（测试所起的一切
+    //   进程皆本树后代），由 ParentAliveFallback 纯逻辑覆盖；2026-10-16 真机
+    //   现场（QuickTool→HarnessAgent 被吞→修后不吞）已实证该分支。
+    void ProjectFallbackUserLaunchNotGhosted() {
+        if (QGuiApplication::platformName() != QLatin1String("windows")) {
+            QSKIP("需要真实 Win32 窗口（windows 平台）");
+        }
+        QTemporaryDir oDir;                       // 临时工程根（含被测 exe 副本）
+        QVERIFY(DeploySelfHost(oDir.path()));
+        const QString sExe = oDir.path() + QStringLiteral("/")
+                             + QFileInfo(QCoreApplication::applicationFilePath()).fileName();
+        const QString sLnk = oDir.path() + QStringLiteral("/probe.lnk");
+        QVERIFY(MakeShortcut(sExe, QStringLiteral("--sandbox-child-host"), sLnk));
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetProjectRoot(oDir.path());
+        stMgr.Start();
+
+        QVERIFY(QProcess::startDetached(QStringLiteral("explorer.exe"),
+                               { QDir::toNativeSeparators(sLnk) }));
+        HWND hChild = nullptr;
+        QVERIFY(WaitCond(15000, [&]() {
+            g_hFoundChild = nullptr;
+            g_sFindExePath = QFileInfo(sExe).canonicalFilePath().toLower();
+            EnumWindows(FindWndByExeProc, 0);
+            return g_hFoundChild != nullptr;
+        }));
+        hChild = g_hFoundChild;
+        QVERIFY(hChild != nullptr);
+        DWORD dwPid = 0;
+        GetWindowThreadProcessId(hChild, &dwPid);
+
+        stMgr.ConsiderWindow(hChild);             // 钩子同口径（非终判，留宽限复判）
+        QTest::qWait(2500);                       // 覆盖宽限期（若误兜底此处会收走）
+        QVERIFY2(!sbx::IsGhosted(hChild), "父活（用户启动形态）+ 工程根内新进程不得兜底收纳");
+        QCOMPARE(stMgr.GhostedCount(), 0);
+
+        stMgr.Shutdown();
+        KillPidTree(dwPid);
+    }
+
+    // 2026-10-16 断链兜底收紧实测②（Agent 通道回归）：cmd start 中间人秒退断链
+    //   （父已死）+ exe 在工程根内 + 新建 → 兜底收纳照常生效（修复不回归）。
+    void ProjectFallbackOrphanChainGhosted() {
+        if (QGuiApplication::platformName() != QLatin1String("windows")) {
+            QSKIP("需要真实 Win32 窗口（windows 平台）");
+        }
+        const QString sExe = QCoreApplication::applicationFilePath();
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetProjectRoot(QCoreApplication::applicationDirPath());
+        stMgr.Start();
+
+        QProcess stMid;                        // 中间人：执行完即退 → 被测进程父死断链
+        stMid.setProgram(QStringLiteral("cmd.exe"));
+        stMid.setArguments({ QStringLiteral("/c"), QStringLiteral("start"), QString(),
+                             QDir::toNativeSeparators(sExe),
+                             QStringLiteral("--sandbox-child-host") });
+        stMid.start();
+        QVERIFY(stMid.waitForFinished(8000));  // cmd start 立即返回退出
+        HWND hChild = nullptr;
+        QVERIFY(WaitCond(12000, [&]() {
+            g_hFoundChild = nullptr;
+            g_sFindExePath = QFileInfo(sExe).canonicalFilePath().toLower();
+            EnumWindows(FindWndByExeProc, 0);
+            return g_hFoundChild != nullptr;
+        }));
+        hChild = g_hFoundChild;
+        QVERIFY(hChild != nullptr);
+        DWORD dwPid = 0;
+        GetWindowThreadProcessId(hChild, &dwPid);
+
+        stMgr.ConsiderWindow(hChild, true);    // 终判：断链兑底应收纳
+        QVERIFY2(WaitCond(5000, [&]() { return sbx::IsGhosted(hChild); }),
+                 "断链（父死）+ 工程根内新进程应兑底收纳");
+        QVERIFY(stMgr.GhostedCount() >= 1);
+        stMgr.Shutdown();                      // 还原窗口停录像
+        QVERIFY(!sbx::IsGhosted(hChild));
+        KillPidTree(dwPid);
+    }
+
+    // 2026-10-09 收纳范围收紧实测：系统应用（notepad，树内子进程启动）不得被
+    //   自动收纳，也不得被 sandbox add 收纳——旧逻辑会立即收走（用户实测
+    //   「Agent 开报告/浏览器给用户看时窗口凭空消失」）。
+    void NotepadNotGhosted() {
+        if (QGuiApplication::platformName() != QLatin1String("windows")) {
+            QSKIP("需要真实 Win32 窗口（windows 平台）");
+        }
+        const QString sNotepad = qEnvironmentVariable("SystemRoot")
+                                 + QStringLiteral("\\notepad.exe");
+        if (!QFileInfo::exists(sNotepad)) {
+            QSKIP("notepad.exe 不存在");
+        }
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.Start();
+
+        QProcess stProc;
+        stProc.setProgram(sNotepad);
+        stProc.start();
+        QVERIFY(stProc.waitForStarted(5000));
+        const DWORD dwPid = static_cast<DWORD>(stProc.processId());
+
+        // 等它出主窗口（可见顶层且属该 pid）。
+        HWND hNp = nullptr;
+        QVERIFY(WaitCond(10000, [&]() {
+            g_hFoundChild = nullptr;
+            g_dwFindPid = dwPid;
+            EnumWindows(FindWndByPidProc, 0);
+            return g_hFoundChild != nullptr;
+        }));
+        hNp = g_hFoundChild;
+        QVERIFY(hNp != nullptr);
+
+        // 自动收纳路径（钩子/扫描 + 宽限终判）：2.5 秒内不得幽灵化。
+        QTest::qWait(2500);
+        QVERIFY2(!sbx::IsGhosted(hNp), "系统应用（notepad）不得被自动收纳");
+
+        // 显式 add：受保护应用必须拒绝。
+        QString sOut;
+        QJsonObject oAdd;
+        oAdd.insert(QStringLiteral("hwnd"),
+                    QStringLiteral("0x%1").arg(reinterpret_cast<quintptr>(hNp), 0, 16));
+        QVERIFY2(!stMgr.Execute(QStringLiteral("add"), oAdd, sOut),
+                 "sandbox add 必须拒绝受保护应用");
+        QVERIFY(!sbx::IsGhosted(hNp));
+
+        stProc.terminate();
+        stProc.waitForFinished(3000);
+        if (stProc.state() == QProcess::Running) {
+            stProc.kill();
+            stProc.waitForFinished(2000);
+        }
+        stMgr.Shutdown();
     }
 
     void ParseCliCases() {
@@ -138,6 +477,18 @@ private slots:
         QVERIFY(sbx::ParseCli({ QStringLiteral("AutoCode.exe"), QStringLiteral("--sandbox"),
                                 QStringLiteral("restore-all") }, &sCmd, &o));
         QCOMPARE(sCmd, QStringLiteral("restore_all"));
+
+        // 2026-10-14 launch：exe + 余参重建成 args 串（含空格元素补引号）。
+        QVERIFY(sbx::ParseCli({ QStringLiteral("AutoCode.exe"), QStringLiteral("--sandbox"),
+                                QStringLiteral("launch"), QStringLiteral("C:\\a b\\app.exe"),
+                                QStringLiteral("--mode"), QStringLiteral("fast run") },
+                              &sCmd, &o));
+        QCOMPARE(sCmd, QStringLiteral("launch"));
+        QCOMPARE(o.value(QStringLiteral("exe")).toString(), QStringLiteral("C:\\a b\\app.exe"));
+        QCOMPARE(o.value(QStringLiteral("args")).toString(),
+                 QStringLiteral("--mode \"fast run\""));
+        QVERIFY(!sbx::ParseCli({ QStringLiteral("AutoCode.exe"), QStringLiteral("--sandbox"),
+                                 QStringLiteral("launch") }, &sCmd, &o));
 
         QVERIFY(!sbx::ParseCli({ QStringLiteral("AutoCode.exe"), QStringLiteral("--sandbox"),
                                  QStringLiteral("不存在命令") }, &sCmd, &o));
@@ -420,6 +771,112 @@ private slots:
         }
     }
 
+    // 2026-10-14 断链兜底回归（Compositer 工程实测「测试窗口一直弹出」根因）：
+    //   Agent 用 powershell Start-Process / cmd start 等中间人方式启动被测程序，
+    //   中间 shell 秒退 → 被测程序主窗口弹出时父进程已死，进程树爬链第一跳即断，
+    //   旧版不收纳 → 窗口裸奍弹到用户桌面。新逻辑：树外但 exe 在工程根内且进程
+    //   新建 → 兑底收纳（工程外仍拒绝）。
+    void BrokenChainFallback() {
+        // 中间人启动（生产形态）：cmd /c start → cmd 立即退出，被测程序成孤儿。
+        const QString sExe = QCoreApplication::applicationFilePath();
+        QVERIFY(QProcess::startDetached(QStringLiteral("cmd.exe"),
+            { QStringLiteral("/c"), QStringLiteral("start"), QString(),
+              sExe, QStringLiteral("--sandbox-child-host") }));
+
+        // 等孤儿窗口出现（可见顶层、标题含 sandbox-child-host）。
+        HWND hKid = nullptr;
+        QVERIFY(WaitCond(10000, [&]() {
+            hKid = nullptr;
+            EnumWindows([](HWND h, LPARAM lp) {
+                wchar_t wsTitle[128] = {};
+                if (GetWindowTextW(h, wsTitle, 128) > 0 && IsWindowVisible(h)
+                        && GetAncestor(h, GA_ROOT) == h
+                        && wcsstr(wsTitle, L"sandbox-child-host") != nullptr) {
+                    *reinterpret_cast<HWND*>(lp) = h;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&hKid));
+            return hKid != nullptr;
+        }));
+        QVERIFY(hKid != nullptr);
+        DWORD dwKidPid = 0;
+        GetWindowThreadProcessId(hKid, &dwKidPid);
+
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+
+        // 反例：工程根指向无关目录 → 不兑底（窗口保持可见）。
+        QTemporaryDir stDir;
+        stMgr.SetProjectRoot(stDir.path());
+        stMgr.Start();
+        QVERIFY2(!stMgr.ConsiderWindow(hKid), "工程外孤儿不得兑底收纳");
+        QTest::qWait(1200);
+        QVERIFY2(!sbx::IsGhosted(hKid), "工程外孤儿不得被鬼化");
+
+        // 正例：工程根指向 exe 所在目录（生产中即被测工程产物目录）→ 兑底收纳
+        //   （宽限 800ms 终判后鬼化；钩子/扫描自动路径同样覆盖）。
+        stMgr.SetProjectRoot(QCoreApplication::applicationDirPath());
+        QVERIFY2(WaitCond(4000, [&]() { return sbx::IsGhosted(hKid); }),
+                 "工程内新建孤儿窗口应被断链兑底收纳");
+        QCOMPARE(stMgr.GhostedCount(), 1);
+
+        // 清场：杀孤儿进程（防后续构建 LNK1104）。
+        if (dwKidPid != 0) {
+            if (HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, dwKidPid)) {
+                TerminateProcess(hP, 1);
+                CloseHandle(hP);
+            }
+        }
+        stMgr.Shutdown();
+    }
+
+    // 2026-10-14 sandbox launch：主进程代启动被测程序 + 手工根登记——窗口弹出
+    //   即收纳（TreePid 命中手工根，零宽限直收），不受断链影响。
+    void SandboxLaunchCommand() {
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.Start();
+
+        QString sOut;
+        // 反例：exe 不存在。
+        QJsonObject oBad;
+        oBad.insert(QStringLiteral("exe"), QStringLiteral("C:/__no_such_app__.exe"));
+        QVERIFY2(!stMgr.Execute(QStringLiteral("launch"), oBad, sOut),
+                 "exe 不存在必须失败");
+
+        // 正例：启动自身 child-host 模式。
+        QJsonObject oLaunch;
+        oLaunch.insert(QStringLiteral("exe"), QCoreApplication::applicationFilePath());
+        oLaunch.insert(QStringLiteral("args"), QStringLiteral("--sandbox-child-host"));
+        QVERIFY(stMgr.Execute(QStringLiteral("launch"), oLaunch, sOut));
+        QVERIFY2(sOut.contains(QStringLiteral("pid=")), qUtf8Printable(sOut));
+
+        // 窗口弹出即自动收纳（手工根零宽限；上限含进程冷启动）。
+        QVERIFY2(WaitCond(8000, [&]() { return stMgr.GhostedCount() >= 1; }),
+                 "launch 启动的窗口应即弹即收");
+        QVERIFY(stMgr.Execute(QStringLiteral("windows"), QJsonObject(), sOut));
+        QVERIFY(sOut.contains(QStringLiteral("sandbox-child-host")));
+
+        // 清场：从在册行拿 pid 终结子进程。
+        const QList<CSandboxManager::SRow> aRows = stMgr.Rows();
+        for (const CSandboxManager::SRow& st : aRows) {
+            if (HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, st.dwPid)) {
+                TerminateProcess(hP, 1);
+                CloseHandle(hP);
+            }
+        }
+        stMgr.Shutdown();
+    }
+
     // 2026-10-08 跨实例续收纳回归（Compositer 工程实测：AutoCode 实例重启后，
     // 退出还原的测试窗口裸奔用户桌面，且新实例进程树出身判定永不再认它）。
     void ReadoptAcrossRestart() {
@@ -481,6 +938,83 @@ private slots:
             QVERIFY(!sbx::IsGhosted(h));
             QVERIFY(!sbx::HasAdoptMark(h));       // 标记清除，窗口恢复常态
             stMgr.Shutdown();
+        }
+        // 场景 E（2026-10-09 用户实测回归）：「曾收纳」标记超龄 → 不再自动收走。
+        //   工程内软件被 Agent 测过一次后，标记永久跟随，此前每次启动/切工程都被
+        //   强制隐形、退出又还原 → 用户桌面反复「消失/出现」。时效窗后超龄=清标记。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));
+            QVERIFY(sbx::RestoreWindow(h, true));          // 退出还原：标记保留（时刻=now）
+            QVERIFY(sbx::HasAdoptMark(h));
+            // 伪造超龄标记（20 分钟前）——与 core 的 kPropAdopt 同名直写。
+            SetPropW(h, sbx::kPropAdopt, reinterpret_cast<HANDLE>(
+                static_cast<intptr_t>(static_cast<ULONG>(
+                    GetTickCount() - 20UL * 60 * 1000))));
+
+            CSandboxManager stMgr;                          // 模拟继任实例（启动很晚）
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable = true;
+            stCfg.bAutoGhost = false;
+            stCfg.bRecord = false;
+            stMgr.SetConfig(stCfg);
+            stMgr.SetProjectRoot(QCoreApplication::applicationDirPath());  // exe 在工程内
+            stMgr.Start();
+            QCOMPARE(stMgr.GhostedCount(), 0);              // 超龄：不收
+            QVERIFY(!sbx::IsGhosted(h));                    // 用户可见
+            QVERIFY(!sbx::HasAdoptMark(h));                 // 标记清除，恢复常态
+            stMgr.Shutdown();
+        }
+        // 场景 F（2026-10-09 多实例互斥）：幽灵中 + 收纳者是活着的其他实例 →
+        //   本实例不得越权还原/续收（此前实例 B 的启动扫描会把实例 A 沙箱里的
+        //   测试窗口强制还原，打断 A 的 Agent 测试）。
+        {
+            CHost stHost;
+            stHost.show();
+            QVERIFY(WaitCond(2000, [&]() { return stHost.isVisible(); }));
+            const HWND h = reinterpret_cast<HWND>(stHost.winId());
+            QVERIFY(sbx::GhostWindow(h));                   // 收纳者=本测试进程
+            QVERIFY(sbx::IsGhosted(h));
+            // 伪造「别的活实例收纳中」：kPropGhost 值改成 explorer 的 pid（必活，
+            // 且不是本进程）。与 core 的 kPropGhost 同名直写。
+            DWORD dwExplorer = 0;
+            {
+                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                PROCESSENTRY32W stPe = { sizeof(stPe) };
+                if (hSnap != INVALID_HANDLE_VALUE) {
+                    if (Process32FirstW(hSnap, &stPe)) {
+                        do {
+                            if (wcscmp(stPe.szExeFile, L"explorer.exe") == 0) {
+                                dwExplorer = stPe.th32ProcessID;
+                                break;
+                            }
+                        } while (Process32NextW(hSnap, &stPe));
+                    }
+                    CloseHandle(hSnap);
+                }
+            }
+            QVERIFY2(dwExplorer != 0, "找不到 explorer 进程");
+            SetPropW(h, sbx::kPropGhost,
+                     reinterpret_cast<HANDLE>(static_cast<intptr_t>(dwExplorer)));
+
+            CSandboxManager stMgr;
+            CSandboxManager::SSbxCfg stCfg;
+            stCfg.bEnable = true;
+            stCfg.bAutoGhost = false;
+            stCfg.bRecord = false;
+            stMgr.SetConfig(stCfg);
+            stMgr.SetProjectRoot(QCoreApplication::applicationDirPath());
+            stMgr.Start();
+            QCOMPARE(stMgr.GhostedCount(), 0);              // 别人在管：不入册
+            QVERIFY(sbx::IsGhosted(h));                     // 也不越权还原（保持原状）
+            stMgr.Shutdown();
+            // 清场：恢复 owner=本进程再正常还原（清标记）。
+            SetPropW(h, sbx::kPropGhost, reinterpret_cast<HANDLE>(
+                static_cast<intptr_t>(GetCurrentProcessId())));
+            QVERIFY(sbx::RestoreWindow(h));
         }
         // 场景 D：Agent 显式 add 收编「已幽灵但不在册」的崩溃残留窗口。
         {

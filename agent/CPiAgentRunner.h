@@ -163,6 +163,10 @@ public:
     //   工具执行中注入、下一模型迭代收到）；一次性形态仍 no-op false（上层排队）。
     bool InjectUserTurn(const QString& a_sText) override;
 
+    // 2026-10-16 退净窗口（同 claude result 后口径）：settle/finish 已收而进程未退，
+    //   此窗口 steer 帧不属于本轮（InjectUserTurn 必 false）。
+    bool IsTurnClosed() const override { return m_bFinished || m_bRpcSettled; }
+
 private slots:
     void slotOnStdOut();
     void slotOnStdErr();

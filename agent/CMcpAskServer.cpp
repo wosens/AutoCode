@@ -217,6 +217,14 @@ void CMcpAskServer::HandleMessage(const QJsonObject& a_oMsg) {
                 st.oSchema = oSchema;
                 return st;
             };
+            aSbxTools.append(fnMake("sandbox_launch",
+                "由沙箱代为启动被测 GUI 程序（启动被测程序的首选方式）：主进程亲自"
+                "启动并登记，窗口弹出即自动隐藏收纳；不受中间 shell（Start-Process/"
+                "cmd start）秒退断链影响。exe=程序全路径；args=命令行参数（可省）；"
+                "workdir=工作目录（可省，默认 exe 所在目录）。",
+                { QStringLiteral("exe"), QStringLiteral("args"),
+                  QStringLiteral("workdir") },
+                { QStringLiteral("exe") }));
             aSbxTools.append(fnMake("sandbox_windows",
                 "列出内置沙箱中已收纳的窗口（Agent 启动的 GUI 程序会被自动隐藏收纳，"
                 "不打扰用户键鼠）。返回 hwnd/pid/尺寸/标题/进程。GUI 测试第一步先调它。",

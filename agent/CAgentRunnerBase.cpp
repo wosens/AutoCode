@@ -5,8 +5,31 @@
 #include <QFile>
 #include "core/CFrwDevice.h"
 #include <QFileInfo>
+#include <QDateTime>
+#include <QProcess>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 // 构造/析构放在 .cpp：锚定基类 vtable（纯虚接口 + QObject 混入，避免每个包含 TU 都内联展开）。
+// 2026.10.15 进程树终止（说明见头文件）：taskkill /T /F 同步执行，超时 8s，
+//   失败静默（直接子进程由调用方 m_pProc->kill() 兼容收尾）。
+void CAgentRunnerBase::KillProcTree(quint64 a_uPid) {
+    if (a_uPid == 0) {
+        return;
+    }
+    QProcess oKill;
+    oKill.start(QStringLiteral("taskkill"),
+               {QStringLiteral("/PID"), QString::number(a_uPid),
+                QStringLiteral("/T"), QStringLiteral("/F")});
+    if (oKill.waitForStarted(2000)) {
+        oKill.waitForFinished(8000);
+    }
+}
+
 CAgentRunnerBase::CAgentRunnerBase(QObject* a_pParent)
     : QObject(a_pParent) {
 }
@@ -26,6 +49,75 @@ QStringList CAgentRunnerBase::SharedSkillDirs() {
         aDirs << QDir::toNativeSeparators(sClaude);
     }
     return aDirs;
+}
+
+// —— 子进程环境统一构造（2026.10.10，说明见头文件声明注释）——
+QProcessEnvironment CAgentRunnerBase::MergedPathEnvironment() {
+    QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+#ifdef _WIN32
+    // 注册表两处 PATH 合并串缓存（30 秒 TTL：装完环境后无需重启 AutoCode 即可命中
+    //   新 PATH 条目；过短则每次 StartStage 都击注册表，过长则装完后最多延迟半分钟）。
+    static QString s_sMergedPathCache;
+    static qint64 s_iCacheStampMs = 0;
+    const qint64 kiNowMs = QDateTime::currentMSecsSinceEpoch();
+    if (s_sMergedPathCache.isEmpty() || kiNowMs - s_iCacheStampMs > 30000) {
+        // RegGetValueW：RRF_RT_REG_SZ|RRF_RT_REG_EXPAND_SZ 接受两种类型且自动展开
+        //   %SystemRoot% 等引用（QSettings 不展开 REG_EXPAND_SZ，不能用）；缓冲区
+        //   逐级加倍重试。任一读失败 → 本轮不合并（回退继承 PATH，行为同旧版）。
+        auto fnRegPath = [](HKEY a_hRoot, const wchar_t* a_pSubKey) -> QString {
+            DWORD dwNeed = 4096;
+            for (int iTry = 0; iTry < 4; ++iTry) {
+                QByteArray buf(int(dwNeed) + int(sizeof(wchar_t)), Qt::Uninitialized);
+                DWORD dwSize = dwNeed;
+                const LSTATUS iRc = RegGetValueW(a_hRoot, a_pSubKey, L"Path",
+                    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                    nullptr, buf.data(), &dwSize);
+                if (iRc == ERROR_SUCCESS) {
+                    // dwSize 对 REG_EXPAND_SZ 展开型返回的是原始（未展开）值大小，
+                    //   可能大于实际写入的展开串长（实测 HKLM Path：原始 942 字符、
+                    //   展开后 932）——按 dwSize 构造 QString 会读过尾，把缓冲区残余
+                    //   垃圾/嵌入 NUL 带进 PATH，毁掉子进程环境块（CreateProcess 失败
+                    //   或子进程拿到残废 env）。成功时缓冲区必有 NUL 结尾，以首个
+                    //   NUL 为真实长度。
+                    const wchar_t* pRaw = reinterpret_cast<const wchar_t*>(buf.constData());
+                    int cch = 0;
+                    while (pRaw[cch] != L'\0') {
+                        ++cch;
+                    }
+                    return QString::fromWCharArray(pRaw, cch);
+                }
+                if (iRc != ERROR_MORE_DATA) {
+                    return QString();
+                }
+                dwNeed = dwSize + 4096;
+            }
+            return QString();
+        };
+        const QString sMachine = fnRegPath(HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+        const QString sUser = fnRegPath(HKEY_CURRENT_USER, L"Environment");
+        const QString sInherited = oEnv.value(QStringLiteral("PATH"));
+        QStringList aParts;
+        for (const QString& sPart : { sMachine, sUser, sInherited }) {
+            const QString sTrim = sPart.trimmed();
+            if (!sTrim.isEmpty()) {
+                aParts << sTrim;
+            }
+        }
+        if (aParts.size() > 1) {   // 只有继承一处 = 无可合并，保持原样
+            s_sMergedPathCache = aParts.join(QLatin1Char(';'));
+        } else {
+            s_sMergedPathCache.clear();
+        }
+        s_iCacheStampMs = kiNowMs;
+    }
+    if (!s_sMergedPathCache.isEmpty()) {
+        oEnv.insert(QStringLiteral("PATH"), s_sMergedPathCache);
+    }
+#else
+    // 非 Windows：无注册表 PATH 语义，直接继承（保持行为一致）。
+#endif
+    return oEnv;
 }
 
 QString CAgentRunnerBase::SharedSkillsCatalog() {
@@ -119,15 +211,19 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
-            "（windows/capture/click/type/keys/tree/restore/add…）。\n"
+            "（launch/windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"
             " --sandbox click <hwnd> <x> <y> ｜ --sandbox type <hwnd> <文本> ｜"
             " --sandbox tree <hwnd>\n"
+            "- 启动被测 GUI 程序：优先 --sandbox launch <exe全路径> [参数...]（主进程代启动，"
+            "窗口弹出即自动收纳）；或在 Bash 直接 ./xxx.exe & 后台运行。禁止用 powershell "
+            "Start-Process / cmd start / explorer 等中间人方式启动：中间 shell 秒退会切断"
+            "进程树，沙箱认不出窗口，测试窗口会裸奍弹到用户桌面。\n"
             "- 截图返回 PNG 路径，用读图工具查看后再定位坐标点击。\n"
             "- 若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/进程早于本轮启动），"
-            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。\n"
-            "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入，"
-            "也禁止绕开沙箱用 python/ctypes 自制 Win32 驱动操控窗口。")
+            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。"
+            "沙箱只收纳本工程程序：系统应用（浏览器/记事本/Office 等装在 Windows 或 "
+            "Program Files 目录）不会也不允许被收纳，不要对它们 add 或操控。")
             .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
         return sSbxOnly;
     }
@@ -169,13 +265,20 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
-            "（windows/capture/click/type/keys/tree/restore/add…）。\n"
+            "（launch/windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"
             " --sandbox click <hwnd> <x> <y> ｜ --sandbox type <hwnd> <文本> ｜"
             " --sandbox tree <hwnd>\n"
+            "- 启动被测 GUI 程序：优先 sandbox launch <exe全路径> [参数...]（MCP 为 "
+            "sandbox_launch；主进程代启动，窗口弹出即自动收纳）；或在 Bash 直接 "
+            "./xxx.exe & 后台运行。禁止用 powershell Start-Process / cmd start / "
+            "explorer 等中间人方式启动：中间 shell 秒退会切断进程树，沙箱认不出"
+            "窗口，测试窗口会裸奍弹到用户桌面。\n"
             "- 截图返回 PNG 路径，用读图工具查看后再定位坐标点击。\n"
             "- 若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/进程早于本轮启动），"
-            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。\n"
+            "先用 sandbox add <hwnd> 把它收进沙箱再操控，不要去动可见窗口。"
+            "沙箱只收纳本工程程序：系统应用（浏览器/记事本/Office 等）不会也不允许被"
+            "收纳，不要对它们 add 或操控，也不要动用户自己打开的窗口。\n"
             "- 禁止物理操控鼠标键盘，禁止 pyautogui/SendInput 类物理输入，"
             "也禁止绕开沙箱用 python/ctypes 自制 Win32 驱动操控窗口%2。\n")
             .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()),

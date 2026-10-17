@@ -1,4 +1,4 @@
-﻿#include "CMainWindow.h"
+#include "CMainWindow.h"
 
 #include <QLabel>
 #include <QMenu>
@@ -92,6 +92,7 @@
 #include "CAskUserDialog.h"
 #include "CAboutDialog.h"
 #include "CNewTaskDialog.h"
+#include "COrchDesignDialog.h"   // 2026-10-14 任务编排设计（功能菜单）
 #include "CTaskHistoryDB.h"
 
 // [Scan] ExcludeDirs 逗号串 → 逐项去空白的清单。用户常在逗号后带空格（".autodev, build"），
@@ -598,8 +599,8 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 2026.08.15 启动配置回填（单一数据源 = exe 同级 config.ini；设置对话框可改并落盘）：
     //   助手 autocompact 已改比例制（[Adhoc] AutoCompactPct），编排器在每次 StartAdhocStage
     //   现读 m_pPm->AutoCompactKFor() 换算，启动期无需回填。
-    // 上下文窗口上限回填（>0 覆盖按模型探测；0=自动）。
-    m_pExecPanel->SetUserContextLimit(m_pPm->LoadAdhocContextLimit());
+    //   （2026-10-15 上下文窗口上限回填已删：[Adhoc] ContextLimit 机制整线移除，
+    //   窗口唯一来源 = 按模型自动探测。）
     // 评审多视角并行档位回填（[Review] Parallel；1=串行回退零回归，默认 3）。
     m_pOrch->SetReviewParallel(m_pPm->LoadReviewParallel());
     // 2026.08.20 抽取为 ApplyAgentConfigToRuntime（多实例热重载复用）。
@@ -727,13 +728,8 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             this, &CMainWindow::OnAsstForeignActivated);
     connect(m_pExecPanel, &CExecutionPanel::sigAsstForeignFinished,
             this, &CMainWindow::OnAsstForeignFinished);
-    // 上下文窗口上限调整 → 持久化到 config.ini（编排器无需感知，面板自身用 m_iContextLimit）。
-    connect(m_pExecPanel, &CExecutionPanel::sigAdhocContextLimitChanged,
-            this, [this](qint64 a_iLimit) {
-        if (m_pPm != nullptr) {
-            m_pPm->SaveAdhocContextLimit(a_iLimit);
-        }
-    });
+    // （2026-10-15 sigAdhocContextLimitChanged→SaveAdhocContextLimit 接线已随
+    //   「设置上下文大小」整线移除：窗口唯一来源 = 按模型自动探测。）
     // 2026-10-05 上下文条右键「选择模型」：面板菜单选择 → 四张节落盘 + 重应用 runner
     //   （下一轮即用新模型）+ 回推面板刷新进度条模型名/菜单勾选。
     connect(m_pExecPanel, &CExecutionPanel::sigSwitchSharedModel,
@@ -825,6 +821,17 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     SetStatus(QStringLiteral("请打开或新建一个工程目录"));
 }
 
+// 2026.10.09 启动界面选定工程的打开入口（公有薄转调，见头文件注释）：多实例锁确认、
+//   MRU 记录、标题/菜单刷新等全部复用 OpenProjectDir 既有路径，无第二实现。
+// 2026.10.14 a_bAsWorkspace=true（启动页「跳过」）：打开 exe 同级 AutoCode 工作目录，
+//   任务/助手全功能可用但不进最近列表（OpenProjectDir 的 RecordRecent 旁路）。
+void CMainWindow::OpenStartupProject(const QString& a_sDir, bool a_bAsWorkspace) {
+    if (a_sDir.isEmpty()) {
+        return;
+    }
+    OpenProjectDir(a_sDir, /*a_bRecordRecent=*/!a_bAsWorkspace);
+}
+
 CMainWindow::~CMainWindow() {
     // 卸载并释放原生消息过滤器（先于 qApp 析构，防悬垂）
     if (m_pMsgFilter != nullptr) {
@@ -840,8 +847,10 @@ CMainWindow::~CMainWindow() {
                 pTask->SaveToFile(m_pPm->TaskDir(pTask->Id()) + QStringLiteral("/task.json"));
             }
         }
-        // 2026.09.07 v2.1.123 摘本实例持有的工程在席锁（崩溃残留由后继打开者按
-        //   PID 存活+进程名复核自动接管）。
+        // 2026.09.07 v2.1.123 摘本实例持有的工程在席锁（崩溃/硬杀残留由后继打开者
+        //   自动接管：2026-10-17 v4.4.387 起在席信号随进程消亡自动消失，文件锁
+        //   残留由 PID 判活+创建时刻交叉验证收尾）。 
+        m_pPm->DropProjectSeatEvent();   // 常规退出主动摘信号（进程退出句柄也会自动关，双保险）
         CProjectManager::ReleaseProjectLock(m_pPm->ProjectDir());
     }
     // 释放历史页 DB 副本（与活跃任务 m_aTasks 相互独立的对象集）
@@ -873,7 +882,10 @@ void CMainWindow::CreateUi() {
     auto* pSplit = new QSplitter(Qt::Horizontal, pCentral);
     m_pMainSplit = pSplit;   // FR-4：记成成员，closeEvent 时 saveState 持久化比例
     m_pTaskPanel = new CTaskListPanel(pSplit);
-    m_pExecPanel = new CExecutionPanel(pSplit);
+    // 2026-10-17 自绘三期：对话日志渲染引擎构造时快照传入（[View] Engine 缺省
+    //   Legacy 卡片流；ModelView=自绘链——面板/助手页建视图二选一，双引擎灰度）。
+    m_pExecPanel = new CExecutionPanel(
+        pSplit, CProjectManager::IsModelViewEngine(m_pPm->LoadViewEngine()));
 
     pSplit->addWidget(m_pTaskPanel);
     pSplit->addWidget(m_pExecPanel);
@@ -901,6 +913,12 @@ void CMainWindow::CreateUi() {
             if (!sArt.isEmpty()) {
                 m_pExecPanel->RestoreArtifactsSplit(
                     QByteArray::fromBase64(sArt.toLatin1()));
+            }
+            // 2026-10-16 助手重命名弹窗几何（[Layout] RenameDlgGeo；坏档/空档自弃）。
+            const QString sRename = m_pPm->LoadLayoutValue(QStringLiteral("RenameDlgGeo"));
+            if (!sRename.isEmpty()) {
+                m_pExecPanel->SetRenameDlgGeo(
+                    QByteArray::fromBase64(sRename.toLatin1()));
             }
         }
     }
@@ -950,6 +968,11 @@ void CMainWindow::CreateUi() {
         connect(pDlg, &CCodeReviewDialog::sigOpenFile,
                 this, [this](const QString& a_sAbs, int a_iLine) {
             m_pExecPanel->ShowFileTab(a_sAbs, true, a_iLine);
+            // 2026-10-08 双击发现行定位：审查窗是非模态顶层窗，可能挡住主窗口的
+            //   预览页 → 定位后把主窗口带到前台（用户能立即看到定位结果）。
+            show();
+            raise();
+            activateWindow();
         });
         // 2026-10-02「按建议修复」：修复提示词注入当前助手提问框（同「添加到聊天框」链路）。
         connect(pDlg, &CCodeReviewDialog::sigFixToChat,
@@ -995,6 +1018,14 @@ void CMainWindow::CreateMenus() {
         // 2026-10-09 拖拽尺寸持久化：调用时取当前 config.ini（exe 同级，PM 可能未建）
         [this]() -> QString {
             return (m_pPm != nullptr) ? m_pPm->ConfigFilePath() : QString();
+        },
+        // 2026-10-09 右键删除：PM 移除（含落盘）+ 面板就地刷新（exec 返回后重排）
+        [this](const QString& sPath) {
+            if (m_pPm != nullptr && m_pRecentPanel != nullptr) {
+                m_pPm->RemoveRecent(sPath);
+                m_pRecentPanel->Refresh(m_pPm->RecentProjects(),
+                                        m_pPm->RecentOpenCounts());
+            }
         });
     {
         auto* pWgtAct = new QWidgetAction(m_pMenuRecent);
@@ -1024,6 +1055,12 @@ void CMainWindow::CreateMenus() {
     pActSettings->setToolTip(QStringLiteral(
         "编辑运行策略、Agent 参数、评审与助手行为、目录排除等配置（保存到 exe 同级 config.ini）"));
     connect(pActSettings, &QAction::triggered, this, &CMainWindow::OnSettings);
+    // 2026-10-14 任务编排设计：任务类型/流程档位/执行阶段动态编排（含阶段要求编辑）。
+    auto* pActOrch = pMenuFunc->addAction(QStringLiteral("任务编排设计..."));
+    pActOrch->setToolTip(QStringLiteral(
+        "编排任务类型、流程档位与执行阶段（增删改/缺省选择/阶段要求提示词编辑），\n"
+        "新建任务按编排后的最新版本显示与执行；新阶段提示词存 prompts 目录"));
+    connect(pActOrch, &QAction::triggered, this, &CMainWindow::OnOrchDesign);
     // 2026.09 后端版本管理（任务 23183ccb）：四后端当前/最新版本与更新分派；
     //   设置页 Agent 组有同源入口。
     auto* pActVersion = pMenuFunc->addAction(QStringLiteral("后端版本管理..."));
@@ -1084,8 +1121,11 @@ bool CMainWindow::nativeEvent(const QByteArray& a_sType, void* a_pMsg, qintptr* 
         if (pMsg->message == WM_NCLBUTTONDBLCLK && m_pTitleBar != nullptr) {
             // 标题栏空白双击 = 点最大化按钮：与按钮共用 OnMaximizeToggle（图标态同源翻转）；
             // 拦掉 DefWindowProc 默认（native 路径不同步按钮图标，会造成两边状态打架）。
-            const QPoint stDb(QPoint(GET_X_LPARAM(pMsg->lParam),
-                                     GET_Y_LPARAM(pMsg->lParam)));
+            // 2026.10.09 DPI 修复：lParam 是物理像素，Qt 几何（mapFromGlobal）是 DIP，
+            //   非 100% 缩放下须除以 devicePixelRatioF 再比较，否则命中错位（双击失效）。
+            const double dDpr = devicePixelRatioF();
+            const QPoint stDb(QPoint(qRound(GET_X_LPARAM(pMsg->lParam) / dDpr),
+                                     qRound(GET_Y_LPARAM(pMsg->lParam) / dDpr)));
             if (m_pTitleBar->HitTest(stDb) == CTitleBar::HitCaption) {
                 OnMaximizeToggle();
                 *a_piRes = 0;
@@ -1094,8 +1134,13 @@ bool CMainWindow::nativeEvent(const QByteArray& a_sType, void* a_pMsg, qintptr* 
             return false;   // 边缘等区域双击交系统默认
         }
         if (pMsg->message == WM_NCHITTEST && m_pTitleBar != nullptr) {
-            const QPoint stGlobal(QPoint(GET_X_LPARAM(pMsg->lParam),
-                                         GET_Y_LPARAM(pMsg->lParam)));
+            // 2026.10.09 DPI 修复：lParam 是物理像素，Qt 几何（HitTest/frameGeometry）
+            //   是 DIP。非 100% 缩放下（125%/150%）两者差 N 倍，直接比较导致标题栏
+            //   拖不动、关闭按钮点不到、边缘缩放带永久错位——统一除以 devicePixelRatioF
+            //   转成 DIP 再参与全部 Qt 侧命中判定。
+            const double dDpr = devicePixelRatioF();
+            const QPoint stGlobal(QPoint(qRound(GET_X_LPARAM(pMsg->lParam) / dDpr),
+                                         qRound(GET_Y_LPARAM(pMsg->lParam) / dDpr)));
             // 先判标题栏：按钮区交还 Qt，图标区返回 HTSYSMENU，空白区返回 Caption。
             switch (m_pTitleBar->HitTest(stGlobal)) {
                 case CTitleBar::HitButton:
@@ -1185,11 +1230,15 @@ void CMainWindow::OnTitleIconClicked(const QPoint& a_stAt) {
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, MF_STRING, SC_CLOSE, L"关闭(&C)    Alt+F4");
 
-    // 锚点：优先调用方给定（标题栏右键=光标处）；空点 → 图标左下角（原生样式）；
-    // 取不到图标则退回鼠标位置。
+    // 锚点：优先调用方给定（标题栏右键=光标处，物理坐标）；空点 → 图标左下角（原生样式）；
+    // 取不到图标则退回鼠标位置。TrackPopupMenu 需要物理像素坐标，而 IconPopupPos
+    // （mapToGlobal）返回 DIP——2026.10.09 DPI 修复：非 100% 缩放下乘 devicePixelRatioF
+    // 换回物理，否则系统菜单弹出位置偏左上。
     QPoint stPos = a_stAt;
-    if (stPos.isNull()) {
-        stPos = (m_pTitleBar != nullptr) ? m_pTitleBar->IconPopupPos() : QPoint();
+    if (stPos.isNull() && m_pTitleBar != nullptr) {
+        const double dDpr = devicePixelRatioF();
+        const QPoint stDip = m_pTitleBar->IconPopupPos();
+        stPos = QPoint(qRound(stDip.x() * dDpr), qRound(stDip.y() * dDpr));
     }
     if (stPos.isNull()) {
         POINT stPt;
@@ -1301,9 +1350,10 @@ void CMainWindow::UpdateWindowTitle() {
     //   窗口标题（WM_GETTEXT）是任务管理器/Alt-Tab 悬停与展开列表的信息源——多实例
     //   （Execute 主/副本）各开不同工程时可直接辨认；自绘标题栏左上角同步刷工程名。
     //   工程名取工程目录末段（与最近打开列表/任务目录口径一致），空目录（未开工程）
-    //   回退纯 AutoCode 标题。
+    //   回退纯 AutoCode 标题。2026.10.14 「跳过」工作目录（exe 同级 \AutoCode）
+    //   工程名恰好也叫 AutoCode，拼出「AutoCode-AutoCode」难看，同口径回退纯标题。
     const QString sName = QFileInfo(m_pPm->ProjectDir()).fileName();
-    if (sName.isEmpty()) {
+    if (sName.isEmpty() || IsWorkspaceDir(m_pPm->ProjectDir())) {
         setWindowTitle(QStringLiteral("AutoCode ") + AutoCodeVersionText());
         if (m_pTitleBar != nullptr) {
             m_pTitleBar->SetTitleText(QStringLiteral("AutoCode"));
@@ -1314,6 +1364,19 @@ void CMainWindow::UpdateWindowTitle() {
     if (m_pTitleBar != nullptr) {
         m_pTitleBar->SetTitleText(QStringLiteral("%1-AutoCode").arg(sName));
     }
+}
+
+// 2026.10.14 是否为「跳过」模式的 AutoCode 工作目录（exe 同级 \AutoCode）：路径
+//   双向 cleanPath 后按 Windows 习惯大小写不敏感比较（exe 目录可能与工程目录仅
+//   盘符/段大小写不同）。
+bool CMainWindow::IsWorkspaceDir(const QString& a_sDir) {
+    if (a_sDir.isEmpty()) {
+        return false;
+    }
+    const QString sWs = QDir::cleanPath(QCoreApplication::applicationDirPath()
+                                        + QStringLiteral("/AutoCode"));
+    const QString sDir = QDir::cleanPath(a_sDir);
+    return sDir.compare(sWs, Qt::CaseInsensitive) == 0;
 }
 
 void CMainWindow::ClearAssistantSessionsOnBackendSwitch() {
@@ -1335,12 +1398,9 @@ void CMainWindow::ApplyTaskConfigOverlay(CTaskInfo* a_pTask) {
     }
     m_pPm->SetTaskConfigOverlay(a_pTask != nullptr ? a_pTask->Id() : QString());
     ApplyAgentConfigToRuntime(false);   // 静默口径（后端不可用警告属启动/保存路径）
-    if (m_pExecPanel != nullptr) {
-        m_pExecPanel->SetUserContextLimit(m_pPm->LoadAdhocContextLimit());
-    }
 }
 
-void CMainWindow::OpenProjectDir(const QString& a_sDir) {
+void CMainWindow::OpenProjectDir(const QString& a_sDir, bool a_bRecordRecent) {
     // 2026.09.07 v2.1.123 多实例工程锁（查锁必须最先做：取消时零副作用）：
     //   工程态（assistant.json/task.json/guide/record）是整文件后写覆盖先写，
     //   双实例同开一工程会互踩（仅 history.db 并发安全）。他实例活持有 →
@@ -1398,10 +1458,15 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
     UpdateWindowTitle();   // 2026.09.07 标题刷成「工程名-AutoCode 版本」（任务管理器可辨认）
 
     // 2026.09.07 v2.1.123 工程锁换岗：摘旧工程自己的锁 → 写新工程在席锁。
+    //   2026-10-17 v4.4.387 在席信号同步换岗：先摘旧信号（句柄随旧工程失效）再
+    //   持新信号；Hold 失败（强制打开下他实例仍持/信号层不可用）不阻断——降级
+    //   文件锁口径继续，后续新实例探测时仍能识别。
+    m_pPm->DropProjectSeatEvent();
     if (!sPrevProject.isEmpty()) {
         CProjectManager::ReleaseProjectLock(sPrevProject);
     }
     CProjectManager::WriteProjectLock(m_pPm->ProjectDir());
+    m_pPm->HoldProjectSeatEvent(m_pPm->ProjectDir());
 
     // 2026.08.20 打开本工程的历史库（.autodev/history.db）：历史页只显示当前工程任务。
     if (m_pHistoryDb) {
@@ -1481,9 +1546,13 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir) {
     // guide.md 缺失不再在打开工程时扫描，改为启动任务时作为初始任务自动生成（见 OnStartTask）。
 
     // 成功打开才记录历史（失败路径已提前 return，FR-2.2）。
+    //   2026.10.14 a_bRecordRecent=false（启动页「跳过」的 AutoCode 工作目录）不记：
+    //   工作目录不算工程，不进最近打开列表。
     // 注：2026.09.22 起「新建工程」菜单已删（与打开工程重复），从零建工程走
     //   OnOpenProject 选空目录，同样经此入口计入最近 —— 待 Q-6 确认的历史项。
-    RecordRecent(a_sDir);
+    if (a_bRecordRecent) {
+        RecordRecent(a_sDir);
+    }
 
     // 工程就绪：启用提示词 agent 输入栏（ClearTasks 已先禁用，此处恢复）
     if (m_pExecPanel != nullptr) {
@@ -1777,8 +1846,8 @@ void CMainWindow::OnSettings() {
     // 2026-10-08 claude 跟随共享表开关（大模型页）：落盘即重应用（含 runner 静态槽）。
     m_pPm->SaveClaudeFollowShared(stDlg.ClaudeFollowShared());
     m_pPm->SaveAutoCompactPct(stDlg.AutoCompactPct());
-    // 2026.09.27 「上下文窗口上限」设置项已删：[Adhoc] ContextLimit 不再由设置页读写，
-    //   入口收敛到上下文进度条右键「设置上下文大小…」（已存值继续生效，未设按模型探测）。
+    // 2026.09.27 「上下文窗口上限」设置项已删：[Adhoc] ContextLimit 不再由设置页读写。
+    //   2026-10-15 右键「设置上下文大小」也已删：上下文窗口唯一来源 = 按模型自动探测。
     m_pPm->SaveAdhocMaxTurns(stDlg.AdhocMaxTurns());   // 2026.09.23 助手轮次上限（下一条提示词即时生效）
     m_pPm->SaveAdhocMaxTurnsAuto(stDlg.AdhocMaxTurnsAuto());   // 2026.09.23 v3.0.219 工作量评估开关
     // 2026-10-08 提示词长度闸门：落盘后由下方 ApplySharedModelsToRunners 尾部统一推面板。
@@ -1790,6 +1859,21 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveExplorerHiddenDirs(stDlg.ExplorerHiddenDirs());
     if (m_pTaskPanel != nullptr) {
         m_pTaskPanel->SetExplorerHiddenDirs(ScanDirList(stDlg.ExplorerHiddenDirs()));
+    }
+    // 2026-10-17 对话日志渲染引擎（[View] Engine）：落盘即可——建视图时读取（面板
+    //   构造快照/助手页创建），已建页不重建（重开助手 Tab / 重启全部生效，灰度期
+    //   双引擎并存零迁移）。状态栏提示口径与 HarnessAgent v1.9.44 一致。
+    {
+        const QString sOldEngine = m_pPm->LoadViewEngine();
+        const QString sNewEngine = stDlg.ViewEngine();
+        m_pPm->SaveViewEngine(sNewEngine);
+        if (sOldEngine != sNewEngine) {
+            const QString sName = (sNewEngine == QStringLiteral("ModelView"))
+                ? QStringLiteral("新版（自绘）") : QStringLiteral("旧版（卡片流）");
+            statusBar()->showMessage(
+                QStringLiteral("日志渲染引擎已切换：%1（对新建立的会话页生效，重开助手 Tab / 重启后全部生效）")
+                    .arg(sName), 8000);
+        }
     }
     // 2026-09-26 内置测试沙箱：落盘 + 热应用到管理器（开关/帧率即时生效，
     //   录像开关对后续新收纳窗口生效；存量窗口录像保持原状）。
@@ -1831,6 +1915,28 @@ void CMainWindow::OnSettings() {
         //   「No conversation found with session ID」）；对话历史/统计不受影响。
         if (bBackendChanged) {
             ClearAssistantSessionsOnBackendSwitch();
+        }
+    }
+    // 2026.10.11 Claude 后端 + 非 anthropic 协议当前条目拦截提示（目标机实害：用户把
+    //   当前模型切到「glm5.2」（10.1.0.201/api/v1 openai 协议）——claude 只说 anthropic
+    //   协议，注入被跳过 → Not logged in。同名易混条目 glm5.2 vs glm5.2-公司）一保存
+    //   就拦住，不再等到发提示词才报 Not logged in。
+    if (bBackendSaved && iNewBackend == 1) {
+        const QList<SDshModelEntry> aUnify = stDlg.DshModels();   // 四页统一后同一份
+        const int iAct = stDlg.DshActiveModel();
+        if (iAct >= 0 && iAct < aUnify.size()) {
+            const QString sApi = aUnify.at(iAct).sApi.trimmed().toLower();
+            if (!sApi.isEmpty() && sApi != QLatin1String("anthropic-messages")) {
+                const QString sName = aUnify.at(iAct).sDisp.isEmpty()
+                    ? aUnify.at(iAct).sModelId : aUnify.at(iAct).sDisp;
+                ExecMsgBox(QMessageBox::Warning, QStringLiteral("当前模型 Claude 无法使用"),
+                    QStringLiteral("后端已选 Claude Code，但当前模型条目「%1」的 API 类型"
+                                   "为 %2——claude 只支持 anthropic-messages 协议端点，"
+                                   "该条目会被跳过（助手将报 Not logged in）。\n\n"
+                                   "请改选 anthropic-messages 类型的条目（如名称含"
+                                   "「公司/claude」的接入点）。")
+                        .arg(sName, sApi), this);
+            }
         }
     }
     // 2026.08.18 根目录应用运行期：显式值优先；空或失效（死路径自愈）时探测 exe
@@ -1993,7 +2099,55 @@ void CMainWindow::OnSettings() {
     // 2026.08.18 修：逐项 trim + 空清单恢复内置默认（与启动路径同源，见 ScanDirList）。
     CGuideFingerprintScanner::SetExcludeDirs(ScanDirList(stDlg.ScanExcludeDirs()));
 
-    SetStatus(QStringLiteral("设置已保存到 config.ini（策略/压缩比例/目录排除对下一阶段生效）"));
+    // 2026.10.11 任务态保存可见性（用户实害：选中任务时改「当前模型」→只写任务档且
+    //   全局 Active 保持原值；取消选择/重启后助手回退全局旧模型，用户以为没生效）：
+    //   覆盖态保存时①状态栏明示保存位置；②刚存的激活项与全局现值不一致 → 弹窗告知
+    //   本次仅任务生效 + 全局当前模型现值 + 全局生效操作路径。
+    QString sStatusTail;
+    if (m_pPm != nullptr && m_pPm->TaskConfigOverlayActive()) {
+        sStatusTail = QStringLiteral("（已保存到当前任务的任务配置，仅该任务选中时生效）");
+        struct SSavedActive {
+            const wchar_t* pSect;
+            int iSaved;
+        };
+        const SSavedActive aSaved[4] = {
+            { L"PiModels",     stDlg.PiActiveModel() },
+            { L"DshModels",    stDlg.DshActiveModel() },
+            { L"HermesModels", stDlg.HermesActiveModel() },
+            { L"CodexModels",  stDlg.CodexActiveModel() },
+        };
+        bool bActiveDiffers = false;
+        for (const SSavedActive& st : aSaved) {
+            if (st.iSaved >= 0 && st.iSaved != m_pPm->LoadModelsActiveGlobal(st.pSect)) {
+                bActiveDiffers = true;
+                break;
+            }
+        }
+        if (bActiveDiffers) {
+            ExecMsgBox(QMessageBox::Information, QStringLiteral("当前模型仅保存到任务配置"),
+                QStringLiteral("当前选中任务时保存，本次「当前模型」只写入了"
+                               "任务配置（任务选中期间生效）。\n\n"
+                               "全局默认的当前模型保持不变：取消选择任务后"
+                               "助手/重启后将使用全局当前模型。若要全局生效："
+                               "取消选择任务 → 设置 → 大模型 → 设为当前 → 保存。"), this);
+        }
+    }
+    // 2026.10.15 设置页改模型（名称/接入点/当前项/增删）后同步面板：尾部统一走
+    //   ApplySharedModelsToRunners 重应用四 runner + SetSharedModels 回推面板——右键
+    //   「选择模型」菜单条目、上下文进度条模型名/窗口即时新表。此前仅靠自身保存触发
+    //   的 config 热重载链，而该链被 m_iCfgSelfSaveMs 2s 防抖跳过 → 面板停留旧表，
+    //   改名后右键菜单仍列旧名（本次缺口）。
+    ApplySharedModelsToRunners();
+    SetStatus(QStringLiteral("设置已保存到 config.ini（策略/压缩比例/目录排除对下一阶段生效）%1")
+                  .arg(sStatusTail));
+}
+
+void CMainWindow::OnOrchDesign() {
+    // 2026-10-14 任务编排设计：模态窗口编辑任务类型/流程档位/执行阶段。
+    //   对话框直接编辑 COrchConfig 单例，结构性变更即时落盘（orchestration.json）
+    //   并注册动态阶段表（FindStage 立即可见）——关闭即全部生效，新建任务即用最新编排。
+    COrchDesignDialog dlg(this);
+    dlg.exec();
 }
 
 void CMainWindow::OnHelp() {
@@ -2214,13 +2368,10 @@ void CMainWindow::OnNewTask() {
         pTask->SetName(dlg.Name());
     }
     pTask->SetType(dlg.Type());
-    // 2026.08.15 (流程档位) 档位 + 勾选阶段清单：全勾（完整流）存空表，语义同旧任务。
+    // 2026.08.15 (流程档位) 档位 + 勾选阶段清单；2026-10-14 编排：勾选流与该基础类型
+    //   内置规范流一致才存空表（旧任务兼容语义）；含自定义阶段/重排序时必须显式存清单。
     pTask->SetTier(dlg.Tier());
-    {
-        const QList<EStage> aChecked = dlg.CheckedStages();
-        const QList<EStage> aFull = CStageMachine::GetFlowStages(dlg.Type());
-        pTask->SetFlowStages(aChecked.size() == aFull.size() ? QList<EStage>() : aChecked);
-    }
+    pTask->SetFlowStages(dlg.IsCanonicalFlow() ? QList<EStage>() : dlg.CheckedStages());
     pTask->SetUserRequest(dlg.UserRequest());
     pTask->SetProjectDir(m_pPm->ProjectDir());
     pTask->SetCurrentStage(EStage::Intake);
@@ -2916,9 +3067,12 @@ void CMainWindow::OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText
     }
 }
 
-void CMainWindow::OnAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts) {
+void CMainWindow::OnAsstAutoRename(QString a_sAsstId, QString a_sPrompts) {
     // 2026-09-22 助手自动重命名：面板已收集好提示词，转编排器借会话交 Agent 总结名称+说明；
     //   同步失败（工程未开/无会话/全部助手忙）也走面板 ApplyAsstAutoName 留失败事件行。
+    //   2026.10.11 参数改值传（172129 崩溃实锤）：原 const& 直连链全程引用面板结构体
+    //   成员，链上同步槽可重排/销毁助手数组 → 引用悬垂；值拷贝在链启动前完成，链上
+    //   任意时点（含失败回退 ApplyAsstAutoName 再用）都安全。
     if (m_bProjectSwitching) {
         return;   // 2026-10-04 切工程隔离窗：停链收尾触发的自动命名不起新轮
                   //   （命名子轮会在旧工程面板尚在时启动，轮块/尾块落盘串新工程档）。
@@ -3272,8 +3426,11 @@ void CMainWindow::OnAdhocHealthCheck() {
         }
         m_aAdhocSuspect.remove(sId);
         m_pExecPanel->SetAsstRunning(sId, false);
+        // 2026-10-09 配套解除命名挂起（bSendAfterAutoName）并退回暂存指令：否则首条
+        //   「先改名后执行」链断裂后，后续发送永远只暂存不提交（另机实测死锁）。
+        m_pExecPanel->AdhocOrphanHeal(sId);
         m_pExecPanel->OnAdhocEvent(sId, QStringLiteral("self_heal"),
-            QStringLiteral("⚠ 检测到助手运行态孤儿（进程已结束但结束信号丢失，可能因档切换竞态），"
+            QStringLiteral("⚠ 检测到助手运行态孤儿（进程已结束但结束信号丢失，可能因后端启动失败/档切换竞态），"
                            "已自动恢复输入栏；若刚才的工作未完成请重发指令"));
     }
     // 疑点表里已不在运行列表的 id 清掉（助手被删/档切换重建）
@@ -3612,6 +3769,12 @@ void CMainWindow::LoadAssistantState(bool a_bProjectSwitch) {
     if (!aPhantoms.isEmpty()) {
         m_pExecPanel->AttachForeignAssistants(aPhantoms, sOldTaskName);
     }
+    // 2026-10-15 模型恢复后同步上下文窗口（用户反馈：重启后进度条仍显 128K，右键
+    //   重选模型才对）：助手档案不存模型名，恢复后 sModel 为空/旧值，而共享表推送
+    //   只在构造期跑过一次（当时面板尚未创建被跳过）。此处助手已全部就位，补一次
+    //   推送 → SetSharedModels 把非覆盖助手 sModel 归一到激活条目并全量刷新进度条，
+    //   分母即条目 iCtx（ContextWindowForModel 条目优先）。幂等，切工程/切任务同链。
+    ApplySharedModelsToRunners();
 }
 
 void CMainWindow::SyncOrchToPanel(const QString& a_sAsstId) {
@@ -3860,7 +4023,19 @@ void CMainWindow::closeEvent(QCloseEvent* a_pEvent) {
             m_pPm->SaveLayoutValue(
                 QStringLiteral("ArtifactsSplit"),
                 QString::fromLatin1(m_pExecPanel->ArtifactsSplitState().toBase64()));
+            // 2026-10-16 重命名弹窗几何一并落盘（从未弹过=空串，下次跳过）。
+            m_pPm->SaveLayoutValue(
+                QStringLiteral("RenameDlgGeo"),
+                QString::fromLatin1(m_pExecPanel->RenameDlgGeo().toBase64()));
         }
+    }
+    // 2026-10-15 退出前显式停全部 runner（用户实害：关闭全部 AutoCode 后 Agent 进程
+    //   仍残留——旧路径从不调 Stop，各 runner QProcess 析构不杀进程，Hermes -z、
+    //   pi cli.js 及其 kernel/辅助 python 孙进程全部成孤儿）。Stop 系静默收尾不发
+    //   sigFinished，无副作用；StopAll 含备份线程 join（退出弹窗已涵盖备份中场景）。
+    if (m_pOrch != nullptr) {
+        m_pOrch->StopAllAdhoc();
+        m_pOrch->StopAll();
     }
     // 2026-09-26 内置沙箱收尾：停钩子/扫描，全部停录像并还原幽灵窗口——
     //   不还原会留下隐形窗口直到重启（用户无感知点击穿透假死）。

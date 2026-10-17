@@ -5,7 +5,13 @@
 #include <QByteArray>
 #include <QTimer>
 #include <QElapsedTimer>
+#include <QDateTime>
 #include <QStringList>
+#include <functional>
+#include <QPointer>
+
+class QNetworkAccessManager;
+class QNetworkReply;
 
 #include "CAgentRunnerBase.h"
 
@@ -35,6 +41,9 @@ public:
     //   开关关/条目非兼容 = 完全走 claude 自身配置，行为与旧版一致）。
     static void SetSharedModelTable(const QList<SDshModelEntry>& a_aModels, int a_iActive);
     static void SetFollowSharedModels(bool a_bOn);
+    // 2026-10-16 跟随开关现状回读：面板空模型分母/进度条模型名兜底用（条件与
+    //   StartStage env 注入镜像——开关开且条目 anthropic-messages 兼容才认激活条目）。
+    static bool FollowSharedModels();
     // 2026-10-08 Claude 专属参数（设置→Claude Code 页；与共享表无关，设了就注入）：
     //   思考预算 MAX_THINKING_TOKENS（<=0=不注入）+ 小模型 ANTHROPIC_SMALL_FAST_MODEL
     //   （空=不注入；claude 后台小任务的中转映射，网关需同时提供该模型名）。
@@ -65,6 +74,18 @@ public:
     //   注：内部两步均为同步子进程，供异步驱动方（CVersionDialog 的 QProcess 探测）
     //   之外的测试/极端场景直接调用。
     static QString ResolveClaudeVersion();
+
+    // 2026.10.10 Claude CLI 兕底探测（用户需求：配置路径失效时自动找到正确的 CLI，
+    //   不死等用户改配置）：候选链① npm 全局真身（npm root -g + bin/claude.exe，对
+    //   npm 前缀配置免疫）→ ② claude 2.x 原生安装器默认位置（%USERPROFILE%\.local
+    //   \bin\claude.exe）→ ③ where claude 结果真身校验（.cmd shim 需同目录
+    //   node_modules 下包真身存在——防 dell 实害那种 shim 在/包不在的假阳性）。
+    //   命中返回真身绝对路径（a_psFrom 输出来源描述供事件行展示）；全落空→空串。
+    //   StartStage 预检发现配置失效时调用，命中则本轮替换生效（不回写 config，
+    //   事件行提示用户固化）。测试注入钩子：s_fnProbeFallback（非空时替代内置探测；
+    //   std::function 以支持捕获型 lambda 注入）。
+    static QString ProbeClaudeCliFallback(QString* a_psFrom = nullptr);
+    static std::function<QString(QString*)> s_fnProbeFallback;
 
     // 模型名 → 上下文窗口 token 上限（未命中回退 200K）。2026.08.15 从
     //   CExecutionPanel::ContextLimitForModel 下沉到 agent 层：编排器计算
@@ -108,6 +129,10 @@ public:
     //   实际能否作为新一轮 user turn 生效取决于协议（R1 已知限制）。返回是否写入成功。
     //   未运行或写入失败时安全 no-op，返回 false（不抛、不影响运行）。
     bool InjectUserTurn(const QString& a_sText) override;
+
+    // 2026-10-16 退净窗口：result 行已收（m_bFinished 在发 sigResult 前置位），进程要等
+    //   EOF 才退——此窗口内 InjectUserTurn 必 false（见其实现注释）而 IsRunning() 仍 true。
+    bool IsTurnClosed() const override { return m_bFinished; }
 
 private slots:
     void slotOnStdOut();
@@ -173,6 +198,18 @@ private:
     qint64    m_iStreamIn = 0;      // 2026.08.27 流式中消息输入（stream_event/message_start）
     qint64    m_iStreamOut = 0;     // 流式中消息累计输出（stream_event/message_delta）
     QString    m_sMcpConfigPath;  // ask_user 模式下生成的 --mcp-config 临时文件（Reset 清理）
+    QString    m_sModelSettingsPath;   // 2026.10.10 模型注入 --settings 临时文件（Reset 清理；用户级 settings.json 会顶掉 env 注入，命令行级配置必生效）
+    // 2026.10.11 鉴权 401 自诊断（目标机实害：claude 报 Invalid API key format 而
+    //   同 key 同网关在其它机器正常——注入 key 指纹/用户侧凭据源当场暴露，免往返拷日志）：
+    //   本轮注入 key 快照（仅指纹展示）+ 是否已发过诊断（Reset 清）。
+    QString    m_sDiagKey;
+    QString    m_sDiagModelSrc;
+    QString    m_sDiagBase;          // 2026.10.11 注入条目 BASE_URL（鉴权/连接失败时本机直探网关用）
+    QString    m_sDiagModel;         // 2026.10.11 注入条目模型名（直探 body 用，保持与真实请求同源）
+    bool       m_bAuthDiagDone = false;
+    qint64     m_iProbeT0 = 0;                // 2026.10.11 网关直探计时锚
+    bool       m_bProbeLargeSent = false;     // 2026.10.11 大包（77KB）探测已发（小包结束后级联补发；Reset 清）
+    QNetworkAccessManager* m_pNetProbe = nullptr;   // 2026.10.11 惰性创建；鉴权/连接失败诊断的网关直探
     QTimer*    m_pGraceTimer = nullptr;   // 崩溃宽限定时器（3s 一轮，上限 80 轮 = 240s）
     bool       m_bGraceActive = false;    // 宽限期进行中（抑制重复失败 / Stop 静默收尾用）
     int        m_iGraceTicks = 0;         // 宽限期已轮询次数

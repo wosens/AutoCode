@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 测试沙箱：防护盾 + 安全对勾 -->
+  <path d="M12 2.8 L19.2 5.4 V10.8 Q19.2 16.4 12 21.2 Q4.8 16.4 4.8 10.8 V5.4 Z" stroke="#2563EB" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M9 11.6 L11.2 13.8 L15.2 9.4" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

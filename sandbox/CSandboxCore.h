@@ -18,9 +18,24 @@ namespace sbx {
 
 // —— 进程树归属 ——
 // 全量 pid→ppid 快照（CreateToolhelp32Snapshot；含已死父进程的记录值）。
-bool BuildParentMap(QHash<DWORD, DWORD>& a_oMap);
+// 2026-10-14 增补 a_oCreated：pid→创建时刻（Unix ms；0=不可得）。归属链判定
+//   要求每一跳「父不晚于子出生」——孤儿进程的真父退出后父 PID 被 Agent 树内
+//   新进程复用（构建期短命进程高 churn 场景，实测 TuKan 被误收养），复用者
+//   创建时刻必然晚于子 → 链路判伪，杜绝跨树误收纳。
+bool BuildParentMap(QHash<DWORD, DWORD>& a_oMap, QHash<DWORD, qint64>& a_oCreated);
 // a_dwPid 的父链（快照内）是否可达 a_dwRoot（含死父 PID 记录值上溯；防环上限 64 跳）。
-bool IsDescendantOf(DWORD a_dwPid, DWORD a_dwRoot, const QHash<DWORD, DWORD>& a_oMap);
+// a_oCreated 每跳校验复用（见 BuildParentMap 注释）；传空表退化为旧行为。
+bool IsDescendantOf(DWORD a_dwPid, DWORD a_dwRoot, const QHash<DWORD, DWORD>& a_oMap,
+                    const QHash<DWORD, qint64>& a_oCreated = QHash<DWORD, qint64>());
+// 2026-10-16 断链判定（IsProjectTestPid 条件③收紧配套）：pid 的父进程是否仍活着。
+//   表键=活进程快照、值=快照记录的原始 ppid（父已死仍非 0），故判活必须看父 pid
+//   是否仍是表键，不能只看 ppid 非 0。三态：
+//   ① ppid 非 0 且父 pid 在表中 → 父活着（explorer/QuickTool/任何启动器）→ true；
+//   ② ppid 非 0 但父 pid 不在表中 → 父已死（Agent 经 Start-Process/cmd start 等
+//     中间人启动、中间 shell 秒退的断链场景）→ false；
+//   ③ 本 pid 不在表中（快照早于进程创建的竞态）→ false（视为断链，交上层
+//     <10 分钟年龄闸把关——配合 IsProjectTestPid 判否前的防陈旧重建，实测不可达）。
+bool IsParentAlive(DWORD a_dwPid, const QHash<DWORD, DWORD>& a_oMap);
 // 进程 exe 全路径（QueryFullProcessImageNameW；失败空串）。
 QString ExePathOfPid(DWORD a_dwPid);
 
@@ -37,8 +52,16 @@ bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark = false);
 bool IsGhosted(HWND a_hWnd);
 // 2026-10-08 「曾收纳」标记（kPropAdopt）：AutoCode 退出还原时保留，用户主动还原
 //   时清除；新实例扫描到它 + 窗口进程 exe 在工程目录内 → 续收纳重新隐形。
+// 2026-10-09 值=打标/还原时刻：续收纳只在时效窗（10 分钟）内生效，超龄=Agent
+//   早不再测、用户可能在用 → 清标记恢复常态，不再自动收走（修用户实测的
+//   「工程内软件窗口反复自动消失/出现」）。
 bool HasAdoptMark(HWND a_hWnd);
 void ClearAdoptMark(HWND a_hWnd);
+ULONG AdoptMarkTick(HWND a_hWnd);            // 打标时刻（GetTickCount 快照）
+DWORD GhostOwnerPid(HWND a_hWnd);            // 幽灵中窗口的收纳者 PID（互斥用）
+// prop 名导出（单元测试伪造跨实例场景直接 SetProp 用）。
+extern const wchar_t* kPropGhost;
+extern const wchar_t* kPropAdopt;
 // 全屏扫描还原所有带本产品标记的窗口（启动兜底：上次崩溃残留的隐形窗口）。
 int  RestoreAllMarked(bool a_bKeepAdoptMark = false);
 
@@ -47,6 +70,12 @@ int  RestoreAllMarked(bool a_bKeepAdoptMark = false);
 bool IsGhostableShape(HWND a_hWnd);
 // 系统宿主进程（explorer/dllhost/svchost 等）——其窗口永不收纳。
 bool IsSystemHostPid(DWORD a_dwPid);
+// 2026-10-09 受保护应用路径：系统/公共应用目录（Windows、Program Files、
+//   Program Files (x86)、LocalAppData\Microsoft\WindowsApps）下的 exe。这些目录
+//   里的程序（浏览器、Office、记事本等）被进程树内启动几乎都是「Agent 打开给
+//   用户看」（看报告/文档/网页）或系统组件，绝不是被测工程程序——自动收纳会让
+//   用户正在查看的窗口凭空消失（用户实测），add 收纳也必须拒绝。
+bool IsProtectedAppPath(const QString& a_sExe);
 
 // —— 离屏截图 ——
 // PrintWindow(PW_RENDERFULLCONTENT) 优先，失败回退 GetWindowDC+BitBlt(CAPTUREBLT)。

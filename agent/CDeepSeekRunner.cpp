@@ -65,15 +65,20 @@ QString CDeepSeekRunner::DshRootPath() {
     return s_sDshRootPath;
 }
 
-// —— 2026.09.27 DSH 额外可写目录（pwsh 沙箱 DACL 放行）——————————————
-// DSH windows-acl 沙箱：workspace-write 的强制是纯 NTFS DACL——受限令牌的 restricting
-//   组里带工作区写 SID（S-1-4-x-y，sha256(规范化工作区根) 派生，见 harness
-//   sandbox-windows-acl/src/workspace-sid.ts）；目录可写 ⟺ 其 DACL 授了该 SID
-//   （Allow，OI|CI，FILE_GENERIC_WRITE|DELETE|FILE_DELETE_CHILD & ~STANDARD_RIGHTS_WRITE，
-//   见 win32-abi.ts GRANT_MASK / acl.ts buildExplicitAccess）。拒绝标记是 stderr 特征
-//   分类（无路径预检）→ 对工程根之外的关联目录授同一 SID 的同形 ACE 即放行，
-//   零 harness 改动、对已部署副本全部生效。ACE 是 standing（留在 DACL 里跨会话复用，
-//   与 harness 自身的 workspace 复用缓存同语义）。
+// —— 2026.09.27 DSH 额外可写目录（pwsh 沙箱 DACL+标签放行；2026-10-17 补标签）———
+// DSH windows-acl 沙箱：workspace-write 的强制是 NTFS DACL + 完整性标签双条件——
+//   受限令牌的 restricting 组里带工作区写 SID（S-1-4-x-y，sha256(规范化工作区根)
+//   派生，见 harness sandbox-windows-acl/src/workspace-sid.ts），且被
+//   restrictTokenIntegrity 降到 Low IL（S-1-16-4096）。目录可写 ⟺ ①DACL 授了该
+//   SID（Allow，OI|CI，FILE_GENERIC_WRITE|DELETE|FILE_DELETE_CHILD & ~STANDARD_RIGHTS_WRITE，
+//   见 win32-abi.ts GRANT_MASK / acl.ts buildExplicitAccess）且 ②SACL 带 Low 标签
+//   （NO_WRITE_UP，过 No-Write-Up 完整性检查——Low 令牌写 Medium 目录必被拒，
+//   2026-10-17 实证补齐：harness grantWrite 对每个放行根同写 Low 标签，
+//   "every granted root carries the Low label that clears the integrity check"）。
+//   拒绝标记是 stderr 特征分类（无路径预检）→ 对工程根之外的关联目录授同 SID
+//   同形 ACE+Low 标签即放行，零 harness 改动、对已部署副本全部生效。ACE/标签
+//   standing（留在 DACL/SACL 里跨会话复用，与 harness 自身的 workspace 复用缓存
+//   同语义；revoke 只撤 ACE 不回摘标签）。
 static QStringList s_aDshExtraWriteDirs;   // [Dsh] ExtraWriteDirs（';' 分隔）
 
 void CDeepSeekRunner::SetDshExtraWriteDirs(const QStringList& a_aDirs) {
@@ -130,6 +135,74 @@ static QString DshWorkspaceWriteSidOf(const QString& a_sCanonicalRoot) {
     const quint64 uMax = (Q_UINT64_C(1) << 30) - 1;
     return QStringLiteral("S-1-4-%1-%2")
         .arg(QString::number(uOne % uMax + 1), QString::number(uTwo % uMax + 1));
+}
+
+// 2026-10-17 补齐 harness 放行的第二条件：受限令牌被 restrictTokenIntegrity 降到
+//   Low IL（S-1-16-4096），No-Write-Up 强制完整性会让 Low 令牌写 Medium 目录被拒
+//   （DACL 授了也过不了完整性检查）——harness grantWrite 对每个放行根同时写
+//   Low 标签（acl.js:"every granted root carries the Low label that clears the
+//   integrity check"）。此处对齐：目录 SACL 幂等补 SYSTEM_MANDATORY_LABEL_ACE
+//   （Low SID，NO_WRITE_UP，OI|CI）。失败=放行不完整（调用方按失败计）；
+//   revoke 不回摘标签（standing，同 harness 语义）。
+static bool DshEnsureLowLabel(const QString& a_sDir) {
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    PSID pLowSid = nullptr;
+    SID_IDENTIFIER_AUTHORITY stAuth = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    if (!AllocateAndInitializeSid(&stAuth, 1, SECURITY_MANDATORY_LOW_RID,
+                                  0, 0, 0, 0, 0, 0, 0, &pLowSid)
+            || pLowSid == nullptr) {
+        return false;
+    }
+    struct CSidFree {
+        PSID p;
+        ~CSidFree() { if (p != nullptr) { FreeSid(p); } }
+    } stSidFree{ pLowSid };
+
+    // 幂等：SACL 已有 Low 标签 ACE 即跳过（已有其他标签（如 Medium）则替换为 Low）。
+    PACL pSacl = nullptr;
+    PSECURITY_DESCRIPTOR pSd = nullptr;
+    if (GetNamedSecurityInfoW(reinterpret_cast<const wchar_t*>(sNative.utf16()),
+                              SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+                              nullptr, nullptr, nullptr, &pSacl, &pSd) == ERROR_SUCCESS) {
+        struct CSdFree2 {
+            PSECURITY_DESCRIPTOR p;
+            ~CSdFree2() { if (p != nullptr) { LocalFree(p); } }
+        } stSdFree{ pSd };
+        if (pSacl != nullptr) {
+            BOOL bHas = FALSE;
+            for (DWORD i = 0; i < pSacl->AceCount && !bHas; ++i) {
+                void* pAce = nullptr;
+                if (!GetAce(pSacl, i, &pAce) || pAce == nullptr) { continue; }
+                const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+                if (pHdr->AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) { continue; }
+                const auto* pLbl = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(pAce);
+                if (EqualSid(reinterpret_cast<PSID>(
+                                 const_cast<unsigned long*>(&pLbl->SidStart)), pLowSid)) {
+                    bHas = TRUE;
+                }
+            }
+            if (bHas) {
+                return true;
+            }
+        }
+    }
+    // 新建单 ACE 标签 ACL（对齐 harness buildLowLabelAcl 单条形态；富余 16 字节防
+    //   AddMandatoryAce 原地写入越界）。
+    QByteArray aBuf(static_cast<int>(sizeof(ACL) + sizeof(SYSTEM_MANDATORY_LABEL_ACE)
+                                    + GetLengthSid(pLowSid)) + 16, Qt::Uninitialized);
+    PACL pNew = reinterpret_cast<PACL>(aBuf.data());
+    if (!InitializeAcl(pNew, static_cast<DWORD>(aBuf.size()), ACL_REVISION_DS)) {
+        return false;
+    }
+    if (!AddMandatoryAce(pNew, ACL_REVISION_DS,
+                         OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                         SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, pLowSid)) {
+        return false;
+    }
+    const DWORD dwR = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(const_cast<ushort*>(sNative.utf16())),
+        SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, pNew);
+    return dwR == ERROR_SUCCESS;
 }
 
 // 授/撤一个 (目录, SID) 的 ACE。a_bGrant=false 撤销（REVOKE_ACCESS 删该 trustee 全部
@@ -195,7 +268,9 @@ static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_
             }
         }
         if (bFound) {
-            return true;
+            // 2026-10-17 DACL 已幂等命中：Low 标签仍须保证（只授 DACL 不够，见
+            //   DshEnsureLowLabel 注释）；revoke 路径不回摘标签。
+            return a_bGrant ? DshEnsureLowLabel(a_sDir) : true;
         }
     }
 
@@ -213,7 +288,90 @@ static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_
         reinterpret_cast<LPWSTR>(const_cast<ushort*>(sNative.utf16())),
         SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, pNew, nullptr);
     LocalFree(pNew);
-    return dwR == ERROR_SUCCESS;
+    if (dwR != ERROR_SUCCESS) {
+        return false;
+    }
+    // 2026-10-17 放行第二条件：Low 标签（Low IL 令牌 No-Write-Up 检查）；失败=放行
+    //   不完整按失败计（DACL ACE 已 standing 无害，下轮幂等重试）。revoke 不回摘。
+    return a_bGrant ? DshEnsureLowLabel(a_sDir) : true;
+}
+
+// 2026.10.15 DSH 命令执行通道自愈（pdfplumber 工程六轮会话全卡 Win32 5 实锤）：
+//   harness 的 grantWrite 对工程根一次性写「capability 写 ACE + deny world 删除 +
+//   Low 强制标签」，其中标签走 SACL，写它需要 WRITE_OWNER——而 owner 隐含权利只有
+//   READ_CONTROL + WRITE_DAC；未提升进程里继承的 Administrators(F) 不生效（组 SID
+//   仅 deny-only），实际只剩 Authenticated Users(M)（Modify 不含 WRITE_OWNER）→
+//   SetNamedSecurityInfoW 全会话 ACCESS_DENIED，命令执行通道整体瘫痪（文件读写
+//   不受影响，agent 会话内诊断/修复/提权三路皆死）。修法：启动会话前补一条当前
+//   用户账户 SID 的显式 (OI)(CI)Full ACE（账户 SID 在过滤 token 中依然 enabled，
+//   WRITE_OWNER 即刻可用；icacls 人工等价：/grant *<SID>:(OI)(CI)(F)）。
+//   返回 0=已具备 1=本轮补上 -1=失败（owner 非本用户等罕见态，提示人工 takeown）。
+static int DshEnsureLabelWritable(const QString& a_sDir)
+{
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    if (!QFileInfo(sNative).isDir()) {
+        return 0;   // 目录不在场：非本函数职责（ApplyExtraWriteDirs 同口径跳过）
+    }
+    HANDLE hTok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+        return -1;
+    }
+    struct CTokGuard {
+        HANDLE h;
+        ~CTokGuard() { if (h != nullptr) { CloseHandle(h); } }
+    } stTokGuard{ hTok };
+    DWORD dwNeed = 0;
+    GetTokenInformation(hTok, TokenUser, nullptr, 0, &dwNeed);
+    if (dwNeed == 0) {
+        return -1;
+    }
+    QByteArray aBuf(static_cast<int>(dwNeed), Qt::Uninitialized);
+    if (!GetTokenInformation(hTok, TokenUser, aBuf.data(), dwNeed, &dwNeed)) {
+        return -1;
+    }
+    const auto* pTu = reinterpret_cast<const TOKEN_USER*>(aBuf.constData());
+
+    PACL pOld = nullptr;
+    PSECURITY_DESCRIPTOR pSd = nullptr;
+    if (GetNamedSecurityInfoW(reinterpret_cast<const wchar_t*>(sNative.utf16()),
+                              SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              nullptr, nullptr, &pOld, nullptr, &pSd) != ERROR_SUCCESS
+            || pOld == nullptr) {
+        if (pSd != nullptr) { LocalFree(pSd); }
+        return -1;
+    }
+    struct CSdGuard {
+        PSECURITY_DESCRIPTOR p;
+        ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
+    } stSdGuard{ pSd };
+    for (DWORD i = 0; i < pOld->AceCount; ++i) {
+        void* pAce = nullptr;
+        if (!GetAce(pOld, i, &pAce) || pAce == nullptr) { continue; }
+        const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+        if (pHdr->AceType != ACCESS_ALLOWED_ACE_TYPE) { continue; }
+        const auto* pAllow = static_cast<const ACCESS_ALLOWED_ACE*>(pAce);
+        if ((pAllow->Mask & WRITE_OWNER) != 0
+                && EqualSid(reinterpret_cast<PSID>(
+                                const_cast<ULONG*>(&pAllow->SidStart)), pTu->User.Sid)) {
+            return 0;   // 已有含 WRITE_OWNER 的账户级允许 ACE：无需处理
+        }
+    }
+
+    EXPLICIT_ACCESS_W stEa = {};
+    stEa.grfAccessPermissions = FILE_ALL_ACCESS;
+    stEa.grfAccessMode = GRANT_ACCESS;
+    stEa.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+    stEa.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    stEa.Trustee.ptstrName = reinterpret_cast<LPWSTR>(pTu->User.Sid);
+    PACL pNew = nullptr;
+    if (SetEntriesInAclW(1, &stEa, pOld, &pNew) != ERROR_SUCCESS || pNew == nullptr) {
+        return -1;
+    }
+    const DWORD dwR = SetNamedSecurityInfoW(
+        reinterpret_cast<LPWSTR>(const_cast<ushort*>(sNative.utf16())),
+        SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, pNew, nullptr);
+    LocalFree(pNew);
+    return dwR == ERROR_SUCCESS ? 1 : -1;
 }
 
 int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
@@ -244,7 +402,6 @@ int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
     }
     return iFailed;
 }
-
 QString CDeepSeekRunner::ResolveNodePath() {
     // 留空走 PATH：QProcess 直起可执行名由系统搜路径（本机装了 node 即零配置）。
     return s_sDshNodePath.isEmpty() ? QStringLiteral("node") : s_sDshNodePath;
@@ -1219,7 +1376,7 @@ void CDeepSeekRunner::HealRunStep(int a_iStep) {
     const QString sRoot = DshRootPath();
     const int kiStepTimeoutMs[] = {0, 60 * 1000, 60 * 1000,
                                    15 * 60 * 1000, 30 * 60 * 1000, 30 * 1000};
-    QProcessEnvironment stEnv = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment stEnv = CAgentRunnerBase::MergedPathEnvironment();
     // 2026-09-12 手工审批弹窗通道（自愈重建后重入 StartStage，环境同口径）
     InjectAskEnv(stEnv);
     stEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
@@ -1401,7 +1558,7 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     }
     // 环境注入：DSH_CWD（bash/fs-local 工作目录）+ DSH_SESSION_ROOT（会话 jsonl 落盘，
     //   放工程 .autodev 下与任务产物同域，不污染工程根）。
-    QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment oEnv = CAgentRunnerBase::MergedPathEnvironment();
     // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
     InjectAskEnv(oEnv);
     // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
@@ -1412,6 +1569,25 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     oEnv.insert(QStringLiteral("DSH_CWD"), a_sWorkDir);
     oEnv.insert(QStringLiteral("DSH_SESSION_ROOT"),
                 a_sWorkDir + QStringLiteral("/.autodev/dsh-sessions"));
+    // 2026-10-16 mkdtemp 断继承修复：CPython tempfile.mkdtemp 内部 os.mkdir(path,
+    //   0o600) 在 Windows 生成保护型 owner-only DACL（不继承父 ACE）——工作区/
+    //   临时能力 SID 的授权 ACE 落空，受限令牌子进程（pip 等）在其内建目录/写文件
+    //   全拒（pdfplumber「评估PDF转Word」DSH 助手七轮实录：pip-unpack-* Errno 13）。
+    //   PYTHONPATH 前挂 exe 同级 dsh\pyshim（sitecustomize 把 tempfile.mkdtemp 换成
+    //   等价普通 mkdir——默认继承 DACL，授权 ACE 天然在位；DSH runner 原样继承
+    //   环境块给受限子进程，注入可达）。幂等：已在路径首则不重挂；目录缺失跳过
+    //   （旧部署副本无 shim 不阻断）。
+    const QString sPyShim = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/dsh/pyshim");
+    if (QDir(sPyShim).exists()) {
+        const QString sOldPp = oEnv.value(QStringLiteral("PYTHONPATH"));
+        if (!sOldPp.startsWith(sPyShim, Qt::CaseInsensitive)) {
+            oEnv.insert(QStringLiteral("PYTHONPATH"),
+                        sOldPp.isEmpty()
+                            ? sPyShim
+                            : sPyShim + QLatin1Char(';') + sOldPp);
+        }
+    }
     // 2026.08.18 自定义大模型：激活条目注入 llm-pi-ai 的 env 槽位（组合 cordis.yml 的
     //   autocode-active provider 逐字段读这些变量；密钥值走 credentials-local 的 env
     //   阶梯最优先级）。未启用（表空/Active 无效）时不设——组合回落 ?? 兜底默认值。
@@ -1481,14 +1657,26 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     //   2026.09.27 额外可写目录自愈授 ACE（幂等；见 ApplyExtraWriteDirs）——pwsh 沙箱
     //   的写强制是纯 NTFS DACL，会话 cwd（=工程根）派生的写 SID 被授到额外目录即放行。
     ApplyExtraWriteDirs(a_sWorkDir, DshExtraWriteDirs());
+    // 2026.10.15 工程根 Low 标签可写性自愈（见 DshEnsureLabelWritable 注释）：补上/
+    //   失败各提示一行，不阻断会话（文件读写不受影响；用户可人工 icacls/takeown）。
+    const int iLbl = DshEnsureLabelWritable(a_sWorkDir);
+    if (iLbl > 0) {
+        emit sigInfo(QStringLiteral(
+            "[dsh] 已自动补工程根写权限 ACE（沙箱命令执行前置，账户级显式条目）"));
+    } else if (iLbl < 0) {
+        emit sigInfo(QStringLiteral(
+            "[dsh] 工程根写权限自愈失败——沙箱命令执行可能被拒（Win32 5）；"
+            "请人工执行：icacls \"<工程根>\" /grant \"*<本机用户SID>:(OI)(CI)(F)\""));
+    }
     m_iInitId = m_iNextRpcId++;
     QJsonObject oParams;
     oParams.insert(QStringLiteral("cwd"), a_sWorkDir);
     oParams.insert(QStringLiteral("provider"), EffectiveProvider());
     oParams.insert(QStringLiteral("model"), EffectiveModel());
     // 2026-10-08 思考强度（SDK initialize reasoningEffort；off/low/high/max；
-    //   服务端校验非空字符串，空=不传走 adapter 默认）。
-    if (!s_sDshEffort.isEmpty()) {
+    //   服务端校验非空字符串，空=不传走 adapter 默认）。2026.10.14 自愈重试后
+    //   （m_bEffortDropped）重启路径也不再带 effort，直至 runner 重建。
+    if (!s_sDshEffort.isEmpty() && !m_bEffortDropped) {
         oParams.insert(QStringLiteral("reasoningEffort"), s_sDshEffort);
     }
     SendRequest(QStringLiteral("initialize"), oParams, m_iInitId);
@@ -1655,6 +1843,10 @@ void CDeepSeekRunner::Stop() {
         m_pStallTimer->stop();
     }
     if (m_pProc->state() != QProcess::NotRunning) {
+        // 2026.10.15 树杀（用户实害：AutoCode 退出后 DSH node 及沙箱辅助 python 残留）：
+        //   taskkill /T /F 收整树，m_pProc->kill 兼容收尾。
+        const quint64 uPid = static_cast<quint64>(m_pProc->processId());
+        KillProcTree(uPid);
         m_pProc->kill();
         m_pProc->waitForFinished(3000);
     }
@@ -1731,6 +1923,27 @@ void CDeepSeekRunner::HandleResponse(int a_iId, const QJsonObject& oRoot) {
         // initialize 响应：error 说明组合/配置问题（重试无益，直接失败）。
         if (oRoot.contains(QStringLiteral("error"))) {
             const QJsonObject oErr = oRoot.value(QStringLiteral("error")).toObject();
+            const QString sErrMsg = oErr.value(QStringLiteral("message")).toString();
+            // 2026.10.14 effort 不支持自愈（ac_bench 实锤：DshEffort=high + glm-5.3
+            //   anthropic 网关模型 → -32603 "does not support reasoning effort \"high\""
+            //   initialize 必挂）：SDK server 仍在进程里活着，不杀进程直接去
+            //   reasoningEffort 重发一次 initialize（本进程生命周期内不再带 effort；
+            //   根因组合由用户在设置页改思考强度/模型解决）。
+            if (!s_sDshEffort.isEmpty() && !m_bEffortDropped
+                && sErrMsg.contains(QStringLiteral("reasoning effort"),
+                                    Qt::CaseInsensitive)) {
+                m_bEffortDropped = true;
+                emit sigInfo(QStringLiteral(
+                    "↻ DSH 报「模型不支持 reasoning effort」——本进程去掉思考强度重试"
+                    "（设置→思考强度/换模型可根治）；原错误：%1").arg(sErrMsg.left(120)));
+                m_iInitId = m_iNextRpcId++;
+                QJsonObject oRetry;
+                oRetry.insert(QStringLiteral("cwd"), m_sPromptWorkDir);
+                oRetry.insert(QStringLiteral("provider"), EffectiveProvider());
+                oRetry.insert(QStringLiteral("model"), EffectiveModel());
+                SendRequest(QStringLiteral("initialize"), oRetry, m_iInitId);
+                return;
+            }
             m_bRebooting = true;   // kill 触发的 slotOnFinished 走 Booting 重试分支，拦下
             m_pProc->kill();
             m_pProc->waitForFinished(3000);
@@ -1738,7 +1951,7 @@ void CDeepSeekRunner::HandleResponse(int a_iId, const QJsonObject& oRoot) {
             MarkProcDead();
             EmitFailed(QStringLiteral("DSH initialize 失败：%1 %2").arg(
                 oErr.value(QStringLiteral("code")).toVariant().toString(),
-                oErr.value(QStringLiteral("message")).toString()));
+                sErrMsg));
             return;
         }
         m_eProcState = ProcReady;

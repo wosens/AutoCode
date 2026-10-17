@@ -89,6 +89,7 @@ private:
     QTreeWidget* HisTreeOf(CTaskListPanel& a_p) { return a_p.findChild<QTreeWidget*>(); }
 };
 
+
 void TestTaskListPanel::selectTaskSwitchesToCurrentTab() {
     CTaskListPanel panel;
     panel.resize(600, 800);
@@ -498,6 +499,53 @@ void TestTaskListPanel::explorerClipboardInterop() {
              CProjectExplorerPanel::XferOk);
     QVERIFY(!QFile::exists(sB));
     QVERIFY(QFile::exists(sDstDir + QStringLiteral("/b.log")));
+
+    // —— 6. 覆盖档（2026.10.16 粘贴同名弹窗「覆盖」，DoPaste 预扫后传入）： ——
+    //   文件替换不留新编号；目录合并（目标独有保留、同名被源替换）；移动覆盖源消失。
+    {
+        QFile fOld(sDstDir + QStringLiteral("/a.txt"));
+        QVERIFY(fOld.open(QIODevice::WriteOnly)); fOld.write("old");
+    }
+    QCOMPARE(CProjectExplorerPanel::TransferItem(sA, sDstDir,
+                                                 /*move=*/false, /*overwrite=*/true),
+             CProjectExplorerPanel::XferOk);
+    QVERIFY(!QFile::exists(sDstDir + QStringLiteral("/a (3).txt")));   // 覆盖不新增编号
+    {
+        QFile fBack(sDstDir + QStringLiteral("/a.txt"));
+        QVERIFY(fBack.open(QIODevice::ReadOnly));
+        QCOMPARE(fBack.readAll(), QByteArray("aaa"));                  // 内容已替换为源
+    }
+    // 目录合并覆盖：源 dirO/inner.txt+onlySrc.txt → 目标预置 dirO/inner.txt+onlyDst.txt。
+    QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dirO")));
+    QVERIFY(QDir().mkpath(sDstDir + QStringLiteral("/dirO")));
+    { QFile f(sRoot + QStringLiteral("/dirO/inner.txt"));   QVERIFY(f.open(QIODevice::WriteOnly)); f.write("new"); }
+    { QFile f(sRoot + QStringLiteral("/dirO/onlySrc.txt")); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("s"); }
+    { QFile f(sDstDir + QStringLiteral("/dirO/inner.txt")); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("old"); }
+    { QFile f(sDstDir + QStringLiteral("/dirO/onlyDst.txt")); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("d"); }
+    QCOMPARE(CProjectExplorerPanel::TransferItem(sRoot + QStringLiteral("/dirO"),
+                                                 sDstDir, /*move=*/false, /*overwrite=*/true),
+             CProjectExplorerPanel::XferOk);
+    QVERIFY(QFile::exists(sDstDir + QStringLiteral("/dirO/onlyDst.txt")));   // 目标独有保留
+    QVERIFY(QFile::exists(sDstDir + QStringLiteral("/dirO/onlySrc.txt")));   // 源文件合入
+    {
+        QFile f(sDstDir + QStringLiteral("/dirO/inner.txt"));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QCOMPARE(f.readAll(), QByteArray("new"));                            // 同名被源替换
+    }
+    // 移动+覆盖：目标同名被替换、源消失、不留编号。
+    const QString sC = sRoot + QStringLiteral("/src/c.txt");
+    { QFile f(sC); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("ccc"); }
+    { QFile f(sDstDir + QStringLiteral("/c.txt")); QVERIFY(f.open(QIODevice::WriteOnly)); f.write("old"); }
+    QCOMPARE(CProjectExplorerPanel::TransferItem(sC, sDstDir,
+                                                 /*move=*/true, /*overwrite=*/true),
+             CProjectExplorerPanel::XferOk);
+    QVERIFY(!QFile::exists(sC));
+    QVERIFY(!QFile::exists(sDstDir + QStringLiteral("/c (2).txt")));
+    {
+        QFile f(sDstDir + QStringLiteral("/c.txt"));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QCOMPARE(f.readAll(), QByteArray("ccc"));
+    }
 
     // 收尾：清空测试写入的剪贴板（勿把测试文件清单留给用户）。
     QGuiApplication::clipboard()->clear();

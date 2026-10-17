@@ -1,4 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M2.5 10 Q2.5 7.5 5 7.5 H9.5 L12.5 10.5 H15.5 Q18 10.5 18 13 V22 Q18 24.5 15.5 24.5 H5 Q2.5 24.5 2.5 22 Z" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M20.5 20.5 H30.5 M25.5 15.5 V25.5" stroke="#27ae60" stroke-width="3.4" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 添加根节点：节点树 + 加号 -->
+  <circle cx="6.8" cy="13" r="2.7" stroke="#2563EB" stroke-width="2"/>
+  <circle cx="15" cy="7" r="2.2" stroke="#2563EB" stroke-width="1.8"/>
+  <circle cx="15" cy="17.5" r="2.2" stroke="#2563EB" stroke-width="1.8"/>
+  <path d="M9.2 12 L13 8 M9.2 14 L13 16.6" stroke="#2563EB" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M19.5 9.5 V14.5 M17 12 H22" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round"/>
 </svg>

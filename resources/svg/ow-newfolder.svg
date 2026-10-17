@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <!-- 文件夹体（后板 + 前板梯形），主色 #2563eb 同 ow-* 图标族 -->
-  <path d="M4 25 L4 8 L11 8 L13.5 11 L26 11 L26 25 Z" stroke="#2563eb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-  <!-- 加号：右上角 -->
-  <path d="M22.5 5.5 L22.5 13.5 M18.5 9.5 L26.5 9.5" stroke="#2563eb" stroke-width="2.6" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 新建文件夹：文件夹 + 加号 -->
+  <path d="M3 7 Q3 5 5 5 H8.6 L10.6 7 H16 Q18 7 18 9 V10.5" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M3 9 V18 Q3 20 5 20 H10.5" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16.5 13.5 V20.5 M13 17 H20" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round"/>
 </svg>

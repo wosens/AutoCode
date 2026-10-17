@@ -1,5 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M7 25 L20 12" stroke="#2563eb" stroke-width="2.4" stroke-linecap="round"/>
-  <path d="M20 12 L23 6 L24 11 L29 12 L24 14 L22.5 19 L20 12 Z" stroke="#2563eb" stroke-width="1.8" stroke-linejoin="round"/>
-  <path d="M7 10 h0.01 M12 5 h0.01 M27 22 h0.01 M10 20 h0.01" stroke="#2563eb" stroke-width="2.8" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 自动命名：魔法棒 + 星光 -->
+  <path d="M4.5 19.5 L13.8 10.2" stroke="#2563EB" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M18 3.2 L18.9 5.8 L21.5 6.7 L18.9 7.6 L18 10.2 L17.1 7.6 L14.5 6.7 L17.1 5.8 Z" fill="#7C6CF0"/>
+  <circle cx="20.6" cy="12.4" r="0.9" fill="#7C6CF0"/>
+  <circle cx="15.2" cy="2.6" r="0.8" fill="#7C6CF0"/>
 </svg>

@@ -1,5 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M4 10 Q4 7 7 7 L11.5 7 L14.5 10.5 H25 Q28 10.5 28 13.5 V14" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M4 10 V24 Q4 27 7 27 H17" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M20 20 H29 M26 17 L29 20 L26 23" stroke="#2563eb" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 资源管理器打开：文件夹 + 文件明细浮窗 -->
+  <path d="M3 8 Q3 6 5 6 H8.6 L10.6 8 H15 Q17 8 17 10 V11" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M3 10 V17.5 Q3 19.5 5 19.5 H11" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="12.5" y="12.5" width="8" height="8" rx="1.6" stroke="#2563EB" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M14.5 15.5 H18.5 M14.5 18 H17.5" stroke="#F5A623" stroke-width="1.6" stroke-linecap="round"/>
 </svg>

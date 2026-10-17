@@ -11,11 +11,21 @@
 #include "project/CGuideFingerprintScanner.h"
 #include "project/CProjectManager.h"
 #include "orch/CTaskOrchestrator.h"
+#include "core/CTaskInfo.h"   // 2026-10-09 autoNameRetryAfterCrash 建任务对象
+#include <QProcess>
 #include "agent/CHermesRunner.h"
+#include "agent/CAgentRunnerBase.h"
 #include "agent/CAgentRunnerFactory.h"
 #include <QTemporaryDir>
 #include <QStandardPaths>
 #include <QTest>
+#include <QDir>
+#ifdef Q_OS_WIN
+#include <windows.h>   // 2026-10-17 DSH 额外可写目录双条件回归（DACL/SACL 验证）
+#include <accctrl.h>
+#include <aclapi.h>
+#include <sddl.h>
+#endif
 
 // 本轮（be3fd900）新增/修改的纯逻辑单元测试。
 // 覆盖范围：
@@ -96,6 +106,108 @@ private:
     }
 
 private slots:
+    // ============ 2026-10-17 DSH 额外可写目录放行双条件回归（ACE+Low 标签） ============
+    //   实害：TukanPrint 工程沙箱内链接落宿主 PlugIns 报 LNK1104/Access denied；
+    //   harness 受限令牌被 restrictTokenIntegrity 降到 Low IL，只授 DACL workspace
+    //   SID ACE 不够——Low 令牌写 Medium 目录被 No-Write-Up 拒，必须同 SACL 补
+    //   Low 标签（harness grantWrite 同款双写）。
+    void testDshExtraWriteDirsAclAndLabel() {
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sWork  = oTmp.path() + QStringLiteral("/ws");
+        const QString sExtra = oTmp.path() + QStringLiteral("/extra");
+        QVERIFY(QDir().mkpath(sWork));
+        QVERIFY(QDir().mkpath(sExtra));
+        // 授予（0 失败）+ 幂等二跑。
+        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
+        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
+
+        // 验证双条件：DACL 应有 mask=GRANT_MASK、OI|CI、S-1-4-* 的 allow ACE；
+        // SACL 应有 Low（S-1-16-4096）标签 ACE。
+        const QString sNative = QDir::toNativeSeparators(sExtra);
+        PACL pDacl = nullptr, pSacl = nullptr;
+        PSECURITY_DESCRIPTOR pSd = nullptr;
+        QCOMPARE(GetNamedSecurityInfoW(
+                     reinterpret_cast<const wchar_t*>(sNative.utf16()), SE_FILE_OBJECT,
+                     DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                     nullptr, nullptr, &pDacl, &pSacl, &pSd), static_cast<DWORD>(ERROR_SUCCESS));
+        struct CSdGuard {
+            PSECURITY_DESCRIPTOR p;
+            ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
+        } stGuard{ pSd };
+        const DWORD kGrant = (FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD)
+                             & ~STANDARD_RIGHTS_WRITE;
+        BOOL bAcl = FALSE, bLabel = FALSE;
+        if (pDacl != nullptr) {
+            for (DWORD i = 0; i < pDacl->AceCount; ++i) {
+                void* pAce = nullptr;
+                if (!GetAce(pDacl, i, &pAce) || pAce == nullptr) { continue; }
+                const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+                if (pHdr->AceType != ACCESS_ALLOWED_ACE_TYPE) { continue; }
+                const auto* pAllow = static_cast<const ACCESS_ALLOWED_ACE*>(pAce);
+                if (pAllow->Mask != kGrant) { continue; }
+                if ((pHdr->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))
+                        != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) {
+                    continue;
+                }
+                LPWSTR wsSid = nullptr;
+                if (ConvertSidToStringSidW(
+                        reinterpret_cast<PSID>(const_cast<unsigned long*>(&pAllow->SidStart)),
+                        &wsSid) && wsSid != nullptr) {
+                    const QString sSid = QString::fromWCharArray(wsSid);
+                    LocalFree(wsSid);
+                    if (sSid.startsWith(QStringLiteral("S-1-4-"))) { bAcl = TRUE; }
+                }
+            }
+        }
+        if (pSacl != nullptr) {
+            for (DWORD i = 0; i < pSacl->AceCount; ++i) {
+                void* pAce = nullptr;
+                if (!GetAce(pSacl, i, &pAce) || pAce == nullptr) { continue; }
+                const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+                if (pHdr->AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) { continue; }
+                const auto* pLbl = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(pAce);
+                LPWSTR wsSid = nullptr;
+                if (ConvertSidToStringSidW(
+                        reinterpret_cast<PSID>(const_cast<unsigned long*>(&pLbl->SidStart)),
+                        &wsSid) && wsSid != nullptr) {
+                    const QString sSid = QString::fromWCharArray(wsSid);
+                    LocalFree(wsSid);
+                    if (sSid == QStringLiteral("S-1-16-4096")) { bLabel = TRUE; }
+                }
+            }
+        }
+        QVERIFY2(bAcl, "额外目录缺 workspace SID allow ACE");
+        QVERIFY2(bLabel, "额外目录缺 Low 标签（Low IL 令牌 No-Write-Up 会拒）");
+    }
+
+    // ============ 2026.10.14 阶段决策解析假驳回死循环回归（ParseDecisionText） ============
+    //   现场复现：Test 阶段报告转述历史驳回结论（「不构成本轮驳回」），且决策行内嵌在
+    //   总结行中（「测试阶段完成，**决策：通过**。」非行首）→ Tier1 行锚定不命中，
+    //   Tier2 尾部扫到「驳回」叙述词 → 通过被误判驳回；因评审通过会重置迭代计数，
+    //   循环不触发熔断 → 无限回炉。
+    void testParseDecisionText() {
+        using E = CTaskOrchestrator;
+        // ① 行首决策行：各自命中（基线口径不回退）。
+        QCOMPARE(E::ParseDecisionText(QStringLiteral("## 测试结果\n全部通过\n\n决策：通过")),
+                 EReviewDecision::Pass);
+        QCOMPARE(E::ParseDecisionText(QStringLiteral("发现崩溃\n\n决策：驳回")),
+                 EReviewDecision::Reject);
+        // ② 现场文本（决策内嵌加粗 + 尾部否定式驳回叙述，无行首决策行）→ 必判通过。
+        QCOMPARE(E::ParseDecisionText(QStringLiteral(
+            "测试阶段完成，**决策：通过**。**执行摘要**：自编译零错误；"
+            "上轮唯一驳回项（向导开-关-开 0xC0000005）一手复证全存活；"
+            "退出期崩溃归因（对照实验，非缺陷）：率无差异且与迭代 5 三基线归因完全一致，"
+            "判非本插件问题，不构成本轮驳回。失败测试：无。")),
+            EReviewDecision::Pass);
+        // ③ 无决策行 + 尾部真实驳回语义 → 仍判驳回（保守兜底不放宽）。
+        QCOMPARE(E::ParseDecisionText(QStringLiteral(
+            "运行了全部测试。3 个用例失败且均为代码缺陷，结论：驳回，退回开发修复。")),
+            EReviewDecision::Reject);
+        // ④ 全空/无任何信号 → 默认通过。
+        QCOMPARE(E::ParseDecisionText(QStringLiteral("完成。")), EReviewDecision::Pass);
+    }
+
     // ============ 2026.09.23 v3.0.219 工作量评估（EstimateAdhocTurns 纯启发式） ============
     //   只升不降、封顶 200；四信号（编号子任务/点名文件/重活关键词/长度）叠加单调。
     void testEstimateAdhocTurns() {
@@ -374,11 +486,12 @@ private slots:
                            CTaskOrchestrator::PermAuto, QString(), nullptr);
         stOrch.SubmitAdhoc(QStringLiteral("asst-q"), QStringLiteral("第三条：补充单元测试"),
                            CTaskOrchestrator::PermAuto, QString(), nullptr);
-        // 等全程收敛（首轮 + 合并轮，最终恰好一次 sigAdhocFinished）。
-        for (int iWait = 0; iWait < 600 && iFinished < 1; ++iWait) {
+        // 等全程收敛：2026-10-16 轮末改「先交还输入栏（finish#1）→ 延迟 1.5s 合并轮
+        //   起跑 → 跑完 finish#2」，全程恰好两次 sigAdhocFinished（旧同步续发版为 1 次）。
+        for (int iWait = 0; iWait < 600 && iFinished < 2; ++iWait) {
             QTest::qWait(100);
         }
-        QCOMPARE(iFinished, 1);
+        QCOMPARE(iFinished, 2);
 
         // 每条排队指令各转正一次。
         QCOMPARE(aPendingStarted.size(), 2);
@@ -484,10 +597,11 @@ private slots:
         QVERIFY(!stOrch.EditQueuedAdhoc(QStringLiteral("asst-re"), sQ3New,
                                         QStringLiteral("  ")));
 
-        for (int iWait = 0; iWait < 600 && iFinished < 1; ++iWait) {
+        // 2026-10-16 轮末延迟 1.5s 续发：等 finish#1（轮 1 交还输入栏）+ finish#2（续发轮）。
+        for (int iWait = 0; iWait < 600 && iFinished < 2; ++iWait) {
             QTest::qWait(100);
         }
-        QCOMPARE(iFinished, 1);
+        QCOMPARE(iFinished, 2);
 
         // 续发只转正了改写后的那一条。
         QCOMPARE(aPendingStarted.size(), 1);
@@ -1142,6 +1256,331 @@ private slots:
         QSKIP("非 Windows 平台跳过");
 #endif // Q_OS_WIN
     }
+    // ============ 2026-10-10 深度链重启预算上调（Compositer 实害二期） ============
+    //   专家模式深度链轮不经 SubmitAdhoc——v4.0.309 的入口上调管不到链内：执行轮上限
+    //   耗尽 → DeepChainRestart 重启时预算阶梯上调（上轮×1.5 封顶 200）。本用例
+    //   （hermes stub 按轮型分流）：执行轮恒触顶（error_max_turns）→ 自动续跑 2 次 →
+    //   深度链重启事件 + 「深度链重启：执行轮轮次预算自动上调 40 → 60」；重启后规划轮
+    //   正常、执行轮成功收链（预算上调后 streak 清零回落由既有用例覆盖）。
+    void deepChainRestartBoostsBudget() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过深度链重启预算用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "const crypto=require('crypto');"
+                "const sid='dc-'+crypto.randomBytes(3).toString('hex');"
+                "const out=o=>console.log(JSON.stringify(o));"
+                "if(!s.includes('专家模式·规划轮')&&!s.includes('专家模式·验证轮')"
+                "&&s.includes('修复这个很重的功能问题')&&!s.includes('重启教训')){"
+                // 首链执行轮（无标记，用户原文直投）：恒触顶（error_max_turns）
+                "out({type:'session',sessionId:sid});"
+                "out({type:'result',subtype:'error_max_turns',sessionId:sid,"
+                "text:'执行未完成'});"
+                "}else{"
+                // 规划轮 / 验证轮 / 带重启教训的执行轮（重启后）：正常
+                "let text='已完成';"
+                "if(s.includes('专家模式·规划轮')){text='## 目标\\n修复\\n## 实施步骤\\n1. 改 a\\n## 验收标准\\n1. 编译过';}"
+                "if(s.includes('专家模式·验证轮')){text='核验证据：全绿\\nVERIFY:PASS';}"
+                "out({type:'session',sessionId:sid});"
+                "out({type:'assistant',text:text,model:'stub-model',"
+                "usage:{input:10,output:5}});"
+                "out({type:'result',subtype:'success',sessionId:sid,text:text});}"
+                "});")
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(1);   // 开专家模式
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        QStringList aKinds, aBudgets;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString& sTxt) {
+            aKinds.append(sKind);
+            if (sKind == QStringLiteral("turns_budget")) {
+                aBudgets.append(sTxt);
+            }
+        });
+        // 提交 → 规划（正常）→ 执行（触顶×3：首轮+续跑2）→ deep_restart + 预算上调
+        //   → 重启链规划/执行/验证正常 → 收链。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-dc"),
+                           QStringLiteral("修复这个很重的功能问题"),
+                           CTaskOrchestrator::PermAuto);
+        for (int iWait = 0; iWait < 600 && !aKinds.contains(QStringLiteral("deep_fail")); ++iWait) {
+            QTest::qWait(100);
+        }
+        QVERIFY(aKinds.contains(QStringLiteral("deep_restart")));
+        QVERIFY(aBudgets.size() >= 1);
+        QString sChainBoost;
+        for (const QString& sE : aBudgets) {
+            if (sE.contains(QStringLiteral("深度链重启"))) { sChainBoost = sE; break; }
+        }
+        QVERIFY2(!sChainBoost.isEmpty(), "无深度链重启上调事件");
+        QVERIFY(sChainBoost.contains(QStringLiteral("48 → 72")));   // 评估 48 × 1.5
+        // 静态配置复位。
+        CTaskOrchestrator::SetAdhocDeepOverride(0);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+    // ============ 2026-10-09 触顶历史感知轮次预算（连续撞上限后下轮自动上调） ============
+    //   Compositer 实害：半月 77/78 轮触顶，用户被迫反复手发「继续」——「继续」二字
+    //   评估器称不出真实工作量恒 40/48。本用例（hermes node stub 按调用序号分流）：
+    //   前 3 次调用回 result subtype=error_max_turns（LastWasMaxTurns → 自动续跑 2 次
+    //   + 压栈断点），第 4 次（用户发「继续」）正常——断言：①断点轮无上调事件；
+    //   ②「继续」轮出现上调事件 40 → 60（上轮 40×1.5，连续触顶 3 轮）；③正常完成后
+    //   触顶计数回落（再发一条不上调）。④纯函数阶梯：40→60→90→135→200→200 且
+    //   不低于评估值。（e2e 载体弃 claude/pi：本测试进程下 QProcess+MergedPath 环境
+    //   组 cmd/node 子进程稳定 FailedToStart——测试基建特例，生产实例不受影响。）
+    void adhocTurnsBudgetBoostAfterLimit() {
+#ifdef Q_OS_WIN
+        // —— ④ 纯函数阶梯（无 spawn，任何环境可跑）——
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 40), 60);
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 60), 90);
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(48, 90), 135);
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 134), 200);   // 134*3/2=201 钳 200
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 140), 200);   // 封顶
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 200), 200);   // 恒顶
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(120, 40), 120);   // 评估值更高取评估
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(200, 40), 200);
+        QCOMPARE(CTaskOrchestrator::TurnsBudgetAfterLimitHit(40, 0), 40);      // 无上轮预算防御
+
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过触顶预算上调用例");
+        }
+        // 2026-10-09 备注：排查期间本机曾现「QProcess+MergedPath 环境 spawn 间歇
+        //   全灭」（未改动的 test_pirunner 同批变红佐证外部因素，后自行恢复；生产
+        //   AutoCode 实例常年正常）。若再遇整批 spawn 用例变红，先跑 test_pirunner
+        //   对照排除环境，勿误判本用例回归。
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/tb_calls.log");
+        // stub：日志 '===' 段数-1=调用序号；前 3 次（n=0,1,2）error_max_turns。
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "const fs=require('fs');"
+                "const logf=%1;"
+                "fs.appendFileSync(logf,'===\\n');"
+                "let n=0;try{"
+                "n=(fs.readFileSync(logf,'utf8').match(/===/g)||[]).length-1;"
+                "}catch(e){}"
+                "const lim=n<=2;"
+                "console.log(JSON.stringify({type:'session',sessionId:'stub-tb-'+n}));"
+                "console.log(JSON.stringify({type:'assistant',"
+                "text:lim?'迁移工作做了很多但本轮没做完':'这一轮迁移工作已全部完成并验证通过',"
+                "model:'stub-model',usage:{input:30,output:8}}));"
+                "console.log(JSON.stringify({type:'result',"
+                "subtype:lim?'error_max_turns':'success',"
+                "sessionId:'stub-tb-'+n,"
+                "text:lim?'迁移工作做了很多但本轮没做完':'这一轮迁移工作已全部完成并验证通过'}));"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(0);
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        int iAsstFinish = 0;
+        QStringList aBudgetEvents;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iAsstFinish; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString& sTxt) {
+            if (sKind == QStringLiteral("turns_budget")) {
+                aBudgetEvents.append(sTxt);
+            }
+        });
+        // ① 首条提示词：打满（调用 0）→ 自动续跑 2 次（调用 1、2）→ 压栈断点。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-tb"),
+                           QStringLiteral("做一个很重的任务"),
+                           CTaskOrchestrator::PermAuto);
+        for (int iWait = 0; iWait < 300 && iAsstFinish == 0; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iAsstFinish, 1);   // 断点轮已收尾（预算耗尽压栈）
+        QVERIFY(aBudgetEvents.isEmpty());   // 断点期间无上调
+        // ② 用户发「继续」（调用 3 正常）：上调 40 → 60（上轮 40×1.5）。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-tb"),
+                           QStringLiteral("继续"),
+                           CTaskOrchestrator::PermAuto);
+        for (int iWait = 0; iWait < 300 && iAsstFinish < 2; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iAsstFinish, 2);
+        QCOMPARE(aBudgetEvents.size(), 1);
+        QVERIFY(aBudgetEvents.at(0).contains(QStringLiteral("40 → 60")));
+        QVERIFY(aBudgetEvents.at(0).contains(QStringLiteral("连续触顶 3 轮")));
+        // ③ 正常完成回落：再发一条不触顶的提问 → 无新上调事件。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-tb"),
+                           QStringLiteral("随便聊聊近况"),
+                           CTaskOrchestrator::PermAuto);
+        for (int iWait = 0; iWait < 300 && iAsstFinish < 3; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iAsstFinish, 3);
+        QCOMPARE(aBudgetEvents.size(), 1);   // 无新上调（回落）
+        // 静态配置复位（不泄漏给同进程后续用例）。
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+    // ============ 2026-10-09 任务命名轮瞬态崩溃自愈重试（AutoNameNow 失败重试一次） ============
+    //   实害：pdfplumber 工程——命名轮 pi RPC 进程流式输出中 libuv 断言 fail-fast 崩溃
+    //   （退出码 0xC0000409，非配置错误），旧版直接打 auto_name_failed、任务名永留临时名。
+    //   本用例：stub CLI 第 2 次调用（命名首轮）无 result 直接 exit(3)（模拟瞬态崩溃）
+    //   → auto_name_retry 事件 + 不发 sigAutoNameDone → singleShot 重入 AutoNameNow
+    //   第 3 次调用正常回名称 → sigAutoNameDone(true) 任务名回填。
+    void autoNameRetryAfterCrash() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 命名崩溃重试用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/crash_calls.log");
+        // stub：日志 '===' 段数=调用序号；n===1（命名首轮）瞬态崩溃（stderr + exit 3，
+        //   无任何事件输出）；其余正常回 result。
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "const fs=require('fs');"
+                "let n=0;try{const t=fs.readFileSync(%1,'utf8');"
+                "n=(t.match(/===/g)||[]).length;}catch(e){}"
+                "fs.appendFileSync(%1,'===\\n'+s+'\\n');"
+                "if(n===1){console.error('stub transient crash');process.exit(3);}"
+                "console.log(JSON.stringify({type:'session',sessionId:'stub-cr-1'}));"
+                "console.log(JSON.stringify({type:'assistant',text:'stub',"
+                "model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',"
+                "sessionId:'stub-cr-1',text:s.includes('%2')?"
+                "'开发pdfplumber动态库':'已完成'}));"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .arg(QStringLiteral("【任务命名】"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(0);
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        int iDoneCount = 0;
+        int iAsstFinish = 0;
+        bool bDoneOk = false;
+        QString sDoneName;
+        bool bRetryEvent = false;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAutoNameDone,
+                         [&](CTaskInfo*, bool bOk, const QString& sName) {
+            ++iDoneCount; bDoneOk = bOk; sDoneName = sName;
+        });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iAsstFinish; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigStageEvent,
+                         [&](CTaskInfo*, const QString& sKind, const QString& sTxt) {
+            if (sKind == QStringLiteral("auto_name_retry")) {
+                bRetryEvent = true;
+            }
+        });
+        // ① 用户轮先跑完（第 1 次调用 n=0 正常）——建出空闲会话供命名轮借用。
+        stOrch.SubmitAdhoc(QStringLiteral("asst-cr"),
+                           QStringLiteral("正常处理这个请求"),
+                           CTaskOrchestrator::PermReadOnly);
+        for (int iWait = 0; iWait < 200 && iAsstFinish == 0; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iAsstFinish, 1);   // 用户轮已结束（会话空闲）
+        // ② 任务命名首轮（第 2 次调用 n=1）瞬态崩溃 → auto_name_retry + 不发 done。
+        CTaskInfo* pTask = new CTaskInfo(&stOrch);
+        pTask->SetId(QStringLiteral("crash01"));
+        pTask->SetUserRequest(QStringLiteral("部署并且编译 pdfplumber 成纯C动态库"));
+        QVERIFY(stOrch.AutoNameNow(pTask, QStringLiteral("asst-cr")));
+        for (int iWait = 0; iWait < 200 && !bRetryEvent; ++iWait) {
+            QTest::qWait(100);
+        }
+        QVERIFY(bRetryEvent);       // 崩溃已被捕获并自动重试
+        QCOMPARE(iDoneCount, 0);    // 重试期间未发 sigAutoNameDone
+        // ③ 重试轮（第 3 次调用 n=2 正常）回填成功。
+        for (int iWait = 0; iWait < 200 && iDoneCount == 0; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iDoneCount, 1);
+        QVERIFY(bDoneOk);
+        QCOMPARE(sDoneName, QStringLiteral("开发pdfplumber动态库"));
+        QCOMPARE(pTask->Name(), QStringLiteral("开发pdfplumber动态库"));
+        // ③ stub 进程无残留。
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+
     // ============ 2026-10-03 自动命名忙等待（AutoNameAsstNow 全忙排队至空闲） ============
     //   实害：HarnessGatewayPlugin 单助手工程——収尾自动命名在 sigAdhocFinished 同步链里
     //   跑，目标 runner 尚未退净被误判「忙」且无空闲会话可借 → 旧版直接 false 打

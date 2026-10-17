@@ -159,7 +159,7 @@ private:
     static QString s_sHermesEffort;   // 2026-10-08 思考强度（agent.reasoning_effort；空=不托管）
     void Reset();
     void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
-    void ApplyUsage(const QJsonObject& oUsage);
+    void ApplyUsage(const QJsonObject& oUsage, bool a_bFromResult = false);
     double ComputeTurnCost() const;
     void EmitFailed(const QString& a_sMsg);
 

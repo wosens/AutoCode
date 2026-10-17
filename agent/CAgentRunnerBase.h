@@ -24,6 +24,14 @@ public:
     explicit CAgentRunnerBase(QObject* a_pParent = nullptr);
     ~CAgentRunnerBase() override;
 
+    // 2026.10.15 进程树终止（用户实害：关闭全部 AutoCode 实例后 Agent 进程仍残留——
+    //   Hermes -z 及其 kernel 孙进程、pi cli.js 及 agent 辅助 python 全成孤儿）。
+    //   Job Object 方案在本机不可靠（AssignProcessToJobObject 实测 err=5，父链已
+    //   在 Job 时被拒；仅 CClaudeRunner 自带 Job 且静默回退），故用系统 taskkill
+    //   /T /F 按树枚举终止；同步执行（超时 8s），失败静默（kill 路径不抛错，
+    //   直接子进程由调用方 m_pProc->kill() 兼容收尾）。
+    static void KillProcTree(quint64 a_uPid);
+
     // 后端标识（"claude" / "dsh"）：日志展示与后端漂移检测用。
     virtual QString BackendName() const = 0;
 
@@ -76,6 +84,13 @@ public:
     // 向当前运行中的进程追加一条用户轮次；未运行或失败时安全 no-op 返回 false。
     virtual bool InjectUserTurn(const QString& a_sText) = 0;
 
+    // 2026-10-16 退净窗口判定（修「轮末排队指令搁浅 + 运行态孤儿反复自愈」）：true =
+    //   本轮 result/settle 已收（InjectUserTurn 必 false）但进程可能尚未退出——此刻
+    //   IsRunning() 仍 true 而本轮实际已结束。编排器据此把排队指令延迟到退净后作为
+    //   新轮投送，而非入队后无人排空（面板卡运行态被看门狗收割）。默认 false：result
+    //   与进程退出同点收尾的后端（hermes/codex/DSH 等）无此窗口。
+    virtual bool IsTurnClosed() const { return false; }
+
     // 最近一次 result 的元信息（供编排器判定 max-turns 与续跑）。
     QString LastSubtype() const { return m_sLastSubtype; }
     QString LastSessionId() const { return m_sLastSessionId; }
@@ -119,6 +134,15 @@ public:
     static QString SharedSkillsCatalog();
     // 指定目录集的清单生成（测试入口）：语义同 SharedSkillsCatalog，目录由调用方给。
     static QString SharedSkillsCatalogFromDirs(const QStringList& aDirs);
+
+    // 子进程环境统一构造（2026.10.10）：systemEnvironment() 基础上把 PATH 替换为
+    // 「注册表 Machine PATH + User PATH + 继承 PATH」合并串（新条目前置优先）。
+    // 动机：install_env.bat 装完 Node/Claude/pi 等写入 Machine/User PATH 后，**已运行**
+    //   的 AutoCode 继承环境看不到新条目——异地新机「装完环境提示成功、发提示词仍
+    //   claude 进程异常退出」一类问题的系统性根因。合并后子进程 cmd 的 PATH 搜索
+    //   即刻命中新装命令，无需重启 AutoCode（同 install_env.bat :RefreshPath 口径）。
+    //   30 秒 TTL 缓存注册表读取；注册表读取失败时安全回退纯 systemEnvironment()。
+    static QProcessEnvironment MergedPathEnvironment();
 
 signals:
     void sigInfo(const QString& a_sLine);                              // 系统/原始信息

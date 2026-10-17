@@ -50,8 +50,10 @@ public:
     // 2026-10-08 手动审查路径：逐文件可增量 + 基线仓（a_sBaselineDir 为
     // review_cache/<目标哈希>.bl；空串=不启用基线）。审查成功的文件基线前移
     // （内容入 blob 仓 + meta 更新），下次「仅审修改」由此判定。
+    // 2026-10-08 并发审查：a_iAgents=并发审查 Agent 数（每文件一个一次性 runner，
+    // N 个 lane 线程各持队列取件；1=串行原路径）。上限 min(agents, 文件数)。
     bool StartEx(const QString& a_sRootDir, const QList<SReviewItem>& a_aFiles,
-                 const QString& a_sBaselineDir, int a_iTimeoutSec);
+                 const QString& a_sBaselineDir, int a_iTimeoutSec, int a_iAgents = 1);
 
     // 停止当前轮（当前文件的 LLM 调用一并终止；已完成的文件结果保留并照常收尾）。
     void Stop();

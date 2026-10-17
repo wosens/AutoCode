@@ -66,12 +66,16 @@ public:
     static void SetDshRootPath(const QString& a_sRoot);
     static QString DshRootPath();
     // 2026.09.27 DSH 额外可写目录（[Dsh] ExtraWriteDirs；';' 分隔）：DSH pwsh 沙箱
-    //   workspace-write 的强制是纯 NTFS DACL（拒绝标记由 stderr 特征分类，无路径
-    //   预检），可写根=会话 cwd=工程根，令牌限制组里带确定性工作区写 SID
-    //   （sha256(规范化工程根)→S-1-4-x-y）。对额外目录授同一 SID 的标准 ACE
-    //   （Allow，OI|CI，Write+Delete）即放行——零 harness 改动，对已部署副本全部
-    //   生效。典型：插件工程产物拷 关联项目\\Execute\\PlugIns 时把该目录加进来。
-    //   fs 文本写工具（fs-sandbox 路径检查）仍限工程根——二进制/拷贝走 pwsh 即可。
+    //   workspace-write 的强制是 NTFS DACL + 完整性标签双条件（拒绝标记由 stderr
+    //   特征分类，无路径预检），可写根=会话 cwd=工程根，令牌限制组里带确定性工作区
+    //   写 SID（sha256(规范化工程根)→S-1-4-x-y）且被 restrictTokenIntegrity 降到
+    //   Low IL（S-1-16-4096）。对额外目录放行两件一起做：①同 SID 标准 ACE（Allow，
+    //   OI|CI，Write+Delete）②SACL 补 Low 标签（NO_WRITE_UP，OI|CI）——2026-10-17
+    //   补：Low 令牌写 Medium 目录被 No-Write-Up 拒，只授 DACL 不够（harness
+    //   grantWrite 对每个放行根同写 Low 标签，见 acl.js）——零 harness 改动，对已
+    //   部署副本全部生效。典型：插件工程产物拷 关联项目\\Execute\\PlugIns 时把该
+    //   目录加进来。fs 文本写工具（fs-sandbox 路径检查）仍限工程根——二进制/拷贝
+    //   走 pwsh 即可。
     static void SetDshExtraWriteDirs(const QStringList& a_aDirs);
     static QStringList DshExtraWriteDirs();
     // 授/撤 ACE（幂等：已有精确 ACE 跳过；命名互斥防多实例竞态）：a_aRevoke 里不在
@@ -303,6 +307,7 @@ private:
     int         m_iPromptId  = 0;         // 当前 session/prompt 请求 id
     int         m_iBootRetry = 0;         // 握手超时已重试次数（上限 1）
     bool        m_bRebooting = false;     // 主动重启中（拦 slotOnFinished 的 Booting 重试分支，防双重重启）
+    bool        m_bEffortDropped = false; // 2026.10.14 initialize 报「模型不支持 reasoning effort」后本进程去 effort 重试（自愈一次，防 DshEffort=high+anthropic 网关模型组合必挂）
     int         m_iFastRetry = 0;         // prompt 中退出已重试次数（上限 2）
     bool        m_bRetryPending = false;  // 快速失败重试等待中
     bool        m_bTurnReported = false;  // 本轮已发 sigFinished（防重复，同 claude m_bFinished）

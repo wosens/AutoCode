@@ -781,7 +781,7 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
     //   PYTHONUTF8/PYTHONIOENCODING 让 python 全链路 UTF-8；LANG/LC_ALL 影响部分
     //   CLI 工具的输出编码。PowerShell 的输出编码由启动时的环境与 profile 决定，
     //   见 README「彻底解决中文编码」一节（profile + 系统 UTF-8 代码页）。
-    QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment oEnv = CAgentRunnerBase::MergedPathEnvironment();
     // 2026-09-12 手工审批弹窗通道（AUTOCODE_ASK_EXE/ASK_PIPE，全后端统一）
     InjectAskEnv(oEnv);
     // 2026-10-07 对话级模型覆盖：生效 key 按起步条目经进程 env 注入（per-进程，
@@ -851,6 +851,10 @@ void CCodexRunner::Stop() {
         m_pStallTimer->stop();
     }
     if (m_pProc->state() != QProcess::NotRunning) {
+        // 2026.10.15 树杀（同 Pi/Hermes/DSH 口径，用户实害进程残留）：taskkill /T /F
+        //   收整树（codex 及其辅助进程），m_pProc->kill 兼容收尾。
+        const quint64 uPid = static_cast<quint64>(m_pProc->processId());
+        KillProcTree(uPid);
         m_pProc->kill();
         m_pProc->waitForFinished(3000);
     }

@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.21)
 
 # 提示：若 CMake 找不到 Qt6，使用 CMakePresets.json 的 "qt6" preset，
 # 或显式 -DCMAKE_PREFIX_PATH=D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64
@@ -48,6 +48,9 @@ qt_add_executable(AutoCode WIN32
     core/CTaskInfo.cpp
     core/CStageMachine.h
     core/CStageMachine.cpp
+    # 2026-10-14 任务编排设计：类型/档位/阶段编排配置（orchestration.json + 动态阶段注册）
+    core/COrchConfig.h
+    core/COrchConfig.cpp
     agent/CClaudeRunner.h
     agent/CClaudeRunner.cpp
     agent/CAgentRunnerBase.h
@@ -87,6 +90,18 @@ qt_add_executable(AutoCode WIN32
     ui/CMessageView.cpp
     ui/CMarkdownPreloader.h
     ui/CMarkdownPreloader.cpp
+    # 2026-10-17 对话流自绘三期（doc/对话流视图自绘改造方案.md）：ModelView 引擎
+    #   四件套——显示条目模型/纯 painter delegate/QTextDocument LRU 池/QListView 视图
+    #   （SBlockData.h 数据结构随 CStreamPresenter.h 分发）
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
     ui/CStageBar.h
     ui/CStageBar.cpp
     ui/CStreamPresenter.h
@@ -101,6 +116,9 @@ qt_add_executable(AutoCode WIN32
     ui/CAskUserDialog.cpp
     ui/CNewTaskDialog.h
     ui/CNewTaskDialog.cpp
+    # 2026-10-14 任务编排设计窗口（功能菜单入口）
+    ui/COrchDesignDialog.h
+    ui/COrchDesignDialog.cpp
     ui/CVersionDialog.h
     ui/CVersionDialog.cpp
     ui/CSettingsDialog.h
@@ -262,7 +280,15 @@ add_custom_command(TARGET AutoCode POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/sdk.autocode.patch.yml"
         "$<TARGET_FILE_DIR:AutoCode>/dsh/sdk.autocode.patch.yml"
-    COMMENT "Sync DSH cordis.autocode.yml + sdk.autocode.patch.yml to output dir"
+    # 2026-10-16 DSH mkdtemp 断继承修复：exe 同级 dsh\pyshim\sitecustomize.py
+    #   （CDeepSeekRunner 前挂 PYTHONPATH 注入受限 python 子进程——tempfile.mkdtemp
+    #   的 0o600 保护型 DACL 断继承致 pip 类写入全拒，详见 agent/dsh/pyshim/）。
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:AutoCode>/dsh/pyshim"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/agent/dsh/pyshim/sitecustomize.py"
+        "$<TARGET_FILE_DIR:AutoCode>/dsh/pyshim/sitecustomize.py"
+    COMMENT "Sync DSH cordis.autocode.yml + sdk.autocode.patch.yml + pyshim to output dir"
 )
 
 # ---- 单元测试（CProjectManager 最近打开历史 MRU 逻辑）----
@@ -331,6 +357,18 @@ qt_add_executable(test_execpanel
     ui/CMessageView.cpp
     ui/CMarkdownPreloader.h
     ui/CMarkdownPreloader.cpp
+    # 2026-10-17 对话流自绘三期（doc/对话流视图自绘改造方案.md）：ModelView 引擎
+    #   四件套——显示条目模型/纯 painter delegate/QTextDocument LRU 池/QListView 视图
+    #   （SBlockData.h 数据结构随 CStreamPresenter.h 分发）
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
     ui/CStageBar.h
     ui/CStageBar.cpp
     ui/CStreamPresenter.h
@@ -346,6 +384,8 @@ qt_add_executable(test_execpanel
     agent/CAgentRunnerFactory.h
     agent/CAgentRunnerBase.h
     agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h   # 2026.10.15 CExecutionPanel::AsstContextLimit 引用 ContextWindowForModel
+    agent/CClaudeRunner.cpp
     core/StageDef.h
     core/StageDef.cpp
     core/CTaskInfo.h
@@ -356,6 +396,7 @@ target_include_directories(test_execpanel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_BINARY_DIR}/gen   # 2026.10.11 AutoCodeVersion.h（启动页版本号经 CRecentProjectsDialog 源问入）
 )
 target_link_libraries(test_execpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
 set_target_properties(test_execpanel PROPERTIES
@@ -477,6 +518,16 @@ qt_add_executable(test_verify_flow
     ui/CMarkdownPreloader.cpp
     ui/CMessageView.h
     ui/CMessageView.cpp
+    # 2026-10-17 自绘三期：CStreamPresenter 的 ModelView 引擎分支引用四件套（链接需要）
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
     ui/CStreamPresenter.h
     ui/CStreamPresenter.cpp
 )
@@ -652,6 +703,16 @@ qt_add_executable(test_orchpi
     ui/CMarkdownPreloader.cpp
     ui/CMessageView.h
     ui/CMessageView.cpp
+    # 2026-10-17 自绘三期：CStreamPresenter 的 ModelView 引擎分支引用四件套（链接需要）
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
     ui/CStreamPresenter.h
     ui/CStreamPresenter.cpp
 )
@@ -917,7 +978,7 @@ add_test(NAME test_sandbox COMMAND test_sandbox)
 set_tests_properties(
     test_projectmanager test_execpanel test_tasklistpanel test_historydb test_verify_flow
     test_record_verify test_rollback test_pirunner test_versiondlg test_codexrunner
-    test_hermesrunner test_frwdevice
+    test_hermesrunner test_frwdevice test_chatmodel
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 # ---- fileread 三件套随所有输出目录（exe 与全部测试）——CFrwDevice 运行时依赖
@@ -925,7 +986,7 @@ set_tests_properties(
 foreach(tgt AutoCode test_projectmanager test_execpanel test_tasklistpanel test_historydb
             test_verify_flow test_record_verify test_rollback import_tasks test_orchpi
             test_dshrunner test_pirunner test_versiondlg test_codexrunner test_hermesrunner
-            test_frwdevice test_sandbox)
+            test_frwdevice test_sandbox test_chatmodel)
     add_custom_command(TARGET ${tgt} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/fileread.dll"
@@ -933,3 +994,51 @@ foreach(tgt AutoCode test_projectmanager test_execpanel test_tasklistpanel test_
             "$<TARGET_FILE_DIR:${tgt}>"
         COMMENT "Copy fileread.dll/code.exe next to ${tgt}")
 endforeach()
+
+# ==== 任务编排设计核心链路回归（2026-10-14，由临时探针 probe_orch 转正）====
+qt_add_executable(test_orchconfig
+    tests/test_orchconfig.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CStageMachine.h
+    core/CStageMachine.cpp
+    core/COrchConfig.h
+    core/COrchConfig.cpp
+)
+target_include_directories(test_orchconfig PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_orchconfig PRIVATE Qt6::Core)
+add_test(NAME test_orchconfig COMMAND test_orchconfig)
+
+# ==== 对话流 Model/View 自绘引擎模型层回归（2026-10-17 自绘三期）====
+# CChatModel 折叠/映射/回填纯逻辑 + CStreamPresenter ModelView 分支集成
+#（Bind(model,view2)/Append/BackfillResult/Rebuild/EnsureCoverage 壳转发）。
+qt_add_executable(test_chatmodel
+    tests/test_chatmodel.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+)
+target_include_directories(test_chatmodel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(test_chatmodel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test frwdevice)
+set_target_properties(test_chatmodel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_chatmodel COMMAND test_chatmodel)
+

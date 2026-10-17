@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QObject>
 #include <QString>
@@ -242,20 +242,47 @@ public:
     // ---- 多实例工程锁（2026.09.07 v2.1.123）----
     // <工程>/.autodev/instance.lock：在席实例标记。工程态（assistant.json/task.json/
     //   guide/record）为整文件后写覆盖先写，双实例同开一工程会互踩——OpenProjectDir
-    //   打开前查锁（他实例持有：弹阻断确认，默认 No；原启动自动恢复静默跳过分支已随
-    //   v2.1.137 移除自动恢复删除），打开成功写自己的锁、切走/退出时摘除；崩溃残留锁
-    //   按 PID 存活判定自动接管（PID 被无关进程复用时按进程名 AutoCode* 复核排除）。
-    //   history.db 本身并发安全不在保护面。
+    //   打开前查锁（他实例持有：弹阻断确认，默认 No），打开成功写自己的锁、切走/退出
+    //   时摘除；崩溃/重启残留锁自动失效接管。
+    // 2026-10-17 v4.4.387 根治层：在席生死不再靠 PID 启发式猜测——项目打开期间本
+    //   实例持有命名内核对象（Event）Global\AutoCodeSeat_v1_<sha256(path)>；进程无论
+    //   正常退出/崩溃/被杀/机器重启/断电，句柄随进程消亡信号自动消失，永不残留、
+    //   PID 复用/权限盲区全部免疫。IsProjectHeldByOther 优先探测该信号；无信号
+    //   （对端为未升级旧版实例）回退 PID 判活（混版本双开仍拦，勿删回退分支）。
     struct SProjectLock {
         qint64  iPid = 0;
         QString sExe;
         QString sStarted;
+        // 2026-10-17 持锁进程创建时刻（Unix epoch ms，GetProcessTimes；started 是写锁
+        //   时刻仅供展示，不可用于身份比对）。>0 时与实际进程创建时刻交叉验证（±3s），
+        //   不一致 = 同名 AutoCode 进程复用 PID → 陈旧锁；旧档无此字段则跳过（兼容）。
+        qint64  iProcStartMs = 0;
     };
     static QString ProjectLockPath(const QString& a_sProjectDir);
     // 读锁（存在且带 pid 才 true）；a_pOut 可空。
     static bool ReadProjectLock(const QString& a_sProjectDir, SProjectLock* a_pOut = nullptr);
-    // 锁主进程存活且非本进程（含进程名复核；OpenProcess 拒绝访问时保守当活）。
+    // 锁主进程存活且非本进程（含进程名复核；OpenProcess 拒绝访问（LocalSystem
+    //   svchost 等受保护进程恒如此）时经 Toolhelp32 快照复核进程名，非 AutoCode*
+    //   判陈旧——2026-10-17 修：重启残留锁 PID 被系统服务复用 + 旧版"保守当活"
+    //   曾误报「工程已被其他实例打开」；锁带 procStartMs 时再交叉验证创建时刻，
+    //   同名 AutoCode 进程复用 PID 亦识别）。
     static bool IsLockHolderAlive(const SProjectLock& a_stLock);
+    // Toolhelp32 快照按 PID 查进程映像名（枚举无需打开目标进程，受保护进程名亦
+    //   可见）；返回是否在快照中找到，a_pOutName 可空。供锁复核/测试用。
+    static bool SnapshotImageNameOfPid(qint64 a_iPid, QString* a_pOutName = nullptr);
+
+    // —— 在席信号（内核对象层，2026-10-17 v4.4.387；详见上面锁节注释）——
+    // 工程在席信号的命名内核对象名（Global\AutoCodeSeat_v1_<sha256 前 24 hex>；
+    //   空目录返回空串）。
+    static QString ProjectSeatEventName(const QString& a_sProjectDir);
+    // 信号是否存在 = 某活实例持有该工程（跨会话/跨用户 Global 命名空间；进程消亡
+    //   即消失。探测失败且非“不存在”时保守视为在席——宁可误报可确认，不可漏报互踩）。
+    static bool ProbeProjectSeatEvent(const QString& a_sProjectDir);
+    // 本实例取得并持有在席信号（他实例已持/信号层不可用返回 false，不抛不计；
+    //   调用方降级文件锁口径继续，勿用作阻断条件）。
+    bool HoldProjectSeatEvent(const QString& a_sProjectDir);
+    // 释放本实例持有的在席信号（切工程/退出；句柄不可继承，子进程不会续命）。
+    void DropProjectSeatEvent();
     static void WriteProjectLock(const QString& a_sProjectDir);
     // 仅摘 pid==本进程 的锁（他实例/陈旧锁不动）。
     static void ReleaseProjectLock(const QString& a_sProjectDir);
@@ -288,8 +315,9 @@ public:
     // 落盘失败不抛；Load 无记录/非法值返回 75（默认）。
     bool SaveAutoCompactPct(int a_iPct);
     int  LoadAutoCompactPct() const;
-    // 比例制换算：K（千 token）= 窗口 × 比例 ÷ 100 ÷ 1000。窗口优先 [Adhoc] ContextLimit
-    // 用户覆盖，未设按模型探测（guide 同步等内置 runner 调 claude 时用）。
+    // 比例制换算：K（千 token）= 窗口 × 比例 ÷ 100 ÷ 1000。窗口按模型探测
+    // （2026-10-15 [Adhoc] ContextLimit 用户覆盖已删，探测为唯一来源；
+    // guide 同步等内置 runner 调 claude 时用）。
     int AutoCompactKFor(const QString& a_sModel) const;
     // 评审阶段并行视角数（[Review] Parallel）：1=串行回退；>1=多视角并行（默认 3）。
     // 无 config.ini/缺键 → 默认 3；非法值（<1 或 >8）兜底回 3。
@@ -399,6 +427,10 @@ public:
     //   a_pActive 带出激活下标（-1 = 无；表空即未启用该功能）。
     QList<SDshModelEntry> LoadDshModels(int* a_pActive = nullptr);
     bool    SaveDshModels(const QList<SDshModelEntry>& a_aModels, int a_iActive);
+    // 2026.10.11 全局作用域读激活下标（无视任务档覆盖）：设置保存时对比「刚存的激活项」
+    //   与全局现值——选中任务保存只写任务档且全局 Active 保持原值，用户取消选择/重启
+    //   后助手回退全局旧模型却无感知（实害："改了当前模型没生效"）。返回 -1 = 表空。
+    int LoadModelsActiveGlobal(const wchar_t* a_pSect) const;
 
     // ---- PIAgent 第三后端（2026.08.19，[Agent] Pi* 键；空=未配置/默认）----
     //   root = PIAgent 仓库根（其下 pi\ 为 monorepo；空=启动时探测 exe 同级 PIAgent）；
@@ -499,6 +531,18 @@ public:
     // 内置默认清单（缺键时的生效值；设置页预填用，与面板默认同源）。
     static QString DefaultExplorerHiddenDirs();
 
+    // ---- 对话日志渲染引擎（config.ini 的 [View] Engine，2026-10-17 自绘三期）----
+    // 双引擎灰度（doc/对话流视图自绘改造方案.md §9.2）：Legacy=CMessageView 卡片流
+    //   （缺省）；ModelView=CChatModel+CChatListView 自绘链。界面态键——读全局
+    //   config.ini 不随任务覆盖（同 [Explorer] 口径）；建视图时读取，已建页不
+    //   重建（切设置后重开会话 Tab/重启生效，HarnessAgent v1.9.44 同语义）。
+    //   值恒归一为 "Legacy"/"ModelView" 两串（缺键/非法值一律 Legacy）。
+    bool    SaveViewEngine(const QString& a_sEngine);
+    static QString LoadViewEngine();   // 静态（面板构造期无实例可读）
+    static bool IsModelViewEngine(const QString& a_sEngine);   // "ModelView" 严格等值判定
+    // 2026-10-17 全局 config.ini 路径静态版（ConfigFilePath 自此抽壳转发）。
+    static QString GlobalConfigPath();
+
     // ---- 内置测试沙箱（2026-09-26，config.ini [Sandbox]，全局键不随任务覆盖）----
     // Enable 总开关（默认开）：Agent 后代 GUI 窗口自动幽灵化收纳 + sandbox_* 命令通道；
     // AutoGhost 自动收纳（默认开）；Record 自动录像（2026.10.02 起默认关，勾选后 MP4 存 exe\sandbox\rec）；
@@ -513,11 +557,6 @@ public:
     int  LoadSandboxFps() const;
     bool SaveSandboxRetainDays(int a_iDays);
     int  LoadSandboxRetainDays() const;
-
-    // ---- 助手上下文窗口上限持久化（config.ini 的 [Adhoc] ContextLimit）----
-    // 0=未设（回退按模型自动探测）；LoadAdhocContextLimit 无记录/非法值返回 0。
-    bool   SaveAdhocContextLimit(qint64 a_iLimit);
-    qint64 LoadAdhocContextLimit() const;
 
     // ---- 专家助手开关持久化（config.ini 的 [Adhoc] ExpertAssistant）----
     // 2026.08.26 闭环改造：启用后助手提交改码提示词时自动做编译/测试验证并回注重试；
@@ -660,4 +699,5 @@ private:
     // 统一备份库（惰性构造；mutable：const 适配层方法内构造）。
     mutable CBackupStore* m_pBackupStore = nullptr;
     mutable QMutex  m_MutexStore;             // 惰性构造互斥（后台 stage 线程并发）
+    void* m_hSeatEvent = nullptr;   // 2026-10-17 在席信号句柄（HANDLE 以 void* 存，避免头文件引 Windows.h；切工程/析构 Drop）
 };

@@ -288,6 +288,7 @@ private slots:
         QSignalSpy spyInfo(&stRunner, &CAgentRunnerBase::sigInfo);
         QSignalSpy spyAssistant(&stRunner, &CAgentRunnerBase::sigAssistantText);
         QSignalSpy spyUsage(&stRunner, &CAgentRunnerBase::sigUsageDelta);
+        QSignalSpy spyCtx(&stRunner, &CAgentRunnerBase::sigContextFill);
         QSignalSpy spyFinished(&stRunner, &CAgentRunnerBase::sigFinished);
         stRunner.StartStage(oTmp.path(), QStringLiteral("请回复 stub 你好"),
                             QString(), 1, QString(), false, 0, false);
@@ -301,6 +302,10 @@ private slots:
         QVERIFY(spyAssistant.size() >= 1);
         QCOMPARE(spyAssistant.at(0).at(0).toString(), QStringLiteral("stub 你好"));
         QVERIFY(spyUsage.size() >= 1);
+        // 2026-10-16 v6 占用口径：assistant 事件携单请求 usage（10+2+1=13）→
+        //   sigContextFill 实时上抛（旧口径仅 result 才上报，整轮无实时数据）。
+        QVERIFY(spyCtx.size() >= 1);
+        QCOMPARE(spyCtx.at(0).at(0).toLongLong(), qint64(13));
         // v2.0.108：progress 事件→60s 节流提示行（首条必达）+ 不破坏后续事件流。
         bool bProgHint = false;
         for (const auto& v : spyInfo) {
@@ -312,6 +317,75 @@ private slots:
         // stub-sid-1 / 运行时配置已在注入 home 下生成（未碰真实 ~/.hermes）。
         QVERIFY(QFile::exists(oTmp.path() + QStringLiteral("/home/agent/config.json")));
         QVERIFY(!stRunner.IsRunning());
+    }
+
+    // 2026-10-16 v6：ctx 占用快照事件 → sigContextFill；result 携本轮累计 usage
+    //   不再覆盖更精细占用（旧口径：轮末累计和远超真实在窗占用，被面板超窗钳成
+    //   「—」——pdfplumber「修界面交互缺陷」Hermes 助手 ctxFill 恒 -1 实害）；
+    //   无 ctx/assistant usage 时 result 累计和仍作兑底（旧补丁未升级时行为不变）。
+    void testCtxFillAndResultFallback() {
+        const QString sNode = FindNode();
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 用例（核心占用分路已有静态覆盖）");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        // 序列一：ctx(90000) → tool → result(usage input=500000 本轮累计和)——
+        //   result 不得把占用覆盖成 500000（会被面板钳「—」）。
+        QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+        QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+        fCli.write("let s='';process.stdin.on('data',d=>s+=d);"
+                   "process.stdin.on('end',()=>{"
+                   "console.log(JSON.stringify({type:'ctx',fill:90000}));"
+                   "console.log(JSON.stringify({type:'tool',tool:'read_file',"
+                   "input:{path:'a.txt'}}));"
+                   "console.log(JSON.stringify({type:'result',subtype:'success',"
+                   "sessionId:'stub-sid-ctx',usage:{input:500000,cacheRead:0,"
+                   "cacheWrite:0,output:20}}));"
+                   "});");
+        fCli.close();
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        {
+            CHermesRunner stRunner;
+            QSignalSpy spyCtx(&stRunner, &CAgentRunnerBase::sigContextFill);
+            QSignalSpy spyFinished(&stRunner, &CAgentRunnerBase::sigFinished);
+            stRunner.StartStage(oTmp.path(), QStringLiteral("占用口径测试"),
+                                QString(), 1, QString(), false, 0, false);
+            QVERIFY(spyFinished.wait(30000));
+            QVERIFY(spyCtx.size() >= 1);
+            QCOMPARE(spyCtx.at(0).at(0).toLongLong(), qint64(90000));
+            // result 累计和（500000）不得覆盖 ctx 快照；轮末占用仍为 90000。
+            QCOMPARE(spyCtx.last().at(0).toLongLong(), qint64(90000));
+            QCOMPARE(stRunner.LastContextFill(), qint64(90000));
+        }
+        // 序列二：仅 result 携 usage（无 ctx/assistant usage，旧补丁形态）→
+        //   累计和作兑底占用上抛（不回归旧版可用性）。
+        QFile fCli2(sRoot + QStringLiteral("/dist/cli.js"));
+        QVERIFY(fCli2.open(QIODevice::WriteOnly | QIODevice::Text));
+        fCli2.write("let s='';process.stdin.on('data',d=>s+=d);"
+                    "process.stdin.on('end',()=>{"
+                    "console.log(JSON.stringify({type:'result',subtype:'success',"
+                    "sessionId:'stub-sid-fb',usage:{input:1500,cacheRead:0,"
+                    "cacheWrite:0,output:9}}));"
+                    "});");
+        fCli2.close();
+        {
+            CHermesRunner stRunner;
+            QSignalSpy spyCtx(&stRunner, &CAgentRunnerBase::sigContextFill);
+            QSignalSpy spyFinished(&stRunner, &CAgentRunnerBase::sigFinished);
+            stRunner.StartStage(oTmp.path(), QStringLiteral("兑底占用测试"),
+                                QString(), 1, QString(), false, 0, false);
+            QVERIFY(spyFinished.wait(30000));
+            QCOMPARE(spyCtx.size(), 1);
+            QCOMPARE(spyCtx.at(0).at(0).toLongLong(), qint64(1500));
+        }
     }
 
     // —— 2026.09.05 轮次上限兜底文本本地化（用户实测 [00:47:43] 裸英文无从排查）——

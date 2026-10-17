@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QString>
 #include <QList>
@@ -69,6 +69,55 @@ inline QString ModelEntryIdentity(const SDshModelEntry& a_stE) {
     return a_stE.sBaseURL.trimmed().toLower() + QChar(1)
          + NormalizeModelApiForMerge(a_stE.sApi) + QChar(1)
          + a_stE.sModelId.trimmed().toLower();
+}
+
+// 2026.10.15 模型列表双击就地编辑：列→字段映射 + 校验回退（纯函数，单测直调；
+//   CSettingsDialog::OnDshModelItemChanged 落库前调）。口径对齐编辑对话框 Entry() 兑底：
+//   显示名空→回退模型 ID；模型 ID 不可空（空/纯空白回退旧值）；上下文/最大输出非
+//   正整数回退旧值；其余列 trim 落存。返回是否发生变化（无变化不落数据不刷表）。
+inline bool ApplyModelCellEdit(SDshModelEntry* a_pE, int a_iCol, const QString& a_sText) {
+    if (a_pE == nullptr) {
+        return false;
+    }
+    const SDshModelEntry stOld = *a_pE;
+    const QString sTxt = a_sText.trimmed();
+    switch (a_iCol) {
+        case 0:   // 显示名（空→回退模型 ID）
+            a_pE->sDisp = sTxt.isEmpty() ? a_pE->sModelId : sTxt;
+            break;
+        case 1:
+            a_pE->sBaseURL = sTxt;
+            break;
+        case 2:
+            a_pE->sApi = sTxt;
+            break;
+        case 3:   // 模型 ID 必填
+            if (!sTxt.isEmpty()) {
+                a_pE->sModelId = sTxt;
+            }
+            break;
+        case 4: {   // 上下文（token）：正整数
+            bool bOk = false;
+            const qint64 iV = a_sText.toLongLong(&bOk);
+            if (bOk && iV > 0) {
+                a_pE->iCtx = iV;
+            }
+            break;
+        }
+        case 5: {   // 最大输出：正整数
+            bool bOk = false;
+            const qint64 iV = a_sText.toLongLong(&bOk);
+            if (bOk && iV > 0) {
+                a_pE->iMaxTok = iV;
+            }
+            break;
+        }
+        default:
+            break;   // 「当前」列（6）等标记列：不改数据
+    }
+    return (a_pE->sDisp != stOld.sDisp || a_pE->sBaseURL != stOld.sBaseURL
+            || a_pE->sApi != stOld.sApi || a_pE->sModelId != stOld.sModelId
+            || a_pE->iCtx != stOld.iCtx || a_pE->iMaxTok != stOld.iMaxTok);
 }
 
 // 2026-10-07 按身份在表中找下标（-1 = 不在表内）。对话级模型覆盖不能硬存下标跨次

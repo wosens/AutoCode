@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <path d="M26 16 A10 10 0 1 1 19.5 6.4" stroke="#2563eb" stroke-width="2.4" stroke-linecap="round"/>
-  <path d="M15.5 3.2 L20.5 5.5 L17.5 10.2" stroke="#2563eb" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 再次执行：循环箭头 + 播放 -->
+  <path d="M19 12 A7 7 0 1 1 15.6 5.75" stroke="#2563EB" stroke-width="2" stroke-linecap="round"/>
+  <path d="M14.6 2.2 L19.4 5.9 L14.3 8.4" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M10.2 8.8 L15 12 L10.2 15.2 Z" fill="#2563EB"/>
 </svg>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 另存为：托盘 + 落盘箭头 -->
+  <path d="M4.5 15 V17 Q4.5 19.5 7 19.5 H17 Q19.5 19.5 19.5 17 V15" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 3.5 V13.2" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M7.8 9.2 L12 13.4 L16.2 9.2" stroke="#30A46C" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

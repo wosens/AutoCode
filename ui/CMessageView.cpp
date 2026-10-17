@@ -11,6 +11,12 @@
 
 namespace {
 const int k_iMaxBlocks = 1500;   // 上限保护：超过则从顶部丢弃最旧
+// 2026.10.16 视口惰性排版带（Assistant 块正文排版/弃正文判定，块数上限内的
+//   O(N) 遍历几何比对，无排版成本）：材化带=视口上下各 2 屏（滚动方向预排版，
+//   滚到即已就绪）；释放带=视口 6 屏外（材化/释放阈值分离形成滞回，带内往返
+//   滚动不反复排版）。带外未材化块保持估高占位（零排版成本）。
+const int k_iMatBandScreens = 2;         // 材化余量（视口上/下各 N 屏）
+const int k_iDematerializeScreens = 6;   // 释放阈值（距视口 N 屏外才弃正文）
 }
 
 CMessageView::CMessageView(QWidget* a_pParent)
@@ -65,6 +71,7 @@ void CMessageView::AddBlock(CMessageBlock* a_pBlock, bool a_bBatch) {
     if (m_bFollow && !a_bBatch) {
         ScrollToBottom();
     }
+    QueueRefreshMaterialization();   // 2026.10.16 建件后惰性带重算（批量帧/流式追加均合并节流）
 }
 
 void CMessageView::Clear() {
@@ -118,6 +125,7 @@ void CMessageView::PrependBlocks(const QList<CMessageBlock*>& a_aBlocks) {
         if (pBar != nullptr) {
             pBar->setValue(qBound(pBar->minimum(), iY, pBar->maximum()));
         }
+        QueueRefreshMaterialization();   // 2026.10.16 前插补建后重算惰性带（新块入带材化）
     };
     // 多帧重锚吸收高度异步收敛：①Markdown documentSizeChanged 逐块落定；②2026.09.04
     //   起批量路径 Assistant 块子线程预排版落地波（占位纯文本→富文本高度跳变，线程池
@@ -147,6 +155,7 @@ void CMessageView::ScrollToBottom() {
         if (pBar2 != nullptr) {
             pBar2->setValue(pBar2->maximum());
         }
+        QueueRefreshMaterialization();   // 2026.10.16 滚底后材化尾部带（value 不变时无 valueChanged）
     });
 }
 
@@ -161,6 +170,7 @@ void CMessageView::ScrollToBottomRobust() {
         if (pBar != nullptr) {
             pBar->setValue(pBar->maximum());
         }
+        QueueRefreshMaterialization();   // 2026.10.16 重建尾帧：材化底部视口带（估高→真实排版）
     };
     fnBottom();
     QTimer::singleShot(0, this, fnBottom);
@@ -189,6 +199,7 @@ void CMessageView::ScrollBlockToTop(CMessageBlock* a_pBlock) {
     };
     fnScroll();
     QTimer::singleShot(0, this, fnScroll);   // 兜底吸收排队 layout
+    QueueRefreshMaterialization();   // 2026.10.16 跳转目标入带材化（目标多为惰性估高块）
 }
 
 void CMessageView::slotScrolled(int a_iValue) {
@@ -206,4 +217,77 @@ void CMessageView::slotScrolled(int a_iValue) {
     } else {
         m_bTopNotified = false;
     }
+    // 2026-10-15 底部分页：滚到底（仅可滚且"非底→底"边沿发一次）→ 外层补建更新块；
+    //   与到顶对称。跟随滚动到底也会命中（AddBlock 滚底 → value=max）——常态无尾隙
+    //   时外层收到即空转，无副作用。
+    if (iMax > 0 && a_iValue >= iMax) {
+        if (!m_bBottomNotified) {
+            m_bBottomNotified = true;
+            emit sigBottomReached();
+        }
+    } else {
+        m_bBottomNotified = false;
+    }
+    QueueRefreshMaterialization();   // 2026.10.16 滚动位置变化 → 惰性带重算（材化新入带块）
+}
+
+// ---------------------------------------------------------------------------
+// 2026.10.16 视口惰性排版驱动（打开助手日志慢二期）
+// ---------------------------------------------------------------------------
+void CMessageView::QueueRefreshMaterialization() {
+    if (m_bMatRefreshQueued) {
+        return;   // 已排队：0ms 定时器天然合并同帧多次触发（滚动风暴/批量建件帧）
+    }
+    m_bMatRefreshQueued = true;
+    QTimer::singleShot(0, this, [this]() {
+        m_bMatRefreshQueued = false;
+        RefreshMaterialization();
+    });
+}
+
+void CMessageView::RefreshMaterialization() {
+    if (m_pLayout == nullptr || m_pContent == nullptr || !isVisible()) {
+        return;   // 隐藏视图（非当前 Tab 的助手页）：保持全惰性，切回时 showEvent 再材化
+    }
+    QScrollBar* pBar = verticalScrollBar();
+    QWidget* pVp = viewport();
+    if (pBar == nullptr || pVp == nullptr) {
+        return;
+    }
+    const int iVh = pVp->height();
+    if (iVh <= 0) {
+        return;
+    }
+    m_pLayout->activate();   // 确保块几何最新（已激活时零成本）
+    const int iVal = pBar->value();
+    const int iMatLo = iVal - k_iMatBandScreens * iVh;
+    const int iMatHi = iVal + iVh + k_iMatBandScreens * iVh;
+    const int iDemLo = iVal - k_iDematerializeScreens * iVh;
+    const int iDemHi = iVal + iVh + k_iDematerializeScreens * iVh;
+    const int iN = m_pLayout->count() - 1;   // 去尾 stretch
+    for (int i = 0; i < iN; ++i) {
+        QLayoutItem* pItem = m_pLayout->itemAt(i);
+        CMessageBlock* pBlk = (pItem != nullptr)
+                                  ? qobject_cast<CMessageBlock*>(pItem->widget()) : nullptr;
+        if (pBlk == nullptr || !pBlk->IsLazyAssistant()) {
+            continue;   // 非惰性块（流式 Assistant/工具卡/事件行等）不参与
+        }
+        const int iY  = pBlk->y();
+        const int iY2 = iY + pBlk->height();
+        if (iY2 >= iMatLo && iY <= iMatHi) {
+            pBlk->MaterializeAssistant();   // 视口带内：正文排版上屏（幂等，已材化自守卫）
+        } else if (iY2 < iDemLo || iY > iDemHi) {
+            pBlk->DematerializeAssistant(); // 远离视口：弃正文保高度（幂等）
+        }
+    }
+}
+
+void CMessageView::resizeEvent(QResizeEvent* a_pEvent) {
+    QScrollArea::resizeEvent(a_pEvent);
+    QueueRefreshMaterialization();   // 视口尺寸变化 → 惰性带重算（估宽/带宽均随视口变）
+}
+
+void CMessageView::showEvent(QShowEvent* a_pEvent) {
+    QScrollArea::showEvent(a_pEvent);
+    QueueRefreshMaterialization();   // 隐藏页建件全惰性（估高占位），切回时材化视口带
 }

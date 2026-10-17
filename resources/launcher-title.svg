@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="200" viewBox="0 0 1240 200">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FBFDFF"/>
+      <stop offset="0.55" stop-color="#E9F2FC"/>
+      <stop offset="1" stop-color="#D3E7F8"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="0.82" cy="0.18" r="0.55">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.62"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.10" cy="0.95" r="0.50">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3E86D6"/>
+      <stop offset="0.45" stop-color="#7FB3E3"/>
+      <stop offset="1" stop-color="#3E86D6" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1240" height="200" fill="url(#bg)"/>
+
+  <!-- 细网格（40px 间距，向下渐隐由整体光斑压暗） -->
+  <path d="M40 0V200 M80 0V200 M120 0V200 M160 0V200 M200 0V200 M240 0V200 M280 0V200 M320 0V200 M360 0V200 M400 0V200 M440 0V200 M480 0V200 M520 0V200 M560 0V200 M600 0V200 M640 0V200 M680 0V200 M720 0V200 M760 0V200 M800 0V200 M840 0V200 M880 0V200 M920 0V200 M960 0V200 M1000 0V200 M1040 0V200 M1080 0V200 M1120 0V200 M1160 0V200 M1200 0V200" stroke="#CFE1F3" stroke-width="1" fill="none"/>
+  <path d="M0 40H1240 M0 80H1240 M0 120H1240 M0 160H1240" stroke="#CFE1F3" stroke-width="1" fill="none"/>
+
+  <!-- 电路走线（右侧区域） -->
+  <g stroke="#A6C8EA" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M742 44 H872 V92 H992"/>
+    <path d="M782 158 H906 V112 H1046 V62 H1148"/>
+    <path d="M826 18 V68 H948"/>
+    <path d="M1068 152 H1172 V104"/>
+    <path d="M700 120 H812 V170 H900"/>
+    <path d="M1120 30 V70 H1200"/>
+  </g>
+  <g fill="#6FA3DC">
+    <circle cx="742" cy="44" r="5"/>
+    <circle cx="992" cy="92" r="5"/>
+    <circle cx="782" cy="158" r="5"/>
+    <circle cx="1148" cy="62" r="5"/>
+    <circle cx="826" cy="18" r="5"/>
+    <circle cx="948" cy="68" r="5"/>
+    <circle cx="1068" cy="152" r="5"/>
+    <circle cx="1172" cy="104" r="5"/>
+    <circle cx="700" cy="120" r="5"/>
+    <circle cx="900" cy="170" r="5"/>
+    <circle cx="1120" cy="30" r="5"/>
+    <circle cx="1200" cy="70" r="5"/>
+  </g>
+  <g fill="#FFFFFF" stroke="#5E93CC" stroke-width="1.5">
+    <circle cx="992" cy="92" r="2.5"/>
+    <circle cx="1148" cy="62" r="2.5"/>
+    <circle cx="1172" cy="104" r="2.5"/>
+    <circle cx="1200" cy="70" r="2.5"/>
+  </g>
+
+  <!-- 六边形装饰 -->
+  <g stroke="#C9DEF4" stroke-width="2" fill="none">
+    <polygon points="1096,26 1138,50 1138,98 1096,122 1054,98 1054,50" opacity="0.85"/>
+    <polygon points="1186,118 1214,134 1214,166 1186,182 1158,166 1158,134" opacity="0.6"/>
+  </g>
+  <polygon points="1096,44 1122,59 1122,89 1096,104 1070,89 1070,59" fill="#EAF3FC" opacity="0.9"/>
+
+  <!-- 斜向光线 -->
+  <g stroke="#FFFFFF" stroke-width="1.5" opacity="0.55" stroke-linecap="round">
+    <path d="M60 150 L220 26"/>
+    <path d="M96 162 L268 26"/>
+    <path d="M132 174 L316 26"/>
+  </g>
+
+  <rect width="1240" height="200" fill="url(#glow1)"/>
+  <rect width="1240" height="200" fill="url(#glow2)"/>
+
+  <!-- 底部品牌渐变线 -->
+  <rect x="0" y="196" width="1240" height="4" fill="url(#brand)"/>
+</svg>

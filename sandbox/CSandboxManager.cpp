@@ -12,6 +12,7 @@
 #include <QCoreApplication>
 #include <QPointer>
 #include <atomic>
+#include <vector>
 
 // —— WinEvent 钩子线程：EVENT_OBJECT_SHOW 到达即把候选 HWND 投递回主线程 ——
 // SetWinEventHook(OUTOFCONTEXT) 要求安装线程跑消息循环；钩子回调无用户参数，
@@ -212,7 +213,17 @@ void CSandboxManager::SetProjectRoot(const QString& a_sRoot) {
 //   保持隐形，Agent 可继续 sandbox_* 操控）；其余（与本工程无关/拿不准的）
 //   还原成可见由用户处置——替代旧的无差别 RestoreAllMarked（会把刚续收纳的
 //   窗口又还原掉）。
+// 2026-10-09 修「用户软件窗口反复自动消失/出现」（本机制两处过度行为实测暴露）：
+//   ①「曾收纳」标记无时效——工程内软件只要被 Agent 测过一次，此后每次启动/
+//     切工程都被强制隐形、退出又还原，用户一天重启多次就反复消失/出现。现标记
+//     值=还原时刻，续收纳仅认最近 kAdoptFreshMs（10 分钟）内的窗口——超龄=Agent
+//     早不再测它、用户可能正在用 → 清标记恢复常态，永不再自动收走。
+//   ②多实例越权——实例 B 的本扫描会把实例 A 正在沙箱管理的窗口强制还原（A 的
+//     内存表仍认为在册，Agent 测试现场被打断）。现按 kPropGhost 值（收纳者 PID）
+//     互斥：收纳者是活着的其他实例 → 跳过不动（各管各的）；死了才是崩溃残留。
 void CSandboxManager::ReadoptProjectWindows() {
+    constexpr ULONG kAdoptFreshMs = 10 * 60 * 1000;   // 续收纳时效窗：最近还原 10 分钟内
+    const DWORD dwSelf = GetCurrentProcessId();
     struct SCtx {
         QVector<QPair<HWND, DWORD>> aMarked;
     } stCtx;
@@ -238,14 +249,41 @@ void CSandboxManager::ReadoptProjectWindows() {
         }
         sRoot += QLatin1Char('/');
     }
+    const ULONG dwNow = GetTickCount();
     for (const auto& pr : std::as_const(stCtx.aMarked)) {
-        const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(pr.second)).toLower();
-        if (!sRoot.isEmpty() && sExe.startsWith(sRoot)) {
-            GhostAndTrack(pr.first);   // 已幽灵的走幂等分支登记；已还原的重新幽灵化
-        } else if (sbx::IsGhosted(pr.first)) {
-            sbx::RestoreWindow(pr.first);   // 与工程无关的隐形残留：还原（清 adopt 标记）
+        const HWND h = pr.first;
+        // 实例互斥：幽灵中且收纳者是活着的其他实例（本窗口归它管）→ 不越权
+        //   动它。OpenProcess 成功即活着（已退 pid 返回失败）；极小概率 pid 被
+        //   无关进程复用 → 误判「别人在管」而跳过，方向保守（不动），无害。
+        if (sbx::IsGhosted(h)) {
+            const DWORD dwOwner = sbx::GhostOwnerPid(h);
+            if (dwOwner != 0 && dwOwner != dwSelf) {
+                if (HANDLE hO = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwOwner)) {
+                    CloseHandle(hO);
+                    continue;   // 别的活实例正在管理：跳过
+                }
+            }
+        }
+        const bool bInProject = !sRoot.isEmpty()
+            && QDir::fromNativeSeparators(sbx::ExePathOfPid(pr.second)).toLower().startsWith(sRoot);
+        if (sbx::IsGhosted(h)) {
+            // 崩溃/强杀残留（收纳者已死）：保持隐形逻辑——工程内续收纳入册供
+            //   Agent 接续操控；工程外还原可见由用户处置。
+            if (bInProject) {
+                GhostAndTrack(h);   // 在册查重幂等（见 GhostAndTrack 头部）
+            } else {
+                sbx::RestoreWindow(h);
+            }
+        } else if (bInProject
+                   && (dwNow - sbx::AdoptMarkTick(h)) < kAdoptFreshMs) {
+            // 可见 + 带标记 + 刚还原不久 + 工程内 = Agent 会话还在继续（实例重启
+            //   间隙通常几十秒）→ 续收纳重新隐形。
+            GhostAndTrack(h);
         } else {
-            sbx::ClearAdoptMark(pr.first);  // 只剩 adopt 标记的可见窗口：清标记即恢复常态
+            // 超龄标记 / 工程外：Agent 早不再测它（用户可能在用）→ 清标记恢复
+            //   常态，不再自动收走。此前无时效版本会把用户正在用的工程内软件
+            //   反复收走又还原（每次启动/切工程一轮）。
+            sbx::ClearAdoptMark(h);
         }
     }
 }
@@ -355,10 +393,101 @@ bool CSandboxManager::TreePid(DWORD a_dwPid) {
     }
     const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
     if (m_oParentMap.isEmpty() || iNow - m_iMapBuiltMs > 500) {
-        sbx::BuildParentMap(m_oParentMap);
+        sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
         m_iMapBuiltMs = iNow;
     }
-    return sbx::IsDescendantOf(a_dwPid, GetCurrentProcessId(), m_oParentMap);
+    return sbx::IsDescendantOf(a_dwPid, GetCurrentProcessId(), m_oParentMap,
+                               m_oParentCreated);
+}
+
+bool CSandboxManager::IsProjectTestPid(DWORD a_dwPid) {
+    // 断链兑底（见 ConsiderWindowImpl 2026-10-14 注）：树外但像「Agent 刚启动的
+    //   被测工程产物」的窗口进程。三重限定压误伤：
+    //   ① 工程根非空且 exe 路径在工程根内（被测程序 = 自研产物，与 2026-10-08
+    //     续收纳/显式 add 的工程目录白名单同一哲学）；
+    //   ② 进程新建 <10 分钟（用户手动打开的应用多已运行较久；拿不到创建时刻
+    //     保守不兑底）；
+    //   ③ 父进程已死（断链）才兑底——Agent 经 powershell Start-Process / cmd
+    //     start 等中间人启动、中间 shell 执行完即退，被测程序主窗口弹出时父
+    //     已死，这是要救的场景；父进程活着（无论 explorer 双击、QuickTool/
+    //     托盘/计划任务/任何非 explorer 启动器）= 用户主动打开，一律不兑底。
+    //     2026-10-16 修：旧口径只豁免「父=explorer.exe」，用户经 QuickTool 打开
+    //     HarnessAgent.exe 被误幽灵化（窗口 alpha=1+点击穿透+无任务栏，「消失」
+    //     但进程存活，实测 ex=0x80801A0）——收紧为父活即拒（IsParentAlive，
+    //     按「父 pid 仍是快照表键」判活，见 CSandboxCore.h 注）。
+    if (m_sProjRoot.isEmpty() || a_dwPid == 0) {
+        return false;
+    }
+    QString sRoot = QDir::fromNativeSeparators(m_sProjRoot).toLower();
+    while (sRoot.endsWith(QLatin1Char('/'))) {
+        sRoot.chop(1);
+    }
+    sRoot += QLatin1Char('/');
+    const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(a_dwPid)).toLower();
+    if (sExe.isEmpty() || !sExe.startsWith(sRoot)) {
+        return false;
+    }
+    // 父表防陈旧（与 TreePid 同一守卫）：表早于进程创建会把活父判成断链（值查
+    //   不到→误兑底），判否前超 500ms 先重建再查。
+    const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
+    if (m_oParentMap.isEmpty() || iNow - m_iMapBuiltMs > 500) {
+        sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
+        m_iMapBuiltMs = iNow;
+    }
+    if (sbx::IsParentAlive(a_dwPid, m_oParentMap)) {
+        return false;   // 父进程活着：用户主动打开（任意启动器），不兑底
+    }
+    const qint64 iCreated = m_oParentCreated.value(a_dwPid, 0);
+    if (iCreated <= 0) {
+        return false;   // 创建时刻不可得：保守不兑底
+    }
+    const qint64 iAgeMs = QDateTime::currentMSecsSinceEpoch() - iCreated;
+    return iAgeMs >= 0 && iAgeMs < 10LL * 60 * 1000;
+}
+
+bool CSandboxManager::LaunchAut(const QJsonObject& a_oArgs, QString& a_sOut) {
+    // sandbox launch <exe> [args...]：主进程亲自启动被测程序并登记手工根——
+    //   窗口弹出即收纳（TreePid 命中手工根 + 零宽限直收），不受 Agent shell
+    //   中间人断链影响（Compositer 实测 Start-Process 秒退断链漏收的治本通道）。
+    QString sExe = QDir::fromNativeSeparators(
+        a_oArgs.value(QStringLiteral("exe")).toString().trimmed());
+    if (sExe.isEmpty()) {
+        a_sOut = QStringLiteral("缺少 exe 参数");
+        return false;
+    }
+    if (!QFileInfo::exists(sExe)) {
+        a_sOut = QStringLiteral("exe 不存在：%1").arg(sExe);
+        return false;
+    }
+    if (sbx::IsProtectedAppPath(sExe)) {
+        a_sOut = QStringLiteral("系统/公共应用不允许由沙箱启动");
+        return false;
+    }
+    QString sWorkdir = a_oArgs.value(QStringLiteral("workdir")).toString().trimmed();
+    if (sWorkdir.isEmpty()) {
+        sWorkdir = QFileInfo(sExe).absolutePath();
+    }
+    const QString sCmdLine = QStringLiteral("\"%1\" %2")
+        .arg(QDir::toNativeSeparators(sExe),
+             a_oArgs.value(QStringLiteral("args")).toString().trimmed());
+    std::vector<wchar_t> vCmd(static_cast<size_t>(sCmdLine.size()) + 1, L'\0');
+    sCmdLine.toWCharArray(vCmd.data());
+    const std::wstring wsDir = QDir::toNativeSeparators(sWorkdir).toStdWString();
+    STARTUPINFOW stSi = {};
+    stSi.cb = sizeof(stSi);
+    PROCESS_INFORMATION stPi = {};
+    if (!CreateProcessW(nullptr, vCmd.data(), nullptr, nullptr, FALSE, 0,
+                        nullptr, wsDir.c_str(), &stSi, &stPi)) {
+        a_sOut = QStringLiteral("启动失败（GetLastError=%1）").arg(GetLastError());
+        return false;
+    }
+    AddManualRootPid(stPi.dwProcessId);
+    CloseHandle(stPi.hThread);   // 句柄即关，防泄露（进程存活不依赖句柄）
+    CloseHandle(stPi.hProcess);
+    a_sOut = QStringLiteral("已由沙箱代启动 pid=%1（窗口弹出即自动收纳）\n"
+                            "查询窗口：sandbox windows；截图：sandbox capture <hwnd>")
+                 .arg(stPi.dwProcessId);
+    return true;
 }
 
 bool CSandboxManager::ConsiderWindow(HWND a_hWnd, bool a_bFinal) {
@@ -386,8 +515,22 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     }
     DWORD dwPid = 0;
     GetWindowThreadProcessId(a_hWnd, &dwPid);
+    // 2026-10-14 断链兑底（Compositer 实测漏收根因）：Agent 用 powershell
+    //   Start-Process / cmd start 等中间人方式启动被测程序时，中间 shell 执行完
+    //   立即退出，被测程序主窗口弹出时父进程已死——IsDescendantOf 沿 ppid 爬链
+    //   第一跳即断（快照无此 pid），TreePid 判否 → 不收纳，窗口正常可见弹到
+    //   用户桌面还抢焦点。兑底：exe 在当前工程根目录内且进程新建 → 视为 Agent
+    //   启动的被测工程产物，继续收纳判定（其后仍过豁免登记/系统宿主/保护路径
+    //   三道闸，用户经 AutoCode UI 打开的工程内程序照常豁免）。2026-10-16 收紧：
+    //   兑底另须父已死（断链）——父活着=用户经 QuickTool/explorer 等任意启动器
+    //   主动打开，不兑底（IsProjectTestPid 条件③，修 QuickTool 打开工程产物被
+    //   误幽灵化）。
+    bool bProjFallback = false;
     if (!TreePid(dwPid)) {
-        return false;
+        bProjFallback = IsProjectTestPid(dwPid);
+        if (!bProjFallback) {
+            return false;
+        }
     }
     // 2026.09.26 用户启动豁免（TreePid 之后判定，复用刚刷新的父表）：命中登记根
     //   （自身或其子进程）不收纳——用户在 UI 主动打开的程序要自己用，不是 Agent
@@ -397,13 +540,22 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
         PruneUserRoots();
         for (const auto& pr : std::as_const(UserRoots())) {
             if (dwPid == pr.first
-                || sbx::IsDescendantOf(dwPid, pr.first, m_oParentMap)) {
+                || sbx::IsDescendantOf(dwPid, pr.first, m_oParentMap, m_oParentCreated)) {
                 return false;
             }
         }
     }
     if (sbx::IsSystemHostPid(dwPid)) {
         return false;   // 树内系统宿主（explorer 等被 agent shell 打开等极端情形）
+    }
+    // 2026-10-09 收纳范围收紧：系统/公共应用目录（Windows、Program Files、
+    //   WindowsApps）下的 exe 不收纳——树内进程启动它们几乎都是「Agent 打开给
+    //   用户看」（浏览器看报告、默认程序看文档/图片）或系统组件，绝非被测工程
+    //   程序；自动收纳它们会让用户正在查看的窗口凭空消失（用户实测）。被测程序
+    //   = 自研代码产物，都在工程/输出目录；确需测试的特殊场景走显式 add
+    //   （AddWindow 同样受保护目录拦截，双保险）。
+    if (sbx::IsProtectedAppPath(sbx::ExePathOfPid(dwPid))) {
+        return false;
     }
     // 2026-10-08 零闪现收纳：旧逻辑对所有树内窗口一律先排 kGhostGraceMs 宽限期
     //   （为等用户启动豁免登记落地），代价是 Agent 后代窗口每个都先裸奔 1.2 秒
@@ -413,8 +565,10 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     //   宽限等待）；链上隔了 runner（cmd/claude/hermes→bash→python→被测程序）
     //   = Agent 后代，豁免登记永不涉及 → 立即收纳。
     const bool bUserLaunchLike =
-        (m_oParentMap.value(dwPid, 0) == GetCurrentProcessId());
-    if (!a_bFinal && bUserLaunchLike && m_stCfg.bAutoGhost) {
+        (m_oParentMap.value(dwPid, 0) == GetCurrentProcessId()) || bProjFallback;
+    if (!a_bFinal && bUserLaunchLike && m_stCfg.bAutoGhost
+            && !m_aManualRoots.contains(dwPid)) {   // launch 登记根：主进程亲自启动，
+        // 豁免登记永不涉及，零闪现直收（不走 800ms 宽限）。
         // 800ms：豁免登记在 ShellExecuteExW 返回后立即执行（毫秒级），800 绰绰
         //   有余（旧 1200 过度保守，用户启动的程序也多闪半秒）。
         constexpr int kGhostGraceMs = 800;
@@ -438,6 +592,13 @@ void CSandboxManager::GhostAndTrack(HWND a_hWnd) {
     //   AddWindow 却恒报成功，--sandbox add 误报「已收纳」）。
     // 2026-10-08 已带标记窗口（跨实例残留，ReadoptProjectWindows 续收纳路径）
     //   GhostWindow 幂等返回 false 是预期——IsGhosted 前提成立则继续登记入册。
+    // 2026-10-09 在册查重：Readopt 在 Start 与每次切工程都跑，已入册窗口直接
+    //   幂等返回，否则重复入册（GhostedCount 虚高、restore 重复处理）。
+    for (const SEntry& st : std::as_const(m_aEntries)) {
+        if (st.h == a_hWnd) {
+            return;
+        }
+    }
     if (!sbx::GhostWindow(a_hWnd) && !sbx::IsGhosted(a_hWnd)) {
         return;
     }
@@ -461,10 +622,14 @@ void CSandboxManager::GhostAndTrack(HWND a_hWnd) {
 }
 
 bool CSandboxManager::AddWindow(HWND a_hWnd) {
-    // 显式收纳：不做出身判定（自身进程窗口/手工指定均允许），仅做有效性校验
-    //（可见顶层）。已带幽灵标记但不在册的（跨实例/崩溃残留）也收——GhostAndTrack
-    // 幂等分支直接登记入册（2026-10-08；此前 IsGhosted 一律拒绝，Agent 对残留
-    // 窗口 sandbox add 会失败，只能裸操控可见窗口）。
+    // 显式收纳：仅收「确定与 Agent 测试相关」的窗口，不设防的旧实现已废——
+    //   Agent 依提示词「不在列表就 add」操作时猜错 hwnd 会把用户正在用的窗口
+    //   收走（用户实测「无关窗口凭空消失」）。2026-10-09 出身白名单：
+    //   ①带幽灵/曾收纳标记的残留窗口（崩溃/跨实例残留，此前就在沙箱里）；
+    //   ②本 AutoCode 进程树内（Agent 启动的进程——自动收纳的漏网补收）；
+    //   ③exe 在当前工程目录内（工程产物）；其余一律拒绝。
+    //   系统/公共应用目录（Windows、Program Files：浏览器/Office/记事本等
+    //   用户正在用的程序）即使带标记也不重收（还原后由用户处置）。
     for (const SEntry& st : std::as_const(m_aEntries)) {
         if (st.h == a_hWnd) {
             return true;
@@ -473,6 +638,28 @@ bool CSandboxManager::AddWindow(HWND a_hWnd) {
     if (!IsWindow(a_hWnd) || !IsWindowVisible(a_hWnd)
             || GetAncestor(a_hWnd, GA_ROOT) != a_hWnd) {
         return false;
+    }
+    const bool bMarked = sbx::IsGhosted(a_hWnd) || sbx::HasAdoptMark(a_hWnd);
+    DWORD dwPid = 0;
+    GetWindowThreadProcessId(a_hWnd, &dwPid);
+    const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(dwPid));
+    if (sbx::IsProtectedAppPath(sExe)) {
+        return false;   // 系统/公共应用：用户可能正在用，永不收纳
+    }
+    if (!bMarked) {
+        const bool bInTree = TreePid(dwPid);
+        QString sRoot = QDir::fromNativeSeparators(m_sProjRoot).toLower();
+        if (!sRoot.isEmpty()) {
+            while (sRoot.endsWith(QLatin1Char('/'))) {
+                sRoot.chop(1);
+            }
+            sRoot += QLatin1Char('/');
+        }
+        const bool bInProject = !sRoot.isEmpty()
+            && sExe.toLower().startsWith(sRoot);
+        if (!bInTree && !bInProject) {
+            return false;   // 树外 + 工程外 + 无标记 = 用户自己的窗口，不收
+        }
     }
     GhostAndTrack(a_hWnd);
     // 2026.09.28 收纳成败以在册为准：GhostWindow 失败（改不动样式/已幽灵化等）时
@@ -694,6 +881,9 @@ bool CSandboxManager::ExecuteLocked(const QString& a_sCmd, const QJsonObject& a_
         iN += sbx::RestoreAllMarked();
         a_sOut = QStringLiteral("已还原 %1 个窗口").arg(iN);
         return true;
+    }
+    if (sCmd == QStringLiteral("launch")) {
+        return LaunchAut(a_oArgs, a_sOut);
     }
     // —— 需要 hwnd 的命令 ——
     bool bHOk = false;

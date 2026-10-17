@@ -1,4 +1,4 @@
-﻿#include "CProjectManager.h"
+#include "CProjectManager.h"
 
 #include <QDir>
 #include <QCoreApplication>
@@ -22,6 +22,7 @@
 
 #include <zstd.h>       // 备份压缩（#2）：第三方静态库 libzstd_static，逐文件 zstd 压缩/解压
 #include <Windows.h>
+#include <tlhelp32.h>   // 2026-10-17 在席锁复核：OpenProcess 拒绝访问时快照查进程名
 #include <climits>
 #include <algorithm>
 
@@ -91,6 +92,7 @@ void CProjectManager::MaybeStartBackgroundGc() {
 }
 
 CProjectManager::~CProjectManager() {
+    DropProjectSeatEvent();   // 2026-10-17 兜底：在席信号随析构必摘（CMainWindow 常规链路外的安全性网）
     delete m_pBackupStore;
 }
 
@@ -739,8 +741,107 @@ bool CProjectManager::ReadProjectLock(const QString& a_sProjectDir, SProjectLock
         a_pOut->iPid     = o.value(QStringLiteral("pid")).toVariant().toLongLong();
         a_pOut->sExe     = o.value(QStringLiteral("exe")).toString();
         a_pOut->sStarted = o.value(QStringLiteral("started")).toString();
+        a_pOut->iProcStartMs = o.value(QStringLiteral("procStartMs")).toVariant().toLongLong();
     }
     return o.value(QStringLiteral("pid")).toVariant().toLongLong() > 0;
+}
+
+bool CProjectManager::SnapshotImageNameOfPid(qint64 a_iPid, QString* a_pOutName) {
+    // Toolhelp32 进程快照按 PID 取映像名：枚举不需要打开目标进程，LocalSystem
+    //   svchost 等受保护进程（OpenProcess 恒 ACCESS_DENIED）的名字照样可见。
+    if (a_pOutName != nullptr) {
+        a_pOutName->clear();
+    }
+    if (a_iPid <= 0) {
+        return false;
+    }
+    HANDLE hSnap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PROCESSENTRY32W stPe = {};
+    stPe.dwSize = sizeof(stPe);
+    BOOL bOk = ::Process32FirstW(hSnap, &stPe);
+    while (bOk) {
+        if (stPe.th32ProcessID == static_cast<DWORD>(a_iPid)) {
+            if (a_pOutName != nullptr) {
+                *a_pOutName = QString::fromWCharArray(stPe.szExeFile);
+            }
+            ::CloseHandle(hSnap);
+            return true;
+        }
+        bOk = ::Process32NextW(hSnap, &stPe);
+    }
+    ::CloseHandle(hSnap);
+    return false;   // 快照中无此 PID = 已退出/被回收
+}
+
+// FILETIME（1601-01-01 起 100ns）→ Unix epoch ms。
+static qint64 FileTimeToMsEpoch(const FILETIME& a_ft) {
+    ULARGE_INTEGER ul = {};
+    ul.LowPart  = a_ft.dwLowDateTime;
+    ul.HighPart = a_ft.dwHighDateTime;
+    return static_cast<qint64>((ul.QuadPart - 116444736000000000ULL) / 10000ULL);
+}
+
+QString CProjectManager::ProjectSeatEventName(const QString& a_sProjectDir) {
+    // 工程在席信号名：Global 命名空间（跨会话/跨用户可见）+ 规范化路径 SHA-256
+    //   前 24 hex——不同工程不同名，同名工程（含大小写/斜杠差异归一）同名。
+    const QString sNorm = QDir::cleanPath(a_sProjectDir).toLower();
+    if (sNorm.isEmpty()) {
+        return QString();
+    }
+    const QByteArray baHash = QCryptographicHash::hash(
+        sNorm.toUtf8(), QCryptographicHash::Sha256);
+    return QStringLiteral("Global\\AutoCodeSeat_v1_")
+           + QString::fromLatin1(baHash.toHex().left(24));
+}
+
+bool CProjectManager::ProbeProjectSeatEvent(const QString& a_sProjectDir) {
+    // 信号存在 = 某活实例持有该工程：进程无论正常退出/崩溃/被杀/机器重启/断电，
+    //   句柄随进程消亡信号即消失——在席判定零 PID 猜测、零残留。
+    const QString sName = ProjectSeatEventName(a_sProjectDir);
+    if (sName.isEmpty()) {
+        return false;
+    }
+    HANDLE hEvt = ::OpenEventW(EVENT_MODIFY_STATE, FALSE,
+                               reinterpret_cast<const wchar_t*>(sName.utf16()));
+    if (hEvt == nullptr) {
+        // 打不开且非"不存在"（如跨用户 ACL 拒绝）→ 保守视为在席（误报可确认，
+        //   漏报会互踩，代价不对称）。
+        return (::GetLastError() != ERROR_FILE_NOT_FOUND);
+    }
+    ::CloseHandle(hEvt);
+    return true;
+}
+
+bool CProjectManager::HoldProjectSeatEvent(const QString& a_sProjectDir) {
+    DropProjectSeatEvent();
+    const QString sName = ProjectSeatEventName(a_sProjectDir);
+    if (sName.isEmpty()) {
+        return true;   // 无效目录：文件锁层仍工作，信号层跳过不算失败
+    }
+    // 手动置位的手动重置 Event，永久 signaled 当"我活着"灯牌：不涉及任何等待/
+    //   所有权语义（进程死→句柄关→对象销毁）。句柄不可继承（SECURITY_ATTRIBUTES
+    //   null），子进程不会给信号续命。
+    HANDLE hEvt = ::CreateEventW(nullptr, TRUE, TRUE,
+                                 reinterpret_cast<const wchar_t*>(sName.utf16()));
+    if (hEvt == nullptr) {
+        return true;   // 信号层不可用（极端）→ 降级文件锁（IsProjectHeldByOther 的 PID 兑底仍有效）
+    }
+    if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+        ::CloseHandle(hEvt);   // 他实例已持（阻断确认已被强制 Yes /竞态双持）→ 不夺占，降级
+        return false;
+    }
+    m_hSeatEvent = hEvt;
+    return true;
+}
+
+void CProjectManager::DropProjectSeatEvent() {
+    if (m_hSeatEvent != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(m_hSeatEvent));
+        m_hSeatEvent = nullptr;
+    }
 }
 
 bool CProjectManager::IsLockHolderAlive(const SProjectLock& a_stLock) {
@@ -752,12 +853,27 @@ bool CProjectManager::IsLockHolderAlive(const SProjectLock& a_stLock) {
     HANDLE hProc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
                                  static_cast<DWORD>(a_stLock.iPid));
     if (hProc == nullptr) {
-        // 打开失败：拒绝访问 = 进程存在但无权限（他人/提权）→ 保守当活；
-        // 参数错等 = PID 已不存在 → 陈旧锁。
-        return (::GetLastError() == ERROR_ACCESS_DENIED);
+        // 打开失败：参数错等 = PID 已不存在 → 陈旧锁；拒绝访问 = 受保护进程
+        //   （LocalSystem 服务/提权他人）无法打开——不能只凭"打不开"就当活
+        //   （2026-10-17 实害：机器重启残留锁的 PID 被 LocalSystem svchost 复用，
+        //   OpenProcess 恒 ACCESS_DENIED → 旧版"保守当活"误报「工程已被其他实例
+        //   打开」，且弹窗里的 PID/exe/启动时间全来自锁文件无法自证清白）→
+        //   Toolhelp32 快照按 PID 复核进程名：非 AutoCode* 或快照中无此 PID 均
+        //   判陈旧自动接管；快照里真是 AutoCode 系（提权实例）才当活。
+        if (::GetLastError() != ERROR_ACCESS_DENIED) {
+            return false;
+        }
+        QString sSnapName;
+        if (!SnapshotImageNameOfPid(a_stLock.iPid, &sSnapName)) {
+            return false;   // PID 实际已不存在（打开失败另有他因）→ 陈旧锁
+        }
+        return sSnapName.startsWith(QStringLiteral("AutoCode"), Qt::CaseInsensitive);
     }
     DWORD dwExit = 0;
     const BOOL bExitOk = ::GetExitCodeProcess(hProc, &dwExit);
+    // 2026-10-17 顺手取创建时刻（须在 CloseHandle 前）：锁带 procStartMs 时交叉验证。
+    FILETIME ftCreate = {}, ftExitT = {}, ftKernel = {}, ftUser = {};
+    const BOOL bTimeOk = ::GetProcessTimes(hProc, &ftCreate, &ftExitT, &ftKernel, &ftUser);
     WCHAR wszImage[MAX_PATH] = {0};
     DWORD dwImageLen = MAX_PATH;
     QString sImage;
@@ -774,6 +890,17 @@ bool CProjectManager::IsLockHolderAlive(const SProjectLock& a_stLock) {
             QStringLiteral("AutoCode"), Qt::CaseInsensitive)) {
         return false;
     }
+    // PID 复用终极复核（2026-10-17）：锁内记录的持锁进程创建时刻与实际进程创建
+    //   时刻不一致（>3s）= 同名 AutoCode 进程复用了 PID（前任已死锁残留）→ 陈旧锁。
+    //   注意 started 是写锁时刻不能用于比对，procStartMs 才是进程身份。旧档无此
+    //   字段（0）→ 跳过（仅按进程名，向后兼容）。
+    if (a_stLock.iProcStartMs > 0 && bTimeOk) {
+        const qint64 iActualMs = FileTimeToMsEpoch(ftCreate);
+        if (iActualMs > 0
+                && qAbs(iActualMs - a_stLock.iProcStartMs) > 3000) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -788,6 +915,15 @@ void CProjectManager::WriteProjectLock(const QString& a_sProjectDir) {
     o[QStringLiteral("exe")]     = QCoreApplication::applicationFilePath();
     o[QStringLiteral("started")] = QDateTime::currentDateTime().toString(
         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    // 2026-10-17 持锁进程创建时刻（epoch ms）：IsLockHolderAlive 与实际进程交叉验证，
+    //   同名 AutoCode 进程复用 PID 亦能识别（started 是写锁时刻仅供展示，勿混用）。
+    {
+        FILETIME ftCreate = {}, ftExitT = {}, ftKernel = {}, ftUser = {};
+        if (::GetProcessTimes(::GetCurrentProcess(), &ftCreate, &ftExitT,
+                              &ftKernel, &ftUser)) {
+            o[QStringLiteral("procStartMs")] = static_cast<double>(FileTimeToMsEpoch(ftCreate));
+        }
+    }
     QFile fLock(sLock);
     if (fLock.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         fLock.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
@@ -807,9 +943,29 @@ void CProjectManager::ReleaseProjectLock(const QString& a_sProjectDir) {
 }
 
 bool CProjectManager::IsProjectHeldByOther(const QString& a_sProjectDir, QString* a_pDesc) {
+    // 2026-10-17 v4.4.387 双层判定：
+    //   ①在席信号（内核对象，根治层）优先——进程消亡即消失，硬杀/重启/断电/PID
+    //     复用/权限盲区全部免疫；②无信号再回退 PID 判活（对端可能是未升级旧版
+    //     实例，混版本双开仍要拦，勿删兑底）。
     SProjectLock st;
-    if (!ReadProjectLock(a_sProjectDir, &st) || !IsLockHolderAlive(st)) {
-        return false;
+    const bool bHasFile = ReadProjectLock(a_sProjectDir, &st);
+    if (ProbeProjectSeatEvent(a_sProjectDir)) {
+        if (st.iPid == static_cast<qint64>(::GetCurrentProcessId())) {
+            return false;   // 自己持的信号（同进程重开本工程）
+        }
+        if (a_pDesc != nullptr) {
+            *a_pDesc = (bHasFile && st.iPid > 0)
+                ? QStringLiteral("PID %1 · %2 · 启动于 %3（在席信号确认）")
+                      .arg(st.iPid)
+                      .arg(st.sExe.isEmpty() ? QStringLiteral("AutoCode")
+                                             : QFileInfo(st.sExe).fileName())
+                      .arg(st.sStarted.isEmpty() ? QStringLiteral("?") : st.sStarted)
+                : QStringLiteral("另一 AutoCode 实例（在席信号确认，锁文件缺失）");
+        }
+        return true;
+    }
+    if (!bHasFile || !IsLockHolderAlive(st)) {
+        return false;   // 信号与 PID 均无在席证据：无锁/陈旧锁自动接管
     }
     if (a_pDesc != nullptr) {
         *a_pDesc = QStringLiteral("PID %1 · %2 · 启动于 %3")
@@ -849,8 +1005,10 @@ void CProjectManager::SetLastBrowseDir(const QString& a_sDir) {
                                sPath.toStdWString().c_str());
 }
 
-QString CProjectManager::ConfigFilePath() const {
+QString CProjectManager::GlobalConfigPath() {
     // 取 exe 全路径 → 去文件名 → 拼 config.ini（NFR-2.1/2.2，禁用 GetCurrentDirectory）。
+    //   2026-10-17 自绘三期：自 ConfigFilePath 抽出的静态版（无实例也可读全局
+    //   config.ini——CExecutionPanel 构造时读 [View] Engine 引擎选择用）。
     wchar_t szBuf[MAX_PATH] = {0};
     const DWORD dwLen = ::GetModuleFileNameW(nullptr, szBuf, MAX_PATH);
     // 返回 0 表示失败；返回 == MAX_PATH 表示可能被截断（buffer 不够），按失败处理（R-1）。
@@ -860,6 +1018,10 @@ QString CProjectManager::ConfigFilePath() const {
     QString sExe = QString::fromWCharArray(szBuf, static_cast<int>(dwLen));
     QDir stDir = QFileInfo(sExe).absoluteDir();
     return QDir::cleanPath(stDir.absolutePath() + QStringLiteral("/config.ini"));
+}
+
+QString CProjectManager::ConfigFilePath() const {
+    return GlobalConfigPath();
 }
 
 // —— 任务级配置覆盖（2026.09.09 v2.1.143，说明见 CProjectManager.h 同名节）——
@@ -939,6 +1101,16 @@ QString CProjectManager::TableCfgPath(const wchar_t* a_pSect) const {
         }
     }
     return ConfigFilePath();
+}
+
+int CProjectManager::LoadModelsActiveGlobal(const wchar_t* a_pSect) const {
+    // 2026.10.11 全局作用域激活下标（无视任务档覆盖，见头文件注释）。
+    int iActive = -1;
+    const QString sGlobal = ConfigFilePath();
+    if (!sGlobal.isEmpty()) {
+        LoadModelsFrom(sGlobal, a_pSect, &iActive);
+    }
+    return iActive;
 }
 
 QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
@@ -1408,10 +1580,9 @@ bool CProjectManager::IsGuideBusy() const {
 
 int CProjectManager::AutoCompactKFor(const QString& a_sModel) const {
     // 2026.08.15 比例制换算：K（千 token）= 窗口 × 比例 ÷ 100 ÷ 1000。
-    // 窗口优先用 [Adhoc] ContextLimit 用户覆盖，未设回退按模型探测；K 至少 1。
-    const qint64 iUserLimit = LoadAdhocContextLimit();
-    const qint64 iWindow = (iUserLimit > 0)
-        ? iUserLimit : CClaudeRunner::ContextWindowForModel(a_sModel);
+    // 窗口口径（2026-10-14）：模型条目 iCtx 优先、名字探测兑底（[Adhoc] ContextLimit
+    // 用户覆盖已于 2026-10-15 删除）；K 至少 1。
+    const qint64 iWindow = CClaudeRunner::ContextWindowForModel(a_sModel);
     return static_cast<int>(qMax<qint64>(1, iWindow * LoadAutoCompactPct() / 100 / 1000));
 }
 
@@ -2437,32 +2608,6 @@ bool CProjectManager::LoadAdhocMaxTurnsAuto() const {
     return GetPrivateProfileIntW(L"Adhoc", L"MaxTurnsAuto", 1, wsPath.c_str()) != 0;
 }
 
-bool CProjectManager::SaveAdhocContextLimit(qint64 a_iLimit) {
-    // 落 [Adhoc] ContextLimit（0 表示未设/回退自动探测）；失败不抛。
-    const QString sPath = SettingsCfgPath();
-    if (sPath.isEmpty()) {
-        return false;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    WritePrivateProfileStringW(L"Adhoc", L"ContextLimit",
-        QString::number(a_iLimit).toStdWString().c_str(), wsPath.c_str());
-    return true;
-}
-
-qint64 CProjectManager::LoadAdhocContextLimit() const {
-    // 无 config.ini / 缺键 / 非法 → 返回 0（回退按模型自动探测）。
-    const QString sPath = SettingsCfgPath();
-    if (sPath.isEmpty()) {
-        return 0;
-    }
-    const std::wstring wsPath = sPath.toStdWString();
-    wchar_t szBuf[32] = { 0 };
-    const DWORD dwCopied = GetPrivateProfileStringW(
-        L"Adhoc", L"ContextLimit", L"0", szBuf, 32, wsPath.c_str());
-    const qint64 iLimit = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).toLongLong();
-    return iLimit > 0 ? iLimit : 0;
-}
-
 // ===========================================================================
 // FR-6 代码回退：源码备份 / 恢复 / 版本清单
 // 纯本地 Qt 文件系统操作（NFR-4 自包含）；备份范围按 Q4 默认排除清单，排除 .autodev/
@@ -2739,8 +2884,45 @@ QString CProjectManager::LoadExplorerHiddenDirs() const {
     return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
 }
 
-QStringList CProjectManager::BackupExcludeDirs() const {
-    // FR-6（Q4 默认排除清单）：.autodev（含 backups 自身，防递归）、build、Execute、
+// —— 对话日志渲染引擎（2026-10-17 自绘三期，[View] Engine）——
+
+bool CProjectManager::IsModelViewEngine(const QString& a_sEngine)
+{
+    // 严格等值判定（缺省/非法值一律 Legacy，HarnessAgent v1.9.44 同口径）
+    return a_sEngine == QStringLiteral("ModelView");
+}
+
+bool CProjectManager::SaveViewEngine(const QString& a_sEngine)
+{
+    // 落 [View] Engine（归一化两值：ModelView 原样，其余一律写 Legacy）。
+    //   注意用全局 ConfigFilePath 而非 SettingsCfgPath——渲染引擎属界面态，
+    //   不参与任务级覆盖（同 [Explorer] 口径）。失败不抛。
+    const QString sPath = GlobalConfigPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsVal = IsModelViewEngine(a_sEngine)
+        ? std::wstring(L"ModelView") : std::wstring(L"Legacy");
+    WritePrivateProfileStringW(L"View", L"Engine", wsVal.c_str(), sPath.toStdWString().c_str());
+    return true;
+}
+
+QString CProjectManager::LoadViewEngine()
+{
+    // 读 [View] Engine：缺键/非法值 → "Legacy"（缺省引擎）；"ModelView" → 自绘链。
+    //   静态（读全局 config.ini，无实例可调——面板构造期取引擎快照用）。
+    const QString sPath = GlobalConfigPath();
+    if (sPath.isEmpty()) {
+        return QStringLiteral("Legacy");
+    }
+    wchar_t szBuf[64] = { 0 };
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"View", L"Engine", L"Legacy", szBuf, 64, sPath.toStdWString().c_str());
+    const QString sVal = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+    return IsModelViewEngine(sVal) ? sVal : QStringLiteral("Legacy");
+}
+
+QStringList CProjectManager::BackupExcludeDirs() const {    // FR-6（Q4 默认排除清单）：.autodev（含 backups 自身，防递归）、build、Execute、
     // .git、.vs、x64。2026.08.15 改读 config.ini [Backup] ExcludeDirs（逗号分隔，
     //   空项跳过）；无 config.ini/缺键/全空 → 回退内置默认。每次调用现读（设置保存即生效）。
     const QStringList aItems = LoadBackupExcludeDirs()

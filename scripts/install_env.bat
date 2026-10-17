@@ -12,6 +12,12 @@ if /i "%~1"=="/dsh" set "DSH_ONLY=1"
 :: ---- 参数：/pi = 只安装 PIAgent（设置页「安装 PIAgent」按钮调用）----
 set "PI_ONLY=0"
 if /i "%~1"=="/pi" set "PI_ONLY=1"
+:: ---- 参数/pi-npm = 联网安装 PIAgent（npm 全局装；设置页「联网安装（npm）」按钮
+::      调用，2026.10.10 新增。修旧直连 cmd /k npm 的实害：提权子进程继承的是
+::      AutoCode 启动时的旧环境，刚装完 Node 未重启主程序必报找不到 npm；本模式
+::      在窗口内 :RefreshPath 读注册表 PATH 并缺 Node 时自动补装后再全局装）----
+set "PI_NPM_ONLY=0"
+if /i "%~1"=="/pi-npm" set "PI_NPM_ONLY=1"
 :: ---- 参数/codex = 只安装 CodexHarness（设置页「安装 CodexHarness…」按钮调用）----
 set "CODEX_ONLY=0"
 if /i "%~1"=="/codex" set "CODEX_ONLY=1"
@@ -42,6 +48,11 @@ if /i "%~1"=="/hermes-update" set "HERMES_ONLY=1"
 set "HERMES_PATCH=0"
 if /i "%~1"=="/hermes-patch" set "HERMES_PATCH=1"
 
+:: ---- 参数：/node = 仅安装/升级 Node.js LTS（后端版本管理「更新」的 Node 预检----
+::      闸调用：PATH 无 node 或主版本过低（Claude Code 2.x 要求 22 以上）时拉起）----
+set "NODE_ONLY=0"
+if /i "%~1"=="/node" set "NODE_ONLY=1"
+
 title AutoCode 环境安装
 cd /d "%~dp0"
 :: DSH 固定安装布局：脚本目录内（即 Execute 程序目录）DeepSeekHarness\deepseek-harness
@@ -60,14 +71,55 @@ if "!HERMES_URL!"=="" set "HERMES_URL=https://github.com/nousresearch/hermes-age
 ::   HERMES_ROOT（兼容外部部署布局，同 /update-dsh 第 3 参口径）。
 if "!HERMES_UPD!"=="1" if not "%~2"=="" set "HERMES_ROOT=%~2"
 
+:: ---- 2026.10.10 提权前置：先探管理员并按需自提权，再打印横幅 ----
+:: 修复：旧序「先横幅→:ADMIN 里 net session→自提权重跑」会把横幅在原窗口与提权
+::       窗口各打印一次（异地部署「CodexHarness 单独安装」横幅出现两遍的根因）；
+:: 探测补 fltmc 兜底：net session 依赖 Server/LanmanServer 服务，该服务被禁用的
+::       机器上提权后仍探测失败→无限弹 UAC/新窗口；/relaunched 标记防循环重跑，
+::       二次仍未提权则降级以当前权限继续（本地目录安装可完成，仅机器级安装受限）。
+:: /hermes-patch 纯文件操作无需提权，保持直接进补丁段。
+if "!HERMES_PATCH!"=="1" goto :HERMES_PATCH
+goto :ELEVATE
+
+:ELEVATE
+set "AC_ADMIN=0"
+net session >nul 2>&1
+if not errorlevel 1 set "AC_ADMIN=1"
+fltmc >nul 2>&1
+if not errorlevel 1 set "AC_ADMIN=1"
+:: 标记检测用纯 cmd 变量替换（不调 find.exe——PATH 混入 Git/Unix 工具目录时
+::       find 会被劫持，防循环守卫失效；内置语法任何机器行为一致）。
+set "AC_RELAUNCHED=0"
+set "AC_ARGS=%*"
+if defined AC_ARGS if not "!AC_ARGS!"=="!AC_ARGS:/relaunched=!" set "AC_RELAUNCHED=1"
+set "AC_ARGS="
+if "!AC_ADMIN!"=="1" goto :MODE_DISPATCH
+if "!AC_RELAUNCHED!"=="1" goto :ELEV_DEGRADE
+echo [提示] 安装需要管理员权限，正在尝试 UAC 提权...
+if "%~1"=="" (
+    powershell -NoProfile -Command "Start-Process '%~f0' -ArgumentList '/relaunched' -Verb RunAs"
+) else (
+    powershell -NoProfile -Command "Start-Process '%~f0' -ArgumentList '%* /relaunched' -Verb RunAs"
+)
+exit /b
+
+:ELEV_DEGRADE
+echo [提示] 未能获得管理员权限（UAC 被拒或系统策略限制），改以当前权限继续...
+echo         机器级安装（winget/MSI/npm 全局）可能失败；本地目录安装可正常完成。
+echo.
+goto :MODE_DISPATCH
+
+:: ---- 模式分派（横幅仅在最终执行的窗口打印一次）----
+:MODE_DISPATCH
 if "!DSH_UPDATE!"=="1" goto :BANNER_DSH_UPDATE
 if "!PI_UPDATE!"=="1" goto :BANNER_PI_UPDATE
 if "!HERMES_UPD!"=="1" goto :BANNER_HERMES
 if "!DSH_ONLY!"=="1" goto :BANNER_DSH
 if "!PI_ONLY!"=="1" goto :BANNER_PI
+if "!PI_NPM_ONLY!"=="1" goto :BANNER_PI_NPM
 if "!CODEX_ONLY!"=="1" goto :BANNER_CODEX
 if "!HERMES_ONLY!"=="1" goto :BANNER_HERMES
-if "!HERMES_PATCH!"=="1" goto :HERMES_PATCH
+if "!NODE_ONLY!"=="1" goto :BANNER_NODE
 echo ============================================================
 echo   AutoCode 环境安装
 echo   一键安装：Git、Node.js LTS、Claude Code CLI
@@ -109,6 +161,17 @@ echo ============================================================
 echo.
 goto :ADMIN
 
+:: ---- PIAgent 联网安装横幅（/pi-npm 模式，2026.10.10）----
+:BANNER_PI_NPM
+echo ============================================================
+echo   PIAgent 联网安装（npm 全局）
+echo   安装内容：npm install -g @earendil-works/pi-coding-agent
+echo   环境自愈：继承 PATH 旧时自动读注册表 PATH 刷新；缺 Node.js 时自动补装
+echo   镜像源：https://registry.npmmirror.com（境内加速）
+echo ============================================================
+echo.
+goto :ADMIN
+
 :BANNER_CODEX
 echo ============================================================
 echo   CodexHarness 单独安装
@@ -142,29 +205,39 @@ echo ============================================================
 echo.
 goto :ADMIN
 
+
+:: ---- Node.js 单独安装/升级横幅（/node 模式，2026.10.10）----
+:BANNER_NODE
+echo ============================================================
+echo   Node.js LTS 安装/升级
+echo   触发条件：PATH 无 node 或主版本过低（Claude Code 2.x 要求 22 以上）
+echo   安装方式：winget 优先，失败自动转 nodejs.org LTS x64 MSI 直装
+echo ============================================================
+echo.
+goto :ADMIN
 :ADMIN
 
-:: ---- 0. 管理员权限检测（写 Program Files / 机器级 PATH 需要）----
-net session >nul 2>&1
-if !errorlevel! neq 0 (
-    echo [提示] 安装需要管理员权限，正在尝试 UAC 提权...
-    if "%~1"=="" (
-        powershell -NoProfile -Command "Start-Process '%~f0' -Verb RunAs"
-    ) else (
-        powershell -NoProfile -Command "Start-Process '%~f0' -ArgumentList '%*' -Verb RunAs"
-    )
-    exit /b
+:: ---- 0. 管理员权限：已于 :ELEVATE 前置完成（2026.10.10 提权先于横幅，自提权
+::      重跑不再重复打印横幅；net session+fltmc 双探测，此处仅报告状态）----
+if "!AC_ADMIN!"=="1" (
+    echo [OK] 已获取管理员权限。
+    echo.
 )
-echo [OK] 已获取管理员权限。
-echo.
+
+:: ---- 0.1 会话 PATH 刷新：读注册表 Machine+User 合并 PATH（:RefreshPath，会追加
+::      回初始 PATH 防丢）。修「上一轮刚装完 Node、本窗口继承的还是旧 PATH」场景：
+::      不刷则 :DETECT 误判 node 缺失而重装（2026.10.10，/pi-npm 前置自愈）----
+call :RefreshPath
 
 :: ---- 1. 选择 Claude Code 接入后端（单装/更新模式跳过）----
 if "!DSH_UPDATE!"=="1" goto :UPDATE_DSH
 if "!PI_UPDATE!"=="1" goto :PI_UPDATE
 if "!DSH_ONLY!"=="1" goto :DETECT
 if "!PI_ONLY!"=="1" goto :DETECT
+if "!PI_NPM_ONLY!"=="1" goto :DETECT
 if "!HERMES_ONLY!"=="1" goto :DETECT
 if "!CODEX_ONLY!"=="1" goto :CODEX
+if "!NODE_ONLY!"=="1" goto :NODE
 echo ============================================================
 echo   请选择 Claude Code 接入模型：
 echo     [1] Anthropic 原版 - 官方直连 + Anthropic 账号或 API key
@@ -189,12 +262,23 @@ set "HAVE_HELPER=0"
 where node   >nul 2>&1 && set "HAVE_NODE=1"
 where git    >nul 2>&1 && set "HAVE_GIT=1"
 where claude >nul 2>&1 && set "HAVE_CLAUDE=1"
+rem 2026.10.10 claude 检测双重验证（dell 实害终审：npm prefix 变更后 %APPDATA%\npm 遗留死
+rem   shim 使 where 假阳性 → HAVE_CLAUDE=1 → NEED=0 → goto 跳过整个安装段——claude 段
+rem   的死 shim 自动修复永远跑不到，重跑多少次都无效）。--version 失败判死 shim，
+rem   置回未装走安装段的自动修复分支（清遗留 shim → 重装 → 复验）。
+if "!HAVE_CLAUDE!"=="1" (
+    call claude --version >nul 2>&1
+    if !errorlevel! neq 0 (
+        set "HAVE_CLAUDE=0"
+        echo    claude   命令存在但无法执行（死 shim，指向的包已不在），将走自动修复
+    )
+)
 if /i "!BACKEND!"=="GLM" ( where chelper >nul 2>&1 && set "HAVE_HELPER=1" )
 
 echo [检测]
 if "!HAVE_NODE!"=="1"   (echo    node     已安装) else (echo    node     缺失)
 if "!HAVE_GIT!"=="1"    (echo    git      已安装) else (echo    git      缺失)
-if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!PI_NPM_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="1" (echo    claude   已安装) else (echo    claude   缺失)
     if /i "!BACKEND!"=="GLM" (
         if "!HAVE_HELPER!"=="1" (echo    chelper  已安装) else (echo    chelper  缺失)
@@ -215,7 +299,15 @@ echo.
 set "NEED=0"
 if "!HAVE_NODE!"=="0"   set "NEED=1"
 if "!HAVE_GIT!"=="0"    set "NEED=1"
-if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
+:: 2026.10.10 版本闸（全量模式）：claude-code@2.x 引擎要求 Node>=22——旧版残装
+::   （如 32 位 0.x）存在但版本过低同样必须升级，否则 npm postinstall 新语法
+::   （const { spawnSync } = require(...)）旧 Node 解析必 SyntaxError。
+set "NODE_LOW=0"
+if "!HAVE_NODE!"=="1" (
+    for /f "tokens=1 delims=v." %%v in ('node -v 2^>nul') do if %%v LSS 22 set "NODE_LOW=1"
+)
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!PI_NPM_ONLY!"=="0" if "!HERMES_ONLY!"=="0" if "!NODE_LOW!"=="1" set "NEED=1"
+if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!PI_NPM_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
     if "!HAVE_CLAUDE!"=="0" set "NEED=1"
     if /i "!BACKEND!"=="GLM" if "!HAVE_HELPER!"=="0" set "NEED=1"
 )
@@ -225,6 +317,7 @@ if "!NEED!"=="0" (
     echo.
     if "!DSH_ONLY!"=="1" goto :DSH
     if "!PI_ONLY!"=="1" goto :PI
+    if "!PI_NPM_ONLY!"=="1" goto :PI_NPM
     if "!HERMES_ONLY!"=="1" goto :HERMES
     goto :DSH_ASK
 )
@@ -246,6 +339,21 @@ if "!HAVE_NODE!"=="0" (
         where node >nul 2>&1 && set "NODE_OK=1"
     )
     if "!NODE_OK!"=="1" ( set "HAVE_NODE=1" ) else ( echo [错误] Node.js 不在 PATH，请关闭窗口后重试。 )
+)
+:: 2026.10.10 旧版升级闸（全量模式）：node 在但主版本 <22 时升级；单装模式
+::   （/dsh /pi /hermes）保持原「存在即跳过」口径，由各自安装段把守。
+if "!HAVE_NODE!"=="1" if "!NODE_LOW!"=="1" (
+    if "!DSH_ONLY!"=="0" if "!PI_ONLY!"=="0" if "!PI_NPM_ONLY!"=="0" if "!HERMES_ONLY!"=="0" (
+        call :EnsureNodeLts
+        call :NodeVerMajor
+        if !NODE_MAJOR_NUM! GEQ 22 (
+            set "NODE_LOW=0"
+        ) else (
+            echo [错误] Node.js 升级未达标，继续安装 Claude Code 必失败，本次中止。
+            echo        请按上方指引卸载旧版 Node.js 后重跑本脚本。
+            goto :END
+        )
+    )
 )
 echo.
 
@@ -308,27 +416,119 @@ if "!DSH_ONLY!"=="1" goto :DSH
 if "!HERMES_ONLY!"=="1" goto :HERMES
 :: PI 单装模式：node 就绪即可（无需 git/npm 全局件），直接进安装段。
 if "!PI_ONLY!"=="1" goto :PI
+:: PI 联网安装模式：环境段就绪（PATH 已刷新/Node 已备/镜像已配），进安装段。
+if "!PI_NPM_ONLY!"=="1" goto :PI_NPM
 
 :: ---- 8. Claude Code CLI（claude 命令）----
+:: 2026.10.10 验收加固（异地部署机实害：npm 装失败静默继续、跳过分支不验 shim
+::   有效性——claude.cmd 存在但包损坏时误报已装）。装后 where claude 复查验收；
+::   已装分支补 claude --version 快验（shim 指向的包被删/损坏可及时发现）。
+:: 2026.10.10 prefix 受保护目录检测（dell 实害：prefix=C:\Program Files\npm，
+::   npm install -g 写受保护目录必须管理员，未提权/降级运行必 EACCES 失败死循环）。
+rem 2026.10.10 关键步骤落盘（异地支持：跑完把本目录 install_env_last.log 反馈开发者）
+set "IEL=%~dp0install_env_last.log"
+for /f "delims=" %%p in ('npm config get prefix 2^>nul') do set "NPM_PREFIX_X=%%p"
+if exist "%CD%\.npmrc" (
+    echo [%date% %time%] [重要] 工作目录存在项目级 .npmrc（优先级高于用户级，会顶掉 prefix 纠正）：>> "!IEL!"
+    type "%CD%\.npmrc" >> "!IEL!" 2>nul
+    echo. >> "!IEL!"
+    echo         项目级 .npmrc 内容：
+    type "%CD%\.npmrc" 2>nul
+)
+echo [%date% %time%] prefix=%NPM_PREFIX_X% >> "!IEL!"
+echo %NPM_PREFIX_X% | findstr /i /c:"Program Files" >nul 2>&1
+if not errorlevel 1 (
+    echo [警告] npm 全局目录指向受保护目录（!NPM_PREFIX_X!）——npm install 写入需要
+    echo         管理员权限，安装常因权限静默失败（dell 机实害循环根因）。
+    choice /c YN /t 15 /d Y /m "自动改回用户目录（%APPDATA%\npm，推荐，15 秒后自动 Y）"
+    if !errorlevel! equ 1 (
+        call npm config set prefix "%APPDATA%\npm"
+        echo [OK] npm 全局目录已改回 %APPDATA%\npm（写入无需管理员，装完命令直接可用）
+        echo [%date% %time%] prefix 自动纠正 Y 已执行 >> "!IEL!"
+    ) else (
+        echo [跳过] 保持 !NPM_PREFIX_X!（若安装失败请提权重跑或手动改回）
+    )
+)
+
 where claude >nul 2>&1
-if !errorlevel! equ 0 (
-    echo [OK] Claude Code 已安装，跳过。
-) else (
+if !errorlevel! neq 0 (
     echo [安装] @anthropic-ai/claude-code ...
     call npm install -g @anthropic-ai/claude-code
+    echo [%date% %time%] 安装分支 npm install rc=!errorlevel! >> "!IEL!"
     call :RefreshPath
+    where claude >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo [错误] Claude Code 安装失败（npm 报错见上方）。常见原因：网络不通、
+        echo [%date% %time%] 结果=错误-安装失败 >> "!IEL!"
+        echo         npm 源不可达、Node 版本过低。处理后重跑本脚本。
+    ) else (
+        call claude --version >nul 2>&1
+        if !errorlevel! equ 0 (
+            echo [OK] Claude Code 安装完成。
+        echo [%date% %time%] 结果=OK-安装完成 >> "!IEL!"
+        ) else (
+            echo [错误] claude 命令已落盘但无法执行（包不完整，--version 失败）。
+            echo         处理：npm install -g @anthropic-ai/claude-code 重装。
+        )
+    )
+) else (
+    call claude --version >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo [OK] Claude Code 已安装，跳过。
+        echo [%date% %time%] 结果=OK-已装跳过 >> "!IEL!"
+    ) else (
+        rem 2026.10.10 死 shim 自动修复（dell 实害：npm prefix 变更后 %APPDATA%
+pm 遗留
+        rem   死 shim 挡在 PATH 前——where 永远命中坏的，重装到新 prefix 也救不回）。
+        rem   处理：删遗留 shim（claude/claude.cmd/claude.ps1，仅同目录 node_modules 下
+        rem   无包真身时）→ 重装 → 复验。npm prefix 非默认时装到 prefix（可能需本窗口
+        rem   的管理员权限），装完 where 命中新位置。
+        echo [修复] claude 命令存在但无法执行（死 shim，指向的包已不在）——
+        echo         自动清理遗留 shim 并重装...
+        if not exist "%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe" (
+            del "%APPDATA%\npm\claude" "%APPDATA%\npm\claude.cmd" "%APPDATA%\npm\claude.ps1" 2>nul
+        )
+
+        call npm install -g @anthropic-ai/claude-code
+        echo [%date% %time%] 死shim修复 npm install rc=!errorlevel! >> "!IEL!"
+        call :RefreshPath
+        call claude --version >nul 2>&1
+        if !errorlevel! equ 0 (
+            echo [OK] Claude Code 重装完成（已自动清理失效的旧 shim）。
+        echo [%date% %time%] 结果=OK-死shim修复重装完成 >> "!IEL!"
+        ) else (
+            rem 重装成功但 PATH 仍解析不到：npm prefix 目录不在 PATH（prefix 变更常见后遗症），
+            rem   用 npm root -g 探真身并给 PATH 指引（dell 实害：prefix=C:\Program Files\npm）。
+            for /f "delims=" %%p in ('npm root -g 2^>nul') do set "NPM_ROOT_G=%%p"
+            if exist "!NPM_ROOT_G!\@anthropic-ai\claude-code\bin\claude.exe" (
+                echo [OK] Claude Code 已装到 npm 全局目录（!NPM_ROOT_G!）。
+        echo [%date% %time%] 结果=OK-真身在但PATH缺 >> "!IEL!"
+                echo [提示] 但该目录不在 PATH，claude 命令无法直接命中——把 npm prefix
+                echo         所在目录（运行 npm config get prefix 查看）加入系统 PATH 后重开 cmd。
+            ) else (
+                echo [错误] 重装后仍未找到 claude 安装。请把本窗口全部内容反馈给开发者。
+        echo [%date% %time%] 结果=错误-重装后仍无安装 >> "!IEL!"
+            )
+        )
+    )
 )
 echo.
 
 :: ---- 9. 国产 GLM 中继（选了 GLM 才装）----
 if /i "!BACKEND!"=="GLM" (
     where chelper >nul 2>&1
-    if !errorlevel! equ 0 (
-        echo [OK] 国产中继 chelper 已安装，跳过。
-    ) else (
+    if !errorlevel! neq 0 (
         echo [安装] @z_ai/coding-helper ...
         call npm install -g @z_ai/coding-helper
         call :RefreshPath
+        where chelper >nul 2>&1
+        if !errorlevel! equ 0 (
+            echo [OK] 国产中继 chelper 安装完成。
+        ) else (
+            echo [错误] chelper 安装失败（npm 报错见上方）。处理后重跑本脚本。
+        )
+    ) else (
+        echo [OK] 国产中继 chelper 已安装，跳过。
     )
     echo.
 )
@@ -766,18 +966,25 @@ if !errorlevel! neq 0 (
     goto :PI_END
 )
 :: 源：默认脚本上级 PIAgent（发布目录旁的源码仓库），环境变量 PI_SRC 可覆盖。
+::   PI_SRC 兼容两种布局（2026.10.10）：PIAgent 仓库根（含 pi\ 子目录），或直接
+::   指向 pi 仓库根（本身含 packages\coding-agent\dist\cli.js）。
 if not defined PI_SRC set "PI_SRC=%~dp0..\PIAgent"
 for %%i in ("!PI_SRC!") do set "PI_SRC=%%~fi"
 for %%i in ("%~dp0PIAgent") do set "PI_DST=%%~fi"
-if not exist "!PI_SRC!\pi\packages\coding-agent\dist\cli.js" (
-    echo [错误] 源目录无效：!PI_SRC!\pi 下未找到 packages\coding-agent\dist\cli.js
-    echo        可用环境变量 PI_SRC 指定 PIAgent 仓库根（含 pi\ 子目录）后重跑：
-    echo          set PI_SRC=D:\path\to\PIAgent ^&^& install_env.bat /pi
-    goto :PI_END
-)
-echo [安装] robocopy 复制 pi 运行时（源：!PI_SRC!\pi → 目标：!PI_DST!\pi）...
+set "PI_SRC_PI=!PI_SRC!\pi"
+if exist "!PI_SRC_PI!\packages\coding-agent\dist\cli.js" goto :PI_SRC_READY
+set "PI_SRC_PI=!PI_SRC!"
+if exist "!PI_SRC_PI!\packages\coding-agent\dist\cli.js" goto :PI_SRC_READY
+echo [错误] 源目录无效：!PI_SRC!\pi 下未找到 packages\coding-agent\dist\cli.js
+echo        可用环境变量 PI_SRC 指定 PIAgent 仓库根（含 pi\ 子目录）后重跑：
+echo          set PI_SRC=D:\path\to\PIAgent ^&^& install_env.bat /pi
+echo        本机无源码时可改走联网安装（需能访问 npm 源）：
+echo          install_env.bat /pi-npm
+goto :PI_END
+:PI_SRC_READY
+echo [安装] robocopy 复制 pi 运行时（源：!PI_SRC_PI! → 目标：!PI_DST!\pi）...
 if not exist "!PI_DST!" mkdir "!PI_DST!"
-robocopy "!PI_SRC!\pi" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+robocopy "!PI_SRC_PI!" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
 if !errorlevel! GEQ 8 (
     echo [错误] robocopy 失败（退出码 !errorlevel!）- 请查看上方输出排查（磁盘空间/占用/权限）。
     goto :PI_END
@@ -792,6 +999,36 @@ if exist "!PI_DST!\pi\packages\coding-agent\dist\cli.js" (
 echo.
 
 :PI_END
+goto :VERIFY
+
+:: ---- PIAgent 联网安装段（/pi-npm 单装模式，2026.10.10 新增：设置页「联网安装
+::      （npm）」按钮改走本模式——旧直连 cmd /k npm install -g 继承的是 AutoCode
+::      进程启动时的环境（刚装完 Node 未重启主程序时为旧 PATH）必报找不到 npm；
+::      本模式经公共段就绪：:ADMIN 已 :RefreshPath 读注册表 PATH、:DETECT 缺
+::      Node 时自动补装、镜像源已配置，再执行全局安装）----
+:PI_NPM
+echo ============================================================
+echo   联网安装 PIAgent（npm install -g @earendil-works/pi-coding-agent）
+echo ============================================================
+where npm >nul 2>&1
+if !errorlevel! neq 0 (
+    echo [错误] 找不到 npm - 请关闭本窗口，重开终端后重试（或先跑环境安装）。
+    goto :PI_NPM_END
+)
+echo [安装] npm install -g @earendil-works/pi-coding-agent ...
+call npm install -g @earendil-works/pi-coding-agent
+call :RefreshPath
+for /f "delims=" %%p in ('npm root -g 2^>nul') do set "NPM_ROOT_G=%%p"
+if exist "!NPM_ROOT_G!\@earendil-works\pi-coding-agent\dist\cli.js" (
+    echo [OK] PIAgent 联网安装完成（npm 全局：!NPM_ROOT_G!）。
+    echo        回到 AutoCode 设置页点「重新检测」即可生效（PIAgent 根目录可留空）。
+) else (
+    echo [错误] 未找到 dist\cli.js - 安装未完成，请查看上方 npm 输出
+    echo        （npm 源可达性/写权限/磁盘空间）排查。
+)
+echo.
+
+:PI_NPM_END
 goto :VERIFY
 
 :: ---- /update-pi 横幅（2026.09.20 版本管理「更新 PIAgent」）----
@@ -1018,6 +1255,19 @@ echo.
 :UPDATE_DSH_END
 goto :VERIFY
 
+:: ---- Node.js LTS 单独安装/升级段（/node：版本管理对话框 Node 预检闸调用）----
+:NODE
+echo ============================================================
+echo   Node.js LTS 安装/升级（Claude Code 2.x 要求 Node 22 以上）
+echo ============================================================
+echo.
+call :EnsureNodeLts
+echo.
+echo   提示 - 窗口出现 [OK] Node.js 已就绪 才算完成；完成后请关闭并重开
+echo   AutoCode（让新 PATH 生效），再回后端版本管理窗点更新。
+echo ============================================================
+goto :END
+
 :: ---- 10. 安装结果验证 ----
 :VERIFY
 echo ============================================================
@@ -1039,6 +1289,8 @@ if exist "!DSH_ROOT!\packages\examples\jsonrpc-demo\lib\bin.js" (
 )
 if exist "%~dp0PIAgent\pi\packages\coding-agent\dist\cli.js" (
     echo [PIAgent] 已安装：%~dp0PIAgent\pi
+) else if exist "!NPM_ROOT_G!\@earendil-works\pi-coding-agent\dist\cli.js" (
+    echo [PIAgent] 已安装（npm 全局）：!NPM_ROOT_G!\@earendil-works\pi-coding-agent
 ) else (
     echo [PIAgent] 未安装 - 可选组件，可在 AutoCode 设置页单独安装
 )
@@ -1139,6 +1391,60 @@ goto :eof
 :: 无 winget 时从 nodejs.org 取最新 LTS 的 x64 MSI 静默安装。
 :: 引号按 PowerShell 字符串规则写（外双内单），避开 cmd/PS 引号冲突。
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { $i=Invoke-RestMethod https://nodejs.org/dist/index.json; $v=($i|Where-Object{$_.lts -ne $false}|Select-Object -First 1).version; Write-Host ('Node LTS '+$v); $p=$env:TEMP+'\node-lts.msi'; Invoke-WebRequest ('https://nodejs.org/dist/'+$v+'/node-'+$v+'-x64.msi') -OutFile $p; Write-Host 'Installing MSI...'; Start-Process msiexec -ArgumentList @('/i',$p,'/qb','/norestart') -Wait } catch { Write-Host ('[错误] '+$_.Exception.Message) }"
+goto :eof
+
+:EnsureNodeLts
+:: 2026.10.10 /node 模式与全量模式共用：确保 PATH 上的 node 主版本 >=22。
+::   已达标直接过；否则 winget（可用时）→ nodejs.org LTS x64 MSI 直装兜底；
+::   装后 NodeSessionFix（重读注册表 PATH + 会话前置 C:\Program Files\nodejs，
+::   防 32 位旧目录在系统 PATH 排前遮蔽新装）再复验；仍 <22 给卸旧指引。
+call :NodeVerMajor
+if !NODE_MAJOR_NUM! GEQ 22 (
+    echo [OK] Node.js 已就绪：!NODE_VER!
+    goto :eof
+)
+echo [升级] Node.js 版本过低（!NODE_VER!，主版本 !NODE_MAJOR_NUM!，需 22 以上）...
+where winget >nul 2>&1
+if !errorlevel! equ 0 (
+    echo   - 尝试 winget（winget 源失败将自动转直装）...
+    winget install --id OpenJS.NodeJS.LTS -e --source winget --accept-source-agreements --accept-package-agreements --disable-interactivity
+)
+call :NodeSessionFix
+call :NodeVerMajor
+if !NODE_MAJOR_NUM! GEQ 22 goto :ENL_DONE
+echo   - winget 未装成，改为直装 Node.js LTS x64 MSI ...
+call :InstallNodeDl
+call :NodeSessionFix
+call :NodeVerMajor
+if !NODE_MAJOR_NUM! GEQ 22 goto :ENL_DONE
+echo.
+echo [错误] Node.js 安装后仍未达标（当前 !NODE_VER!，需 22 以上）。
+echo        常见原因：机器上有更老的 Node（如 32 位 0.x，C:\Program Files (x86)\nodejs）
+echo        在系统 PATH 中排在前面，遮蔽了新装版本。
+echo        处理：控制面板卸载旧版 Node.js，重开本窗口重跑本脚本。
+goto :eof
+:ENL_DONE
+echo [OK] Node.js 已就绪：!NODE_VER!
+goto :eof
+
+:NodeVerMajor
+:: 探测当前 PATH 首个 node 的完整版本与主版本（node 缺失/异常 = 0）。
+::   NODE_VER 形如 v22.19.0；NODE_MAJOR_NUM = 去 v 后第一段数字（v0.12.2 → 0）。
+set "NODE_VER=未知"
+set "NODE_MAJOR_NUM=0"
+where node >nul 2>&1
+if !errorlevel! neq 0 goto :eof
+for /f "delims=" %%v in ('node -v 2^>nul') do set "NODE_VER=%%v"
+if "!NODE_VER!"=="未知" goto :eof
+for /f "tokens=1 delims=v." %%v in ("!NODE_VER!") do set "NODE_MAJOR_NUM=%%v"
+goto :eof
+
+:NodeSessionFix
+:: 装后 PATH 会话修正：重读注册表 PATH（MSI 写机器级需重读才可见），再把新 x64
+::   Node 固定目录前置到会话 PATH——本窗口后续 npm 用新 Node；系统级持久顺序仍
+::   以注册表为准（旧目录排前时需卸旧版，见 EnsureNodeLts 的指引）。
+call :RefreshPath
+if exist "C:\Program Files\nodejs\node.exe" set "PATH=C:\Program Files\nodejs;!PATH!"
 goto :eof
 
 :InstallGitDl

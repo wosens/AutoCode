@@ -1,5 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
-  <circle cx="13" cy="13" r="8" stroke="#2563eb" stroke-width="2.6"/>
-  <path d="M19 19 L27.5 27.5" stroke="#2563eb" stroke-width="3.2" stroke-linecap="round"/>
-  <path d="M9.5 13.2 L12.2 16 L17 10.6" stroke="#27ae60" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- 代码审查：文档 + 审查镜 -->
+  <path d="M5 4.5 H10.5 L14.5 8.5 V11" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M14.5 15.5 V17.5 Q14.5 19.5 12.5 19.5 H7 Q5 19.5 5 17.5 V4.5" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M10.5 4.5 V8.5 H14.5" stroke="#2563EB" stroke-width="2" stroke-linejoin="round"/>
+  <circle cx="16.2" cy="15.8" r="4.2" stroke="#2563EB" stroke-width="2"/>
+  <path d="M19.2 18.8 L21.5 21.1" stroke="#2563EB" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M14.6 15.8 L15.7 16.9 L17.7 14.6" stroke="#30A46C" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

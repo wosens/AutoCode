@@ -1,36 +1,15 @@
-﻿#pragma once
+#pragma once
 
 #include <QString>
 #include <QList>
-#include <QJsonObject>
-#include <QJsonValue>
 #include <QPointer>
 #include <functional>
 #include <memory>
 
-#include "CMessageBlock.h"
-#include "CMessageView.h"   // 2026-10-09 QPointer<CMessageView> 需完整类型（前向声明下 qpointer.h static_cast 编译错）
-
-// class CMessageView;   // 2026-10-09 已改含完整头（QPointer 实例化点需知道 QObject 派生关系）
-
-// =============================================================================
-// SBlockData：一条对话流中单个消息块的数据快照（2026.09.03 自 CExecutionPanel 嵌套
-// 结构迁出为全局——任务日志与各助手日志共用 CStreamPresenter，数据结构须独立于面板）。
-// 由流呈现器持有；面板按 taskId（任务流）/助手 id（助手流）路由落盘（chat.json/assistant.json）。
-// =============================================================================
-struct SBlockData {
-    CMessageBlock::EKind eKind = CMessageBlock::Assistant;
-    QString sText;        // Assistant/Event/System/Error 文本
-    QString sTool;        // ToolUse 工具名
-    QString sInput;       // ToolUse 入参 JSON
-    QString sResult;      // ToolUse 结果（到达后回填）
-    QString sEventKind;   // Event 的 kind
-    QString sViewId;      // 评审多视角并行的视角标识（v1/v2/...；空=串行路径）
-    QString sBackend;     // Assistant 块的产出后端显示名（消息到达时拍摄，随块持久化）
-};
-
-QJsonObject BlockToJson(const SBlockData& a_stData);   // SBlockData ↔ JSON（chat.json/assistant.json 共用）
-SBlockData BlockFromJson(const QJsonObject& a_o);
+#include "SBlockData.h"      // 2026-10-17 SBlockData/BlockToJson 自本头拆出（解 CChatModel 环）
+#include "CMessageView.h"    // 2026-10-09 QPointer<CMessageView> 需完整类型（前向声明下 qpointer.h static_cast 编译错）
+#include "CChatModel.h"      // 2026-10-17 QPointer<CChatModel> 完整类型（同上先例）
+#include "CChatListView.h"   // 2026-10-17 QPointer<CChatListView> 完整类型（同上先例）
 
 // =============================================================================
 // CStreamPresenter：一条对话流的呈现器（2026.09.03 收拢任务日志与助手日志的双份平行实现）。
@@ -66,16 +45,28 @@ public:
 
     // —— 视图绑定 ——
     void Bind(CMessageView* a_pView);   // 绑定视图（接线分页信号；重复绑定先解绑旧视图）
+    // 2026-10-17 自绘三期（doc/对话流视图自绘改造方案.md §9.2）：ModelView 引擎
+    //   绑定——挂 (CChatModel, CChatListView) 自绘链。数据正本/落盘/fnDirty 与 Legacy
+    //   完全共用（两引擎同档互切零迁移）；窗口机制退役（模型持全量投影，视图天然
+    //   虚拟化只画可视区）。绑定后调用方应跟 Rebuild 投影数据。
+    void Bind(CChatModel* a_pModel, CChatListView* a_pView2);
     void Unbind();                      // 解绑：断线 + 清视图块 + 弃件保数据 + 复位前沿/作废在途帧
     CMessageView* View() const { return m_pView; }
-    bool Bound() const { return m_pView != nullptr; }
+    bool Bound() const { return m_pView != nullptr || m_pModel != nullptr; }
+    // —— ModelView 引擎观察口（测试/面板判定用；Legacy 恒 false）——
+    bool ModelView() const { return m_pModel != nullptr; }
+    CChatModel* ChatModel() const { return m_pModel; }
+    CChatListView* ChatView() const { return m_pView2; }
 
     // —— 数据 ——
     QList<SBlockData>& Blocks() { return m_aBlocks; }
     const QList<SBlockData>& Blocks() const { return m_aBlocks; }
     void SetBlocks(const QList<SBlockData>& a_aBlocks) { m_aBlocks = a_aBlocks; }   // 载入/换数据（绑定时调用方应跟 Rebuild）
     int Count() const { return m_aBlocks.size(); }
-    int WidgetCount() const { return m_aWidgets.size(); }   // 已建件数（0=未建/已弃件，切档惰性重建判定用）
+    int WidgetCount() const { return m_aWidgets.size(); }   // 已建件数（0=未建/已弃件，切档惰性重建判定用；ModelView 恒 0——用 Projected()）
+    // 2026-10-17 ModelView 引擎：数据是否已投影进模型（Rebuild 置位、Unbind 摘除）——
+    //   面板切 Tab 惰性重建判定的 MV 口径（Legacy 的 WidgetCount()==0 等价物）。
+    bool Projected() const { return m_bProjected; }
     int Frontier() const { return m_iFrontier; }   // [0,frontier) 尚未建件（测试/诊断）
 
     // —— 上屏 ——
@@ -87,6 +78,9 @@ public:
     bool Rebuilding() const { return m_bRebuilding; }
     // 反向分页：补建更早一段前插视图（到顶信号触发）；返回是否补了（前沿已到 0 则 false）
     bool PrependOlder();
+    // 2026-10-15 底部分页：跳转窗口尾截断（窗口尾早于数据尾）时滚到底分轮补建更新
+    //   一段（与 PrependOlder 对称）；返回是否补了（无尾隙/在途 false）。
+    bool AppendNewer();
     // 数据下标 → 块 widget（未建件区间返回 nullptr）
     CMessageBlock* WidgetAt(int a_iIdx) const;
     // 结果回填：从尾回溯找最后一个未闭合 ToolUse（可选视角过滤）写数据 + 刷件 + fnDirty；
@@ -94,12 +88,20 @@ public:
     int BackfillResult(const QString& a_sResult, const QString& a_sViewId = QString());
     // 跳转覆盖：目标块早于前沿时分轮补建（每轮一帧突发，交还事件循环防长冻）至覆盖后回调；
     // 已覆盖则同步回调。目标越界/未绑定不回调。
+    // 2026-10-15 远跳优化：目标距前沿超过一轮补建量（k_iViewPrepend）时不再逐轮前插
+    //   （长会话 O(N) 建件 + 每帧全树 adjustSize ≈ O(N²)，点旧提示词界面卡顿数秒~
+    //   数十秒），改为整窗跳建：弃全部件、直接建 [目标, 目标+k_iViewInitial)，完成
+    //   后目标块滚到视口顶——响应恒为 O(窗口) 与距离无关。窗口尾之后的块数据-only，
+    //   向下滚到底由 AppendNewer 分轮补建。
     void EnsureCoverage(int a_iTargetIdx, std::function<void(CMessageBlock*)> a_fnDone);
 
 private:
     void RebuildChunk(quint32 a_uGen);                      // 分帧重建一帧（代际号不符=被顶替，立即终止）
+    void JumpRebuild(int a_iTargetIdx, std::function<void(CMessageBlock*)> a_fnDone);   // 2026-10-15 远跳整窗跳建
     void BuildOlderChunk(QList<CMessageBlock*>& a_aNewWidgets);   // 补本帧 8 块 [frontier-8, frontier)（块内合并仍生效）
     void PrependFrame(quint32 a_uGen);                      // 2026.09.04 到顶补建分帧驱动（8 块/帧至本轮目标）
+    void NewerFrame(quint32 a_uGen);                        // 2026-10-15 到底补建分帧驱动（8 块/帧至本轮目标）
+    void BuildNewerChunk();                                 // 2026-10-15 补本帧 8 块 [窗口尾, 窗口尾+8)（尾部追加，合并仍生效）
     void OnBlockDropped(CMessageBlock* a_pBlock);           // 视图超上限丢最旧块 → 同步并行列表+推进前沿
     // 数据快照 → 块 widget（parent=绑定视图）。a_bAsyncMarkdown=true（批量路径：重建/
     //   补建）时 Assistant 块走子线程预排版（主线程只落地）；流式追加传 false（单块
@@ -119,17 +121,31 @@ private:
     //   AttachForeignAssistants→CreateAsstTab→CreateAsstWidgets→Bind→Unbind→Clear）；
     //   QPointer 销毁自动置空，判空路径自然回退纯数据态，无需逐拆页点补 Unbind。
     QPointer<CMessageView> m_pView;                    // 绑定视图（空=纯数据态：任务未选中/助手 Tab 已关）
+    // —— 2026-10-17 自绘三期 ModelView 引擎挂点（与 m_pView 互斥；数据/落盘共用）——
+    //   QPointer（同 m_pView 先例）：拆页路径（跨档幽灵 TakeRunningForReload 的
+    //   pPage->deleteLater）销毁视图/模型后流对象仍存活，裸指针复绑踩已释放内存；
+    //   QPointer 销毁自动置空，判空路径自然回退纯数据态。
+    QPointer<CChatModel>    m_pModel;       // 绑定的显示条目模型（不持有：面板/助手页持有）
+    QPointer<CChatListView> m_pView2;       // 绑定的自绘视图（不持有：同上）
     std::function<void()> m_fnDirty;               // 数据变化回调（落盘路由）
     QList<SBlockData>     m_aBlocks;               // 对话流数据（唯一正本）
     QList<CMessageBlock*> m_aWidgets;              // 并行块 widget（aWidgets[k] ↔ 数据下标 frontier+k）
     int                   m_iFrontier = 0;         // 反向分页前沿：[0,frontier) 未建件
     int                   m_iRebuildIdx = 0;       // 分帧重建进度
+    bool                  m_bProjected = false;    // 2026-10-17 ModelView：数据已投影进模型（Rebuild 置位/Unbind 摘除）
     quint32               m_uGen = 0;              // 分帧重建代际号（Rebuild/Unbind 时 +1 作废旧帧）
     bool                  m_bRebuilding = false;   // 分帧重建中（Append 只入数据，帧循环按序补件）
     bool                  m_bPrepending = false;   // 2026.09.04 到顶补建分帧进行中（挡重复到顶信号）
     int                   m_iPrependTarget = 0;    // 本轮补建目标前沿（frontier 推进到此即收尾）
+    // —— 2026-10-15 远跳窗口 / 底部分页 ——
+    bool                  m_bAppendingNewer = false;   // 到底补建分帧进行中（挡重复到底信号）
+    int                   m_iNewerTarget = 0;      // 本轮到底补建目标窗口尾（推进到此即收尾）
+    int                   m_iJumpTarget = -1;      // 跳建完成后滚到顶的目标数据下标（-1=普通重建跟到尾）
+    int                   m_iJumpEnd = INT_MAX;    // 本轮重建窗口终点（普通重建=INT_MAX 跟到数据尾）
+    std::function<void(CMessageBlock*)> m_fnJumpDone;   // 跳建完成回调（参数=目标块件；滚到顶用）
     std::function<void()> m_fnRebuildDone;         // 当前重建的完成回调
     QMetaObject::Connection m_aConnTop;            // sigTopReached 接线（Unbind 断开）
+    QMetaObject::Connection m_aConnBottom;         // sigBottomReached 接线（Unbind 断开；2026-10-15）
     QMetaObject::Connection m_aConnDrop;           // sigBlockDropped 接线（Unbind 断开）
 };
 

@@ -12,6 +12,11 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QNetworkProxy>
+#include <QPointer>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -108,6 +113,8 @@ static bool ClaudeSupportsAutocompact() {
     static int s_iProbe = 0;           // 0=未探测 1=支持 -1=不支持
     if (s_iProbe == 0) {
         QProcess oProbe;
+        // 2026.10.10 探测同用合并 PATH（异地新机装完 claude 未重启 AutoCode 也能探到）。
+        oProbe.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
         oProbe.start(QStringLiteral("cmd.exe"),
                      {QStringLiteral("/c"), CClaudeRunner::ClaudeCmd(), QStringLiteral("--help")});
         if (!oProbe.waitForStarted(5000) || !oProbe.waitForFinished(15000)) {
@@ -128,6 +135,8 @@ static bool s_bPartialSupported = false;
 static bool ClaudeSupportsPartialMessages() {
     if (!s_bPartialProbeDone) {
         QProcess oProbe;
+        // 2026.10.10 探测同用合并 PATH（同 ClaudeSupportsAutocompact）。
+        oProbe.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
         oProbe.start(QStringLiteral("cmd.exe"),
                      {QStringLiteral("/c"), CClaudeRunner::ClaudeCmd(), QStringLiteral("--help")});
         if (!oProbe.waitForStarted(5000) || !oProbe.waitForFinished(15000)) {
@@ -158,6 +167,10 @@ void CClaudeRunner::SetSharedModelTable(const QList<SDshModelEntry>& a_aModels,
 
 void CClaudeRunner::SetFollowSharedModels(bool a_bOn) {
     s_bFollowSharedModels = a_bOn;
+}
+
+bool CClaudeRunner::FollowSharedModels() {
+    return s_bFollowSharedModels;
 }
 
 void CClaudeRunner::SetClaudeCmd(const QString& a_sCmd) {
@@ -196,6 +209,48 @@ qint64 CClaudeRunner::ContextWindowForModel(const QString& a_sModel) {
     // 按模型名粗分上下文窗口（token）；未命中回退 200K。具体窗口以模型官方规格为准
     // （新模型可在此补充映射）。原实现于 CExecutionPanel::ContextLimitForModel，
     // 2026.08.15 下沉到 agent 层供编排器复用。
+    // 2026-10-14/15 条目优先：共享模型表（设置→模型页）里用户为条目显式设置的 iCtx
+    //   是权威值优先使用——glm-5.3 等新模型规格不在下方名字探测表内（恒 128K），
+    //   用户在条目里设 1M 后 UI/闸门/压缩阈值应同步（实测反馈：条目设 1000000
+    //   主界面进度条仍显示 128K，即取值处均未读条目值）。同名模型可有多条目
+    //   （不同网关/副本，Ctx 可不同），匹配优先级：
+    //   ① provider 槽位前缀（pi/codex 回报 "autocode-1/glm-5.3"）→ 表内第 N-1 条
+    //     （与 ~/.pi/agent/models.json 槽位同源；尾部模型名一致才认，表重排后尖链）；
+    //   ② 无前缀 → 激活条目优先（当前在用），否则首个同名条目；
+    //   ③ 条目未命中或 iCtx 非法（≤0）→ 名字粗分探测兑底。
+    const QString sFull = a_sModel.trimmed();
+    const QString sTail = [&sFull]() {
+        const int iPos = sFull.lastIndexOf(QLatin1Char('/'));
+        return (iPos >= 0 ? sFull.mid(iPos + 1) : sFull).toLower();
+    }();
+    if (!sTail.isEmpty() && !s_aSharedModels.isEmpty()) {
+        static const QRegularExpression reSlot(QStringLiteral("^autocode-(\\d+)/"));
+        const QRegularExpressionMatch mSlot = reSlot.match(sFull);
+        const int iSlot = mSlot.hasMatch() ? mSlot.captured(1).toInt() : 0;   // 0=无槽位前缀
+        const auto fnCtxOf = [&sTail](const SDshModelEntry& stE) -> qint64 {
+            return (stE.sModelId.trimmed().toLower() == sTail && stE.iCtx > 0)
+                       ? stE.iCtx : 0;
+        };
+        // ① 槽位命中（下标有效且模型名一致）；② 激活条目；③ 首个同名条目
+        if (iSlot >= 1 && iSlot <= s_aSharedModels.size()) {
+            const qint64 iCtx = fnCtxOf(s_aSharedModels.at(iSlot - 1));
+            if (iCtx > 0) {
+                return iCtx;
+            }
+        }
+        if (s_iSharedActive >= 0 && s_iSharedActive < s_aSharedModels.size()) {
+            const qint64 iCtx = fnCtxOf(s_aSharedModels.at(s_iSharedActive));
+            if (iCtx > 0) {
+                return iCtx;
+            }
+        }
+        for (const SDshModelEntry& stE : s_aSharedModels) {
+            const qint64 iCtx = fnCtxOf(stE);
+            if (iCtx > 0) {
+                return iCtx;
+            }
+        }
+    }
     const QString s = a_sModel.toLower().trimmed();
     if (s.contains(QStringLiteral("glm"))) {
         return 128000;   // GLM-4.x 系列（按公开规格 128K）
@@ -227,11 +282,27 @@ QString CClaudeRunner::NpmGlobalClaudePkgPath() {
         return s_sClaudePkgCache;
     }
     s_bClaudePkgProbed = true;
-    const QString sNpm = QStandardPaths::findExecutable(QStringLiteral("npm.cmd"));
+    // 2026.10.10 npm.cmd 定位：继承 PATH 找不到时用合并 PATH（注册表）兑底——
+    //   异地新机装完环境未重启 AutoCode 时 findExecutable 只看旧 PATH。
+    QString sNpm = QStandardPaths::findExecutable(QStringLiteral("npm.cmd"));
+    if (sNpm.isEmpty()) {
+        const QStringList aPathDirs = CAgentRunnerBase::MergedPathEnvironment()
+                                          .value(QStringLiteral("PATH"))
+                                          .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+        for (const QString& sDir : aPathDirs) {
+            const QString sTry = QDir::fromNativeSeparators(sDir.trimmed())
+                                 + QStringLiteral("/npm.cmd");
+            if (QFileInfo::exists(sTry)) {
+                sNpm = sTry;
+                break;
+            }
+        }
+    }
     if (sNpm.isEmpty()) {
         return QString();
     }
     QProcess stProc;
+    stProc.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
     stProc.start(sNpm, { QStringLiteral("root"), QStringLiteral("-g") });
     if (!stProc.waitForStarted(5000) || !stProc.waitForFinished(10000)) {
         return QString();
@@ -249,10 +320,76 @@ QString CClaudeRunner::NpmGlobalClaudePkgPath() {
     return s_sClaudePkgCache;
 }
 
+QString CClaudeRunner::ProbeClaudeCliFallback(QString* a_psFrom) {
+    if (s_fnProbeFallback != nullptr) {
+        return s_fnProbeFallback(a_psFrom);
+    }
+    // 候选①：npm 全局真身（NpmGlobalClaudePkgPath 已缓存 npm root -g 探测，
+    //   对 npm 前缀配置免疫；bin/claude.exe 是 2.x 包内真身）。
+    const QString sPkgJson = NpmGlobalClaudePkgPath();
+    if (!sPkgJson.isEmpty()) {
+        const QString sExe = QDir::fromNativeSeparators(QFileInfo(sPkgJson).absolutePath())
+                             + QStringLiteral("/bin/claude.exe");
+        if (QFileInfo::exists(sExe)) {
+            if (a_psFrom != nullptr) {
+                *a_psFrom = QStringLiteral("npm 全局安装");
+            }
+            return QDir::toNativeSeparators(sExe);
+        }
+    }
+    // 候选②：claude 2.x 原生安装器默认位置（原生安装不走 npm，PATH 注册时机不定）。
+    const QString sNative = QDir::homePath() + QStringLiteral("/.local/bin/claude.exe");
+    if (QFileInfo::exists(sNative)) {
+        if (a_psFrom != nullptr) {
+            *a_psFrom = QStringLiteral("原生安装器默认位置");
+        }
+        return QDir::toNativeSeparators(sNative);
+    }
+    // 候选③：where claude 逐行筛——.exe 直接用；.cmd shim 必须同目录 node_modules
+    //   下包真身存在（防「shim 在/包不在」假阳性，dell 机实害形态），命中用真身。
+    QProcess stWhere;
+    stWhere.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
+    stWhere.start(QStringLiteral("cmd.exe"),
+                  { QStringLiteral("/c"), QStringLiteral("where"), QStringLiteral("claude") });
+    if (stWhere.waitForStarted(3000) && stWhere.waitForFinished(5000)
+        && stWhere.exitCode() == 0) {
+        const QStringList aLines = QString::fromLocal8Bit(stWhere.readAllStandardOutput())
+                                       .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        for (QString sLine : aLines) {
+            sLine = sLine.trimmed();
+            if (sLine.isEmpty()) {
+                continue;
+            }
+            if (sLine.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive)
+                && QFileInfo::exists(sLine)) {
+                if (a_psFrom != nullptr) {
+                    *a_psFrom = QStringLiteral("PATH 搜索");
+                }
+                return QDir::toNativeSeparators(sLine);
+            }
+            if (sLine.endsWith(QStringLiteral(".cmd"), Qt::CaseInsensitive)) {
+                const QString sReal = QDir::fromNativeSeparators(QFileInfo(sLine).absolutePath())
+                    + QStringLiteral("/node_modules/@anthropic-ai/claude-code/bin/claude.exe");
+                if (QFileInfo::exists(sReal)) {
+                    if (a_psFrom != nullptr) {
+                        *a_psFrom = QStringLiteral("npm shim 校验通过");
+                    }
+                    return QDir::toNativeSeparators(sReal);
+                }
+            }
+        }
+    }
+    return QString();
+}
+
+std::function<QString(QString*)> CClaudeRunner::s_fnProbeFallback = nullptr;
+
 QString CClaudeRunner::ResolveClaudeVersion() {
     // 链①：cmd /c <ClaudeCmd> --version（Windows 上 claude 是 npm shim claude.cmd，
     //   必须经 cmd /c 启动；5s 启动/10s 结束）→ ParseClaudeVersionOutput。
     QProcess stProc;
+    // 2026.10.10 版本探测同用合并 PATH（安装后未重启 AutoCode 也能解析出版本）。
+    stProc.setProcessEnvironment(CAgentRunnerBase::MergedPathEnvironment());
     stProc.start(QStringLiteral("cmd.exe"),
                  { QStringLiteral("/c"), ClaudeCmd(), QStringLiteral("--version") });
     if (stProc.waitForStarted(5000) && stProc.waitForFinished(10000)) {
@@ -287,6 +424,17 @@ void CClaudeRunner::Reset() {
         QFile::remove(m_sMcpConfigPath);
         m_sMcpConfigPath.clear();
     }
+    if (!m_sModelSettingsPath.isEmpty()) {
+        QFile::remove(m_sModelSettingsPath);
+        m_sModelSettingsPath.clear();
+    }
+    // 2026.10.11 鉴权自诊断状态复位（新一轮可再发）
+    m_sDiagKey.clear();
+    m_sDiagModelSrc.clear();
+    m_sDiagBase.clear();
+    m_sDiagModel.clear();
+    m_bAuthDiagDone = false;
+    m_bProbeLargeSent = false;
     // 崩溃宽限期状态复位（上一轮宽限未收尾的极端场景兜底）
     if (m_pGraceTimer != nullptr) {
         m_pGraceTimer->stop();
@@ -416,6 +564,16 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
           //   claude 收到 EOF 即干净退出，生命周期与旧模式等价。
           << QStringLiteral("--input-format") << QStringLiteral("stream-json")
           << QStringLiteral("--verbose");
+    // 2026.10.10 模型注入临时 settings（dell 实害终审：用户 ~/.claude/settings.json 的
+    //   env 块（BASE_URL=智谱官方+余额不足 token）在 claude 启动时顶掉进程注入的环境
+    //   变量——env 注入对该形态无效。--settings 命令行级配置文件优先级高于用户
+    //   settings.json，生成临时文件把模型/网关/鉴权写入——注入必生效、不动用户文件
+    //   保通用性。m_sModelSettingsPath 随 Reset/析构清理（同 mcp-config 口径）。
+    // 2026.10.10 修一轮滞后（目标机实害：改了网关地址 claude 仍连旧地址）：此处不能
+    //   预先取 m_sModelSettingsPath——Reset() 已在本轮开头把上一轮文件删除并清空成员，
+    //   本轮的新文件要等下方注入块（pUse 解析后）才生成。所以 --settings 参数改由
+    //   注入块在生成/决定不注入后同步进 aArgs（见 fnSyncSettingsArg），保证本轮
+    //   启动参数携带本轮配置，模型变更立即生效。
     // deny 黑名单：--dangerously-skip-permissions(bypass) 下 allow 白名单失效、deny 仍生效，
     //   故用 --disallowedTools 显式禁用各阶段不该有的工具；空串=不禁任何工具（Develop/Verify 全开）。
     if (!a_sDisallowedTools.isEmpty()) {
@@ -440,23 +598,52 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
               << QStringLiteral("当你需要向用户确认选择、澄清需求或在多方案间做决定时，"
                                 "调用 mcp__autocode__ask_user 工具向用户提问，不要自行假设用户意图。"
                                 "GUI/界面测试一律用内置沙箱工具 mcp__autocode__sandbox_*："
-                                "先 sandbox_windows 列窗口，sandbox_capture 截图（PNG 路径，"
+                                "启动被测 GUI 程序优先用 sandbox_launch（exe=全路径，主进程"
+                                "代启动、窗口弹出即自动收纳）；先 sandbox_windows 列窗口，"
+                                "sandbox_capture 截图（PNG 路径，"
                                 "用读图工具查看），sandbox_click/type/keys 消息级操控"
                                 "（后台点击不抢焦点，不打扰用户），sandbox_tree 取控件树；"
+                                "禁止用 powershell Start-Process / cmd start 启动被测程序"
+                                "（中间 shell 秒退切断进程树，测试窗口会裸奍弹到用户桌面）；"
                                 "若目标窗口不在 sandbox_windows 列表里（AutoCode 重启过/"
                                 "进程早于本轮启动），先 sandbox_add <hwnd> 收进沙箱再操控；"
+                                "沙箱只收纳本工程程序，系统应用（浏览器/记事本/Office 等）"
+                                "不会也不允许被收纳，不要对它们 add 或操控，也不要动"
+                                "用户自己打开的窗口；"
                                 "禁止物理操控鼠标键盘，也禁止绕开沙箱用 python/ctypes "
                                 "自制 Win32 驱动操控可见窗口。测试过程已自动录像，无需额外操作。");
     }
 
     m_pProc->setWorkingDirectory(a_sWorkDir);
+    // 2026.10.10 --settings 参数同步器（修一轮滞后，见上方 aArgs 处注释）：注入块
+    //   生成新临时文件后调它把本轮路径写进启动参数；决定不注入/写文件失败时传空
+    //   路径清理残留参数（否则上一轮的旧配置文件会顶着本轮的「走 claude 自身配置」
+    //   决策继续生效）。必须在 m_pProc->start 之前调（aArgs 尚未用）。
+    auto fnSyncSettingsArg = [&aArgs](const QString& a_sFile) {
+        const int iIdx = aArgs.indexOf(QStringLiteral("--settings"));
+        if (!a_sFile.isEmpty()) {
+            const QString sNative = QDir::toNativeSeparators(a_sFile);
+            if (iIdx >= 0 && iIdx + 1 < aArgs.size()) {
+                aArgs[iIdx + 1] = sNative;
+            } else {
+                aArgs << QStringLiteral("--settings") << sNative;
+            }
+        } else if (iIdx >= 0) {
+            aArgs.removeAt(iIdx);            // "--settings"
+            if (iIdx < aArgs.size()) {
+                aArgs.removeAt(iIdx);        // 路径参数
+            }
+        }
+    };
     // 2026.08.22 中文编码根治（同 CCodexRunner）：子进程全链路 UTF-8，防 GBK 乱码/挂起。
     {
-        QProcessEnvironment oEnv = QProcessEnvironment::systemEnvironment();
+        QProcessEnvironment oEnv = CAgentRunnerBase::MergedPathEnvironment();
         oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
         oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
         oEnv.insert(QStringLiteral("LANG"), QStringLiteral("zh_CN.UTF-8"));
         oEnv.insert(QStringLiteral("LC_ALL"), QStringLiteral("zh_CN.UTF-8"));
+        bool bSettingsFileOk = false;   // 2026.10.10 本轮 --settings 文件就位（压制用户 settings.json env；
+        //                             注入块置位，尾部覆盖检测分口径提示用）
         // 2026-10-08 共享大模型表消费（任务/助手全覆盖）：本助手实例槽覆盖优先，
         //   其次「Claude 后端跟随本表」开关 + 共享表当前条目。仅 anthropic-messages
         //   兼容条目注入（claude CLI 只说 anthropic 协议；chat/openai 条目跳过并留痕，
@@ -478,16 +665,94 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
                     oEnv.insert(QStringLiteral("ANTHROPIC_BASE_URL"), pUse->sBaseURL);
                     if (!pUse->sApiKey.isEmpty()) {
                         oEnv.insert(QStringLiteral("ANTHROPIC_API_KEY"), pUse->sApiKey);
+                        // 2026.10.10 双鉴权注入（dell 实害终审：API_KEY 走 x-api-key 头、
+                        //   AUTH_TOKEN 走 Bearer 头——中转只认 Bearer 时 x-api-key 必 1113；
+                        //   同值双注入两种认证头都通，用户无需手改 claude 配置保通用性）。
+                        oEnv.insert(QStringLiteral("ANTHROPIC_AUTH_TOKEN"), pUse->sApiKey);
                     }
                     oEnv.insert(QStringLiteral("ANTHROPIC_MODEL"), pUse->sModelId);
-                    emit sigInfo(QStringLiteral("[claude-model] %1 生效：%2（%3）")
-                        .arg(sSrc, pUse->sModelId, pUse->sBaseURL));
+                    // 2026.10.10 辅助调用同源（本机 ~/.claude/settings.json 全套 env 先例：
+                    //   claude 的后台小任务/子代理按 sonnet/haiku/opus 档位名取模型，只注入
+                    //   ANTHROPIC_MODEL 时它们仍打官方模型名——网关不识别/计费不覆盖
+                    //   （dell 实害：主请求 OK、辅助请求报 1113）。三档位全部注入同源模型。
+                    oEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_SONNET_MODEL"), pUse->sModelId);
+                    oEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_HAIKU_MODEL"), pUse->sModelId);
+                    oEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_OPUS_MODEL"), pUse->sModelId);
+                    // 2026.10.10 --settings 临时文件（env 注入会被用户 settings.json
+                    //   顶掉，见 aArgs 处注释）：env 块同源写入，命令行级优先必生效。
+                    //   写成后立即同步进本轮启动参数（fnSyncSettingsArg，修上一轮仅
+                    //   在 aArgs 组装时预取、而成员已被 Reset 清空导致永不携带的滞后）。
+                    {
+                        static int s_iSeq = 0;
+                        m_sModelSettingsPath = QDir::tempPath()
+                            + QStringLiteral("/autocode_claude_model_%1_%2.json")
+                                  .arg(QCoreApplication::applicationPid()).arg(++s_iSeq);
+                        QJsonObject oSetEnv;
+                        oSetEnv.insert(QStringLiteral("ANTHROPIC_BASE_URL"), pUse->sBaseURL);
+                        if (!pUse->sApiKey.isEmpty()) {
+                            oSetEnv.insert(QStringLiteral("ANTHROPIC_API_KEY"), pUse->sApiKey);
+                            oSetEnv.insert(QStringLiteral("ANTHROPIC_AUTH_TOKEN"), pUse->sApiKey);
+                        }
+                        oSetEnv.insert(QStringLiteral("ANTHROPIC_MODEL"), pUse->sModelId);
+                        oSetEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_SONNET_MODEL"), pUse->sModelId);
+                        oSetEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_HAIKU_MODEL"), pUse->sModelId);
+                        oSetEnv.insert(QStringLiteral("ANTHROPIC_DEFAULT_OPUS_MODEL"), pUse->sModelId);
+                        QJsonObject oSet;
+                        oSet.insert(QStringLiteral("env"), oSetEnv);
+                        QFile fSet(m_sModelSettingsPath);
+                        if (fSet.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                            fSet.write(QJsonDocument(oSet).toJson(QJsonDocument::Compact));
+                            fSet.close();
+                            bSettingsFileOk = true;
+                            fnSyncSettingsArg(m_sModelSettingsPath);
+                        } else {
+                            m_sModelSettingsPath.clear();   // 写不了退回纯 env 注入
+                            fnSyncSettingsArg(QString());   // 清残留 --settings 参数
+                        }
+                    }
+                    emit sigInfo(QStringLiteral("[claude-model] %1%4 生效：%2（%3）")
+                        .arg(sSrc, pUse->sModelId, pUse->sBaseURL,
+                             sSrc == QStringLiteral("本助手覆盖")
+                                 ? QStringLiteral("（对话级覆盖——设置页改全局当前模型"
+                                                   "不影响本助手；右键上下文条→选择模型→"
+                                                   "跟随全局设置 可清除）")
+                                 : QString()));
+                    // 2026.10.11 注入 key 快照 + 格式预检（目标机 401 Invalid API key
+                    //   format 实害：同配置在其它机器正常，问题必在 key 值形态或本机
+                    //   claude 用户级凭据——当场暴露，不等失败后猜）：claude/网关
+                    //   仅认字母数字加减写下划线；带 Bearer/sk- 前缀、引号、空格等
+                    //   必被拒（401 Invalid API key format，实测网关双文案均为此形态）。
+                    m_sDiagKey = pUse->sApiKey;
+                    m_sDiagModelSrc = sSrc;
+                    m_sDiagBase = pUse->sBaseURL;   // 2026.10.11 鉴权/连接失败诊断的网关直探锚点
+                    m_sDiagModel = pUse->sModelId;
+                    if (!pUse->sApiKey.isEmpty()) {
+                        static const QRegularExpression reClean(
+                            QStringLiteral("^[A-Za-z0-9_-]+$"));
+                        if (!reClean.match(pUse->sApiKey).hasMatch()) {
+                            emit sigInfo(QStringLiteral(
+                                "[claude-model] ⚠ 注入的 Key 含非法字符（仅允许字母/数字/"
+                                "-/_）——网关必拒（401 Invalid API key format）。常见"
+                                "原因：Key 值误带 Bearer/sk- 前缀、引号或空格；请到"
+                                "「设置 → 大模型」检查条目「%1」的 Key")
+                                .arg(pUse->sModelId));
+                        }
+                    }
                 } else {
+                    fnSyncSettingsArg(QString());   // 本轮不注入：清残留 --settings 参数
                     emit sigInfo(QStringLiteral(
                         "[claude-model] %1 条目「%2」API 类型为 %3（非 anthropic-messages），"
                         "本轮跳过注入、走 claude 自身配置")
                         .arg(sSrc, pUse->sModelId, pUse->sApi));
                 }
+            } else {
+                fnSyncSettingsArg(QString());   // 本轮不注入：清残留 --settings 参数
+                // 2026.10.10 未注入可见性（dell 实害：跟随关/表空时静默走 claude 自身
+                //   配置，用户误以为用了模型表——429 余额不足排查半天）。
+                emit sigInfo(QStringLiteral(
+                    "[claude-model] 本轮未注入模型配置（无实例覆盖且跟随开关关/共享表无"
+                    "激活条目），走 claude 自身配置（~/.claude/settings.json）——"
+                    "若模型/网关不对请检查「设置 → 大模型表」"));
             }
         }
         // 2026-10-08 Claude 专属参数（与共享表无关，设了就注入）。
@@ -498,6 +763,212 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
             oEnv.insert(QStringLiteral("ANTHROPIC_SMALL_FAST_MODEL"), s_sSmallFastModel);
         }
         m_pProc->setProcessEnvironment(oEnv);
+        // 2026.10.10 自身配置覆盖检测（dell 实害推断：~/.claude/settings.json 的 env 块
+        //   在 claude 启动时会合并/覆盖进程环境——里面有智谱的 ANTHROPIC_BASE_URL/KEY
+        //   时，AutoCode 注入的模型表 env 被顶掉，请求仍打旧端点报 1113/余额不足）。
+        //   读 settings.json 的 env 对象，列出 ANTHROPIC_* 覆盖键提醒用户；文件不存在/
+        //   解析失败/无覆盖键则静默。
+        {
+            const QString sSettings = QDir::homePath()
+                + QStringLiteral("/.claude/settings.json");
+            QFile fSettings(sSettings);
+            if (fSettings.open(QIODevice::ReadOnly)) {
+                QJsonParseError stErr;
+                const QJsonDocument oDoc = QJsonDocument::fromJson(
+                    fSettings.readAll(), &stErr);
+                fSettings.close();
+                if (stErr.error == QJsonParseError::NoError && oDoc.isObject()) {
+                    const QJsonObject oEnvCfg = oDoc.object()
+                                                    .value(QStringLiteral("env"))
+                                                    .toObject();
+                    QStringList aOverride;
+                    QString sUrl, sModel;
+                    for (auto it = oEnvCfg.begin(); it != oEnvCfg.end(); ++it) {
+                        if (!it.key().startsWith(QStringLiteral("ANTHROPIC_"))) {
+                            continue;
+                        }
+                        aOverride << it.key();
+                        // 2026.10.10 关键值直显（dell 排障：用户翻 settings.json 才知道
+                        //   claude 实际用的端点/模型）——BASE_URL/模型全文，key/token 打码。
+                        const QString sVal = it.value().toString();
+                        if (it.key() == QStringLiteral("ANTHROPIC_BASE_URL")) {
+                            sUrl = sVal;
+                        } else if (it.key() == QStringLiteral("ANTHROPIC_MODEL")) {
+                            sModel = sVal;
+                        }
+                    }
+                    if (!aOverride.isEmpty()) {
+                        QString sDetail = aOverride.join(QStringLiteral(", "));
+                        if (!sUrl.isEmpty()) {
+                            sDetail += QStringLiteral("；BASE_URL=%1").arg(sUrl);
+                        }
+                        if (!sModel.isEmpty()) {
+                            sDetail += QStringLiteral("；MODEL=%1").arg(sModel);
+                        } else {
+                            sDetail += QStringLiteral("；未配 ANTHROPIC_MODEL（主请求走 claude "
+                                                      "内置默认模型名）");
+                        }
+                        // 2026.10.10 分口径提示（目标机实害：--settings 文件已压制用户
+                        //   settings.json env 时仍报「会顶掉」，用户误以为 claude 在用
+                        //   旧地址）：本轮 --settings 文件就位 = 覆盖键被压制（AutoCode
+                        //   注入优先生效，提示改为可见性说明）；未就位（未注入/写文件
+                        //   失败）= 覆盖键真实生效，保留「会顶掉」警示。
+                        if (bSettingsFileOk) {
+                            emit sigInfo(QStringLiteral(
+                                "[claude-model] 提示：claude 自身配置（%1）的 env 块含 %2 个 "
+                                "ANTHROPIC_* 键（%3）；本轮已由 --settings 命令行级配置压制，"
+                                "实际用 AutoCode 注入的模型/网关，该文件不生效")
+                                .arg(QDir::toNativeSeparators(sSettings))
+                                .arg(aOverride.size())
+                                .arg(sDetail.left(400)));
+                        } else {
+                            emit sigInfo(QStringLiteral(
+                                "[claude-model] 注意：claude 自身配置（%1）的 env 块含 %2 个 "
+                                "ANTHROPIC_* 覆盖键，会在启动时顶掉本轮注入的模型/网关——"
+                                "%3。若模型/端点不符请清理或同步该文件")
+                                .arg(QDir::toNativeSeparators(sSettings))
+                                .arg(aOverride.size())
+                                .arg(sDetail.left(400)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2026.10.10 预检：ClaudeCmd 为裸命令名时，用与子进程相同的合并 PATH 验证可见性；
+    //   不可见直接给可操作报错（而不是三连快速失败重试后只甩裸退出码——异地新机
+    //   「装完环境发提示词仍失败」时用户至少能看到确切原因与处置路径）。
+    //   绝对/相对路径配置不预检（用户自管路径，行为与旧版一致）。
+    const QString sCmdPreflight = ClaudeCmd();
+    QString sEffective = sCmdPreflight;
+    QString sProbeFrom;
+    bool bMissing = false;
+    bool bWhereVisible = false;   // 裸名在 PATH 可见（区分「不可见」与「可见但死 shim」报错文案）
+    if (!sCmdPreflight.contains(QLatin1Char('/'))
+        && !sCmdPreflight.contains(QLatin1Char('\\'))) {
+        // 2026.10.10 裸名双重预检（dell 实害：npm prefix 变更后 %APPDATA%\\npm 遗留
+        //   死 shim——where 命中≠可用，启动即「系统找不到指定的路径」三连重试）：
+        //   ①where 可见；②试运行 --version（rc==0 才算真可用，死 shim 秒败被拦）。
+        //   任一不达 → missing → 走兕底探测链。
+        QProcess stWhere;
+        stWhere.setProcessEnvironment(m_pProc->processEnvironment());
+        stWhere.start(QStringLiteral("cmd.exe"),
+                      { QStringLiteral("/c"), QStringLiteral("where"), sCmdPreflight });
+        const bool bVisible = stWhere.waitForStarted(3000) && stWhere.waitForFinished(5000)
+                              && stWhere.exitCode() == 0;
+        bMissing = !bVisible;
+        bWhereVisible = bVisible;
+        // 进程内验证缓存：同名验证通过过即不再重复（每轮 StartStage 免多拉一次
+        //   CLI，1~2 秒/轮的可感知代价只付一次；命令替换/修复后仍能跑则验证仍真）。
+        static QString s_sPreflightVerified;
+        if (bVisible && sCmdPreflight != s_sPreflightVerified) {
+            QProcess stVer;
+            stVer.setProcessEnvironment(m_pProc->processEnvironment());
+            stVer.start(QStringLiteral("cmd.exe"),
+                        { QStringLiteral("/c"), sCmdPreflight, QStringLiteral("--version") });
+            bMissing = !(stVer.waitForStarted(3000) && stVer.waitForFinished(15000)
+                         && stVer.exitCode() == 0);
+            if (!bMissing) {
+                s_sPreflightVerified = sCmdPreflight;
+            }
+        }
+    } else {
+        // 2026.10.10 绝对/相对路径预检（异地部署机 dell 实害）：目录不存在时 cmd
+        //   只报模糊的「系统找不到指定的路径。」退出码 1（对照实验：文件不存在才是
+        //   「不是内部或外部命令」），真因埋没。启动前 QFileInfo::exists 验证。
+        bMissing = !QFileInfo::exists(sCmdPreflight);
+    }
+    if (bMissing) {
+        // 2026.10.10 兕底探测（用户需求：确保找到正确的 claude code cli）：配置失效
+        //   时自动定位本机可用安装（npm 全局真身→原生安装器→PATH shim 真身校验），
+        //   命中则本轮替换生效并事件行告知（不回写 config，固化由用户自行决定）；
+        //   全落空才 EmitFailed（按裸名/路径分场景给精确指引）。
+        sEffective = ProbeClaudeCliFallback(&sProbeFrom);
+    }
+    if (bMissing && sEffective.isEmpty()) {
+        // 2026.10.10 环境自诊断（dell 实害：异地机拿不到 cmd 现场，两轮日志往返仍缺
+        //   npm/prefix 状态）：报错时自动收集 node/npm/prefix/npm root -g/where 命令
+        //   输出附在错误尾部——一次报错自带全部定位现场。
+        QString sDiag;
+        {
+            QProcess stDiag;
+            auto fnRun = [&stDiag, this](const QString& a_sCmd, const QStringList& a_aArgs) {
+                stDiag.setProcessEnvironment(m_pProc->processEnvironment());
+                stDiag.start(a_sCmd, a_aArgs);
+                if (!stDiag.waitForStarted(2000) || !stDiag.waitForFinished(8000)) {
+                    return QStringLiteral("(超时/失败)");
+                }
+                return QString::fromLocal8Bit(
+                    stDiag.readAllStandardOutput() + stDiag.readAllStandardError())
+                    .trimmed()
+                    .replace(QLatin1Char('\n'), QStringLiteral(" ; "));
+            };
+            sDiag += QStringLiteral("\n——环境诊断：")
+                + QStringLiteral("\nnode -v：") + fnRun(QStringLiteral("node.exe"), { QStringLiteral("-v") })
+                + QStringLiteral("\nnpm -v：") + fnRun(QStringLiteral("cmd.exe"),
+                    { QStringLiteral("/c"), QStringLiteral("npm"), QStringLiteral("-v") })
+                + QStringLiteral("\nnpm prefix：") + fnRun(QStringLiteral("cmd.exe"),
+                    { QStringLiteral("/c"), QStringLiteral("npm"), QStringLiteral("config"), QStringLiteral("get"), QStringLiteral("prefix") })
+                + QStringLiteral("\nnpm root -g：") + fnRun(QStringLiteral("cmd.exe"),
+                    { QStringLiteral("/c"), QStringLiteral("npm"), QStringLiteral("root"), QStringLiteral("-g") })
+                + QStringLiteral("\nwhere claude：") + fnRun(QStringLiteral("cmd.exe"),
+                    { QStringLiteral("/c"), QStringLiteral("where"), QStringLiteral("claude") })
+                + QStringLiteral("\nnpm config list：") + fnRun(QStringLiteral("cmd.exe"),
+                    { QStringLiteral("/c"), QStringLiteral("npm"), QStringLiteral("config"),
+                      QStringLiteral("list") }).left(600)
+                + QStringLiteral("\n工程目录 .npmrc：")
+                + [a_sWorkDir]() {
+                      const QString sN = QDir::fromNativeSeparators(a_sWorkDir)
+                                         + QStringLiteral("/.npmrc");
+                      QFile f(sN);
+                      if (!f.exists()) { return QStringLiteral("（无）"); }
+                      if (!f.open(QIODevice::ReadOnly)) { return sN + QStringLiteral("（存在但读不了）"); }
+                      const QString sC = QString::fromUtf8(f.readAll()).trimmed();
+                      f.close();
+                      return sN + QStringLiteral(" → ")
+                             + sC.left(200).replace(QLatin1Char('\n'), QStringLiteral(" ; "));
+                  }();
+        }
+        if (!sCmdPreflight.contains(QLatin1Char('/'))
+            && !sCmdPreflight.contains(QLatin1Char('\\'))) {
+            if (bWhereVisible) {
+                // 死 shim 形态（dell 实害）：where 命中但 --version 验败，兕底探测也空。
+                EmitFailed(QStringLiteral(
+                    "%1 命令在 PATH 中存在但无法执行（死 shim：指向的包已不在，常见于"
+                    "npm prefix 变更后 %APPDATA%\\npm 目录遗留），且未探测到其他可用安装。\n"
+                    "处理：管理员 cmd 运行 del \"%APPDATA%\\npm\\%1*\" 后重跑环境安装，"
+                    "或重装：npm install -g @anthropic-ai/claude-code。")
+                    .arg(sCmdPreflight) + sDiag);
+            } else {
+                EmitFailed(QStringLiteral(
+                    "未在 PATH 中找到 %1 命令（已合并注册表 Machine/User PATH 仍未见，\n"
+                    "npm 全局/原生安装位置也未探测到可用安装）。\n"
+                    "常见原因：①Claude Code 未安装或安装未完成；②安装在非标准位置。\n"
+                    "处理：cmd 窗口运行「%1 --version」验证；若能找到，把该绝对路径填到"
+                    "「设置 → Agent」的 Claude 命令后重试；找不到则重跑环境安装。")
+                    .arg(sCmdPreflight) + sDiag);
+            }
+        } else {
+            EmitFailed(QStringLiteral(
+                "配置的 Claude 命令路径不存在：%1\n"
+                "（npm 全局/原生安装位置也未探测到可用安装。）\n"
+                "常见原因：①该机器上 Claude Code 未安装在此位置（npm 全局装在 npm 目录下"
+                "node_modules\\@anthropic-ai\\claude-code，原生安装器装在"
+                "%USERPROFILE%\\.local\\bin\\claude.exe）；②路径拼写错误。\n"
+                "处理：cmd 窗口运行「where claude」找真实位置，填到「设置 → Agent」的"
+                "Claude 命令；或改填裸名 claude（自动按合并 PATH 查找）。")
+                .arg(sCmdPreflight) + sDiag);
+        }
+        return;
+    }
+    if (bMissing) {
+        emit sigInfo(QStringLiteral(
+            "[system] 配置的 Claude 命令（%1）不可用，已自动探测到可用安装：%2（来源：%3）。"
+            "本轮生效；如需固化请到「设置 → Agent」修改 Claude 命令。")
+            .arg(sCmdPreflight, sEffective, sProbeFrom));
+        if (aArgs.size() > 1) {
+            aArgs[1] = sEffective;   // aArgs 形如 {"/c", <cmd>, "-p", ...}
+        }
     }
     // 上一进程收尾等待已移至函数开头（Reset() 之前，2026.08.17 竞态修复），此处直接启动。
     m_aLastArgs    = aArgs;      // 快速失败重试：保存本次启动参数
@@ -777,7 +1248,400 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine, int a_iEpoch) {
             const QJsonObject oItem = v.toObject();
             const QString sKind = oItem.value(QStringLiteral("type")).toString();
             if (sKind == QStringLiteral("text")) {
-                emit sigAssistantText(oItem.value(QStringLiteral("text")).toString());
+                const QString sTxt = oItem.value(QStringLiteral("text")).toString();
+                emit sigAssistantText(sTxt);
+                // 2026.10.11 鉴权失败自诊断：claude 输出鉴权错误（401/Invalid key/
+                //   authenticate）时，一次性追发注入 key 指纹 + 本机凭据源清单
+                //   （目标机实害：同配置其它机器正常，差异必在本机 claude 用户级状态）。
+                if (!m_bAuthDiagDone
+                    && (sTxt.contains(QStringLiteral("Failed to authenticate"),
+                                      Qt::CaseInsensitive)
+                        || sTxt.contains(QStringLiteral("Invalid API key"),
+                                         Qt::CaseInsensitive)
+                        || sTxt.contains(QStringLiteral("API Error: 401"))
+                        || sTxt.contains(QStringLiteral("ECONNRESET"))
+                        || sTxt.contains(QStringLiteral("Connection dropped"))
+                        || sTxt.contains(QStringLiteral("Connection error"))
+                        || sTxt.contains(QStringLiteral("fetch failed")))) {
+                    m_bAuthDiagDone = true;
+                    QString sFp = QStringLiteral("（未注入）");
+                    if (!m_sDiagKey.isEmpty()) {
+                        const int iK = m_sDiagKey.size();
+                        const QString sHead = m_sDiagKey.left(4);
+                        const QString sTail = m_sDiagKey.right(4);
+                        static const QRegularExpression reClean(
+                            QStringLiteral("^[A-Za-z0-9_-]+$"));
+                        sFp = QStringLiteral("长度 %1，%2…%3，%4")
+                                  .arg(iK).arg(sHead, sTail)
+                                  .arg(reClean.match(m_sDiagKey).hasMatch()
+                                           ? QStringLiteral("格式合法")
+                                           : QStringLiteral("⚠ 含非法字符（仅允许字母/数字/-/_）"));
+                    }
+                    QStringList aSrc;
+                    {   // ⓪ apiKeyHelper（优先级高于 env 注入；Windows 下脚本输出带 CRLF/
+                        //   额外字符会变成非法 key → 401 Invalid API key format，dell 盲区）
+                        const QString sS0 = QDir::homePath()
+                            + QStringLiteral("/.claude/settings.json");
+                        QFile fS0(sS0);
+                        if (fS0.open(QIODevice::ReadOnly)) {
+                            const QJsonDocument oD0 = QJsonDocument::fromJson(fS0.readAll());
+                            fS0.close();
+                            const QString sHelper = oD0.object()
+                                .value(QStringLiteral("apiKeyHelper")).toString();
+                            if (!sHelper.isEmpty()) {
+                                aSrc << QStringLiteral("⚠ ~/.claude/settings.json 配置了 "
+                                                       "apiKeyHelper：%1——它优先于 AutoCode 注入，"
+                                                       "脚本输出的多余字符（CRLF/引号）会变成非法 key！")
+                                          .arg(sHelper);
+                            }
+                        }
+                    }
+                    {   // ① 用户级 settings.json 的 env ANTHROPIC_* 键
+                        const QString sS = QDir::homePath()
+                            + QStringLiteral("/.claude/settings.json");
+                        QFile fS(sS);
+                        if (fS.open(QIODevice::ReadOnly)) {
+                            const QJsonDocument oD = QJsonDocument::fromJson(fS.readAll());
+                            fS.close();
+                            const QStringList aKeys = oD.object()
+                                .value(QStringLiteral("env")).toObject().keys();
+                            int iAnth = 0;
+                            for (const QString& s : aKeys) {
+                                if (s.startsWith(QStringLiteral("ANTHROPIC_"))) { ++iAnth; }
+                            }
+                            if (iAnth > 0) {
+                                aSrc << QStringLiteral("~/.claude/settings.json env 含 %1 个"
+                                                       " ANTHROPIC_* 键（已被本轮 --settings "
+                                                       "压制，正常不生效）").arg(iAnth);
+                            }
+                        }
+                    }
+                    {   // ② 登录凭据（/login managed key）
+                        const QString sC = QDir::homePath()
+                            + QStringLiteral("/.claude/.credentials.json");
+                        if (QFile::exists(sC)) {
+                            aSrc << QStringLiteral("~/.claude/.credentials.json 存在"
+                                                   "（曾 /login 登录；注入 env 正常会优先，"
+                                                   "若仍 401 请检查其内容）");
+                        }
+                    }
+                    {   // ③ 企业托管配置
+                        const QString sM = QStringLiteral("C:/ProgramData/ClaudeCode/"
+                                                        "managed-settings.json");
+                        if (QFile::exists(sM)) {
+                            aSrc << QStringLiteral("⚠ 存在企业托管配置 %1（优先级最高，"
+                                                   "可能改写鉴权；若含 apiKeyHelper 同样会顶掉"
+                                                   "注入）")
+                                      .arg(QDir::toNativeSeparators(sM));
+                        }
+                    }
+                    {   // ④ 本进程环境残留（机器级 ANTHROPIC_* 环境变量）
+                        const QProcessEnvironment oSys = QProcessEnvironment::systemEnvironment();
+                        for (const QString& s : { QStringLiteral("ANTHROPIC_API_KEY"),
+                                                  QStringLiteral("ANTHROPIC_AUTH_TOKEN") }) {
+                            if (oSys.contains(s)) {
+                                aSrc << QStringLiteral("⚠ 机器环境变量 %1 已设置（注入值"
+                                                       "会覆盖；若显示 401 请核对两处值）").arg(s);
+                            }
+                        }
+                    }
+                    emit sigInfo(QStringLiteral(
+                        "[claude-model] 鉴权失败诊断：本轮注入（%1）Key 指纹：%2；"
+                        "%3。排查：①若指纹含非法字符→设置→大模型改 Key（勿带 Bearer/"
+                        "sk- 前缀引号空格）；②确认 AutoCode 为最新版（标题栏 v4.1.329+，"
+                        "旧版 --settings 未随启动参数传递）；③命令行验证：set "
+                        "ANTHROPIC_BASE_URL=<接入点> && set ANTHROPIC_API_KEY=<Key> && "
+                        "claude -p hi")
+                        .arg(m_sDiagModelSrc.isEmpty()
+                                 ? QStringLiteral("无") : m_sDiagModelSrc)
+                        .arg(sFp)
+                        .arg(aSrc.isEmpty()
+                                 ? QStringLiteral("本机无用户级凭据源覆盖")
+                                 : aSrc.join(QStringLiteral("；"))));
+                    // 2026.10.11 本机网关直探（目标机 401/ECONNRESET 终审定位：开发机同 key
+                    //   同网关全 200、目标机 Pi 通而 claude 拒——唯一未测变量=目标机网络路径）
+                    //   AutoCode 亲自从本机 POST 注入的接入点（同 key 同 UA，小包流式）：
+                    //   200=网络通而 claude 进程被本机拦截（代理/安全软件）；401/reset=网络
+                    //   路径拦截大包或源 IP 受限。异步发射结果，不阻塞 UI。附带代理环境变量检测。
+                    if (!m_sDiagBase.isEmpty()) {
+                        if (m_pNetProbe == nullptr) {
+                            m_pNetProbe = new QNetworkAccessManager(this);
+                            // 直连探测（不走系统代理）：与 pi 同口径；若代理是元凶，
+                            //   「直探通而 claude 不通」正好构成判定证据。
+                            m_pNetProbe->setProxy(QNetworkProxy::NoProxy);
+                            // 2026.10.11 管理器级 finished（reply 级 connect 实测不达，
+                            //   管理器级稳）：一次性探测结果 → 诊断事件行。
+                            connect(m_pNetProbe,
+                                    &QNetworkAccessManager::finished,
+                                    this, [this](QNetworkReply* a_pR) {
+                                const qint64 iMs =
+                                    QDateTime::currentMSecsSinceEpoch() - m_iProbeT0;
+                                const QNetworkReply::NetworkError eErr = a_pR->error();
+                                const int iStatus = a_pR->attribute(
+                                    QNetworkRequest::HttpStatusCodeAttribute).toInt();
+                                const QString sBody2 = QString::fromUtf8(
+                                    a_pR->read(160)).simplified();
+                                QString sVerdict;
+                                const bool bWasLarge2 = m_bProbeLargeSent;
+                                if (eErr == QNetworkReply::NoError && iStatus == 200) {
+                                    sVerdict = bWasLarge2
+                                        ? QStringLiteral(
+                                            "大包也通——本机链路无体积拦截，claude 失败"
+                                            "另有原因（把本行+失败原文反馈开发）")
+                                        : QStringLiteral(
+                                            "小包通且 key 有效（等待大包探测对照）");
+                                } else if (eErr == QNetworkReply::OperationCanceledError) {
+                                    sVerdict = bWasLarge2
+                                        ? QStringLiteral(
+                                            "⚠ 大包超时而小包通——出口链路拦截大体积上传"
+                                            "（上网行为管理/防火墙）实锤：换内网接入点/443"
+                                            "端口/联系 IT 白名单")
+                                        : QStringLiteral(
+                                            "本机到网关超时（网络不通/被防火墙丢包）");
+                                } else if (iStatus == 401) {
+                                    sVerdict = bWasLarge2
+                                        ? QStringLiteral(
+                                            "⚠ 大包 401 而小包通——出口链路对大体积上传"
+                                            "注入错误响应（上网行为管理/防火墙）实锤："
+                                            "换内网接入点/443 端口/联系 IT 白名单")
+                                        : QStringLiteral(
+                                            "网关拒绝本机这个 key（源 IP 受限/key 绑定/"
+                                            "中转层拦截——在网关侧排查；401 文案对合法但"
+                                            "未注册的 key 也报 Invalid API key format）");
+                                } else if (iStatus == 403) {
+                                    sVerdict = QStringLiteral(
+                                        "网关 403（客户端校验/来源受限——网关侧排查）");
+                                } else if (eErr == QNetworkReply::RemoteHostClosedError) {
+                                    sVerdict = bWasLarge2
+                                        ? QStringLiteral(
+                                            "⚠ 大包被中途断开而小包通——出口拦截大体积"
+                                            "上传实锤（与 claude 的 ECONNRESET 同源）")
+                                        : QStringLiteral(
+                                            "连接被中途断开（链路层拦截/不稳定）");
+                                } else {
+                                    sVerdict = QStringLiteral(
+                                        "非 200（网络错误=%1，响应：%2）——本机到网关链路异常")
+                                        .arg(static_cast<int>(eErr))
+                                        .arg(sBody2.left(80));
+                                }
+                                QString sProxy2;
+                                {
+                                    const QProcessEnvironment oSys =
+                                        QProcessEnvironment::systemEnvironment();
+                                    for (const QString& s : {
+                                             QStringLiteral("HTTP_PROXY"),
+                                             QStringLiteral("HTTPS_PROXY"),
+                                             QStringLiteral("ALL_PROXY"),
+                                             QStringLiteral("http_proxy"),
+                                             QStringLiteral("https_proxy") }) {
+                                        const QString sV = oSys.value(s);
+                                        if (!sV.isEmpty()) {
+                                            sProxy2 += QStringLiteral(" %1=%2").arg(s, sV);
+                                        }
+                                    }
+                                }
+                                emit sigInfo(QStringLiteral(
+                                    "[claude-model] 网关直探（%6）：POST %1/v1/messages → "
+                                    "HTTP %2（%3 ms）；%4%5")
+                                    .arg(m_sDiagBase, QString::number(iStatus),
+                                         QString::number(iMs), sVerdict,
+                                         sProxy2.isEmpty()
+                                             ? QString()
+                                             : QStringLiteral(
+                                                   "；⚠ 检测到代理环境变量：%1")
+                                                   .arg(sProxy2),
+                                         m_bProbeLargeSent
+                                             ? QStringLiteral("大包77KB")
+                                             : QStringLiteral("小包")));
+                                // 2026.10.11 大包级联（目标机终审实锤：小包 200 而 claude
+                                //   实际 77KB 大包 401——出口行为管理/防火墙按体积拦
+                                //   非标端口大上传，注入 401 或掐断）：小包结束后自动
+                                //   补发 77KB 同款请求；大包失败+小包成功=出口拦截铁证。
+                                if (!m_bProbeLargeSent) {
+                                    m_bProbeLargeSent = true;
+                                    QNetworkRequest stReqBig((QUrl(
+                                        m_sDiagBase + QStringLiteral("/v1/messages"))));
+                                    stReqBig.setHeader(
+                                        QNetworkRequest::ContentTypeHeader,
+                                        QStringLiteral("application/json"));
+                                    stReqBig.setRawHeader("anthropic-version",
+                                                          "2023-06-01");
+                                    stReqBig.setRawHeader(
+                                        "User-Agent",
+                                        "claude-cli/2.1.296 (external, sdk-cli)");
+                                    if (!m_sDiagKey.isEmpty()) {
+                                        stReqBig.setRawHeader(
+                                            "x-api-key", m_sDiagKey.toUtf8());
+                                        stReqBig.setRawHeader(
+                                            "Authorization",
+                                            ("Bearer " + m_sDiagKey).toUtf8());
+                                    }
+                                    const QString sPad(77000, QLatin1Char('a'));
+                                    const QByteArray sBodyBig = QStringLiteral(
+                                        "{\"model\":\"%1\",\"max_tokens\":8,"
+                                        "\"stream\":true,\"messages\":[{"
+                                        "\"role\":\"user\",\"content\":[{"
+                                        "\"type\":\"text\",\"text\":\"hi %2\"}]}]}")
+                                        .arg(m_sDiagModel.isEmpty()
+                                                 ? QStringLiteral("glm-5.3")
+                                                 : m_sDiagModel,
+                                             sPad)
+                                        .toUtf8();
+                                    m_iProbeT0 = QDateTime::currentMSecsSinceEpoch();
+                                    QNetworkReply* pR2 = m_pNetProbe->post(stReqBig, sBodyBig);
+                                    // 2026.10.11 崩溃修复（336 版 UAF 实锤）：reply 在
+                                    //   管理器级 finished 里被 deleteLater，裸指针捕获的
+                                    //   超时定时器晚到即读已释放对象。QPointer 守卫代之。
+                                    const QPointer<QNetworkReply> pGuard2 = pR2;
+                                    QTimer::singleShot(30000, this, [pGuard2]() {
+                                        if (QNetworkReply* a_pR2 = pGuard2.data()) {
+                                            if (a_pR2->isRunning()) {
+                                                a_pR2->abort();
+                                            }
+                                        }
+                                    });
+                                }
+                                a_pR->deleteLater();
+                            });
+                        }
+                        QString sUrl = m_sDiagBase;
+                        while (sUrl.endsWith(QLatin1Char('/'))) {
+                            sUrl.chop(1);
+                        }
+                        sUrl += QStringLiteral("/v1/messages");
+                        QNetworkRequest stReq((QUrl(sUrl)));
+                        stReq.setHeader(QNetworkRequest::ContentTypeHeader,
+                                        QStringLiteral("application/json"));
+                        stReq.setRawHeader("anthropic-version", "2023-06-01");
+                        stReq.setRawHeader("User-Agent",
+                                           "claude-cli/2.1.296 (external, cli)");
+                        if (!m_sDiagKey.isEmpty()) {
+                            stReq.setRawHeader("x-api-key", m_sDiagKey.toUtf8());
+                            stReq.setRawHeader("Authorization",
+                                ("Bearer " + m_sDiagKey).toUtf8());
+                        }
+                        const QByteArray sBody = QStringLiteral(
+                            "{\"model\":\"%1\",\"max_tokens\":8,\"stream\":true,"
+                            "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+                            .arg(m_sDiagModel.isEmpty()
+                                     ? QStringLiteral("glm-5.3") : m_sDiagModel)
+                            .toUtf8();
+                        // 代理环境检测（claude 尊重代理 env；pi 不走 → "pi 通 claude 不通"差异源）
+                        QString sProxy;
+                        {
+                            const QProcessEnvironment oSys =
+                                QProcessEnvironment::systemEnvironment();
+                            for (const QString& s : { QStringLiteral("HTTP_PROXY"),
+                                                      QStringLiteral("HTTPS_PROXY"),
+                                                      QStringLiteral("ALL_PROXY"),
+                                                      QStringLiteral("http_proxy"),
+                                                      QStringLiteral("https_proxy") }) {
+                                const QString sV = oSys.value(s);
+                                if (!sV.isEmpty()) {
+                                    sProxy += QStringLiteral(" %1=%2").arg(s, sV);
+                                }
+                            }
+                        }
+                        m_iProbeT0 = QDateTime::currentMSecsSinceEpoch();
+                        QNetworkReply* pR = m_pNetProbe->post(stReq, sBody);
+                        // 2026.10.11 崩溃修复：同上，QPointer 防 reply 先行销毁的 UAF
+                        //   （dump 实证：336 版 15s 定时器触发时 reply 已 deleteLater）
+                        const QPointer<QNetworkReply> pGuard = pR;
+                        QTimer::singleShot(15000, this, [pGuard]() {
+                            if (QNetworkReply* a_pR2 = pGuard.data()) {
+                                if (a_pR2->isRunning()) {
+                                    a_pR2->abort();
+                                }
+                            }
+                        });
+                        // 2026.10.11 node 直探（终审定位：目标机实测 QNAM 直探 200 而 claude
+                        //   仍 401——claude 本体是 node.exe，安全软件/终端管控常按进程过滤
+                        //   HTTP。用 node.exe 发同款请求：QNAM 200 + node 401/reset = 铁证
+                        //   进程级拦截；两者都 200 = 拦截不存在，问题在 claude 自身逻辑）。
+                        {
+                            const QString sJs = QDir::tempPath()
+                                + QStringLiteral("/autocode_node_probe.js");
+                            {
+                                QFile fJs(sJs);
+                                if (fJs.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                                    fJs.write(QStringLiteral(
+                                        "const u=process.env.AUTOCODE_PROBE_URL||'';"
+                                        "const k=process.env.AUTOCODE_PROBE_KEY||'';"
+                                        "const m=process.env.AUTOCODE_PROBE_MODEL||'glm-5.3';"
+                                        "fetch(u,{method:'POST',headers:{"
+                                        "'content-type':'application/json',"
+                                        "'x-api-key':k,'anthropic-version':'2023-06-01',"
+                                        "'user-agent':'claude-cli/2.1.296 (external, cli)'},"
+                                        "body:JSON.stringify({model:m,max_tokens:8,"
+                                        "messages:[{role:'user',content:'hi'}]})})"
+                                        ".then(async r=>{console.log('HTTP '+r.status+' '"
+                                        "+(await r.text()).slice(0,100).replace(/\\s+/g,' '))})"
+                                        ".catch(e=>console.log('ERR '"
+                                        "+((e.cause&&e.cause.code)||e.message)))").toUtf8());
+                                    fJs.close();
+                                }
+                            }
+                            QProcessEnvironment oPE =
+                                CAgentRunnerBase::MergedPathEnvironment();
+                            oPE.insert(QStringLiteral("AUTOCODE_PROBE_URL"), sUrl);
+                            oPE.insert(QStringLiteral("AUTOCODE_PROBE_KEY"), m_sDiagKey);
+                            oPE.insert(QStringLiteral("AUTOCODE_PROBE_MODEL"),
+                                       m_sDiagModel.isEmpty()
+                                           ? QStringLiteral("glm-5.3") : m_sDiagModel);
+                            const qint64 iT0n = QDateTime::currentMSecsSinceEpoch();
+                            auto* pProc = new QProcess(this);
+                            pProc->setProcessEnvironment(oPE);
+                            connect(pProc, &QProcess::finished, this,
+                                    [this, pProc, iT0n](
+                                        int a_iCode, QProcess::ExitStatus) {
+                                const QString sOut = QString::fromUtf8(
+                                    pProc->readAllStandardOutput()).simplified();
+                                const QString sErr = QString::fromUtf8(
+                                    pProc->readAllStandardError()).simplified();
+                                const qint64 iMs =
+                                    QDateTime::currentMSecsSinceEpoch() - iT0n;
+                                QString sLine = !sOut.isEmpty() ? sOut : sErr;
+                                QString sJudge;
+                                if (sOut.contains(QStringLiteral("HTTP 200"))) {
+                                    sJudge = QStringLiteral(
+                                        "（node 同样直连成功——本机无进程级拦截，"
+                                        "问题在 claude 自身配置逻辑）");
+                                } else if (sOut.contains(QStringLiteral("HTTP 401"))) {
+                                    sJudge = QStringLiteral(
+                                        "（⚠ node.exe 被拦截改写——安全软件/终端管控"
+                                        "对 node.exe 的 HTTP 过滤实锤，退出码 %1）").arg(a_iCode);
+                                } else if (sOut.contains(QStringLiteral("ERR "))) {
+                                    sJudge = QStringLiteral(
+                                        "（⚠ node.exe 网络层失败——连接被安全软件/防火墙"
+                                        "针对进程掐断，退出码 %1）").arg(a_iCode);
+                                } else {
+                                    sJudge = QStringLiteral("（node 探测异常，退出码 %1）")
+                                                 .arg(a_iCode);
+                                }
+                                emit sigInfo(QStringLiteral(
+                                    "[claude-model] node 直探（与 claude 同进程类型）："
+                                    "%1（%2 ms）%3")
+                                    .arg(sLine.left(120),
+                                         QString::number(iMs), sJudge));
+                                pProc->deleteLater();
+                            });
+                            // 2026.10.11 崩溃修复：pProc 在 finished 里 deleteLater，
+                            //   30s 超时定时器裸捕获同属 UAF，QPointer 守卫代之
+                            const QPointer<QProcess> pProcGuard = pProc;
+                            QTimer::singleShot(30000, this, [pProcGuard]() {
+                                if (QProcess* a_pProc = pProcGuard.data()) {
+                                    if (a_pProc->state() != QProcess::NotRunning) {
+                                        a_pProc->kill();
+                                    }
+                                }
+                            });
+                            pProc->start(QStringLiteral("cmd.exe"),
+                                         { QStringLiteral("/c"),
+                                           QStringLiteral("node"),
+                                           QDir::toNativeSeparators(sJs) });
+                        }
+                    }
+                }
             } else if (sKind == QStringLiteral("tool_use")) {
                 const QString sTool = oItem.value(QStringLiteral("name")).toString();
                 const QJsonObject oInput = oItem.value(QStringLiteral("input")).toObject();
@@ -1290,6 +2154,18 @@ void CClaudeRunner::EmitFailed(const QString& a_sMsg) {
             sTail = sTail.left(800) + QStringLiteral("…");
         }
         sMsg += QStringLiteral("；stderr 尾部：%1").arg(sTail);
+        // 2026.10.10 路径类失败提示：cmd 本地化报「系统找不到指定的路径/文件」时，
+        //   启动链里存在失效路径（claude.cmd shim 引用的 node/cli.js 缺失等）——
+        //   给出可操作指引，避免只剩裸报错无从下手。
+        if (sTail.contains(QStringLiteral("找不到指定的路径"))
+            || sTail.contains(QStringLiteral("找不到文件"))
+            || sTail.contains(QStringLiteral("不是内部或外部命令"))) {
+            sMsg += QStringLiteral("\n提示：claude 启动链中存在失效路径/缺失命令。"
+                "请在 cmd 窗口运行「%1 --version」验证：报错则重跑环境安装"
+                "（install_env.bat）；正常则把 where 结果的绝对路径填到"
+                "「设置 → Agent」的 Claude 命令后重试。")
+                .arg(ClaudeCmd());
+        }
     }
     m_bFinished = true;
     emit sigInfo(QStringLiteral("[错误] ") + sMsg);

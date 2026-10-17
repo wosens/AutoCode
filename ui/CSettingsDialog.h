@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <QDialog>
 #include <QList>
@@ -7,6 +7,7 @@
 #include "CVersionDialog.h"    // FBusyCheck（后端版本管理入口性判据注入）
 
 class QComboBox;
+class QTreeWidgetItem;   // 2026.10.15 双击就地编辑 itemChanged 槽参数
 class QSpinBox;
 class QDoubleSpinBox;
 class QLineEdit;
@@ -116,6 +117,9 @@ public:
     QString ScanExcludeDirs() const;
     QString BackupExcludeDirs() const;
     QString ExplorerHiddenDirs() const;   // 2026.09.23 资源管理器隐藏目录（全量清单原文）
+    // 2026-10-17 对话日志渲染引擎（[View] Engine："Legacy"=卡片流缺省 /
+    //   "ModelView"=Model/View 自绘链——归一化两值，双引擎灰度开关）。
+    QString ViewEngine() const;
     // 2026-09-26 内置测试沙箱（[Sandbox]：Agent 后代 GUI 窗口自动收纳/录像）。
     bool SandboxEnable() const;
     bool SandboxAutoGhost() const;
@@ -146,6 +150,9 @@ private:
     int CurDshModelRow() const;
     void OnDshModelAdd();
     void OnDshModelEdit();
+    // 2026.10.15 双击单元格就地编辑：itemChanged 落回 m_aDshModels（数字列非法回退旧值；
+    //   显示名清空回退模型 ID、模型 ID 不可空，口径同编辑对话框 Entry() 兑底）。
+    void OnDshModelItemChanged(QTreeWidgetItem* a_pItem, int a_iCol);
     // 2026.08.27 复制选中条目：预填编辑对话框（显示名加“-副本”后缀，可改），
     //   确认后追加到列表末尾——快速建同网关的多个模型。
     void OnDshModelCopy();
@@ -279,6 +286,7 @@ private:
     QLineEdit*  m_pEditScanDirs     = nullptr;
     QLineEdit*  m_pEditBackupDirs   = nullptr;
     QLineEdit*  m_pEditExplHidden   = nullptr;   // 2026.09.23 资源管理器隐藏目录（[Explorer] HiddenDirs）
+    QComboBox*  m_pComboViewEngine  = nullptr;   // 2026-10-17 对话日志渲染引擎（[View] Engine：Legacy/ModelView）
     // 2026-09-26 内置测试沙箱（[Sandbox]）
     QCheckBox*  m_pChkSbxEnable   = nullptr;   // 总开关
     QCheckBox*  m_pChkSbxAuto     = nullptr;   // 自动收纳新窗口

@@ -5,6 +5,7 @@
 #include <QRect>
 #include <QSet>
 #include <QFileInfo>
+#include <QDir>       // 2026-10-09 IsProtectedAppPath：路径规范化
 #include <QElapsedTimer>
 #include <QCoreApplication>
 #include <QRegularExpression>
@@ -23,15 +24,21 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 
-namespace {
-
-// 幽灵化标记（SetProp；崩溃后新实例可据此还原）。
+// 幽灵化标记（SetProp；崩溃后新实例可据此还原）。2026-10-09 移入 sbx 并解除
+//   文件内限定：单元测试需直接访问 prop 名伪造跨实例场景（越权保护/标记超龄）。
+namespace sbx {
 const wchar_t* kPropGhost   = L"AutoCodeSbxGhost.1";   // 值 = 收纳者 PID
 const wchar_t* kPropOrigEx  = L"AutoCodeSbxOrigEx.1";  // 值 = 原 GWL_EXSTYLE
 // 2026-10-08 「曾收纳」标记：AutoCode 退出还原在册窗口时保留（区别于用户主动
 //   还原——那会连此标记一并清）。新实例启动/切工程时扫到它：窗口进程 exe 在
 //   当前工程目录内 → 续收纳重新隐形（否则窗口裸奔在用户桌面，Compositer 实测）。
+// 2026-10-09 值改存打标/还原时刻 GetTickCount()（原恒为 1 无时效）：续收纳只认
+//   「最近还原」的窗口——超龄说明 Agent 早不再测它，用户可能正在用，不得再收
+//   （用户实测：工程内软件窗口反复自动消失/出现，就是无时效标记被反复续收）。
 const wchar_t* kPropAdopt   = L"AutoCodeSbxAdopt.1";
+} // namespace sbx
+
+namespace {
 
 // 永不收纳的窗口类（控制台 host / 提示 / 阴影等辅助窗口）。
 bool IsDeniedWndClass(const QString& a_sCls) {
@@ -75,33 +82,79 @@ namespace sbx {
 // ---------------------------------------------------------------------------
 // 进程树归属
 // ---------------------------------------------------------------------------
-bool BuildParentMap(QHash<DWORD, DWORD>& a_oMap) {
+bool BuildParentMap(QHash<DWORD, DWORD>& a_oMap, QHash<DWORD, qint64>& a_oCreated) {
     a_oMap.clear();
+    a_oCreated.clear();
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         return false;
     }
+    // 2026-10-14 进程创建时刻（FILETIME 100ns/1601 纪元 → Unix ms）。逐 pid
+    //   OpenProcess+GetProcessTimes（几百进程量级毫秒级开销；表 500ms 才重建
+    //   一次）；拿不到（System 等保护进程）记 0 = 校验时视为不可得，保持旧行为。
+    const auto fnCreateMs = [](DWORD a_dwPid) -> qint64 {
+        if (a_dwPid == 0) {
+            return 0;
+        }
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, a_dwPid);
+        if (hProc == nullptr) {
+            return 0;
+        }
+        FILETIME ftCreate = {}, ftExit = {}, ftKernel = {}, ftUser = {};
+        qint64 iMs = 0;
+        if (GetProcessTimes(hProc, &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+            LARGE_INTEGER li;
+            li.HighPart = ftCreate.dwHighDateTime;
+            li.LowPart = ftCreate.dwLowDateTime;
+            iMs = (li.QuadPart - 116444736000000000LL) / 10000;
+        }
+        CloseHandle(hProc);
+        return iMs;
+    };
     PROCESSENTRY32W stPe = {};
     stPe.dwSize = sizeof(stPe);
     if (Process32FirstW(hSnap, &stPe)) {
         do {
             a_oMap.insert(stPe.th32ProcessID, stPe.th32ParentProcessID);
+            a_oCreated.insert(stPe.th32ProcessID, fnCreateMs(stPe.th32ProcessID));
         } while (Process32NextW(hSnap, &stPe));
     }
     CloseHandle(hSnap);
     return !a_oMap.isEmpty();
 }
 
-bool IsDescendantOf(DWORD a_dwPid, DWORD a_dwRoot, const QHash<DWORD, DWORD>& a_oMap) {
+bool IsParentAlive(DWORD a_dwPid, const QHash<DWORD, DWORD>& a_oMap) {
+    // 见 CSandboxCore.h 2026-10-16 注：父 pid 仍是表键 = 父活着；值非 0 但键缺席
+    //   = 断链（父死）；本体缺席 = 快照竞态，按断链口径交上层年龄闸。
+    const DWORD dwPpid = a_oMap.value(a_dwPid, 0);
+    return dwPpid != 0 && a_oMap.contains(dwPpid);
+}
+
+bool IsDescendantOf(DWORD a_dwPid, DWORD a_dwRoot, const QHash<DWORD, DWORD>& a_oMap,
+                    const QHash<DWORD, qint64>& a_oCreated) {
     if (a_dwRoot == 0 || a_dwPid == 0) {
         return false;
     }
     DWORD dwCur = a_dwPid;
+    qint64 iCurMs = a_oCreated.value(dwCur, 0);
     for (int i = 0; i < 64 && dwCur != 0; ++i) {   // 防环上限
         if (dwCur == a_dwRoot) {
             return true;
         }
-        dwCur = a_oMap.value(dwCur, 0);
+        const DWORD dwNext = a_oMap.value(dwCur, 0);
+        if (dwNext == 0) {
+            break;
+        }
+        // 2026-10-14 PID 复用防护：父必须不晚于子出生。双方创建时刻都可得且父
+        //   更年轻 = 当前持有该父 PID 的是复用者（真父已死，子是孤儿），此链是
+        //   假归属 → 立即判否。任一端不可得（0：保护进程/权限）保持旧行为，
+        //   不影响正常归属判定（真父创建恒早于子，无假阴性）。
+        const qint64 iNextMs = a_oCreated.value(dwNext, 0);
+        if (iCurMs > 0 && iNextMs > 0 && iNextMs > iCurMs) {
+            return false;
+        }
+        dwCur = dwNext;
+        iCurMs = iNextMs;
     }
     return false;
 }
@@ -156,7 +209,8 @@ bool GhostWindow(HWND a_hWnd) {
         return false;
     }
     SetPropW(a_hWnd, kPropOrigEx, reinterpret_cast<HANDLE>(static_cast<intptr_t>(lEx)));
-    SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(static_cast<intptr_t>(1)));   // 曾收纳（退出还原后留供继任实例续收）
+    SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(
+        static_cast<intptr_t>(static_cast<ULONG>(GetTickCount()))));   // 曾收纳（时刻；退出还原时刷新）
     const LONG_PTR lNew = lEx | WS_EX_LAYERED | WS_EX_TRANSPARENT
                         | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
     SetLastError(0);   // SetWindowLongPtr 成功可合法返回 0（原值即 0），先清防残留误判
@@ -200,6 +254,11 @@ bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark) {
     //   自动续收它；AutoCode 退出路径传 true 保留，供继任实例识别续收。
     if (!a_bKeepAdoptMark) {
         RemovePropW(a_hWnd, kPropAdopt);
+    } else {
+        // 退出还原：刷新「曾收纳」时刻——继任实例的时效窗从还原起算（收纳后
+        //   AutoCode 连续跑数小时再退出，旧时刻已超龄会被误判成「用户在用」）。
+        SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(
+            static_cast<intptr_t>(static_cast<ULONG>(GetTickCount()))));
     }
     if (ITaskbarList* pList = nullptr;
         SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
@@ -233,6 +292,28 @@ int RestoreAllMarked(bool a_bKeepAdoptMark) {
 
 bool HasAdoptMark(HWND a_hWnd) {
     return IsWindow(a_hWnd) && GetPropW(a_hWnd, kPropAdopt) != nullptr;
+}
+
+// 2026-10-09 「曾收纳」时刻（GetTickCount 快照；无标记返回 0）。年龄判定用无符号
+//   减法（now - tick）自动处理 49.7 天回绕。
+ULONG AdoptMarkTick(HWND a_hWnd) {
+    if (!IsWindow(a_hWnd)) {
+        return 0;
+    }
+    const HANDLE hVal = GetPropW(a_hWnd, kPropAdopt);
+    return hVal != nullptr ? static_cast<ULONG>(
+        static_cast<ULONG_PTR>(reinterpret_cast<intptr_t>(hVal))) : 0;
+}
+
+// 2026-10-09 幽灵中窗口的收纳者 PID（kPropGhost 值；非幽灵返回 0）——多实例
+//   互斥用：别的活实例正在管理的窗口，本实例不得越权还原/续收。
+DWORD GhostOwnerPid(HWND a_hWnd) {
+    if (!IsWindow(a_hWnd)) {
+        return 0;
+    }
+    const HANDLE hVal = GetPropW(a_hWnd, kPropGhost);
+    return hVal != nullptr ? static_cast<DWORD>(
+        static_cast<ULONG_PTR>(reinterpret_cast<intptr_t>(hVal))) : 0;
 }
 
 void ClearAdoptMark(HWND a_hWnd) {
@@ -296,6 +377,47 @@ bool IsSystemHostPid(DWORD a_dwPid) {
     }
     const QString sBase = QFileInfo(sExe).fileName().toLower();
     return IsDeniedHostExe(sBase);
+}
+
+// 2026-10-09 受保护应用目录（惰性初始化；环境变量在进程生命周期内不变）。
+//   前缀比较统一补 '/'，防「C:\Windows」误吞「C:\Windows98\x.exe」这类近邻路径。
+QStringList ProtectedAppRoots() {
+    static const QStringList s_aRoots = [] {
+        QStringList aOut;
+        const auto fnAdd = [&aOut](const QString& sDir) {
+            QString s = QDir::fromNativeSeparators(sDir).toLower();
+            while (s.endsWith(QLatin1Char('/'))) {
+                s.chop(1);
+            }
+            if (!s.isEmpty()) {
+                aOut << s;
+            }
+        };
+        fnAdd(qEnvironmentVariable("SystemRoot"));          // C:\Windows（记事本/注册表工具…）
+        fnAdd(qEnvironmentVariable("windir"));              // 兼容别名
+        fnAdd(qEnvironmentVariable("ProgramFiles"));        // C:\Program Files
+        fnAdd(qEnvironmentVariable("ProgramFiles(x86)"));   // C:\Program Files (x86)
+        fnAdd(qEnvironmentVariable("LocalAppData")
+              + QStringLiteral("\\Microsoft\\WindowsApps")); // UWP 执行别名（Win11 记事本等）
+        return aOut;
+    }();
+    return s_aRoots;
+}
+
+bool IsProtectedAppPath(const QString& a_sExe) {
+    if (a_sExe.isEmpty()) {
+        return false;
+    }
+    QString sExe = QDir::fromNativeSeparators(a_sExe).toLower();
+    while (sExe.endsWith(QLatin1Char('/'))) {
+        sExe.chop(1);
+    }
+    for (const QString& sRoot : ProtectedAppRoots()) {
+        if (sExe == sRoot || sExe.startsWith(sRoot + QLatin1Char('/'))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +816,23 @@ bool ParseCli(const QStringList& a_aArgs, QString* a_psCmd, QJsonObject* a_pOut)
         if (iN < 5) return false;
         o.insert(QStringLiteral("hwnd"), fnH(3));
         o.insert(QStringLiteral("text"), QStringList(a_aArgs.mid(4)).join(QLatin1Char(' ')));
+    } else if (sCmd == QStringLiteral("launch")) {
+        // --sandbox launch <exe> [参数...]：主进程代启动被测程序（2026-10-14
+        //   断链漏收治理：Start-Process/cmd start 中间人秒退会切断进程树）。
+        if (iN < 4) return false;
+        o.insert(QStringLiteral("exe"), fnArg(3));
+        if (iN >= 5) {
+            // 余参重建成命令行串：含空格/制表的元素补引号（Qt 拆参已剥一层）。
+            QStringList aRest;
+            for (int k = 4; k < iN; ++k) {
+                const QString s = a_aArgs.at(k);
+                aRest.append(s.contains(QLatin1Char(' '))
+                                 || s.contains(QLatin1Char('\t'))
+                                 || s.isEmpty()
+                             ? QStringLiteral("\"%1\"").arg(s) : s);
+            }
+            o.insert(QStringLiteral("args"), aRest.join(QLatin1Char(' ')));
+        }
     } else if (sCmd == QStringLiteral("keys")) {
         if (iN < 5) return false;
         o.insert(QStringLiteral("hwnd"), fnH(3));

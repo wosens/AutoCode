@@ -35,6 +35,7 @@ class QPushButton;
 class QTabWidget;
 class QComboBox;
 class QCheckBox;
+class QSpinBox;   // 2026-10-08 并发审查 Agent 数（config.ini [Review] Agents）
 class CReviewSpinner;   // 2026-10-02 审查中动态图标（cpp 内定义，同 CBusyIndicator 风格）
 
 // —— 2026-10-08 过滤档案项（config.ini [Review] Filters，JSON [{n,e}]）——
@@ -107,6 +108,9 @@ private:
     // —— 2026-10-08 过滤档案（config.ini [Review] Filters，JSON 数组 [{n,e}]）——
     QList<SReviewFilter> LoadFilters() const;
     void SaveFilters(const QList<SReviewFilter>& a_aFilters);
+    // 2026-10-08 并发审查 Agent 数（config.ini [Review] Agents；缺省 10，1..32）。
+    int  LoadAgents() const;
+    void SaveAgents(int a_iAgents);
     static QList<QByteArray> ExtsOfProfile(const SReviewFilter& a_stProfile);
     QList<QByteArray> AllFilterExts() const;   // 全部档案扩展名并集（=「全部」口径）
 
@@ -140,6 +144,7 @@ private:
 
     QLabel*      m_pLblTarget  = nullptr;
     QCheckBox*   m_pChkFull    = nullptr;   // 全量审查（缺省不勾）
+    QSpinBox*    m_pSpinAgents = nullptr;   // 2026-10-08 并发审查 Agent 数（1..32，缺省 10）
     QTabWidget*  m_pTabs       = nullptr;
     // 选择文件页
     QComboBox*   m_pCboFilter  = nullptr;
