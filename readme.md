@@ -160,13 +160,13 @@ flowchart LR
 
 ## 🖥️ 界面一览
 
-![AutoCode 主界面](Execute/help/images/main-window.png)
+![AutoCode 主界面](images/main-window.png)
 
 | 左栏 · 任务列表 + 工程资源管理器 | 阶段进度 · 阶段产物 |
 |:---:|:---:|
-| ![任务列表与资源管理器](Execute/help/images/panel-left.png) | ![阶段进度与产物](Execute/help/images/panel-stages.png) |
+| ![任务列表与资源管理器](images/panel-left.png) | ![阶段进度与产物](images/panel-stages.png) |
 
-![助手工作台：提示词、权限、上下文占用与模型选择](Execute/help/images/panel-input.png)
+![助手工作台：提示词、权限、上下文占用与模型选择](images/panel-input.png)
 
 ---
 
@@ -229,6 +229,7 @@ AutoCode/
 ├── resources/              # 图标资源（SVG 源稿 + 多尺寸 PNG）
 ├── doc/                    # 设计方案文档
 ├── help/                   # 用户帮助《使用说明.html》（三方同步）
+├── images/                 # 介绍文档插图（readme.md：矢量横幅 + 界面截图）
 └── Execute/                # 部署产物：AutoCode.exe · prompts · config.ini · help
 ```
 
