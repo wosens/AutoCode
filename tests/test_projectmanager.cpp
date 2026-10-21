@@ -12,6 +12,9 @@
 #include <QWindow>          // 窗口级 QTest 鼠标事件（真实输入管线）
 #include <QTabWidget>
 #include <QComboBox>       // 2026-10-08 思考强度下拉用例
+#include <QLineEdit>       // 2026-10-20 模型表双击用例（编辑器判型）
+#include <QTimer>          // 2026-10-20 双击开编辑对话框用例（嵌套循环内关闭模态）
+#include <QProcess>        // 2026-10-21 沙箱遗留标签恢复用例（icacls 造现场/应用命令）
 #include <QMainWindow>       // 2026.09.26 设置对话框几何漂移用例（父窗口）
 
 #include <windows.h>       // WritePrivateProfileStringW（坏档构造，与生产代码同通道）
@@ -19,6 +22,7 @@
 
 #include "project/CProjectManager.h"
 #include "ui/CSettingsDialog.h"
+#include "agent/CDeepSeekRunner.h"   // 2026-10-21 沙箱遗留标签恢复用例
 
 // 最近打开工程历史（MRU）单元测试。
 // 覆盖需求 AC-2/3/4/5/6/7/11/12 的可自动化部分（CProjectManager 的纯逻辑 + config.ini 往返）。
@@ -999,6 +1003,79 @@ private slots:
         }
     }
 
+    // 2026-10-20 模型列表双击的真实输入链回归：QWindow 级合成自然双击序列——双击前
+    //   选中在他行，首击换行触发 currentItemChanged（仅刷按钮态，不再全表重建），
+    //   紧随的双击弹出编辑对话框（模态）；内联编辑位已全关（见用例内断言）。
+    // 2026-10-20 模型列表双击打开编辑对话框回归（用户需求：双击进编辑界面，取代
+    //   2026-10-15 的双击单元格就地编辑）：内联编辑位全关（NoEditTriggers）；双击
+    //   数据行 → 弹出 CDshModelEditDialog 模态对话框（0ms 单发定时器在其 exec
+    //   嵌套循环内关闭）；拒绝对话框数据不变；空表占位行双击不弹框。
+    void testSettingsModelDblClickEditDialog() {
+        {
+            QFile f(ConfigPath());
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write("[DshModels]\r\nCount=2\r\nActive=-1\r\n"
+                    "M0Disp=GLM-5.3\r\n"
+                    "M0URL=http://192.168.118.128:9000/claude\r\n"
+                    "M0Key=k\r\nM0Api=anthropic-messages\r\n"
+                    "M0Model=glm-5.3\r\nM0Ctx=1000000\r\nM0Max=32768\r\n"
+                    "M1Disp=Spark\r\n"
+                    "M1URL=http://127.0.0.1:8080/v1\r\n"
+                    "M1Api=openai-completions\r\n"
+                    "M1Model=spark\r\nM1Ctx=131072\r\nM1Max=8192\r\n");
+        }
+        CProjectManager stPm;
+        CSettingsDialog stDlg(&stPm);
+        stDlg.resize(1000, 760);
+        stDlg.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&stDlg));
+        QApplication::processEvents();
+        QTreeWidget* pTree = stDlg.findChildren<QTreeWidget*>().first();   // 唯一模型树（「模型」页）
+        QCOMPARE(pTree->topLevelItemCount(), 2);
+        // 内联编辑已整体关闭：双击不再就地起编辑器，改开编辑对话框
+        QCOMPARE(int(pTree->editTriggers()), int(QAbstractItemView::NoEditTriggers));
+        for (QWidget* pW = pTree->parentWidget(); pW != nullptr; pW = pW->parentWidget()) {
+            if (auto* pTabW = qobject_cast<QTabWidget*>(pW)) {   // 非当前页控件不收事件
+                pTabW->setCurrentWidget(pTree->parentWidget()->parentWidget());
+                break;
+            }
+        }
+        QApplication::processEvents();
+        QWindow* pWin = stDlg.windowHandle();
+        QVERIFY(pWin != nullptr);
+
+        // ① 首击换行（选中 Spark）→ 双击 GLM 行「显示名」列：弹出编辑对话框。
+        pTree->setCurrentItem(pTree->topLevelItem(1));
+        QApplication::processEvents();
+        const QRect rc0 = pTree->visualItemRect(pTree->topLevelItem(0));
+        // visualItemRect 是 viewport 坐标（表头占 pTree 顶部一段），须经 viewport 映射；
+        //   行矩形横贯全表宽，x 取列 0 内 20px（列矩形中点会落进中段其他列）。
+        const QPoint pt = pTree->viewport()->mapTo(&stDlg,
+            QPoint(pTree->columnViewportPosition(0) + 20, rc0.center().y()));
+        QTest::mouseClick(pWin, Qt::LeftButton, Qt::KeyboardModifier::NoModifier, pt);
+        QCOMPARE(pTree->indexOfTopLevelItem(pTree->currentItem()), 0);   // 首击确已选中 GLM 行
+        QApplication::processEvents();
+        // ② 双击 → itemDoubleClicked → OnDshModelEdit 弹模态编辑对话框；
+        //   0ms 单发定时器在其 exec 嵌套事件循环内抓 activeModalWidget 关闭（拒绝）。
+        bool bDlgSeen = false;
+        QTimer::singleShot(0, [&bDlgSeen]() {
+            QWidget* pM = QApplication::activeModalWidget();
+            bDlgSeen = (qobject_cast<QDialog*>(pM) != nullptr);
+            if (pM != nullptr) {
+                pM->close();   // 关闭 → exec 回 Rejected → 数据不变
+            }
+        });
+        QTest::mouseDClick(pWin, Qt::LeftButton, Qt::KeyboardModifier::NoModifier, pt);
+        QApplication::processEvents();
+        QVERIFY2(bDlgSeen, QStringLiteral("double click did not open edit dialog (focus=%1)")
+            .arg(QApplication::focusWidget() != nullptr
+                     ? QApplication::focusWidget()->metaObject()->className()
+                     : QStringLiteral("null")).toUtf8().constData());
+        QVERIFY(QApplication::activeModalWidget() == nullptr);   // 已随关闭退出
+        // 拒绝编辑 → 显示名仍为原值
+        QCOMPARE(pTree->topLevelItem(0)->text(0), QStringLiteral("GLM-5.3"));
+    }
+
     // 2026-10-08 四后端思考强度/思考预算设置接通（DSH/Codex/Hermes 下拉 + claude 预算框）：
     //   默认空/0、落盘回填、选项集合三段。接通前为半截工程（runner 注入/config 存取在，
     //   UI 与主窗口接线缺，设置页无任何入口）。
@@ -1164,6 +1241,7 @@ private slots:
     //   修复=showEvent 回贴精确几何。三轮「构造→show→done 落盘→销毁」断言 y 逐轮相等；
     //   offscreen 无原生窗口漂移不发生，QSKIP（口径同 test_execpanel recentDialogGeometryNoDrift）。
     void settingsDialogGeometryNoDrift();
+    void testDshRestoreNeutralSecurity();   // 2026-10-21 沙箱遗留标签中性恢复
 };
 
 void CTestProjectManager::settingsDialogGeometryNoDrift() {
@@ -1194,6 +1272,55 @@ void CTestProjectManager::settingsDialogGeometryNoDrift() {
         }
         iPrevY = iY;
     }
+}
+
+// 2026-10-21 沙箱遗留低完整性标签中性恢复回归（danger-full-access 缺省后的
+//   清理路径）：无标签/Medium=已中性；icacls 打 Low 后按令牌特权走静默恢复
+//   （返回 1）或提权命令（-1，命令含目录与 /setintegritylevel），命令可执行
+//   且应用后再查=0；子目录继承标签随恢复自动归中（一条恢复清整树的实证）。
+void CTestProjectManager::testDshRestoreNeutralSecurity() {
+    QTemporaryDir stTmp;
+    QVERIFY(stTmp.isValid());
+    const QString sRoot = stTmp.path();
+    QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/sub/deep")));
+    // ① 无标签 = 已中性（幂等不动）。
+    QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(sRoot), 0);
+    // ② 打 Low 标签 → 恢复（特权令牌静默；过滤令牌给提权命令）。
+    QProcess stIcacls;
+    stIcacls.start(QStringLiteral("icacls"),
+                   {sRoot, QStringLiteral("/setintegritylevel"),
+                    QStringLiteral("(OI)(CI)L")});
+    QVERIFY(stIcacls.waitForFinished(15000));
+    QCOMPARE(stIcacls.exitCode(), 0);
+    QString sCmd;
+    const int iRst = CDeepSeekRunner::RestoreNeutralSecurity(sRoot, &sCmd);
+    if (iRst == 1) {
+        // 特权令牌：本轮已静默替换为 Medium，落到底部幂等断言。
+    } else {
+        QCOMPARE(iRst, -1);
+        QVERIFY2(sCmd.contains(QStringLiteral("setintegritylevel"))
+                     && sCmd.contains(QDir::toNativeSeparators(sRoot)),
+                 qPrintable(sCmd));
+        QProcess stFix;
+        stFix.start(QStringLiteral("cmd.exe"), {QStringLiteral("/c"), sCmd});
+        QVERIFY(stFix.waitForFinished(15000));
+        QCOMPARE(stFix.exitCode(), 0);
+    }
+    // ③ 恢复后再查=0；子目录继承标签同轮归中（恢复函数清整树的实证）。
+    QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(sRoot), 0);
+    QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(
+                 sRoot + QStringLiteral("/sub/deep")), 0);
+    // ④ Medium 本来就中性：不再动。
+    QProcess stMed;
+    stMed.start(QStringLiteral("icacls"),
+                {sRoot, QStringLiteral("/setintegritylevel"),
+                 QStringLiteral("(OI)(CI)M")});
+    QVERIFY(stMed.waitForFinished(15000));
+    QCOMPARE(stMed.exitCode(), 0);
+    QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(sRoot), 0);
+    // ⑤ 目录不在场 = 无需恢复。
+    QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(
+                 sRoot + QStringLiteral("/no_such_dir")), 0);
 }
 
 QTEST_MAIN(CTestProjectManager)

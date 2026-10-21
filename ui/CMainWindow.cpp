@@ -24,6 +24,7 @@
 #include <QSizePolicy>
 #include <QUuid>
 #include <QDateTime>
+#include <QThread>
 #include <QTimer>
 #include <QThreadPool>   // 2026-10-01 沙箱命令异步化：投线程池执行（MTA COM）
 #include <objbase.h>     // CoInitializeEx（WIN32_LEAN_AND_MEAN 裁掉了 ole2）
@@ -424,6 +425,8 @@ void CMainWindow::ApplyAgentConfigToRuntime(bool a_bStartup) {
     CDeepSeekRunner::SetDshBinJsPath(m_pPm->LoadDshBinJsPath());
     CDeepSeekRunner::SetDshCordisPath(m_pPm->LoadDshCordisPath());
     CDeepSeekRunner::SetDshProvider(m_pPm->LoadDshProvider());
+    // 2026-10-19 会话权限模式（[Agent] DshPermissionMode；缺省 danger-full-access）。
+    CDeepSeekRunner::SetDshPermissionMode(m_pPm->LoadDshPermissionMode());
     CDeepSeekRunner::SetDshModel(m_pPm->LoadDshModel());
     // 2026-10-08 思考强度（initialize reasoningEffort；空=默认不注入）。
     CDeepSeekRunner::SetDshEffort(m_pPm->LoadDshEffort());
@@ -605,6 +608,33 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     m_pOrch->SetReviewParallel(m_pPm->LoadReviewParallel());
     // 2026.08.20 抽取为 ApplyAgentConfigToRuntime（多实例热重载复用）。
     ApplyAgentConfigToRuntime(true);
+    // 2026-10-19 DSH 自愈失败提权回调：EnsureProcess 静默自愈失败（过滤令牌下
+    //   SetNamedSecurityInfoW Win32 5）且在 GUI 线程时经此同步询问用户——确认 →
+    //   runas icacls 补账户级 F → 复查；true=已修复（EnsureProcess 信此值发成功
+    //   日志，不二次复查）。复查未过同样登记抑制集，防每次 submit 重复弹窗。
+    CDeepSeekRunner::SetAclElevateHandler([this](const QString& a_sDir, const QString& a_sCmd) {
+        if (!RunAclElevateFlow(QStringLiteral("工程目录权限修复"), {a_sDir}, a_sCmd)) {
+            return false;
+        }
+        // 2026-10-21 按命令类型复查：/setintegritylevel=沙箱遗留标签恢复（对
+        //   RestoreNeutralSecurity）；其余仍查账户写权限 ACE（EnsureDirWriteAce）。
+        const bool bRelabel = a_sCmd.contains(QStringLiteral("/setintegritylevel"));
+        const bool bOk = bRelabel
+            ? CDeepSeekRunner::RestoreNeutralSecurity(a_sDir) == 0
+            : CDeepSeekRunner::EnsureDirWriteAce(a_sDir) == 0;
+        if (!bOk) {
+            m_aAclElevateSuppressed.insert(QDir::toNativeSeparators(a_sDir).toLower());
+        }
+        ExecMsgBox(bOk ? QMessageBox::Information : QMessageBox::Warning,
+                   QStringLiteral("工程目录权限修复"),
+                   bOk ? (bRelabel
+                              ? QStringLiteral("提权修复成功：沙箱遗留低完整性标签已清除，"
+                                              "普通程序（VS/MSBuild 等）可直接写入，任务继续。")
+                              : QStringLiteral("提权修复成功：已补当前账户写权限 ACE，任务继续。"))
+                       : QStringLiteral("提权修复后复查仍未通过。\n可手工执行：\n%1").arg(a_sCmd),
+                   this);
+        return bOk;
+    });
     // 2026.08.20 多实例配置同步：盯 config.ini（exe 同级全局共享），其他实例保存后
     //   本实例热重载。WritePrivateProfileStringW 非原子、设置页一次写几十键，防抖 1s
     //   合并成一次；自身保存 2s 内的变更跳过（m_iCfgSelfSaveMs 打点）。
@@ -839,6 +869,8 @@ CMainWindow::~CMainWindow() {
         delete m_pMsgFilter;
         m_pMsgFilter = nullptr;
     }
+    // 2026-10-19 摘除 DSH 自愈失败提权回调（静态槽持 this，主窗先亡防悬垂）。
+    CDeepSeekRunner::SetAclElevateHandler({});
     // 兜底落盘：sigChanged 已即时保存，此处防异常退出漏盘
     if (m_pPm != nullptr && !m_pPm->ProjectDir().isEmpty()) {
         for (CTaskInfo* pTask : m_aTasks) {
@@ -1345,6 +1377,45 @@ QMessageBox::StandardButton CMainWindow::ExecQuestion(const QString& a_sTitle,
     return static_cast<QMessageBox::StandardButton>(stBox.exec());
 }
 
+bool CMainWindow::RunAclElevateFlow(const QString& a_sTitle, const QStringList& a_aDirs,
+                                    const QString& a_sCmds) {
+    // 2026-10-19 三挂点共用的提权修复公共流（见头文件声明注释）。抑制键=native
+    //   小写目录路径（QDir::toNativeSeparators + toLower，盘符大小写归一）。
+    QStringList aKeys;
+    for (const QString& s : a_aDirs) {
+        aKeys << QDir::toNativeSeparators(s).toLower();
+    }
+    for (const QString& sKey : aKeys) {
+        if (m_aAclElevateSuppressed.contains(sKey)) {
+            return false;   // 本会话已拒绝/失败过：不再骚扰
+        }
+    }
+    const QMessageBox::StandardButton eAns = ExecQuestion(a_sTitle,
+        QStringLiteral("以下目录缺少当前账户的写权限，且自动修复失败\n"
+                       "（管理员账户经 UAC 过滤令牌运行时常见）：\n\n%1\n\n"
+                       "将以管理员权限执行：\n%2\n\n"
+                       "修复后所有后端（Harness）均可使用这些目录。\n现在提权修复吗？")
+            .arg(a_aDirs.join(QLatin1Char('\n')), a_sCmds), this);
+    if (eAns != QMessageBox::Yes) {
+        for (const QString& sKey : aKeys) {
+            m_aAclElevateSuppressed.insert(sKey);
+        }
+        return false;
+    }
+    // runas 提权执行 + 有界等待（用户停在 UAC 框时主窗短暂无响应属预期——安全
+    //   桌面本就独占输入）；失败统一登记抑制并给出手工命令兜底。
+    if (!CDeepSeekRunner::RunElevatedCmdBlocking(a_sCmds, 90000)) {
+        for (const QString& sKey : aKeys) {
+            m_aAclElevateSuppressed.insert(sKey);
+        }
+        ExecMsgBox(QMessageBox::Warning, a_sTitle,
+                   QStringLiteral("提权修复未完成（UAC 被拒或命令失败）。\n可手工执行：\n%1")
+                       .arg(a_sCmds), this);
+        return false;
+    }
+    return true;   // 命令已成功执行；修复复查归调用方（口径随挂点不同）
+}
+
 void CMainWindow::UpdateWindowTitle() {
     // 2026.09.07 需求：标题＝「工程名-AutoCode 版本」（未开工程＝「AutoCode 版本」）。
     //   窗口标题（WM_GETTEXT）是任务管理器/Alt-Tab 悬停与展开列表的信息源——多实例
@@ -1456,6 +1527,100 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir, bool a_bRecordRecent) {
     m_pPm->EnsureAutoDev();
 
     UpdateWindowTitle();   // 2026.09.07 标题刷成「工程名-AutoCode 版本」（任务管理器可辨认）
+
+    // 2026-10-19 工程根+关联目录写权限 ACE 预检（全后端通用，不限 DSH）：静默自愈
+    //   失败（过滤令牌下 SetNamedSecurityInfoW Win32 5）→ 一次提权确认（目录清单
+    //   = 工程根 + 配置的额外可写目录中自愈失败者）→ runas icacls 账户级 F → 复查。
+    //   账户级 F 是通用钥匙：DSH 沙箱 grantWrite/各后端 Harness 内部的 DACL 授权
+    //   都跑在用户令牌下，账户拿回 WRITE_DAC/WRITE_OWNER 后全部恢复（S-1-4 能力
+    //   SID 精确条目 icacls 表达不了，仍由各后端非提权自愈补齐）。插在 Open 成功
+    //   后、座位锁换岗（首次向工程根写文件）前。健康目录静默自愈成功，零打扰；
+    //   修复失败不 return——工程照常打开，与 EnsureProcess 自愈「不阻断」口径一致。
+    {
+        QStringList aNeed;
+        if (CDeepSeekRunner::EnsureDirWriteAce(m_pPm->ProjectDir()) < 0) {
+            aNeed << m_pPm->ProjectDir();
+        }
+        for (const QString& sDir : CDeepSeekRunner::DshExtraWriteDirs()) {
+            if (CDeepSeekRunner::EnsureDirWriteAce(sDir) < 0 && !aNeed.contains(sDir)) {
+                aNeed << sDir;   // 目录不在场时 EnsureDirWriteAce 返回 0，自动跳过
+            }
+        }
+        QStringList aCmds;
+        for (const QString& sDir : aNeed) {
+            aCmds << CDeepSeekRunner::BuildIcaclsGrantCmd(sDir);
+        }
+        aCmds.removeAll(QString());
+        if (!aCmds.isEmpty()
+                && RunAclElevateFlow(QStringLiteral("目录权限修复"), aNeed,
+                                     aCmds.join(QStringLiteral(" & ")))) {
+            QStringList aStill;
+            for (const QString& sDir : aNeed) {
+                if (CDeepSeekRunner::EnsureDirWriteAce(sDir) != 0) {
+                    aStill << sDir;
+                }
+            }
+            for (const QString& sDir : aStill) {
+                m_aAclElevateSuppressed.insert(QDir::toNativeSeparators(sDir).toLower());
+            }
+            ExecMsgBox(aStill.isEmpty() ? QMessageBox::Information : QMessageBox::Warning,
+                       QStringLiteral("目录权限修复"),
+                       aStill.isEmpty()
+                           ? QStringLiteral("提权修复成功：已为 %1 个目录补当前账户写权限，"
+                                            "所有后端（Harness）均可使用。")
+                                 .arg(QString::number(aNeed.size()))
+                           : QStringLiteral("以下目录提权修复后仍未通过：\n%1\n"
+                                            "可手工执行：\n%2")
+                                 .arg(aStill.join(QLatin1Char('\n')),
+                                      aCmds.join(QStringLiteral(" & "))),
+                       this);
+        }
+    }
+
+    // 2026-10-21 沙箱关闭（danger-full-access 缺省）时，工程根/关联目录的沙箱遗留
+    //   低完整性标签恢复：静默失败 → 复用提权流跑 icacls /setintegritylevel
+    //   （替换式、子树继承自动跟随，一条清整树）。紧随上面的 ACE 预检，同一次
+    //   打开至多一次 UAC；健康机器（无低标签）零提示。workspace-write 时代工程
+    //   拷到新机器即命中，此处是发布场景的主入口（EnsureProcess 兜底运行中补）。
+    if (CDeepSeekRunner::DshPermissionMode() == QStringLiteral("danger-full-access")) {
+        QStringList aLblNeed;
+        QStringList aLblCmds;
+        QStringList aLblAll = { m_pPm->ProjectDir() };
+        aLblAll += CDeepSeekRunner::DshExtraWriteDirs();
+        for (const QString& sDir : aLblAll) {
+            QString sCmd;
+            if (CDeepSeekRunner::RestoreNeutralSecurity(sDir, &sCmd) < 0
+                    && !sCmd.isEmpty()) {
+                aLblNeed << sDir;
+                aLblCmds << sCmd;
+            }
+        }
+        if (!aLblNeed.isEmpty()
+                && RunAclElevateFlow(QStringLiteral("目录权限修复"), aLblNeed,
+                                     aLblCmds.join(QStringLiteral(" & ")))) {
+            QStringList aStill;
+            for (const QString& sDir : aLblNeed) {
+                if (CDeepSeekRunner::RestoreNeutralSecurity(sDir) != 0) {
+                    aStill << sDir;
+                }
+            }
+            for (const QString& sDir : aStill) {
+                m_aAclElevateSuppressed.insert(QDir::toNativeSeparators(sDir).toLower());
+            }
+            ExecMsgBox(aStill.isEmpty() ? QMessageBox::Information : QMessageBox::Warning,
+                       QStringLiteral("目录权限修复"),
+                       aStill.isEmpty()
+                           ? QStringLiteral("提权修复成功：已清除 %1 个目录的沙箱遗留"
+                                            "低完整性标签，普通程序（VS/MSBuild 等）"
+                                            "可直接写入。")
+                                 .arg(QString::number(aLblNeed.size()))
+                           : QStringLiteral("以下目录标签恢复仍未完成：\n%1\n"
+                                            "可手工执行：\n%2")
+                                 .arg(aStill.join(QLatin1Char('\n')),
+                                      aLblCmds.join(QStringLiteral(" & "))),
+                       this);
+        }
+    }
 
     // 2026.09.07 v2.1.123 工程锁换岗：摘旧工程自己的锁 → 写新工程在席锁。
     //   2026-10-17 v4.4.387 在席信号同步换岗：先摘旧信号（句柄随旧工程失效）再
@@ -1729,7 +1894,47 @@ void CMainWindow::OnVersionManage() {
             && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning());
     };
     CVersionDialog stDlg(fnBusy, this);
+    // 2026.10.21 右键「自动修复」跨窗分派：对话框组好自愈提示词，主窗口建助手提交。
+    connect(&stDlg, &CVersionDialog::sigAutoFixRequested,
+            this, &CMainWindow::OnBackendAutoFix);
     stDlg.exec();
+}
+
+void CMainWindow::OnBackendAutoFix(int a_iFaultBackend, int a_iFixBackend,
+                                   const QString& a_sPrompt) {
+    Q_UNUSED(a_iFaultBackend);   // 故障后端信息已在 a_sPrompt 内（情况说明段）
+    // 后端自愈落地：复用/新建「后端自愈」助手 → 面板档 + 编排器会话双写粘性修复后端
+    //   → OnAdhocSubmit 走既有助手链（流式日志/统计/中断全复用）。
+    //   前置：工程已开（助手会话需要工作目录）；目标助手不在跑（复用名撞运行中时
+    //   LoadAsstAdhoc 覆盖会话链会伤及在跑轮，直接拒绝并提示）。
+    if (m_pOrch == nullptr || m_pExecPanel == nullptr
+            || a_iFixBackend < 1 || a_iFixBackend > 5) {
+        return;
+    }
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("后端自愈"),
+            QStringLiteral("请先打开一个工程再使用自动修复（自愈 Agent 需要工作目录）。"));
+        return;
+    }
+    // 后端号 → 粘性名（与 CAgentRunnerFactory::NameOf 同词汇表，字符串比较防漂移）。
+    const QString asName[6] = { QString(), QStringLiteral("claude"), QStringLiteral("dsh"),
+                                QStringLiteral("pi"), QStringLiteral("codex"),
+                                QStringLiteral("hermes") };
+    const QString sFixBackend = asName[a_iFixBackend];
+    const QString sId = m_pExecPanel->CreateHealAsst();
+    if (sId.isEmpty()) {
+        return;
+    }
+    if (m_pOrch->IsAsstAdhocRunning(sId)) {
+        QMessageBox::warning(this, QStringLiteral("后端自愈"),
+            QStringLiteral("「后端自愈」助手正在执行上一轮修复，请等它结束后再试。"));
+        return;
+    }
+    // 绑定修复后端：面板档（持久化正本）+ 编排器会话（运行权威；LoadAsstAdhoc 覆盖
+    //   会话链=本轮全新开始，旧修复历史不回灌，防上轮故障噪音带偏本轮）。
+    m_pExecPanel->UpdateAsstBackend(sId, sFixBackend);
+    m_pOrch->LoadAsstAdhoc(sId, QString(), QJsonArray(), QString(), sFixBackend);
+    OnAdhocSubmit(sId, a_sPrompt, 0 /*PermAuto 自动审批*/);
 }
 
 void CMainWindow::OnSettings() {
@@ -1819,7 +2024,57 @@ void CMainWindow::OnSettings() {
         m_pPm->SaveDshExtraWriteDirs(aNew);
         CDeepSeekRunner::SetDshExtraWriteDirs(aNew);
         const QString sCurProj = (m_pPm != nullptr) ? m_pPm->ProjectDir() : QString();
-        CDeepSeekRunner::ApplyExtraWriteDirs(sCurProj, aNew, aOld);
+        // 2026-10-19 授权失败清单出参 + 提权修复（全后端通用）：需提权目录 =
+        //   ①DSH 工作区写 SID 精确授权（ApplyExtraWriteDirs）失败者——多为过滤
+        //   令牌下拿不到 WRITE_DAC；②本轮新加目录账户级 ACE 静默自愈失败者
+        //   （不限 DSH：账户拿回 WRITE_DAC/WRITE_OWNER 后所有后端 Harness 的
+        //   沙箱授权都恢复）。runas icacls 只补账户级 F，精确条目（S-1-4 能力
+        //   SID ACE + Low 标签，icacls 表达不了）由重跑既有幂等实现收尾。多目录
+        //   以 " & " 串联进单次 UAC（icacls 参数各带引号，cmd 对引号内 & 不切分）；
+        //   串联退出码只反映末条，判定以重跑复查为准。
+        QStringList aFailed;
+        CDeepSeekRunner::ApplyExtraWriteDirs(sCurProj, aNew, aOld, &aFailed);
+        QStringList aNeed = aFailed;
+        for (const QString& sDir : aNew) {
+            if (!aOld.contains(sDir) && !aNeed.contains(sDir)
+                    && CDeepSeekRunner::EnsureDirWriteAce(sDir) < 0) {
+                aNeed << sDir;   // 新加目录账户级预敷失败（目录不在场返回 0，自动跳过）
+            }
+        }
+        if (!aNeed.isEmpty()) {
+            QStringList aCmds;
+            for (const QString& sDir : aNeed) {
+                aCmds << CDeepSeekRunner::BuildIcaclsGrantCmd(sDir);
+            }
+            aCmds.removeAll(QString());
+            if (!aCmds.isEmpty()
+                    && RunAclElevateFlow(QStringLiteral("目录授权"), aNeed,
+                                         aCmds.join(QStringLiteral(" & ")))) {
+                QStringList aStill;
+                CDeepSeekRunner::ApplyExtraWriteDirs(sCurProj, aNew, QStringList(), &aStill);
+                for (const QString& sDir : aNeed) {
+                    if (CDeepSeekRunner::EnsureDirWriteAce(sDir) != 0
+                            && !aStill.contains(sDir)) {
+                        aStill << sDir;
+                    }
+                }
+                for (const QString& sDir : aStill) {
+                    m_aAclElevateSuppressed.insert(
+                        QDir::toNativeSeparators(sDir).toLower());
+                }
+                ExecMsgBox(aStill.isEmpty() ? QMessageBox::Information : QMessageBox::Warning,
+                           QStringLiteral("目录授权"),
+                           aStill.isEmpty()
+                               ? QStringLiteral("提权授权成功，%1 个目录已全部放行，"
+                                                "所有后端（Harness）均可使用。")
+                                     .arg(QString::number(aNeed.size()))
+                               : QStringLiteral("以下目录提权修复后仍未通过（授权部分完成）：\n%1\n"
+                                                "可手工执行：\n%2")
+                                     .arg(aStill.join(QLatin1Char('\n')),
+                                          aCmds.join(QStringLiteral(" & "))),
+                           this);
+            }
+        }
     }
     m_pPm->SaveDshNodePath(stDlg.DshNodePath());
     if (!stDlg.DshRoot().isEmpty()) {
@@ -3597,6 +3852,63 @@ void CMainWindow::SaveAssistantState(bool a_bForce) {
         QJsonArray aFinal = a_aGroup;
         QString sActive;
         if (a_sKey == m_pExecPanel->ViewKey()) {
+            // 2026-10-19 v4.4.390 防抹守卫（周报工程实害：面板重置态的默认空助手
+            //   随一次落盘把 231 块实档整版覆盖成 311 字节空档，对话不可再生——
+            //   ResetAssistants/ClearAllBlocks→默认助手 + 其后任意 layout 落盘即触发）。
+            //   判据：待写视图档 =「仅一个从未使用过的默认助手」（0 块 + 未绑后端 +
+            //   缺省名），而盘上现档任一助手带对话块 → 判定重置态误写，跳过本次落盘
+            //   （数据保住；合法"删光助手"流程同样会被拦——重启复活最后一份档案，
+            //   相比整档蒸发可接受）。备份防线见 RotateStateBackup（.bak/.bak2 两代）。
+            //   2026-10-19 v4.4.393 加固（HotNews 实害：双实例并发下 7.5MB 实档连烧
+            //   .bak/.bak2 两代）：①重置判据从「仅一个」放宽为「全部为未用过的默认
+            //   助手」（重置态可能带多个空助手）；②守卫核对旧档时同样会撞上他实例
+            //   并发写的共享冲突——旧档在场却读不出/解析失败必须 fail-closed 拒绝
+            //   覆盖，宁可少写一次，不可在无法核对旧档时盲目整版覆盖。
+            auto fnTrivialDefault = [](const QJsonArray& a_a) {
+                if (a_a.isEmpty()) {
+                    return false;
+                }
+                for (const QJsonValue& v : a_a) {
+                    const QJsonObject o = v.toObject();
+                    if (!o.value(QStringLiteral("blocks")).toArray().isEmpty()
+                            || !o.value(QStringLiteral("sid")).toString().isEmpty()
+                            || !o.value(QStringLiteral("backend")).toString().isEmpty()
+                            || !o.value(QStringLiteral("name")).toString()
+                                    .startsWith(QStringLiteral("助手"))) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            auto fnHasBlocks = [](const QJsonArray& a_a) {
+                for (const QJsonValue& v : a_a) {
+                    if (!v.toObject().value(QStringLiteral("blocks")).toArray().isEmpty()) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (fnTrivialDefault(aFinal)) {
+                const QString sOldFile = a_sKey.isEmpty()
+                    ? m_pPm->AssistantStateFile()
+                    : m_pPm->TaskAssistantFile(a_sKey);
+                const QByteArray aOldBytes = a_sKey.isEmpty()
+                    ? m_pPm->ReadAssistantState()
+                    : m_pPm->ReadTaskAssistantState(a_sKey);
+                const QJsonDocument stOld = QJsonDocument::fromJson(aOldBytes);
+                const bool bOldHasBlocks = stOld.isObject()
+                        && fnHasBlocks(stOld.object()
+                                  .value(QStringLiteral("assistants")).toArray());
+                const QFileInfo stOldInfo(sOldFile);
+                const bool bOldUnreadable = stOldInfo.exists() && stOldInfo.size() > 0
+                        && (aOldBytes.isEmpty() || !stOld.isObject());
+                if (bOldHasBlocks || bOldUnreadable) {
+                    qWarning() << "[AssistantState] 防抹守卫拦截：默认空助手整版覆盖实档（key="
+                               << a_sKey << "，旧档含对话块=" << bOldHasBlocks
+                               << "，旧档在场读不出=" << bOldUnreadable << "），本次落盘跳过";
+                    return;
+                }
+            }
             sActive = m_pExecPanel->ActiveAsstId();   // 本档：当前激活助手
         } else {
             // 外档：合并盘上现档（面板幽灵覆写同名 id，其余保留）；
@@ -3684,8 +3996,26 @@ void CMainWindow::LoadAssistantState(bool a_bProjectSwitch) {
     }
     // 助手档按任务分档：选中任务读其私有档，否则读工程全局档（与 SaveAssistantState 对称）。
     const bool bTaskKey = (m_pCur != nullptr);
-    const QByteArray aData = bTaskKey ? m_pPm->ReadTaskAssistantState(m_pCur->Id())
-                                      : m_pPm->ReadAssistantState();
+    QByteArray aData = bTaskKey ? m_pPm->ReadTaskAssistantState(m_pCur->Id())
+                                : m_pPm->ReadAssistantState();
+    // 2026-10-19 v4.4.393 读失败≠无档：他实例并发写档案（WriteOnly|Truncate 相位）
+    //   的共享冲突是瞬态的——空读且文件在场时小睡重读一次（40ms，UI 线程既有阻塞
+    //   惯例内），仍读不出才按无档处理。HotNews 7.5MB 实害链第一环正是「读瞬态
+    //   失败→ResetAssistants→防抖落盘默认空助手」；防抹守卫兜底之外，此处掐断
+    //   触发源头（重置面板的诱因本身就不该发生）。
+    if (aData.isEmpty()) {
+        const QString sStateFile = bTaskKey ? m_pPm->TaskAssistantFile(m_pCur->Id())
+                                            : m_pPm->AssistantStateFile();
+        const QFileInfo stStateInfo(sStateFile);
+        if (stStateInfo.exists() && stStateInfo.size() > 0) {
+            QThread::msleep(40);
+            aData = bTaskKey ? m_pPm->ReadTaskAssistantState(m_pCur->Id())
+                             : m_pPm->ReadAssistantState();
+            if (aData.isEmpty()) {
+                qWarning() << "[AssistantState] 档案在场却读不出（他实例并发写？）：" << sStateFile;
+            }
+        }
+    }
     if (aData.isEmpty()) {
         // 无存档（该任务还没用过助手 / 工程首次打开）：显式清空当前助手态。
         //   不能直接 return——否则上一档（别的任务或全局）的会话链/对话块会串进这一档，
@@ -3700,6 +4030,18 @@ void CMainWindow::LoadAssistantState(bool a_bProjectSwitch) {
     }
     const QJsonDocument oDoc = QJsonDocument::fromJson(aData);
     if (!oDoc.isObject()) {
+        // 2026-10-19 v4.4.393 非空却解析失败（读到半截/损坏）：原先裸 return 会让
+        //   面板残留上一档内容，随后的落盘把旧档对话串写进本档文件（跨档串档）。
+        //   改按无档同路清空面板；盘上损坏档案由防抹守卫拦住默认态覆盖，待面板
+        //   产生真实内容再落盘时自然修复。
+        qWarning() << "[AssistantState] 档案解析失败，按无档处理（bytes="
+                   << aData.size() << "）";
+        m_pOrch->ResetAdhocSessions(aKeepIds);
+        m_pExecPanel->ResetAssistants();
+        m_pExecPanel->SetAdhocContext(QString(), 0);
+        if (!aPhantoms.isEmpty()) {
+            m_pExecPanel->AttachForeignAssistants(aPhantoms, sOldTaskName);
+        }
         return;
     }
     const QJsonObject oRoot = oDoc.object();

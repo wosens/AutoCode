@@ -1,4 +1,4 @@
-﻿#include "CDeepSeekRunner.h"
+#include "CDeepSeekRunner.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -11,6 +11,7 @@
 #include <QJsonParseError>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 #include <QUuid>
 
@@ -24,6 +25,7 @@
 #include <windows.h>
 #include <aclapi.h>   // GetNamedSecurityInfo / SetEntriesInAcl / SetNamedSecurityInfo
 #include <sddl.h>     // ConvertStringSidToSid
+#include <shellapi.h> // 2026-10-19 ShellExecuteExW（提权 runas icacls 修复通道）
 
 // —— 进程级全局配置（static：所有 DSH runner 实例共享，主窗口启动/设置变更时写）——
 static QString s_sDshRootPath;    // DSH 仓库根（deepseek-harness 目录；空=未配置/未探测到）
@@ -33,6 +35,7 @@ static QString s_sDshBinJsPath;   // bin.js 绝对路径（空=按根目录推�
 static QString s_sDshCordisPath;  // cordis.yml 绝对路径（空=按根目录推导；显式键优先，旧档回退）
 static QString s_sDshProvider;    // provider 名（空回退 glm-custom）
 static QString s_sDshModel;       // 模型名（固定路由项已删，仅作 [DshModels] 缺省占位）
+static QString s_sDshPermissionMode;  // 2026-10-19 会话权限模式（空回退 danger-full-access）
 // 计费单价（$/百万 token；DSH 协议只报 token 不报金额，客户端折算）。
 //   默认对齐 claude 后端经同一网关显示的 Sonnet 档价目；全 0 = 不折算（费用列回 "-"）。
 static double s_dDshPriceInPerM        = 3.0;
@@ -80,6 +83,10 @@ QString CDeepSeekRunner::DshRootPath() {
 //   standing（留在 DACL/SACL 里跨会话复用，与 harness 自身的 workspace 复用缓存
 //   同语义；revoke 只撤 ACE 不回摘标签）。
 static QStringList s_aDshExtraWriteDirs;   // [Dsh] ExtraWriteDirs（';' 分隔）
+// 2026-10-19 提权修复回调槽（进程级；CMainWindow 构造时安装、析构时清空——
+//   EnsureProcess 静默自愈失败且在 GUI 线程时同步调用，true=已修复且复查通过；
+//   参数=目录 + icacls 命令全文，确认框/runas/复查/会话内抑制全在 UI 侧）。
+static std::function<bool(const QString&, const QString&)> s_fnAclElevateFix;
 
 void CDeepSeekRunner::SetDshExtraWriteDirs(const QStringList& a_aDirs) {
     QStringList aNorm;
@@ -270,7 +277,11 @@ static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_
         if (bFound) {
             // 2026-10-17 DACL 已幂等命中：Low 标签仍须保证（只授 DACL 不够，见
             //   DshEnsureLowLabel 注释）；revoke 路径不回摘标签。
-            return a_bGrant ? DshEnsureLowLabel(a_sDir) : true;
+            //   2026-10-21 danger-full-access 下沙箱已关，不打标签保持中性
+            //   （既有标签的清理走 DshRestoreNeutralSecurity）。
+            return (a_bGrant && CDeepSeekRunner::DshPermissionMode()
+                    != QStringLiteral("danger-full-access"))
+                       ? DshEnsureLowLabel(a_sDir) : true;
         }
     }
 
@@ -293,7 +304,10 @@ static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_
     }
     // 2026-10-17 放行第二条件：Low 标签（Low IL 令牌 No-Write-Up 检查）；失败=放行
     //   不完整按失败计（DACL ACE 已 standing 无害，下轮幂等重试）。revoke 不回摘。
-    return a_bGrant ? DshEnsureLowLabel(a_sDir) : true;
+    //   2026-10-21 danger-full-access 下不打标签保持中性（同上方幂等命中分支）。
+    return (a_bGrant && CDeepSeekRunner::DshPermissionMode()
+            != QStringLiteral("danger-full-access"))
+               ? DshEnsureLowLabel(a_sDir) : true;
 }
 
 // 2026.10.15 DSH 命令执行通道自愈（pdfplumber 工程六轮会话全卡 Win32 5 实锤）：
@@ -374,6 +388,179 @@ static int DshEnsureLabelWritable(const QString& a_sDir)
     return dwR == ERROR_SUCCESS ? 1 : -1;
 }
 
+// —— 2026-10-21 沙箱关闭（danger-full-access 缺省，v5.0.400 起）时的标签中性恢复 ——
+// workspace-write 时代给工程根/关联目录打过的低完整性强制标签（Low/Untrusted，
+//   NO_WRITE_UP）在沙箱不再装配后无人清理：标签墙挡一切 Medium 进程在目录内新建
+//   文件（harness 自身、用户 VS/MSBuild/资源管理器），工程拷到新机器即命中——
+//   「发布后没权限」的根子。恢复=替换为 Medium 标签（标签替换式，子树继承标签
+//   自动跟随，一次搞定整树；icacls /setintegritylevel (OI)(CI)M 实证同语义）。
+// 返回 0=已中性（无标签或 Medium+，幂等不动）1=本轮已恢复 -1=失败（a_pOutCmd
+//   非空时收 icacls 提权命令全文）。静默写 SACL 需 SeSecurityPrivilege（过滤
+//   令牌常态 Win32 5），失败方走命令提权，同 EnsureDirWriteAce 口径。
+static int DshRestoreNeutralSecurity(const QString& a_sDir, QString* a_pOutCmd)
+{
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    if (!QFileInfo(sNative).isDir()) {
+        return 0;   // 不在场：无需恢复（同 DshEnsureLabelWritable 口径）
+    }
+    PSID pMed = nullptr;
+    SID_IDENTIFIER_AUTHORITY stLblAuth = SECURITY_MANDATORY_LABEL_AUTHORITY;
+    if (!AllocateAndInitializeSid(&stLblAuth, 1, SECURITY_MANDATORY_MEDIUM_RID,
+                                  0, 0, 0, 0, 0, 0, 0, &pMed)
+            || pMed == nullptr) {
+        return -1;
+    }
+    struct CSidGuard {
+        PSID p;
+        ~CSidGuard() { if (p != nullptr) { FreeSid(p); } }
+    } stSidGuard{ pMed };
+
+    // 读现标签定裁决：首条 SYSTEM_MANDATORY_LABEL_ACE 为 Medium=已中性；其余
+    //   （Low/Untrusted）或读失败=需恢复。标签唯一，防御性只认第一条。
+    PACL pOldSacl = nullptr;
+    PSECURITY_DESCRIPTOR pSd = nullptr;
+    bool bNeedRestore = false;
+    if (GetNamedSecurityInfoW(reinterpret_cast<const wchar_t*>(sNative.utf16()),
+                              SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+                              nullptr, nullptr, nullptr, &pOldSacl,
+                              &pSd) == ERROR_SUCCESS) {
+        struct CSdGuard {
+            PSECURITY_DESCRIPTOR p;
+            ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
+        } stSdGuard{ pSd };
+        void* pAce = nullptr;
+        ACE_HEADER* pHdr = nullptr;
+        if (pOldSacl != nullptr && pOldSacl->AceCount > 0
+                && GetAce(pOldSacl, 0, &pAce) && pAce != nullptr
+                && (pHdr = static_cast<ACE_HEADER*>(pAce))->AceType
+                       == SYSTEM_MANDATORY_LABEL_ACE_TYPE) {
+            const PSID pCur = reinterpret_cast<PSID>(
+                &static_cast<SYSTEM_MANDATORY_LABEL_ACE*>(pAce)->SidStart);
+            bNeedRestore = !EqualSid(pCur, pMed);
+        }
+    } else {
+        bNeedRestore = true;   // 读不到按需恢复处理；写路径再失败则给提权命令
+    }
+    if (!bNeedRestore) {
+        return 0;
+    }
+
+    // 静默替换为 Medium (OI)(CI)（SACL 写需 SeSecurityPrivilege，过滤令牌常态失败）。
+    QByteArray aBuf(static_cast<int>(sizeof(ACL)
+                                     + sizeof(SYSTEM_MANDATORY_LABEL_ACE)
+                                     + GetLengthSid(pMed)) + 16, Qt::Uninitialized);
+    PACL pNewSacl = reinterpret_cast<PACL>(aBuf.data());
+    if (InitializeAcl(pNewSacl, static_cast<DWORD>(aBuf.size()), ACL_REVISION_DS)
+            && AddMandatoryAce(pNewSacl, ACL_REVISION_DS,
+                               OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                               SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, pMed)
+            && SetNamedSecurityInfoW(
+                   reinterpret_cast<LPWSTR>(const_cast<ushort*>(sNative.utf16())),
+                   SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION,
+                   nullptr, nullptr, nullptr, pNewSacl) == ERROR_SUCCESS) {
+        return 1;
+    }
+    if (a_pOutCmd != nullptr) {
+        *a_pOutCmd = QStringLiteral("icacls \"%1\" /setintegritylevel (OI)(CI)M")
+                         .arg(sNative);
+    }
+    return -1;
+}
+
+// —— 2026-10-20 握手期用户目录写权限预检（SyncCardManageCH367 实录）——
+// DSH SDK profile 布局每次冷启动，CLI 的 prepareProfile 都会无条件重写
+//   %USERPROFILE%\.dsh\profiles\sdk\cordis.yml（profile-boot 注释明言 "always
+//   rewritten"，防 Loader 树写回膨胀）。该写入被系统拒绝时（EPERM: operation
+//   not permitted），node 直接以退出码 1 崩溃，AutoCode 握手重试风暴全灭
+//   （2026-10-20 00:44 SyncCard 开发阶段实录：20:03 同参数同文件写入成功、
+//   00:44 起必拒，且同进程同分钟内 ~/.dsh/storages 写成功 = 对单文件的瞬时
+//   拦截特征，非 ACL/只读）。此处以同口径探针（ReadWrite 打开即关，不落字节）
+//   在拉进程前验证；能自愈（只读属性/文件级 ACL）先修，修不动则带处置指引
+//   快速失败——错误直达用户，不烧阶段重试预算。
+// 返回 true=可写（或已修复/环境异常不误伤）；false=*a_psErr 带处置指引。
+static bool DshEnsureProfileWritable(QString* a_psErr)
+{
+    QString sHome = qEnvironmentVariable("DSH_HOME");
+    if (sHome.trimmed().isEmpty()) {
+        sHome = qEnvironmentVariable("USERPROFILE");   // harness resolveDshHome 缺省同源
+    }
+    if (sHome.trimmed().isEmpty()) {
+        return true;   // 拿不到主目录（异常环境）：不误伤，放行走既有握手报错路径
+    }
+    const QString sDir = QDir(sHome).filePath(QStringLiteral(".dsh/profiles/sdk"));
+    const QString sFile = QDir(sDir).filePath(QStringLiteral("cordis.yml"));
+    auto fFail = [a_psErr](const QString& a_sMsg) {
+        if (a_psErr != nullptr) {
+            *a_psErr = a_sMsg;
+        }
+        return false;
+    };
+    // 目录缺席：建目录 + 临时文件探目录可写（不代写 cordis.yml——空/残缺根配置
+    //   会改变 Loader 首读行为，重写是 prepareProfile 自己的事）。
+    if (!QFileInfo::exists(sFile)) {
+        if (!QDir().mkpath(sDir)) {
+            const QString sSid = CDeepSeekRunner::CurrentUserSidString();
+            return fFail(QStringLiteral("无法创建 %1（权限被拒）。请以管理员执行："
+                                        "icacls \"%2\" /grant \"*%3:(OI)(CI)(F)\"")
+                             .arg(QDir::toNativeSeparators(sDir),
+                                  QDir::toNativeSeparators(sDir),
+                                  sSid.isEmpty() ? QStringLiteral("<本机用户SID>") : sSid));
+        }
+        QFile oProbe(QDir(sDir).filePath(QStringLiteral(".autocode-probe.tmp")));
+        if (!oProbe.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            return fFail(QStringLiteral("目录 %1 不可写（权限被拒）。请检查杀软/防护"
+                                        "对 %2 的拦截或以管理员补 ACL 后重试。")
+                             .arg(QDir::toNativeSeparators(sDir),
+                                  QDir::toNativeSeparators(sDir)));
+        }
+        oProbe.close();
+        oProbe.remove();
+        return true;
+    }
+    // 在场：同口径探针——ReadWrite 打开即关（writeFileSync 以写意图打开，本探针
+    //   等价且不落任何字节）。
+    auto fTry = [&sFile]() {
+        QFile oF(sFile);
+        if (!oF.open(QIODevice::ReadWrite)) {
+            return false;
+        }
+        oF.close();
+        return true;
+    };
+    if (fTry()) {
+        return true;
+    }
+    // 自愈①：只读属性（Qt 权限位映射 FILE_ATTRIBUTE_READONLY，补写位即清除）。
+    const QFile::Permissions stFull =
+        QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser
+        | QFile::ReadGroup | QFile::WriteGroup | QFile::ReadOther | QFile::WriteOther;
+    QFile::setPermissions(sFile, stFull);
+    if (fTry()) {
+        return true;
+    }
+    // 自愈②：文件级 ACL（当前用户账户 SID 显式 F；owner 通常可非提权改 ACL，
+    //   失败不阻断——进入下面的处置指引）。
+    const QString sSid = CDeepSeekRunner::CurrentUserSidString();
+    if (!sSid.isEmpty()) {
+        QProcess::execute(QStringLiteral("icacls"),
+                          { QDir::toNativeSeparators(sFile), QStringLiteral("/grant"),
+                            QStringLiteral("*%1:F").arg(sSid) });
+        if (fTry()) {
+            return true;
+        }
+    }
+    // 修不动：给全量处置指引（杀软白名单优先——实测同进程同分钟内 storages 可写、
+    //   仅此文件被拒，为实时防护拦截特征而非 ACL/只读）。
+    return fFail(QStringLiteral(
+        "DSH 每次启动都会重写 %1（握手期 prepareProfile），该写入当前被系统拒绝，"
+        "进程将以退出码 1 崩溃。处置：①把 %2 目录与 node.exe 加入杀软/防护白名单"
+        "（实测特征为实时防护瞬时拦截）；②管理员执行：attrib -r \"%1\" 与 "
+        "icacls \"%1\" /grant \"*%3:F\"；然后重试本阶段。")
+            .arg(QDir::toNativeSeparators(sFile),
+                 QDir::toNativeSeparators(sDir),
+                 sSid.isEmpty() ? QStringLiteral("<本机用户SID>") : sSid));
+}
+
 int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
                                          const QStringList& a_aGrant,
                                          const QStringList& a_aRevoke) {
@@ -402,6 +589,128 @@ int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
     }
     return iFailed;
 }
+
+// —— 2026-10-19 缺写权限 ACE 的提权修复支撑（声明注释见 CDeepSeekRunner.h）——
+void CDeepSeekRunner::SetAclElevateHandler(
+    std::function<bool(const QString& a_sDir, const QString& a_sCmd)> a_fn) {
+    s_fnAclElevateFix = std::move(a_fn);
+}
+
+int CDeepSeekRunner::EnsureDirWriteAce(const QString& a_sDir) {
+    // 公开放行既有文件内自愈（查询+尝试补 ACE，零改动；口径见其注释块）。
+    return DshEnsureLabelWritable(a_sDir);
+}
+
+int CDeepSeekRunner::RestoreNeutralSecurity(const QString& a_sDir,
+                                            QString* a_pOutCmd) {
+    // 公开放行沙箱关闭时的标签中性恢复（口径见文件内注释块）。
+    return DshRestoreNeutralSecurity(a_sDir, a_pOutCmd);
+}
+
+QString CDeepSeekRunner::CurrentUserSidString() {
+    // OpenProcessToken → TokenUser（缓冲套路同 DshEnsureLabelWritable）→
+    //   ConvertSidToStringSidW；全路径释放（token 句柄 + SID 串 LocalFree）。
+    HANDLE hTok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+        return QString();
+    }
+    struct CTokGuard {
+        HANDLE h;
+        ~CTokGuard() { if (h != nullptr) { CloseHandle(h); } }
+    } stTokGuard{ hTok };
+    DWORD dwNeed = 0;
+    GetTokenInformation(hTok, TokenUser, nullptr, 0, &dwNeed);
+    if (dwNeed == 0) {
+        return QString();
+    }
+    QByteArray aBuf(static_cast<int>(dwNeed), Qt::Uninitialized);
+    if (!GetTokenInformation(hTok, TokenUser, aBuf.data(), dwNeed, &dwNeed)) {
+        return QString();
+    }
+    const auto* pTu = reinterpret_cast<const TOKEN_USER*>(aBuf.constData());
+    LPWSTR szSid = nullptr;
+    if (!ConvertSidToStringSidW(pTu->User.Sid, &szSid) || szSid == nullptr) {
+        return QString();
+    }
+    const QString sSid = QString::fromWCharArray(szSid);
+    LocalFree(szSid);
+    return sSid;
+}
+
+QString CDeepSeekRunner::BuildIcaclsGrantCmd(const QString& a_sDir) {
+    // 与既有自愈失败提示文案（EnsureProcess）同形：账户级 (OI)(CI)(F)，* 前缀=按 SID
+    //   授予（避免本机用户名与账户名不一致的歧义）。
+    const QString sNative = QDir::toNativeSeparators(a_sDir);
+    if (!QFileInfo(sNative).isDir()) {
+        return QString();
+    }
+    const QString sSid = CurrentUserSidString();
+    if (sSid.isEmpty()) {
+        return QString();
+    }
+    return QStringLiteral("icacls \"%1\" /grant \"*%2:(OI)(CI)(F)\"").arg(sNative, sSid);
+}
+
+bool CDeepSeekRunner::RunElevatedCmdBlocking(const QString& a_sCmd, int a_iTimeoutMs,
+                                             unsigned long* a_pdwExit) {
+    // ShellExecuteExW runas（UAC 确认；被拒=失败返回，口径同 CMainWindow 安装按钮）
+    //   + SEE_MASK_NOCLOSEPROCESS 拿句柄有界等待（GUI 线程同步阻塞是既有惯例；
+    //   /c 而非 /k 防提权 cmd 滞留、SW_HIDE 防控制台闪窗，结果以调用方复查为准）。
+    const QString sArgs = QStringLiteral("/c ") + a_sCmd;
+    SHELLEXECUTEINFOW stSei = {};
+    stSei.cbSize = sizeof(stSei);
+    stSei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    stSei.lpVerb = L"runas";
+    stSei.lpFile = L"cmd.exe";
+    stSei.lpParameters = reinterpret_cast<LPCWSTR>(sArgs.utf16());
+    stSei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&stSei) || stSei.hProcess == nullptr) {
+        return false;
+    }
+    const DWORD dwW = WaitForSingleObject(stSei.hProcess,
+                                          static_cast<DWORD>(a_iTimeoutMs));
+    DWORD dwExit = static_cast<DWORD>(-1);
+    GetExitCodeProcess(stSei.hProcess, &dwExit);   // WAIT_TIMEOUT 时也尽力取（已结束即有效）
+    CloseHandle(stSei.hProcess);
+    if (a_pdwExit != nullptr) {
+        *a_pdwExit = static_cast<unsigned long>(dwExit);
+    }
+    return dwW == WAIT_OBJECT_0 && dwExit == 0;
+}
+
+int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
+                                         const QStringList& a_aGrant,
+                                         const QStringList& a_aRevoke,
+                                         QStringList* a_pOutFailed) {
+    // 旧三参实现的同循环 + 失败目录出参（旧签名零改动；出参仅收 DshApplyDirAce
+    //   真失败的目录，规范根/SID 为空的退化分支不进——提权修不了目录级以外的问题）。
+    if ((a_aGrant.isEmpty() && a_aRevoke.isEmpty()) || a_sWorkDir.trimmed().isEmpty()) {
+        return 0;
+    }
+    const QString sCanonicalRoot = DshCanonicalWinPath(a_sWorkDir);
+    if (sCanonicalRoot.isEmpty()) {
+        return a_aGrant.size();
+    }
+    const QString sSid = DshWorkspaceWriteSidOf(sCanonicalRoot);
+    if (sSid.isEmpty()) {
+        return a_aGrant.size();
+    }
+    int iFailed = 0;
+    for (const QString& sDir : a_aRevoke) {
+        if (!a_aGrant.contains(sDir) && !DshApplyDirAce(sDir, sSid, false)) {
+            ++iFailed;
+            if (a_pOutFailed != nullptr) { a_pOutFailed->append(sDir); }
+        }
+    }
+    for (const QString& sDir : a_aGrant) {
+        if (!DshApplyDirAce(sDir, sSid, true)) {
+            ++iFailed;
+            if (a_pOutFailed != nullptr) { a_pOutFailed->append(sDir); }
+        }
+    }
+    return iFailed;
+}
+
 QString CDeepSeekRunner::ResolveNodePath() {
     // 留空走 PATH：QProcess 直起可执行名由系统搜路径（本机装了 node 即零配置）。
     return s_sDshNodePath.isEmpty() ? QStringLiteral("node") : s_sDshNodePath;
@@ -456,6 +765,43 @@ QStringList CDeepSeekRunner::ResolveStartArgs() {
                  QStringLiteral("--patch"), ResolvePatchPath() };
     }
     return { ResolveBinJsPath(), ResolveCordisPath() };
+}
+
+QProcessEnvironment CDeepSeekRunner::DshProbeEnv() {
+    // 2026.10.21 探测握手环境（EnsureProcess 环境块的静态子集，仅 LLM 路由相关）：
+    //   合并 PATH + PYTHON UTF-8 + 自定义模型槽位（激活条目；无则不设）+
+    //   GLM_CUSTOM_API_KEY 兼容底（同 EnsureProcess 内 2026.10.21 修复，否则新版
+    //   llm-pi-ai 为 glm-custom 建 adapter 时报错、全部路由注册失败）。
+    QProcessEnvironment oEnv = MergedPathEnvironment();
+    oEnv.insert(QStringLiteral("PYTHONUTF8"), QStringLiteral("1"));
+    oEnv.insert(QStringLiteral("PYTHONIOENCODING"), QStringLiteral("utf-8"));
+    if (CustomActiveValid()) {
+        const SCustomModel& stM = s_aCustomModels.at(s_iCustomActive);
+        oEnv.insert(QStringLiteral("DSH_LLM_NAME"),
+                    stM.sDisp.isEmpty() ? QStringLiteral("AutoCode Active Model") : stM.sDisp);
+        oEnv.insert(QStringLiteral("DSH_LLM_BASE_URL"), stM.sBaseURL);
+        oEnv.insert(QStringLiteral("DSH_LLM_API"),
+                    stM.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stM.sApi);
+        oEnv.insert(QStringLiteral("DSH_LLM_MODEL"), stM.sModelId);
+        oEnv.insert(QStringLiteral("DSH_LLM_CTX"), QString::number(stM.iCtx));
+        oEnv.insert(QStringLiteral("DSH_LLM_MAXTOK"), QString::number(stM.iMaxTok));
+        oEnv.insert(QStringLiteral("AUTOCODE_DSH_API_KEY"), stM.sApiKey);
+    }
+    if (!oEnv.contains(QStringLiteral("GLM_CUSTOM_API_KEY"))
+        && !QProcessEnvironment::systemEnvironment()
+                 .contains(QStringLiteral("GLM_CUSTOM_API_KEY"))) {
+        oEnv.insert(QStringLiteral("GLM_CUSTOM_API_KEY"), QString());
+    }
+    return oEnv;
+}
+
+QString CDeepSeekRunner::DshProbeProvider() {
+    // EffectiveProvider 的静态口径（探测进程无实例态/无对话级覆盖——探测用全局激活）。
+    return CustomActiveValid() ? QStringLiteral("autocode-active") : DshProvider();
+}
+
+QString CDeepSeekRunner::DshProbeModel() {
+    return CustomActiveValid() ? s_aCustomModels.at(s_iCustomActive).sModelId : DshModel();
 }
 
 QString CDeepSeekRunner::ResolveCordisPath() {
@@ -1059,6 +1405,21 @@ QString CDeepSeekRunner::DshProvider() {
     return s_sDshProvider.isEmpty() ? QStringLiteral("glm-custom") : s_sDshProvider;
 }
 
+// 2026-10-19 会话权限模式：dsh 组合层（dsh-base cordis.patch.yml）的 sandbox-policy
+//   mode 与 approval policy 同读 DSH_PERMISSION_MODE（?? 'workspace-write' / ?? 'ask'
+//   兜底）。danger-full-access 时 dsh 侧沙箱装配整段跳过、审批转 never——已存在 exe
+//   冻结（workspace-write 下写/改名/删除全拒且新产物落地即冻结）与提权审批无应答
+//   fail-closed 两类阻塞随之消失。缺省对齐 Codex 后端（-s danger-full-access）与
+//   claude 后端（无沙箱）的 unrestricted 姿态；[Agent] DshPermissionMode 可回退。
+void CDeepSeekRunner::SetDshPermissionMode(const QString& a_sMode) {
+    s_sDshPermissionMode = a_sMode.trimmed();
+}
+
+QString CDeepSeekRunner::DshPermissionMode() {
+    return s_sDshPermissionMode.isEmpty() ? QStringLiteral("danger-full-access")
+                                          : s_sDshPermissionMode;
+}
+
 void CDeepSeekRunner::SetDshModel(const QString& a_sModel) {
     s_sDshModel = a_sModel.trimmed().isEmpty() ? QStringLiteral("glm-5.2")
                                                : a_sModel.trimmed();
@@ -1569,6 +1930,8 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     oEnv.insert(QStringLiteral("DSH_CWD"), a_sWorkDir);
     oEnv.insert(QStringLiteral("DSH_SESSION_ROOT"),
                 a_sWorkDir + QStringLiteral("/.autodev/dsh-sessions"));
+    // 2026-10-19 会话权限模式随进程注入（组合层逐值读取，见 DshPermissionMode 注释）。
+    oEnv.insert(QStringLiteral("DSH_PERMISSION_MODE"), DshPermissionMode());
     // 2026-10-16 mkdtemp 断继承修复：CPython tempfile.mkdtemp 内部 os.mkdir(path,
     //   0o600) 在 Windows 生成保护型 owner-only DACL（不继承父 ACE）——工作区/
     //   临时能力 SID 的授权 ACE 落空，受限令牌子进程（pip 等）在其内建目录/写文件
@@ -1614,6 +1977,19 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
         m_sLlmBaseUrl.clear();
         m_sLlmLabel = DshModel();
     }
+    // 2026.10.21 glm-custom 路由兼容底（本机实测故障，SyncCardManageCH367 10-20 报错
+    //   同根因）：新版 DSH（dsh-v0.1.5+）llm-pi-ai 插件启动时会为 imported settings
+    //   里的**全部** provider（含 glm-custom）构建 adapter，其 apiKeyEnv 指向的
+    //   GLM_CUSTOM_API_KEY 在环境缺失时插件 boot 报错 → 所有 adapter 均未注册 →
+    //   initialize 报误导性错误「no adapter registered for provider "glm-custom"」。
+    //   实测：环境注入 GLM_CUSTOM_API_KEY（空串即可）后握手即恢复。仅在该键完全
+    //   不在环境（注入块与系统环境都无）时补空占位——用户自设真键/credentials 平铺
+    //   自愈后 dsh 侧注入的值不被覆盖。只改 AutoCode 侧（不修改 Harness 文件）。
+    if (!oEnv.contains(QStringLiteral("GLM_CUSTOM_API_KEY"))
+        && !QProcessEnvironment::systemEnvironment()
+                 .contains(QStringLiteral("GLM_CUSTOM_API_KEY"))) {
+        oEnv.insert(QStringLiteral("GLM_CUSTOM_API_KEY"), QString());
+    }
     // 2026.08.24 便携资产注入（三后端统一口径，见 CAgentRunnerBase 注释）：
     //   技能目录 = <exe>\skills（便携）+ ~/.claude/skills（存在者），';' 连接经
     //   DSH_SKILLS_DIRS 传入组合 yml（customSkillDirs 按分隔符拆分）；
@@ -1637,6 +2013,17 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     m_eProcState = ProcBooting;
     m_uptime.restart();
     m_actClock.restart();
+    // 2026-10-20 握手期用户目录写权限预检（DshEnsureProfileWritable）：DSH SDK
+    //   profile 每次冷启动无条件重写 %USERPROFILE%\.dsh\profiles\sdk\cordis.yml，
+    //   被拒时进程即崩（退出码 1）且握手重试风暴全灭——SyncCardManageCH367
+    //   2026-10-20 00:44 开发阶段实录。探针只开不写；可自愈先修，修不动带指引
+    //   快速失败。
+    QString sProfileErr;
+    if (!DshEnsureProfileWritable(&sProfileErr)) {
+        m_eProcState = ProcDead;
+        EmitFailed(QStringLiteral("DSH 握手前置自检失败：%1").arg(sProfileErr));
+        return false;
+    }
     // node 直起（不经 cmd.exe：参数化传参，无 shim 引号重解析问题；Windows 路径含
     //   空格安全）。stdin 全程不关（铁律：bin.js 对 stdin end 敏感）。
     // 2026.09.10 双布局参数：Profile = dsh CLI --profile sdk --patch <exe组合层>；
@@ -1654,19 +2041,62 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
     }
     // initialize 握手：cwd/provider/model（maxTokens 不传——组合 maxTokensAsSuccess=false，
     //   token 封顶以 turn/end reason=max-tokens 上报，续跑语义靠它）。
-    //   2026.09.27 额外可写目录自愈授 ACE（幂等；见 ApplyExtraWriteDirs）——pwsh 沙箱
-    //   的写强制是纯 NTFS DACL，会话 cwd（=工程根）派生的写 SID 被授到额外目录即放行。
-    ApplyExtraWriteDirs(a_sWorkDir, DshExtraWriteDirs());
-    // 2026.10.15 工程根 Low 标签可写性自愈（见 DshEnsureLabelWritable 注释）：补上/
-    //   失败各提示一行，不阻断会话（文件读写不受影响；用户可人工 icacls/takeown）。
-    const int iLbl = DshEnsureLabelWritable(a_sWorkDir);
-    if (iLbl > 0) {
-        emit sigInfo(QStringLiteral(
-            "[dsh] 已自动补工程根写权限 ACE（沙箱命令执行前置，账户级显式条目）"));
-    } else if (iLbl < 0) {
-        emit sigInfo(QStringLiteral(
-            "[dsh] 工程根写权限自愈失败——沙箱命令执行可能被拒（Win32 5）；"
-            "请人工执行：icacls \"<工程根>\" /grant \"*<本机用户SID>:(OI)(CI)(F)\""));
+    if (DshPermissionMode() == QStringLiteral("danger-full-access")) {
+        // 2026-10-21 沙箱已关（本模式跳过装配，DshApplyDirAce 也不再打标签）：
+        //   workspace-write 时代遗留的低完整性标签在此静默恢复中性（Medium），
+        //   失败走提权回调跑 icacls /setintegritylevel——工程根+关联目录一次清完。
+        QStringList aLblDirs = { a_sWorkDir };
+        aLblDirs += DshExtraWriteDirs();
+        for (const QString& sDir : aLblDirs) {
+            QString sCmd;
+            const int iRst = DshRestoreNeutralSecurity(sDir, &sCmd);
+            if (iRst == 1) {
+                emit sigInfo(QStringLiteral(
+                    "[dsh] 已清除目录沙箱遗留低完整性标签（恢复中性，普通程序可写）：")
+                    + sDir);
+            } else if (iRst < 0 && !sCmd.isEmpty()) {
+                const bool bGui = (QThread::currentThread()
+                                   == QCoreApplication::instance()->thread());
+                if (bGui && s_fnAclElevateFix) {
+                    s_fnAclElevateFix(sDir, sCmd);   // 确认/runas/复查全在 CMainWindow
+                } else {
+                    emit sigInfo(QStringLiteral(
+                        "[dsh] 目录残留沙箱低完整性标签且静默恢复失败——普通程序"
+                        "（VS/MSBuild 等）可能无法写入；请人工执行：%1").arg(sCmd));
+                }
+            }
+        }
+    } else {
+        // 2026.09.27 额外可写目录自愈授 ACE（幂等；见 ApplyExtraWriteDirs）——pwsh 沙箱
+        //   的写强制是纯 NTFS DACL，会话 cwd（=工程根）派生的写 SID 被授到额外目录即放行。
+        ApplyExtraWriteDirs(a_sWorkDir, DshExtraWriteDirs());
+        // 2026-10-15 工程根 Low 标签可写性自愈（见 DshEnsureLabelWritable 注释）：补上/
+        //   失败各提示一行，不阻断会话（文件读写不受影响；用户可人工 icacls/takeown）。
+        const int iLbl = DshEnsureLabelWritable(a_sWorkDir);
+        if (iLbl > 0) {
+            emit sigInfo(QStringLiteral(
+                "[dsh] 已自动补工程根写权限 ACE（沙箱命令执行前置，账户级显式条目）"));
+        } else if (iLbl < 0) {
+            // 2026-10-19 静默自愈失败 → GUI 线程先走提权回调（确认框 + runas icacls +
+            //   复查，全在 CMainWindow 注入的 handler 内；评审 worker 线程 bGui=false
+            //   跳过，维持纯日志降级）。修复成功后无需重试——icacls 已补账户级 F，
+            //   本分支后的沙箱标签写入随会话自然可用。
+            bool bFixed = false;
+            const bool bGui = (QThread::currentThread()
+                               == QCoreApplication::instance()->thread());
+            const QString sCmd = BuildIcaclsGrantCmd(a_sWorkDir);
+            if (bGui && s_fnAclElevateFix && !sCmd.isEmpty()) {
+                bFixed = s_fnAclElevateFix(a_sWorkDir, sCmd);
+            }
+            if (bFixed) {
+                emit sigInfo(QStringLiteral(
+                    "[dsh] 已提权补工程根写权限 ACE（icacls 账户级条目，沙箱命令执行恢复）"));
+            } else {
+                emit sigInfo(QStringLiteral(
+                    "[dsh] 工程根写权限自愈失败——沙箱命令执行可能被拒（Win32 5）；"
+                    "请人工执行：icacls \"<工程根>\" /grant \"*<本机用户SID>:(OI)(CI)(F)\""));
+            }
+        }
     }
     m_iInitId = m_iNextRpcId++;
     QJsonObject oParams;

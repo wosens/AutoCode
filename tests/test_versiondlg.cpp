@@ -293,6 +293,35 @@ int main(int argc, char* argv[]) {
               QStringLiteral("无版本串应返回空"));
     }
 
+    // —— 7. BuildAutoFixPrompt（2026.10.21 后端自愈提示词组装）——
+    {
+        const QString sPrompt = CVersionDialog::BuildAutoFixPrompt(
+            2, QStringLiteral("DeepSeekHarness"),
+            QStringLiteral("E:/fake/dsh-root"),
+            QStringLiteral("initialize 被拒：no adapter registered"),
+            QStringLiteral("C:/fake/exe-dir/harness.md"));
+        Check(sPrompt.contains(QStringLiteral("DeepSeekHarness 后端出现故障")),
+              QStringLiteral("提示词应含故障后端与「出现故障」"));
+        Check(sPrompt.contains(QStringLiteral("no adapter registered")),
+              QStringLiteral("提示词应带探测失败详情"));
+        Check(sPrompt.contains(QStringLiteral("E:/fake/dsh-root")),
+              QStringLiteral("提示词应带安装位置"));
+        Check(sPrompt.contains(QStringLiteral("C:/fake/exe-dir/harness.md")),
+              QStringLiteral("提示词应带 harness.md 绝对路径"));
+        Check(sPrompt.contains(QStringLiteral("GLM_CUSTOM_API_KEY")),
+              QStringLiteral("DSH 专属提示应含环境键线索"));
+        // 空详情/空位置兑底：不产生空段，且仍引用 harness.md。
+        const QString sBare = CVersionDialog::BuildAutoFixPrompt(
+            1, QStringLiteral("Claude Code"), QString(), QString(),
+            QStringLiteral("C:/fake/harness.md"));
+        Check(sBare.contains(QStringLiteral("可用性验证未通过")),
+              QStringLiteral("空详情应落「可用性验证未通过」兑底"));
+        Check(sBare.contains(QStringLiteral("按 harness.md 探测")),
+              QStringLiteral("空位置应落探测指引兑底"));
+        Check(!sBare.contains(QStringLiteral("GLM_CUSTOM_API_KEY")),
+              QStringLiteral("Claude 行不应混入 DSH 专属提示"));
+    }
+
     if (g_iFail == 0) {
         g_out << "test_versiondlg: ALL PASSED" << Qt::endl;
         return 0;

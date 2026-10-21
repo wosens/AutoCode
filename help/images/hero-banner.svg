@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-label="AutoCode - Multi-Agent Coding Orchestrator">
+  <defs>
+    <linearGradient id="bgG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0c1322"/>
+      <stop offset="55%" stop-color="#0e1a33"/>
+      <stop offset="100%" stop-color="#0a0f1e"/>
+    </linearGradient>
+    <linearGradient id="accG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="flowG" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="hexG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="blur6" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+    <pattern id="gridP" width="42" height="42" patternUnits="userSpaceOnUse">
+      <path d="M42 0H0V42" fill="none" stroke="#93c5fd" stroke-opacity="0.05"/>
+    </pattern>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="1199" height="339" rx="18" fill="url(#bgG)"/>
+  <rect x="0.5" y="0.5" width="1199" height="339" rx="18" fill="url(#gridP)"/>
+  <rect x="0.5" y="0.5" width="1199" height="339" rx="18" fill="none" stroke="#1e293b"/>
+
+  <!-- faint circuit traces -->
+  <g fill="none" stroke="#38bdf8" stroke-opacity="0.14">
+    <path d="M0 296 H150 L178 268 H296"/>
+    <path d="M0 46 H96 L124 74 H226"/>
+    <path d="M1200 20 H1104 L1076 48 H1000"/>
+  </g>
+  <g fill="#38bdf8" fill-opacity="0.35">
+    <circle cx="296" cy="268" r="2.5"/>
+    <circle cx="226" cy="74" r="2.5"/>
+    <circle cx="1000" cy="48" r="2.5"/>
+  </g>
+
+  <!-- wordmark -->
+  <rect x="48" y="116" width="5" height="122" rx="2.5" fill="url(#accG)"/>
+  <text x="74" y="163" font-family="'Segoe UI','Microsoft YaHei',Arial,sans-serif" font-size="56" font-weight="700" fill="#f1f5f9" letter-spacing="1">AutoCode</text>
+  <text x="76" y="197" font-family="'Segoe UI',Arial,sans-serif" font-size="16" fill="#7dd3fc" letter-spacing="4.5">MULTI-AGENT CODING ORCHESTRATOR</text>
+  <text x="76" y="226" font-family="Consolas,Menlo,monospace" font-size="13.5" fill="#64748b">Pipeline &#183; 5 Agent Backends &#183; C++ / Qt 6.8 &#183; Windows</text>
+
+  <!-- flows into the hub (glow layer) -->
+  <g fill="none" stroke="url(#flowG)" stroke-opacity="0.22" stroke-width="6" filter="url(#blur6)">
+    <path d="M630 84 Q796 66 950 150"/>
+    <path d="M602 254 Q766 276 950 188"/>
+    <path d="M766 54 Q884 64 956 146"/>
+    <path d="M772 284 Q886 296 956 192"/>
+    <path d="M906 168 H938"/>
+  </g>
+  <!-- flows into the hub (line layer) -->
+  <g fill="none" stroke="url(#flowG)" stroke-opacity="0.75" stroke-width="1.8">
+    <path d="M630 84 Q796 66 950 150"/>
+    <path d="M602 254 Q766 276 950 188"/>
+    <path d="M766 54 Q884 64 956 146"/>
+    <path d="M772 284 Q886 296 956 192"/>
+    <path d="M906 168 H938"/>
+  </g>
+  <g fill="#e0f2fe" fill-opacity="0.9">
+    <circle cx="806" cy="94" r="2.6"/>
+    <circle cx="782" cy="262" r="2.6"/>
+    <circle cx="864" cy="74" r="2.6"/>
+    <circle cx="864" cy="288" r="2.6"/>
+    <circle cx="922" cy="168" r="2.6"/>
+  </g>
+
+  <!-- five agent orbs -->
+  <g>
+    <circle cx="630" cy="84" r="17" fill="#34d399" fill-opacity="0.33" filter="url(#blur6)"/>
+    <circle cx="630" cy="84" r="9" fill="#34d399"/>
+    <circle cx="627" cy="81" r="2.6" fill="#ecfdf5" fill-opacity="0.85"/>
+  </g>
+  <g>
+    <circle cx="602" cy="254" r="17" fill="#22d3ee" fill-opacity="0.33" filter="url(#blur6)"/>
+    <circle cx="602" cy="254" r="9" fill="#22d3ee"/>
+    <circle cx="599" cy="251" r="2.6" fill="#ecfeff" fill-opacity="0.85"/>
+  </g>
+  <g>
+    <circle cx="766" cy="54" r="17" fill="#60a5fa" fill-opacity="0.33" filter="url(#blur6)"/>
+    <circle cx="766" cy="54" r="9" fill="#60a5fa"/>
+    <circle cx="763" cy="51" r="2.6" fill="#eff6ff" fill-opacity="0.85"/>
+  </g>
+  <g>
+    <circle cx="772" cy="284" r="17" fill="#a78bfa" fill-opacity="0.33" filter="url(#blur6)"/>
+    <circle cx="772" cy="284" r="9" fill="#a78bfa"/>
+    <circle cx="769" cy="281" r="2.6" fill="#f5f3ff" fill-opacity="0.85"/>
+  </g>
+  <g>
+    <circle cx="906" cy="168" r="17" fill="#fbbf24" fill-opacity="0.33" filter="url(#blur6)"/>
+    <circle cx="906" cy="168" r="9" fill="#fbbf24"/>
+    <circle cx="903" cy="165" r="2.6" fill="#fffbeb" fill-opacity="0.85"/>
+  </g>
+
+  <!-- central hub -->
+  <circle cx="984" cy="168" r="72" fill="url(#hubGlow)"/>
+  <polygon points="1028,168 1006,206 962,206 940,168 962,130 1006,130" fill="#0d1730" stroke="url(#hexG)" stroke-width="2.5"/>
+  <polygon points="1016,168 1000,196 968,196 952,168 968,140 1000,140" fill="none" stroke="#38bdf8" stroke-opacity="0.35" stroke-width="1"/>
+  <circle cx="984" cy="168" r="15" fill="none" stroke="#e0f2fe" stroke-width="1.6"/>
+  <circle cx="984" cy="168" r="5.5" fill="#e0f2fe"/>
+
+  <!-- output -->
+  <g stroke="#94a3b8" stroke-width="1.6" fill="none">
+    <path d="M1030 168 H1064"/>
+    <path d="M1058 162 L1066 168 L1058 174"/>
+  </g>
+  <text x="1114" y="177" font-family="Consolas,Menlo,monospace" font-size="24" font-weight="600" fill="#cbd5e1" text-anchor="middle">&lt;/&gt;</text>
+  <g fill="#334155" opacity="0.9">
+    <rect x="1076" y="196" width="76" height="5" rx="2.5"/>
+    <rect x="1088" y="207" width="52" height="5" rx="2.5"/>
+    <rect x="1076" y="218" width="64" height="5" rx="2.5"/>
+  </g>
+
+  <!-- corner accents -->
+  <circle cx="1152" cy="52" r="3" fill="#38bdf8" opacity="0.5"/>
+  <circle cx="1168" cy="66" r="2" fill="#a78bfa" opacity="0.5"/>
+</svg>

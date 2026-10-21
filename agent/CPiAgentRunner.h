@@ -197,6 +197,7 @@ private:
     // —— 2026.09.22 RPC 形态状态 ——
     bool        m_bRpcMode = false;       // 本轮走 RPC 形态（事件帧含 response/agent_settled）
     bool        m_bRpcSettled = false;    // 已收 agent_settled（轮完整收敛，已关写通道）
+    bool        m_bLockHealTried = false; // 2026-10-20 settings 锁失败自愈重拉标记（一轮限一次）
     struct SRetryParams {                 // RPC 早夭自动回退重拉的一次性形态参数
         QString sWorkDir, sPrompt, sDisallowed, sResumeSid;
         int iMaxTurns = 30; bool bFork = false; int iAutocompactK = 0; bool bEnableAskUser = false;

@@ -246,6 +246,11 @@ add_custom_command(TARGET AutoCode POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/agent_env_guard.md"
         "$<TARGET_FILE_DIR:AutoCode>/agent_env_guard.md"
     COMMAND cmd /c "if not exist \"$<TARGET_FILE_DIR:AutoCode>\\CLAUDE.md\" copy /y \"$<TARGET_FILE_DIR:AutoCode>\\agent_env_guard.md\" \"$<TARGET_FILE_DIR:AutoCode>\\CLAUDE.md\" >nul"
+    # 2026.10.21 后端自愈知识库：exe 同级 harness.md（后端版本管理右键「自动修复」
+    #   提示词引用；修复 Agent 按它了解五后端启动方式/验证命令/常见故障）。
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/harness.md"
+        "$<TARGET_FILE_DIR:AutoCode>/harness.md"
     COMMENT "Copy install_env.bat to output dir"
 )
 
@@ -973,6 +978,41 @@ set_target_properties(test_sandbox PROPERTIES
 )
 add_test(NAME test_sandbox COMMAND test_sandbox)
 
+# ==== 对话流 Model/View 自绘引擎模型层回归（2026-10-17 自绘三期）====
+# CChatModel 折叠/映射/回填纯逻辑 + CStreamPresenter ModelView 分支集成
+#（Bind(model,view2)/Append/BackfillResult/Rebuild/EnsureCoverage 壳转发）。
+#（2026-10-19 顺序修正：目标定义必须在 978 set_tests_properties / 989 foreach
+#   POST_BUILD 引用之前——上一会话把目标块放文件尾，配置期"找不到 test"炸配置。）
+qt_add_executable(test_chatmodel
+    tests/test_chatmodel.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+)
+target_include_directories(test_chatmodel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(test_chatmodel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test frwdevice)
+set_target_properties(test_chatmodel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_chatmodel COMMAND test_chatmodel)
+
 # ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
 # 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
 set_tests_properties(
@@ -1008,37 +1048,4 @@ qt_add_executable(test_orchconfig
 target_include_directories(test_orchconfig PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_orchconfig PRIVATE Qt6::Core)
 add_test(NAME test_orchconfig COMMAND test_orchconfig)
-
-# ==== 对话流 Model/View 自绘引擎模型层回归（2026-10-17 自绘三期）====
-# CChatModel 折叠/映射/回填纯逻辑 + CStreamPresenter ModelView 分支集成
-#（Bind(model,view2)/Append/BackfillResult/Rebuild/EnsureCoverage 壳转发）。
-qt_add_executable(test_chatmodel
-    tests/test_chatmodel.cpp
-    ui/SBlockData.h
-    ui/CChatModel.h
-    ui/CChatModel.cpp
-    ui/CChatDocPool.h
-    ui/CChatDocPool.cpp
-    ui/CChatDelegate.h
-    ui/CChatDelegate.cpp
-    ui/CChatListView.h
-    ui/CChatListView.cpp
-    ui/CStreamPresenter.h
-    ui/CStreamPresenter.cpp
-    ui/CMessageView.h
-    ui/CMessageView.cpp
-    ui/CMessageBlock.h
-    ui/CMessageBlock.cpp
-    ui/CMarkdownPreloader.h
-    ui/CMarkdownPreloader.cpp
-)
-target_include_directories(test_chatmodel PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/ui
-)
-target_link_libraries(test_chatmodel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test frwdevice)
-set_target_properties(test_chatmodel PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
-)
-add_test(NAME test_chatmodel COMMAND test_chatmodel)
 

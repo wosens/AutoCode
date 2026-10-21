@@ -71,10 +71,11 @@ inline QString ModelEntryIdentity(const SDshModelEntry& a_stE) {
          + a_stE.sModelId.trimmed().toLower();
 }
 
-// 2026.10.15 模型列表双击就地编辑：列→字段映射 + 校验回退（纯函数，单测直调；
-//   CSettingsDialog::OnDshModelItemChanged 落库前调）。口径对齐编辑对话框 Entry() 兑底：
-//   显示名空→回退模型 ID；模型 ID 不可空（空/纯空白回退旧值）；上下文/最大输出非
-//   正整数回退旧值；其余列 trim 落存。返回是否发生变化（无变化不落数据不刷表）。
+// 2026.10.15 模型列表双击就地编辑的列→字段映射 + 校验回退（纯函数）。2026-10-20
+//   起生产链双击改开编辑对话框（内联编辑位已除），本函数保留为与对话框 Entry()
+//   同口径的校验工具，由 test_execpanel 持续覆盖：显示名空→回退模型 ID；模型 ID
+//   不可空（空/纯空白回退旧值）；上下文/最大输出非正整数回退旧值；其余列 trim 落存。
+//   返回是否发生变化（无变化不落数据不刷表）。
 inline bool ApplyModelCellEdit(SDshModelEntry* a_pE, int a_iCol, const QString& a_sText) {
     if (a_pE == nullptr) {
         return false;

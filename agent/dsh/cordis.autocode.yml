@@ -48,6 +48,14 @@
             name: Active Model
             contextWindow: !!js Number(process.env.DSH_LLM_CTX ?? 131072)
             maxTokens: !!js Number(process.env.DSH_LLM_MAXTOK ?? 32768)
+            # 2026.10.20 思考强度能力声明（同 sdk.autocode.patch.yml 注）：缺省
+            #   hand-declared 模型无 reasoning 能力，设置页思考强度会被服务端拒；
+            #   off 留空 = 不发思考参数。
+            reasoningEfforts:
+              'off':
+              low: low
+              high: high
+              max: max
       glm-custom:
         displayName: GLM Custom (Anthropic)
         apiKeyEnv: GLM_CUSTOM_API_KEY
@@ -58,6 +66,11 @@
             name: GLM 5.2
             contextWindow: 131072
             maxTokens: 32768
+            reasoningEfforts:
+              'off':
+              low: low
+              high: high
+              max: max
 
 # Managed child-process groups for the bash executor (spawn/kill/output plumbing).
 - id: subprocess

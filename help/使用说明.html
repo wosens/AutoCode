@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -6,103 +6,163 @@
 <title>AutoCode 使用说明</title>
 <style>
   :root {
-    --c-primary: #2b6cb0;
-    --c-primary-dark: #1a4e8a;
-    --c-bg: #f7f9fc;
+    --c-primary: #2563eb;       /* 品牌蓝（与 readme / 菜单图标同源） */
+    --c-primary-dark: #1d4ed8;
+    --c-sky: #38bdf8;           /* 横幅流线天蓝 */
+    --c-navy: #0f172a;          /* 深蓝画布 */
+    --c-bg: #f4f7fb;
     --c-card: #ffffff;
-    --c-border: #dde5ee;
-    --c-text: #2d3748;
-    --c-text-light: #718096;
-    --c-green: #2f9e63;
-    --c-orange: #d97b2c;
-    --c-red: #c53a3a;
-    --c-purple: #7048ba;
+    --c-border: #e2e8f0;
+    --c-text: #1e293b;
+    --c-text-light: #64748b;
+    --c-green: #059669;
+    --c-orange: #ea8a0c;
+    --c-red: #e11d48;
+    --c-purple: #7c3aed;
   }
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
     margin: 0;
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
     color: var(--c-text);
     background: var(--c-bg);
+    background-image: radial-gradient(rgba(37,99,235,.045) 1px, transparent 1px);
+    background-size: 26px 26px;
     line-height: 1.7;
   }
-  /* ===== 顶部横幅 ===== */
+  ::selection { background: #bfdbfe; }
+
+  /* ===== 顶部横幅（与 hero-banner.svg 同一深蓝画布，无缝衔接） ===== */
   .hero {
-    background: linear-gradient(135deg, #1a4e8a 0%, #2b6cb0 55%, #4299e1 100%);
-    color: #fff;
-    padding: 44px 24px 40px;
+    background: linear-gradient(135deg, #0c1322 0%, #0e1a33 55%, #0a0f1e 100%);
+    color: #f1f5f9;
+    padding: 30px 20px 48px;
     text-align: center;
   }
-  .hero h1 { margin: 0 0 10px; font-size: 34px; letter-spacing: 2px; }
-  .hero p { margin: 0; font-size: 16px; opacity: .92; }
+  .hero-art {
+    width: 100%; max-width: 1020px; display: block; margin: 0 auto 10px;
+  }
+  .hero h1 {
+    margin: 4px 0 10px; font-size: 30px; letter-spacing: 14px; font-weight: 700;
+    background: linear-gradient(90deg, #7dd3fc, #a78bfa);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    text-indent: 14px; /* 抵消末字后的字距 */
+  }
+  .hero p.tag { margin: 0 0 6px; font-size: 15.5px; color: #94a3b8; }
   .hero .ver { display: inline-block; margin-top: 14px; font-size: 12px;
-    background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.35);
-    border-radius: 20px; padding: 3px 16px; }
+    background: rgba(255,255,255,.08); border: 1px solid rgba(148,163,184,.35);
+    border-radius: 20px; padding: 3px 16px; color: #cbd5e1; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 14px 0 2px; }
+  .bdg {
+    display: inline-flex; border-radius: 5px; overflow: hidden;
+    font-family: Consolas, "Courier New", monospace; font-size: 12px; font-weight: 600; line-height: 1;
+    box-shadow: 0 1px 3px rgba(0,0,0,.4);
+  }
+  .bdg .k { background: #334155; color: #e2e8f0; padding: 5px 8px; }
+  .bdg .v { background: #2563eb; color: #fff; padding: 5px 9px; }
+  .bdg .v.cpp  { background: #00599C; }
+  .bdg .v.qt   { background: #41CD52; color: #0b3d16; }
+  .bdg .v.cmake{ background: #064F8C; }
+  .bdg .v.test { background: #7c3aed; }
+  .bdg .v.port { background: #0d9f6e; }
+
   .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px 60px; }
 
-  /* ===== 目录 ===== */
+  /* ===== 目录（悬浮吸顶） ===== */
   nav.toc {
-    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 10px;
-    margin: -26px auto 34px; max-width: 860px; padding: 18px 26px;
-    box-shadow: 0 4px 14px rgba(20,40,80,.08);
-    display: flex; flex-wrap: wrap; gap: 8px 22px; justify-content: center;
+    position: sticky; top: 12px; z-index: 40;
+    background: rgba(255,255,255,.92);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    border: 1px solid var(--c-border); border-radius: 999px;
+    margin: -30px auto 34px; max-width: 880px; padding: 9px 22px;
+    box-shadow: 0 6px 20px rgba(15,23,42,.12);
+    display: flex; flex-wrap: wrap; gap: 4px 6px; justify-content: center;
   }
-  nav.toc a { color: var(--c-primary); text-decoration: none; font-size: 14px; }
-  nav.toc a:hover { text-decoration: underline; }
+  nav.toc a {
+    color: #334155; text-decoration: none; font-size: 13.5px;
+    padding: 4px 12px; border-radius: 999px; border: 1px solid transparent;
+  }
+  nav.toc a:hover { background: #eff6ff; border-color: #bfdbfe; color: var(--c-primary-dark); }
 
   h2.sec {
-    font-size: 24px; margin: 52px 0 6px; padding-left: 14px;
-    border-left: 6px solid var(--c-primary); color: var(--c-primary-dark);
+    font-size: 23px; margin: 54px 0 6px; padding-left: 14px;
+    border-left: 5px solid; border-image: linear-gradient(#38bdf8, #2563eb) 1;
+    color: var(--c-navy); scroll-margin-top: 76px;
+  }
+  h2.sec::after {
+    content: ""; display: block; width: 130px; height: 3px; border-radius: 2px;
+    margin-top: 7px; background: linear-gradient(90deg, #38bdf8, #2563eb 55%, transparent);
   }
   h2.sec .no { color: var(--c-text-light); font-size: 15px; font-weight: normal; margin-left: 8px; }
-  h3 { font-size: 18px; margin: 30px 0 8px; color: var(--c-primary-dark); }
-  p.lead { color: var(--c-text-light); margin: 4px 0 20px; padding-left: 20px; }
+  h3 { font-size: 18px; margin: 30px 0 8px; color: #1e40af; }
+  p.lead { color: var(--c-text-light); margin: 4px 0 20px; padding-left: 19px; }
 
-  /* ===== 亮点卡片 ===== */
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 18px; margin: 22px 0; }
+  /* ===== 亮点卡片（顶色 = 横幅五光球 + 天蓝，悬浮轻抬） ===== */
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin: 22px 0; }
+  @media (max-width: 980px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 640px) { .cards { grid-template-columns: 1fr; } }
   .card {
     background: var(--c-card); border: 1px solid var(--c-border); border-radius: 12px;
-    padding: 20px 22px 16px; box-shadow: 0 2px 8px rgba(20,40,80,.05);
-    border-top: 4px solid var(--c-primary);
+    padding: 20px 22px 16px; box-shadow: 0 2px 8px rgba(15,23,42,.05);
+    border-top: 4px solid #38bdf8;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
   }
-  .card:nth-child(2) { border-top-color: var(--c-green); }
-  .card:nth-child(3) { border-top-color: var(--c-orange); }
-  .card:nth-child(4) { border-top-color: var(--c-purple); }
-  .card:nth-child(5) { border-top-color: var(--c-red); }
-  .card:nth-child(6) { border-top-color: #0d8f9e; }
-  .card .ico { font-size: 26px; }
-  .card b.t { display: block; font-size: 16px; margin: 6px 0 6px; }
+  .card:nth-child(2) { border-top-color: #34d399; }
+  .card:nth-child(3) { border-top-color: #fbbf24; }
+  .card:nth-child(4) { border-top-color: #a78bfa; }
+  .card:nth-child(5) { border-top-color: #f43f5e; }
+  .card:nth-child(6) { border-top-color: #22d3ee; }
+  .card:nth-child(7) { border-top-color: #fb923c; }
+  .card:nth-child(8) { border-top-color: #818cf8; }
+  .card:nth-child(9) { border-top-color: #2dd4bf; }
+  .card:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(15,23,42,.11); border-color: #bfdbfe; }
+  .card .ico {
+    display: inline-flex; width: 44px; height: 44px; border-radius: 12px;
+    align-items: center; justify-content: center; font-size: 23px; background: rgba(56,189,248,.13);
+  }
+  .card:nth-child(2) .ico { background: rgba(52,211,153,.13); }
+  .card:nth-child(3) .ico { background: rgba(251,191,36,.15); }
+  .card:nth-child(4) .ico { background: rgba(167,139,250,.13); }
+  .card:nth-child(5) .ico { background: rgba(244,63,94,.11); }
+  .card:nth-child(6) .ico { background: rgba(34,211,238,.13); }
+  .card:nth-child(7) .ico { background: rgba(251,146,60,.14); }
+  .card:nth-child(8) .ico { background: rgba(129,140,248,.13); }
+  .card:nth-child(9) .ico { background: rgba(45,212,191,.13); }
+  .card b.t { display: block; font-size: 16px; margin: 8px 0 6px; color: var(--c-navy); }
   .card span.d { font-size: 13.5px; color: var(--c-text-light); }
 
   /* ===== 快速上手步骤 ===== */
   .steps { counter-reset: step; margin: 18px 0; }
   .step {
     position: relative; background: var(--c-card); border: 1px solid var(--c-border);
-    border-radius: 10px; padding: 14px 18px 14px 66px; margin-bottom: 12px;
+    border-radius: 12px; padding: 14px 18px 14px 68px; margin-bottom: 12px;
+    box-shadow: 0 2px 8px rgba(15,23,42,.04);
   }
   .step::before {
     counter-increment: step; content: counter(step);
     position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
-    width: 34px; height: 34px; border-radius: 50%; background: var(--c-primary);
+    width: 34px; height: 34px; border-radius: 50%;
+    background: linear-gradient(135deg, #38bdf8, #2563eb);
     color: #fff; font-weight: bold; font-size: 17px;
     display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 3px 9px rgba(37,99,235,.35);
   }
-  .step b { color: var(--c-primary-dark); }
+  .step b { color: #1e40af; }
   .step .hint { font-size: 13px; color: var(--c-text-light); }
 
   /* ===== 图片 ===== */
   figure { margin: 18px 0; text-align: center; }
   figure img {
-    max-width: 100%; border: 1px solid var(--c-border); border-radius: 8px;
-    box-shadow: 0 3px 12px rgba(20,40,80,.10); background: #fff;
+    max-width: 100%; border: 1px solid var(--c-border); border-radius: 10px;
+    box-shadow: 0 6px 18px rgba(15,23,42,.09); background: #fff;
   }
   figure figcaption { font-size: 13px; color: var(--c-text-light); margin-top: 8px; }
-  figure.narrow { max-width: 720px; margin-left: auto; margin-right: auto; }
+  figure.narrow { max-width: 760px; margin-left: auto; margin-right: auto; }
 
   /* 界面分区标注表 */
-  table.zones { width: 100%; border-collapse: collapse; margin: 14px 0 8px; background: var(--c-card); }
-  table.zones th, table.zones td { border: 1px solid var(--c-border); padding: 8px 12px; font-size: 14px; text-align: left; vertical-align: top; }
-  table.zones th { background: #eef3fa; color: var(--c-primary-dark); }
+  table.zones { width: 100%; margin: 14px 0 8px; background: var(--c-card); }
+  table.zones th, table.zones td { padding: 9px 12px; font-size: 14px; text-align: left; vertical-align: top; }
   .badge {
     display: inline-flex; width: 22px; height: 22px; border-radius: 50%; align-items: center;
     justify-content: center; background: var(--c-orange); color: #fff; font-size: 13px;
@@ -113,7 +173,7 @@
   .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 14px 0 6px; }
   .chip {
     border-radius: 8px; color: #fff; padding: 5px 13px; font-size: 13.5px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.15); white-space: nowrap;
+    box-shadow: 0 1px 3px rgba(0,0,0,.18); white-space: nowrap;
   }
   .chip small { opacity: .85; font-size: 11px; margin-left: 4px; }
   .chip.g  { background: var(--c-green); }    /* 需求 */
@@ -121,57 +181,111 @@
   .chip.p  { background: var(--c-purple); }   /* 计划 */
   .chip.o  { background: var(--c-orange); }   /* 实现 */
   .chip.r  { background: var(--c-red); }      /* 质检 */
-  .chip.gr { background: #8a97a8; }           /* bugfix 专属 */
-  .arrow { color: #a0aec0; font-size: 15px; font-weight: bold; }
+  .chip.gr { background: #64748b; }           /* bugfix 专属 */
+  .arrow { color: #94a3b8; font-size: 15px; font-weight: bold; }
   .legend { font-size: 12.5px; color: var(--c-text-light); margin-bottom: 10px; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin: 0 4px 0 12px; }
 
-  /* ===== 通用表格 ===== */
-  table.tbl { width: 100%; border-collapse: collapse; margin: 14px 0; background: var(--c-card); font-size: 14px; }
-  table.tbl th, table.tbl td { border: 1px solid var(--c-border); padding: 7px 12px; text-align: left; }
-  table.tbl th { background: #eef3fa; color: var(--c-primary-dark); }
-  table.tbl tr:nth-child(even) { background: #fbfcfe; }
+  /* ===== 通用表格（深蓝表头 + 圆角 + 斑马纹） ===== */
+  table.tbl { width: 100%; margin: 14px 0; background: var(--c-card); font-size: 14px;
+    border-collapse: separate; border-spacing: 0; border: 1px solid var(--c-border); border-radius: 10px;
+    overflow: hidden;
+  }
+  table.tbl th, table.tbl td { padding: 8px 12px; text-align: left; }
+  table.tbl th {
+    background: linear-gradient(135deg, #13203a, #1e3a8a);
+    color: #bfdbfe; font-weight: 600; letter-spacing: .4px;
+    border-bottom: 1px solid #1e3a8a;
+  }
+  table.tbl th:not(:first-child), table.tbl td:not(:first-child) { border-left: 1px solid #e8eef7; }
+  table.tbl td { border-top: 1px solid #e8eef7; }
+  table.tbl tr:nth-child(even) > td { background: #f8fafc; }
+  table.tbl tr:first-child th:first-child { border-top-left-radius: 9px; }
+  table.tbl tr:first-child th:last-child  { border-top-right-radius: 9px; }
+  table.tbl tr:last-child td:first-child  { border-bottom-left-radius: 9px; }
+  table.tbl tr:last-child td:last-child   { border-bottom-right-radius: 9px; }
+  table.zones {
+    border-collapse: separate; border-spacing: 0; border: 1px solid var(--c-border); border-radius: 10px;
+    overflow: hidden;
+  }
+  table.zones th {
+    background: linear-gradient(135deg, #13203a, #1e3a8a);
+    color: #bfdbfe; font-weight: 600; letter-spacing: .4px;
+  }
+  table.zones th:not(:first-child), table.zones td:not(:first-child) { border-left: 1px solid #e8eef7; }
+  table.zones td { border-top: 1px solid #e8eef7; }
+  table.zones tr:first-child th:first-child { border-top-left-radius: 9px; }
+  table.zones tr:first-child th:last-child  { border-top-right-radius: 9px; }
+  table.zones tr:last-child td:first-child  { border-bottom-left-radius: 9px; }
+  table.zones tr:last-child td:last-child   { border-bottom-right-radius: 9px; }
   code, .path {
     font-family: Consolas, "Courier New", monospace; font-size: 13px;
-    background: #eef2f7; border-radius: 4px; padding: 1px 6px; color: #c0341d;
+    background: #eff6ff; border: 1px solid #dbeafe; border-radius: 4px;
+    padding: 1px 6px; color: #1d4ed8;
   }
   .tree {
-    background: #20293a; color: #cfe3ff; border-radius: 10px; padding: 16px 22px;
+    background: #0c1424; color: #cbd5e1; border: 1px solid #1e293b; border-radius: 12px;
+    padding: 16px 22px;
     font-family: Consolas, monospace; font-size: 13.5px; line-height: 1.9;
     overflow-x: auto; margin: 14px 0; white-space: pre;
+    box-shadow: 0 6px 18px rgba(15,23,42,.14);
   }
-  .tree .c { color: #7ee2a8; }
-  .tree .d { color: #ffd479; }
+  .tree .c { color: #6ee7b7; }
+  .tree .d { color: #fbbf24; }
 
   /* ===== 提示框 ===== */
   .tip, .warn {
     border-radius: 10px; padding: 12px 18px; margin: 16px 0; font-size: 14px;
   }
-  .tip  { background: #e8f6ef; border: 1px solid #bce4cf; }
+  .tip  { background: #eff6ff; border: 1px solid #bfdbfe; border-left: 4px solid var(--c-primary); }
   .tip::before  { content: "💡 "; }
-  .warn { background: #fdf0e7; border: 1px solid #f3d3b5; }
+  .warn { background: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #f59e0b; }
   .warn::before { content: "⚠️ "; }
 
   /* ===== FAQ ===== */
   details {
-    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 9px;
+    background: var(--c-card); border: 1px solid var(--c-border); border-radius: 10px;
+    border-left: 3px solid transparent;
     padding: 12px 18px; margin-bottom: 10px;
+    transition: border-color .18s ease, box-shadow .18s ease;
   }
-  details summary { font-weight: bold; font-size: 15px; cursor: pointer; color: var(--c-primary-dark); }
+  details:hover { border-color: #93c5fd; box-shadow: 0 4px 12px rgba(15,23,42,.07); }
+  details[open] { border-left-color: var(--c-primary); background: #f8faff; }
+  details summary { font-weight: bold; font-size: 15px; cursor: pointer; color: #1e40af; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸"; display: inline-block; color: var(--c-primary); margin-right: 8px; transition: transform .15s ease; }
+  details[open] summary::before { transform: rotate(90deg); }
   details p { font-size: 14px; margin: 10px 0 2px; }
 
   footer {
-    text-align: center; color: var(--c-text-light); font-size: 13px;
-    padding: 28px 0 10px; border-top: 1px solid var(--c-border); margin-top: 50px;
+    text-align: center; margin-top: 56px; padding: 28px 20px 24px;
+    background: linear-gradient(135deg, #0c1322, #1e3a8a);
+    border-radius: 16px; color: #94a3b8;
+    box-shadow: 0 10px 26px rgba(15,23,42,.18);
   }
-</style>
+  footer .ft-title { color: #f1f5f9; font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+  footer .ft-tag {
+    color: #7dd3fc; font-size: 12px; letter-spacing: 3px;
+    font-family: Consolas, "Courier New", monospace; margin-bottom: 10px;
+  }
+  footer .ft-meta { font-size: 12.5px; color: #64748b; }
+  </style>
 </head>
 <body>
 
 <div class="hero">
-  <h1>AutoCode 使用说明</h1>
-  <p>多 Agent 后端驱动的全自动软件开发编排器 —— 从需求到交付，一条流水线跑到底</p>
-  <span class="ver">C++ / Qt 6 · 绿色便携 · 版本号见标题栏（v主.次.编译号）</span>
+  <img class="hero-art" src="images/hero-banner.svg" alt="AutoCode — 多 Agent 后端驱动的自动化编码任务编排器"/>
+  <h1>使用说明</h1>
+  <p class="tag">多 Agent 后端驱动的全自动软件开发编排器 —— 从需求到交付，一条流水线跑到底</p>
+  <div class="badges">
+    <span class="bdg"><span class="k">platform</span><span class="v">Windows 10 / 11</span></span>
+    <span class="bdg"><span class="k">C++</span><span class="v cpp">MSVC</span></span>
+    <span class="bdg"><span class="k">Qt</span><span class="v qt">6.8</span></span>
+    <span class="bdg"><span class="k">build</span><span class="v cmake">CMake</span></span>
+    <span class="bdg"><span class="k">tests</span><span class="v test">QtTest / CTest</span></span>
+    <span class="bdg"><span class="k">portable</span><span class="v port">绿色便携</span></span>
+  </div>
+  <span class="ver">版本号见标题栏（v主.次.编译号）</span>
 </div>
 
 <nav class="toc">
@@ -187,14 +301,19 @@
 <div class="wrap">
 
 <!-- ================= 亮点 ================= -->
-<h2 class="sec" id="highlights">亮点速览</h2>
-<p class="lead">先看最值得知道的六件事</p>
+<h2 class="sec" id="highlights">✨ 亮点速览</h2>
+<p class="lead">先看最值得知道的九件事</p>
 
 <div class="cards">
   <div class="card">
     <span class="ico">🏭</span>
     <b class="t">全流程自动编排</b>
     <span class="d">需求收集 → 需求确认 → 评审 → 设计 → 计划 → 开发 → 代码审查 → 测试，每个阶段自动调度大模型 Agent 执行（Claude Code / DSH / PIAgent / CodexHarness / Hermes 五后端任选），全程无需人工盯守。</span>
+  </div>
+  <div class="card">
+    <span class="ico">🎼</span>
+    <b class="t">任务自定义编排</b>
+    <span class="d">任务类型 / 流程档位 / 执行阶段全部可增删改与排序——菜单「功能 → 任务编排设计」可视化编辑，各阶段提示词要求就地修改，变更即时生效、随目录便携；内置 14 阶段、双工作流与三档位开箱即用，任务怎么跑由你定义。</span>
   </div>
   <div class="card">
     <span class="ico">🔀</span>
@@ -210,6 +329,11 @@
     <span class="ico">🔄</span>
     <b class="t">评审驳回自动迭代</b>
     <span class="d">内置三道评审关卡，不通过自动打回上游阶段重做；每阶段最多重跑 3 次，超过则弹人工介入窗——可人工确认放行继续、再迭代一轮或保持暂停，绝不无限空转。</span>
+  </div>
+  <div class="card">
+    <span class="ico">⏪</span>
+    <b class="t">代码全程可回溯</b>
+    <span class="d">每条指令 / 每个阶段自动增量快照成「记录点」，回退窗口任选时点一键还原，回退前自动留底现场（回退本身也可撤销）；「查看变更」双栏对比直观看每次改了什么，历史臃肿可「设为基准」瘦身——误改秒回，放心让 Agent 干活。</span>
   </div>
   <div class="card">
     <span class="ico">📊</span>
@@ -229,8 +353,12 @@
 </div>
 
 <!-- ================= 快速上手 ================= -->
-<h2 class="sec" id="quick">30 秒上手</h2>
+<h2 class="sec" id="quick">🚀 30 秒上手</h2>
 <p class="lead">四步跑通第一个任务</p>
+<figure class="narrow">
+  <img src="images/launcher.png" alt="AutoCode 启动页">
+  <figcaption>启动页：最近工程以按钮流式排布，顶部搜索框即时过滤（按名称/路径）；点工程按钮直接进入，「跳过」进入免工程工作目录，右上 ✕ 退出程序</figcaption>
+</figure>
 
 <div class="steps">
   <div class="step">
@@ -252,7 +380,7 @@
 </div>
 
 <!-- ================= 界面总览 ================= -->
-<h2 class="sec" id="ui">界面总览</h2>
+<h2 class="sec" id="ui">🖥️ 界面总览</h2>
 <p class="lead">一屏读懂：左管任务，右看执行</p>
 
 <figure>
@@ -307,7 +435,7 @@
 </table>
 
 <!-- ================= 工作流 ================= -->
-<h2 class="sec" id="workflow">工作流与阶段</h2>
+<h2 class="sec" id="workflow">🔁 工作流与阶段</h2>
 <p class="lead">AutoCode 的核心：两条流水线 + 三道评审关卡</p>
 
 <h3>① Feature 流程（新功能，10 个阶段）</h3>
@@ -322,7 +450,7 @@
   <span class="chip o">开发<small>8</small></span><span class="arrow">→</span>
   <span class="chip r">代码审查<small>9</small></span><span class="arrow">→</span>
   <span class="chip r">测试<small>10</small></span><span class="arrow">→</span>
-  <span class="chip" style="background:#2d3748">✅ 完成</span>
+  <span class="chip" style="background:#0f172a">✅ 完成</span>
 </div>
 
 <h3>② Bugfix 流程（修缺陷，8 个阶段）</h3>
@@ -334,7 +462,7 @@
   <span class="chip o">修复<small>13</small></span><span class="arrow">→</span>
   <span class="chip r">代码审查<small>9</small></span><span class="arrow">→</span>
   <span class="chip r">测试<small>10</small></span><span class="arrow">→</span>
-  <span class="chip" style="background:#2d3748">✅ 完成</span>
+  <span class="chip" style="background:#0f172a">✅ 完成</span>
 </div>
 <div class="legend">
   分组：
@@ -343,7 +471,7 @@
   <i style="background:var(--c-purple)"></i>计划
   <i style="background:var(--c-orange)"></i>实现
   <i style="background:var(--c-red)"></i>质检
-  <i style="background:#8a97a8"></i>缺陷专线
+  <i style="background:#64748b"></i>缺陷专线
 </div>
 
 <h3>③ 评审驳回 → 自动打回重做</h3>
@@ -351,44 +479,44 @@
 <svg viewBox="0 0 900 210" style="max-width:900px;width:100%" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei, sans-serif">
   <defs>
     <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
-      <polygon points="0 0, 8 3.5, 0 7" fill="#c53a3a"/>
+      <polygon points="0 0, 8 3.5, 0 7" fill="#e11d48"/>
     </marker>
     <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
-      <polygon points="0 0, 8 3.5, 0 7" fill="#2f9e63"/>
+      <polygon points="0 0, 8 3.5, 0 7" fill="#059669"/>
     </marker>
   </defs>
   <!-- 生产阶段 -->
   <g font-size="14" text-anchor="middle">
-    <rect x="30"  y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="95"  y="85" fill="#fff">需求确认</text>
-    <rect x="330" y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="395" y="85" fill="#fff">设计</text>
-    <rect x="630" y="60" width="130" height="40" rx="9" fill="#2b6cb0"/><text x="695" y="85" fill="#fff">计划</text>
-    <rect x="630" y="140" width="130" height="40" rx="9" fill="#d97b2c"/><text x="695" y="165" fill="#fff">开发</text>
+    <rect x="30"  y="60" width="130" height="40" rx="9" fill="#2563eb"/><text x="95"  y="85" fill="#fff">需求确认</text>
+    <rect x="330" y="60" width="130" height="40" rx="9" fill="#2563eb"/><text x="395" y="85" fill="#fff">设计</text>
+    <rect x="630" y="60" width="130" height="40" rx="9" fill="#2563eb"/><text x="695" y="85" fill="#fff">计划</text>
+    <rect x="630" y="140" width="130" height="40" rx="9" fill="#ea8a0c"/><text x="695" y="165" fill="#fff">开发</text>
     <!-- 评审关卡 -->
-    <rect x="180" y="60" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
-    <text x="235" y="78" fill="#c53a3a" font-size="13">🔒 评审关卡</text><text x="235" y="94" fill="#c53a3a" font-size="12">需求评审</text>
-    <rect x="480" y="60" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
-    <text x="535" y="78" fill="#c53a3a" font-size="13">🔒 评审关卡</text><text x="535" y="94" fill="#c53a3a" font-size="12">设计评审</text>
-    <rect x="480" y="140" width="110" height="40" rx="20" fill="none" stroke="#c53a3a" stroke-width="2.5" stroke-dasharray="6 4"/>
-    <text x="535" y="158" fill="#c53a3a" font-size="13">🔒 代码审查</text><text x="535" y="174" fill="#c53a3a" font-size="12">/ 测试</text>
+    <rect x="180" y="60" width="110" height="40" rx="20" fill="none" stroke="#e11d48" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="235" y="78" fill="#e11d48" font-size="13">🔒 评审关卡</text><text x="235" y="94" fill="#e11d48" font-size="12">需求评审</text>
+    <rect x="480" y="60" width="110" height="40" rx="20" fill="none" stroke="#e11d48" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="535" y="78" fill="#e11d48" font-size="13">🔒 评审关卡</text><text x="535" y="94" fill="#e11d48" font-size="12">设计评审</text>
+    <rect x="480" y="140" width="110" height="40" rx="20" fill="none" stroke="#e11d48" stroke-width="2.5" stroke-dasharray="6 4"/>
+    <text x="535" y="158" fill="#e11d48" font-size="13">🔒 代码审查</text><text x="535" y="174" fill="#e11d48" font-size="12">/ 测试</text>
   </g>
   <!-- 通过箭头 -->
-  <g stroke="#2f9e63" stroke-width="2.2" fill="none">
+  <g stroke="#059669" stroke-width="2.2" fill="none">
     <line x1="160" y1="80" x2="176" y2="80" marker-end="url(#ag)"/>
     <line x1="290" y1="80" x2="326" y2="80" marker-end="url(#ag)"/>
     <line x1="460" y1="80" x2="476" y2="80" marker-end="url(#ag)"/>
     <line x1="590" y1="80" x2="626" y2="80" marker-end="url(#ag)"/>
   </g>
-  <text x="450" y="40" fill="#2f9e63" font-size="13" text-anchor="middle">✔ 评审通过 → 进入下一阶段</text>
+  <text x="450" y="40" fill="#059669" font-size="13" text-anchor="middle">✔ 评审通过 → 进入下一阶段</text>
   <!-- 驳回回路 -->
-  <g stroke="#c53a3a" stroke-width="2.2" fill="none">
+  <g stroke="#e11d48" stroke-width="2.2" fill="none">
     <path d="M 235 100 C 235 128, 120 118, 96 102" marker-end="url(#ar)"/>
     <path d="M 535 100 C 535 126, 420 116, 397 102" marker-end="url(#ar)"/>
     <path d="M 535 140 C 535 126, 660 122, 693 102" marker-end="url(#ar)"/>
   </g>
-  <text x="180" y="145" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 不通过</text>
-  <text x="420" y="145" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 打回重做</text>
-  <text x="750" y="132" fill="#c53a3a" font-size="13" text-anchor="middle">✘ 打回重做</text>
-  <text x="450" y="200" fill="#718096" font-size="12.5" text-anchor="middle">同一阶段最多重跑 3 次，超过则弹「评审人工介入」窗：人工放行继续 / 再迭代一轮 / 保持暂停</text>
+  <text x="180" y="145" fill="#e11d48" font-size="13" text-anchor="middle">✘ 不通过</text>
+  <text x="420" y="145" fill="#e11d48" font-size="13" text-anchor="middle">✘ 打回重做</text>
+  <text x="750" y="132" fill="#e11d48" font-size="13" text-anchor="middle">✘ 打回重做</text>
+  <text x="450" y="200" fill="#64748b" font-size="12.5" text-anchor="middle">同一阶段最多重跑 3 次，超过则弹「评审人工介入」窗：人工放行继续 / 再迭代一轮 / 保持暂停</text>
 </svg>
 <figcaption>评审关卡机制：只读评审阶段在 CLI 层硬性限制为只读（Read/Grep/Glob），不通过自动路由回上游生产阶段；迭代熔断后由用户裁决走向</figcaption>
 </figure>
@@ -418,7 +546,7 @@
 </table>
 
 <!-- ================= 功能详解 ================= -->
-<h2 class="sec" id="detail">功能详解</h2>
+<h2 class="sec" id="detail">🧩 功能详解</h2>
 
 <h3>🛠 工程管理</h3>
 <figure class="narrow">
@@ -569,6 +697,11 @@
 <p><b>任务级配置覆盖（2026.09.09 新增）</b>：选中任务时打开设置，顶部会出现黄色提示条「◆ 任务模式：本次设置保存到任务目录（任务：×××）…」——此时读到的参数为<b>任务档优先</b>（<code>.autodev/tasks/&lt;id&gt;/config.ini</code>，缺键自动继承全局值），确定后参数<b>写入该任务目录</b>（全局 config.ini 不动）；未选任务时读写全局。点击任务时运行期参数（后端/模型表/路径自愈/单价/评审并行/目录排除等）自动切到该任务的配置，取消选中/删除任务/切工程后回全局。想让某任务用不同后端或模型，选中它再改设置即可，互不影响。</p>
 <p><b>模型配置超集同步（2026.09.09）</b>：<b>自定义大模型条目无论何时保存都会同时并入全局（缺省）配置</b>——同身份（请求地址+API 格式+模型名）的条目以最新内容更新、新条目追加、从不删除，全局永远是所有任务模型配置的超集；全局表原为空时自动采用任务表的激活条目（缺省自身始终可用）。任务档还没有自己的模型表时，设置页实时显示全局表（跟随超集增长）；任务一旦保存过自己的模型表即冻结为该任务自己的视图。后端、单价等其余参数仍是任务私有（不回写全局）。</p>
 
+<figure class="narrow">
+  <img src="images/backends-ring.svg" alt="AutoCode 统一编排五个 Agent 后端">
+  <figcaption>五大 Agent 后端：同一套编排核心统一适配，切换后端只是换一个下拉选项</figcaption>
+</figure>
+
 <p><b>Agent 后端（五选一）</b> — 「常用」页下拉切换。<b>助手粘性后端（2026.09.20 起）</b>：每个助手在首次发送时绑定当时的后端，之后<b>切换全局后端不影响任何已有助手</b>（运行中的也不变，继续用各自原后端跑完），仅<b>新建助手/新任务</b>使用新后端——助手运行中随时可切换，状态栏会提示。任务或 guide 运行中切换暂保留原值（提示后空闲再切）：任务多阶段复用同一会话链，中途换后端会跨后端语义错乱。</p>
 <table class="tbl">
   <tr><th style="width:170px">后端</th><th>说明</th></tr>
@@ -621,11 +754,13 @@
 <div class="tip">装好后安装按钮置灰不隐藏（仍可「重新检测」）。根目录输入框<b>输入即自动重检</b>：直接填本机已有安装路径（含全局 npm 目录）即可解锁后端下拉，不必非走安装按钮。</div>
 
 <h3>🧭 后端版本管理</h3>
-<p><b>后端版本管理</b> — 菜单 <code>功能(F) → 后端版本管理...</code> 或设置页「Agent」组「后端版本管理…」按钮：五 Agent 后端（Claude Code / DeepSeekHarness / PIAgent / CodexHarness / Hermes）的<b>当前版本 / 最新版本 / 结论 / 更新入口</b>一站式表格。</p>
+<p><b>后端版本管理</b> — 菜单 <code>功能(F) → 后端版本管理...</code> 或设置页「Agent」组「后端版本管理…」按钮：五 Agent 后端（Claude Code / DeepSeekHarness / PIAgent / CodexHarness / Hermes）的<b>当前版本 / 最新版本 / 结论 / 可用 / 更新入口</b>一站式表格。</p>
 <table class="tbl">
   <tr><th style="width:150px">操作</th><th>说明</th></tr>
   <tr><td><b>当前版本</b></td><td>打开即自动读取：DSH / Pi / Codex / Hermes 直读本机安装文件；Claude 子进程探测（约 1–2 秒）。「刷新版本」随时重读。</td></tr>
   <tr><td><b>查询最新版(联网)</b></td><td>手动触发（不自动联网）：npm registry 查三包 + git ls-remote 查 DSH 远端 tag，约 5–15 秒；显示的是<b>查询时刻</b>的远端值，仅本次会话有效，不落盘。Hermes 改用<b>发布版本号</b>比对（与其余 Harness 一致，2026.09.21）：上游有 v2026.M.D 日历发布 tag，git ls-remote --tags 取最大发布 tag 作为最新版本号（不再显示 HEAD 提交号）；本地版本列优先取 git describe 最近可达发布 tag（非 git 部署回退包版本号，此时明示无法比对）；相等=已是最新（v2026.M.D）；远端有更新发布=有新版本（附本地上次同步时刻）。注：上游 main 分支为高频提交，开发提交不参与判定，仅发布 tag 出新版才算更新。</td></tr>
+  <tr><td><b>验证所有后端</b><br>（2026.10.21）</td><td>进程级探测各后端是否<b>可用</b>并写入「可用」列：Claude/Pi/Codex/Hermes 拉 CLI 跑 <code>--version</code>（先过配置预检），DSH 为长驻 JSON-RPC 进程，做真实 <code>initialize</code> 握手验证。绿=可用、红=不可用（tooltip 显示失败原因全文，如配置缺失/握手被拒的原始报错）、灰=未验证、黄=验证中；每后端最多约 35 秒，结果仅本次会话有效。探测的是「CLI 可启动 + 配置完整」，<b>不含模型 API 连通性</b>。行右键菜单「验证此后端」可单独重测一行。</td></tr>
+  <tr><td><b>右键「自动修复」</b><br>（2026.10.21）</td><td>某行后端不可用时，右键该行选「自动修复」：AutoCode 自动新建/复用名为「后端自愈」的专用助手，绑定一个已验证可用的其他后端，并提交一份自愈提示词（含故障后端、探测失败详情、安装位置与 <code>harness.md</code> 知识库索引，要求 Agent 读文档→定位→修复→验证→汇报）。修复过程在助手日志全程可见、可中断；完成后回到本窗点「验证所有后端」复检。前置：已打开工程（自愈 Agent 需要工作目录）且至少一个其他后端验证可用。知识库正本为 exe 同级 <code>harness.md</code>（五后端启动方式/验证命令/常见故障）。</td></tr>
   <tr><td><b>更新</b></td><td>按行分派：见下表。均弹<b>可见管理员命令窗口</b>执行，完成后窗口保持打开（cmd /k）供核对输出。</td></tr>
 </table>
 <table class="tbl">
@@ -646,7 +781,7 @@
 <div class="warn">注意：Codex 只能连 chat completions 兼容端点（openai-completions 等同 chat）；anthropic-messages 端点的条目不能设为 Codex 的当前模型。另外「最大输出」不得超过网关上限 <b>131072</b>（2^17）——超限值会触发网关 500，该后端全部请求失败。PIAgent 页还有「计费单价($/M)」四项（纯输入/缓存读/缓存写/输出），配置后任务费用列自动折算，全 0 则显示 "-"。</div>
 
 <!-- ================= FAQ ================= -->
-<h2 class="sec" id="faq">常见问题</h2>
+<h2 class="sec" id="faq">❓ 常见问题</h2>
 
 <details>
   <summary>助手提示「调用失败：无错误文本（subtype=error_during_execution）」？</summary>
@@ -726,8 +861,10 @@
   <h3>提示「达到轮次上限，自动续跑」是什么意思？</h3><p>这不是错误，是护栏机制：助手单条提示词一次执行最多跑 <b>40 轮</b>（每轮＝模型思考＋工具调用，读文件/改代码/构建都算），达到上限时 AutoCode 会<b>自动续跑（最多 2 次）</b>接着干，已完成的工作全部落盘不丢；若三次共 120 轮仍未干完，会保留断点并提示发送「继续」接着做。频繁触顶说明单条提示词任务太大（如多文件重构＋自测＋构建），两个办法：<b>① 拆任务</b>——把大需求拆成多条小提示词分步发送（推荐，每步都可验证）；<b>② 调上限</b>——设置 → 运行策略 → <b>「助手轮次上限」</b>（10～200，[Adhoc] MaxTurns，默认 40），保存后下一条提示词即生效。此外 AutoCode 会在<b>发送前自动做工作量评估</b>（2026.09.23 新增，纯本地启发式、零 token）：按提示词里的编号子任务数、点名的源文件数、重活关键词（重构/自测/构建…）与文本长度综合估算，重任务自动上调本轮轮次预算（日志提示「⚙ 工作量评估：轮次上限 40 → N」），小任务不受影响、只升不降；勾选框「按提示词工作量自动上调」可关闭（[Adhoc] MaxTurnsAuto，默认开）。</p>
   <h3>「日志渲染引擎」新旧版有什么区别？切换会丢会话记录吗？</h3><p>这是任务/助手日志区的渲染方式灰度开关（设置 → 常用 → 评审与助手）：「旧版（卡片流）」每条消息一个控件块，长期默认、短会话最稳妥；「新版（自绘）」（2026-10-17）改用 Model/View 虚拟化——只绘制可视区、滚动全程零消息子控件、正文排版按视口带惰性材化，长会话（数千条消息）载档、滚动与跳转明显更流畅，交互完全等价（折叠/展开、双击助手消息拖选复制、链接单击打开、错误工具卡标红——实时回填的单条卡自动展开）。<b>两档随时互切、会话记录零迁移零丢失</b>：会话正本始终存于任务/助手目录的 chat.json / assistant.json，渲染引擎只决定显示方式，切回旧版一切照旧。切换保存后对新建立的会话页生效（状态栏有提示），重开助手 Tab 或重启程序后全部生效。</p>
   <footer>
-  AutoCode · 梅文海 2026.8 · 本文档由「帮助(H) → 帮助」打开，位于程序目录 help\使用说明.html
-</footer>
+    <div class="ft-title">AutoCode · 多 Agent 自动化编码任务编排器</div>
+    <div class="ft-tag">Pipeline · Five Backends · One Cockpit</div>
+    <div class="ft-meta">梅文海 2026.8 · 本文档由「帮助(H) → 帮助」打开，位于程序目录 help\使用说明.html</div>
+  </footer>
 
 </div>
 </body>

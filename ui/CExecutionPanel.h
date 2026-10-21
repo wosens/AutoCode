@@ -70,6 +70,10 @@ public:
     // 2026.09.09 彻底删除助手核心层（无弹窗；观察口：DeleteAsst UI 确认后调它，
     //   测试直调本层验证删除效果）。与 CloseAsst（软关闭可恢复）对应。
     void DeleteAsstCore(const QString& a_sId);
+    // 2026.10.21 后端自愈（版本管理对话框右键「自动修复」）：程序化新建/复用
+    //   「后端自愈」专用助手并激活，返回助手 id（空=面板未就绪）。修复后端绑定由
+    //   调用方（主窗口）续写 UpdateAsstBackend + 编排器 LoadAsstAdhoc。
+    QString CreateHealAsst();
     void ShowTaskLogPage();
     void SetTaskTabsVisible(bool a_bShow);  // 2026-10-03 任务侧 Tab（日志/产物）显隐统一入口
     // 2026.08.29 上下文进度条菜单（右键入口；2026.09.11 左键单击入口已取消，

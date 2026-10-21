@@ -18,7 +18,9 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMenu>
+#include <QMouseEvent>   // 2026.10.19 启动页横幅拖动窗口
 #include <QPainter>
+#include <QWindow>       // 2026.10.19 startSystemMove（横幅拖动窗口）
 #include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
@@ -92,6 +94,18 @@ protected:
             // 图缺失兑底：纯浅色底（保证文字可读，不空白）。
             p.fillRect(rect(), QColor(0xEF, 0xF5, 0xFD));
         }
+    }
+
+    void mousePressEvent(QMouseEvent* a_pEvent) override {
+        // 2026.10.19 横幅图像区可拖动窗口（效果同标题栏）：Qt6 原生系统拖动
+        //   startSystemMove（含 Aero 吸附），与主窗口 WM_NCHITTEST→HTCAPTION
+        //   的标题栏拖动一致；左键发起，其余按键走默认。横幅内的品牌字/副字/
+        //   版本号 QLabel 纯文本默认 ignore 鼠标事件上抛，按压也会落到这里。
+        if (a_pEvent->button() == Qt::LeftButton
+            && window() != nullptr && window()->windowHandle() != nullptr) {
+            window()->windowHandle()->startSystemMove();
+        }
+        QWidget::mousePressEvent(a_pEvent);
     }
 
     void resizeEvent(QResizeEvent*) override {

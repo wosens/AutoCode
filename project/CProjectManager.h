@@ -402,6 +402,10 @@ public:
     // DSH provider/model（默认 glm-custom / glm-5.2，内网中继 anthropic-messages API）。
     bool    SaveDshProvider(const QString& a_sProvider);
     QString LoadDshProvider();
+    // 2026-10-19 DSH 会话权限模式（[Agent] DshPermissionMode；缺省
+    //   danger-full-access，与 Codex/claude 后端 unrestricted 姿态对齐）。
+    bool    SaveDshPermissionMode(const QString& a_sMode);
+    QString LoadDshPermissionMode();
     bool    SaveDshModel(const QString& a_sModel);
     QString LoadDshModel();
     // 2026.08.18 DSH 计费单价（$/百万 token）：DSH 只报 token，客户端按单价折算；

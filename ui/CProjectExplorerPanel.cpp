@@ -1100,16 +1100,17 @@ void CProjectExplorerPanel::OnCustomContextMenu(const QPoint& a_stPos) {
     // 2026-09-30 代码审查（ReviewSdk 静态审查，选中文件/文件夹均可）。
     QAction* pActCReview   = menu.addAction(
         MenuIcon(QStringLiteral("ow-review")), QStringLiteral("代码审查(&S)"));
+    // 2026.09.23 刷新：树更新依赖 QFileSystemModel 内部 watcher 的文件系统事件，
+    //   Windows 通知缓冲溢出/杀软延迟会丢事件致树停滞（如 Agent 批量落盘后新文件
+    //   不出现）——手动触发一次全量重列（详见 NudgeDirWatch）。视图级操作恒可用。
+    //   2026.10.20 与「属性」位置互换（刷新在上、属性在下），分隔线随组前移。
+    menu.addSeparator();
+    QAction* pActRefresh   = menu.addAction(
+        MenuIcon(QStringLiteral("ow-refresh")), QStringLiteral("刷新(&F)"));
     // 2026.10.02 属性：SHObjectProperties 原生属性框（失败兑底自绘）；只读/
     //   隐藏勾选可写回，与 NFR-7 口径一致根外禁用。
     QAction* pActProps     = menu.addAction(
         MenuIcon(QStringLiteral("ow-properties")), QStringLiteral("属性(&R)"));
-    // 2026.09.23 刷新：树更新依赖 QFileSystemModel 内部 watcher 的文件系统事件，
-    //   Windows 通知缓冲溢出/杀软延迟会丢事件致树停滞（如 Agent 批量落盘后新文件
-    //   不出现）——手动触发一次全量重列（详见 NudgeDirWatch）。视图级操作恒可用。
-    menu.addSeparator();
-    QAction* pActRefresh   = menu.addAction(
-        MenuIcon(QStringLiteral("ow-refresh")), QStringLiteral("刷新(&F)"));
 
     // 粘贴依赖工程根已设 + 剪贴板可能有文件（系统 CF_HDROP——含资源管理器剪切/复制，
     //   或写板失败时的内部快照兑底）；其余依赖选中节点在根内。

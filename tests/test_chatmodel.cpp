@@ -170,7 +170,7 @@ void TestChatModel::oneToOneKinds()
     m.AppendBlock(stEv);
     SBlockData stErr;
     stErr.eKind = CMessageBlock::Error;
-    stErr.sText = QStringLiteral("[错误] 失败"));
+    stErr.sText = QStringLiteral("[错误] 失败");
     m.AppendBlock(stErr);
     QCOMPARE(m.ItemCount(), 3);
     QCOMPARE(m.PeekItem(0)->eKind, CMessageBlock::Assistant);

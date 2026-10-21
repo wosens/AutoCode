@@ -111,6 +111,9 @@ private slots:
     //   harness 受限令牌被 restrictTokenIntegrity 降到 Low IL，只授 DACL workspace
     //   SID ACE 不够——Low 令牌写 Medium 目录被 No-Write-Up 拒，必须同 SACL 补
     //   Low 标签（harness grantWrite 同款双写）。
+    //   2026-10-21 权限模式拆分：缺省 danger-full-access（沙箱关）只授 ACE 不打
+    //   标签（目录保持中性，遗留 Low 标签的清理走 RestoreNeutralSecurity）；
+    //   workspace-write 沙箱模式下双条件契约不回退。
     void testDshExtraWriteDirsAclAndLabel() {
         QTemporaryDir oTmp;
         QVERIFY(oTmp.isValid());
@@ -118,67 +121,88 @@ private slots:
         const QString sExtra = oTmp.path() + QStringLiteral("/extra");
         QVERIFY(QDir().mkpath(sWork));
         QVERIFY(QDir().mkpath(sExtra));
-        // 授予（0 失败）+ 幂等二跑。
-        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
-        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
-
-        // 验证双条件：DACL 应有 mask=GRANT_MASK、OI|CI、S-1-4-* 的 allow ACE；
-        // SACL 应有 Low（S-1-16-4096）标签 ACE。
+        // 标签/ACE 扫描（两模式复用）：DACL 找 mask=GRANT_MASK、OI|CI、S-1-4-* 的
+        //   allow ACE；SACL 找 Low（S-1-16-4096）标签 ACE。
         const QString sNative = QDir::toNativeSeparators(sExtra);
-        PACL pDacl = nullptr, pSacl = nullptr;
-        PSECURITY_DESCRIPTOR pSd = nullptr;
-        QCOMPARE(GetNamedSecurityInfoW(
-                     reinterpret_cast<const wchar_t*>(sNative.utf16()), SE_FILE_OBJECT,
-                     DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
-                     nullptr, nullptr, &pDacl, &pSacl, &pSd), static_cast<DWORD>(ERROR_SUCCESS));
-        struct CSdGuard {
-            PSECURITY_DESCRIPTOR p;
-            ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
-        } stGuard{ pSd };
-        const DWORD kGrant = (FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD)
-                             & ~STANDARD_RIGHTS_WRITE;
+        auto fnpScan = [&](BOOL& abAcl, BOOL& abLabel) {
+            abAcl = FALSE;
+            abLabel = FALSE;
+            PACL pDacl = nullptr, pSacl = nullptr;
+            PSECURITY_DESCRIPTOR pSd = nullptr;
+            if (GetNamedSecurityInfoW(
+                    reinterpret_cast<const wchar_t*>(sNative.utf16()), SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                    nullptr, nullptr, &pDacl, &pSacl, &pSd) != ERROR_SUCCESS) {
+                return;
+            }
+            struct CSdGuard {
+                PSECURITY_DESCRIPTOR p;
+                ~CSdGuard() { if (p != nullptr) { LocalFree(p); } }
+            } stGuard{ pSd };
+            const DWORD kGrant = (FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD)
+                                 & ~STANDARD_RIGHTS_WRITE;
+            if (pDacl != nullptr) {
+                for (DWORD i = 0; i < pDacl->AceCount; ++i) {
+                    void* pAce = nullptr;
+                    if (!GetAce(pDacl, i, &pAce) || pAce == nullptr) { continue; }
+                    const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+                    if (pHdr->AceType != ACCESS_ALLOWED_ACE_TYPE) { continue; }
+                    const auto* pAllow = static_cast<const ACCESS_ALLOWED_ACE*>(pAce);
+                    if (pAllow->Mask != kGrant) { continue; }
+                    if ((pHdr->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))
+                            != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) {
+                        continue;
+                    }
+                    LPWSTR wsSid = nullptr;
+                    if (ConvertSidToStringSidW(
+                            reinterpret_cast<PSID>(const_cast<unsigned long*>(&pAllow->SidStart)),
+                            &wsSid) && wsSid != nullptr) {
+                        const QString sSid = QString::fromWCharArray(wsSid);
+                        LocalFree(wsSid);
+                        if (sSid.startsWith(QStringLiteral("S-1-4-"))) { abAcl = TRUE; }
+                    }
+                }
+            }
+            if (pSacl != nullptr) {
+                for (DWORD i = 0; i < pSacl->AceCount; ++i) {
+                    void* pAce = nullptr;
+                    if (!GetAce(pSacl, i, &pAce) || pAce == nullptr) { continue; }
+                    const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
+                    if (pHdr->AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) { continue; }
+                    const auto* pLbl = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(pAce);
+                    LPWSTR wsSid = nullptr;
+                    if (ConvertSidToStringSidW(
+                            reinterpret_cast<PSID>(const_cast<unsigned long*>(&pLbl->SidStart)),
+                            &wsSid) && wsSid != nullptr) {
+                        const QString sSid = QString::fromWCharArray(wsSid);
+                        LocalFree(wsSid);
+                        if (sSid == QStringLiteral("S-1-16-4096")) { abLabel = TRUE; }
+                    }
+                }
+            }
+        };
+
+        // ① 缺省（danger-full-access）：授 workspace SID ACE、不打 Low 标签，
+        //   幂等二跑。
+        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
+        QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
         BOOL bAcl = FALSE, bLabel = FALSE;
-        if (pDacl != nullptr) {
-            for (DWORD i = 0; i < pDacl->AceCount; ++i) {
-                void* pAce = nullptr;
-                if (!GetAce(pDacl, i, &pAce) || pAce == nullptr) { continue; }
-                const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
-                if (pHdr->AceType != ACCESS_ALLOWED_ACE_TYPE) { continue; }
-                const auto* pAllow = static_cast<const ACCESS_ALLOWED_ACE*>(pAce);
-                if (pAllow->Mask != kGrant) { continue; }
-                if ((pHdr->AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))
-                        != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)) {
-                    continue;
-                }
-                LPWSTR wsSid = nullptr;
-                if (ConvertSidToStringSidW(
-                        reinterpret_cast<PSID>(const_cast<unsigned long*>(&pAllow->SidStart)),
-                        &wsSid) && wsSid != nullptr) {
-                    const QString sSid = QString::fromWCharArray(wsSid);
-                    LocalFree(wsSid);
-                    if (sSid.startsWith(QStringLiteral("S-1-4-"))) { bAcl = TRUE; }
-                }
-            }
-        }
-        if (pSacl != nullptr) {
-            for (DWORD i = 0; i < pSacl->AceCount; ++i) {
-                void* pAce = nullptr;
-                if (!GetAce(pSacl, i, &pAce) || pAce == nullptr) { continue; }
-                const auto* pHdr = static_cast<const ACE_HEADER*>(pAce);
-                if (pHdr->AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE) { continue; }
-                const auto* pLbl = static_cast<const SYSTEM_MANDATORY_LABEL_ACE*>(pAce);
-                LPWSTR wsSid = nullptr;
-                if (ConvertSidToStringSidW(
-                        reinterpret_cast<PSID>(const_cast<unsigned long*>(&pLbl->SidStart)),
-                        &wsSid) && wsSid != nullptr) {
-                    const QString sSid = QString::fromWCharArray(wsSid);
-                    LocalFree(wsSid);
-                    if (sSid == QStringLiteral("S-1-16-4096")) { bLabel = TRUE; }
-                }
-            }
-        }
+        fnpScan(bAcl, bLabel);
         QVERIFY2(bAcl, "额外目录缺 workspace SID allow ACE");
-        QVERIFY2(bLabel, "额外目录缺 Low 标签（Low IL 令牌 No-Write-Up 会拒）");
+        QVERIFY2(!bLabel, "danger-full-access 下不应打 Low 标签（沙箱已关保持中性）");
+
+        // ② workspace-write（沙箱在装）：双条件齐备（原契约不回退）；会话静态态
+        //   用完即还（防串染其他用例）。
+        {
+            struct CModeRestore {
+                ~CModeRestore() { CDeepSeekRunner::SetDshPermissionMode(QString()); }
+            } stModeRestore;
+            CDeepSeekRunner::SetDshPermissionMode(QStringLiteral("workspace-write"));
+            QCOMPARE(CDeepSeekRunner::ApplyExtraWriteDirs(sWork, {sExtra}), 0);
+            fnpScan(bAcl, bLabel);
+            QVERIFY2(bAcl, "额外目录缺 workspace SID allow ACE");
+            QVERIFY2(bLabel, "额外目录缺 Low 标签（Low IL 令牌 No-Write-Up 会拒）");
+        }
     }
 
     // ============ 2026.10.14 阶段决策解析假驳回死循环回归（ParseDecisionText） ============

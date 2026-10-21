@@ -4379,6 +4379,32 @@ void CExecutionPanel::DeleteAsst(const QString& a_sId) {
     DeleteAsstCore(a_sId);
 }
 
+QString CExecutionPanel::CreateHealAsst() {
+    // 2026.10.21 后端自愈（版本管理对话框「自动修复」）：程序化新建专用助手并激活。
+    //   已有同名且打开的「后端自愈」助手时直接复用切过去（多次修复共用一个助手，
+    //   后端重绑定由主窗口续写；复用前主窗口已挡运行态）。返回助手 id。
+    for (const SAsst& st : m_aAssts) {
+        if (!st.bClosed && st.sName == QStringLiteral("后端自愈")) {
+            if (st.pPage != nullptr) {
+                m_pTabs->setCurrentWidget(st.pPage);   // → sigAsstSwitched（主窗口同步）
+            }
+            return st.sId;
+        }
+    }
+    SAsst st;
+    st.sId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    st.sName = QStringLiteral("后端自愈");
+    st.sOwnerKey = m_sViewKey;   // 归属当前视图档（同 OnAsstAddClicked）
+    m_aAssts.append(st);   // 先入列表再建 Tab（UpdateTabCloseButtons 需按视图反查）
+    CreateAsstTab(m_aAssts.last());
+    UpdateTabCloseButtons();
+    if (AsstById(st.sId) != nullptr && AsstById(st.sId)->pPage != nullptr) {
+        m_pTabs->setCurrentWidget(AsstById(st.sId)->pPage);
+    }
+    emit sigAsstAdded(st.sId);
+    return st.sId;
+}
+
 void CExecutionPanel::DeleteAsstCore(const QString& a_sId) {
     // 彻底删除核心（无弹窗，DeleteAsst 确认后调用；测试直调本层）：
     //   Tab/控件销毁 + 对话流/统计随 SAsst 移除 + 编排器会话链释放（sigAsstRemoved →

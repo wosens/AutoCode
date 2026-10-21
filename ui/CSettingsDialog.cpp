@@ -1,8 +1,7 @@
 #include "CSettingsDialog.h"
 
 #include <QAbstractItemModel>
-#include <QAbstractItemView>   // 2026.10.15 模型列表双击就地编辑 EditTriggers
-#include <QStyledItemDelegate>   // 2026.10.15 API 类型列下拉 delegate
+#include <QAbstractItemView>   // NoEditTriggers（模型列表双击改开编辑对话框）
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -127,36 +126,8 @@ static void RestoreModelColWidths(CProjectManager* a_pPm, QTreeWidget* a_pTree,
     }
 }
 
-// 2026.10.15 模型列表「API 类型」列就地编辑下拉（候选同 CDshModelEditDialog 的
-//   m_pEditApi；旧档自由文本值不在候选时动态补入，与对话框同语义）。
-class CModelApiColDelegate : public QStyledItemDelegate {
-public:
-    using QStyledItemDelegate::QStyledItemDelegate;
-    QWidget* createEditor(QWidget* a_pParent, const QStyleOptionViewItem&,
-                          const QModelIndex&) const override {
-        auto* pBox = new QComboBox(a_pParent);
-        pBox->addItems(QStringList()
-            << QStringLiteral("anthropic-messages")
-            << QStringLiteral("openai-completions")
-            << QStringLiteral("openai-responses")
-            << QStringLiteral("google-generative-ai")
-            << QStringLiteral("google-vertex"));
-        return pBox;
-    }
-    void setEditorData(QWidget* a_pEditor, const QModelIndex& a_stIdx) const override {
-        auto* pBox = static_cast<QComboBox*>(a_pEditor);
-        const QString sCur = a_stIdx.data(Qt::EditRole).toString();
-        if (pBox->findText(sCur) < 0) {
-            pBox->addItem(sCur);   // 旧档自由文本（如 chat）动态补入
-        }
-        pBox->setCurrentText(sCur);
-    }
-    void setModelData(QWidget* a_pEditor, QAbstractItemModel* a_pModel,
-                      const QModelIndex& a_stIdx) const override {
-        a_pModel->setData(a_stIdx, static_cast<QComboBox*>(a_pEditor)->currentText(),
-                          Qt::EditRole);
-    }
-};
+// 2026-10-20 双击改为打开编辑对话框后，「API 类型」列就地编辑下拉（原
+//   CModelApiColDelegate）与 itemChanged 落库口一并移除——无内联编辑即无这两处。
 // 2026.08.18 自定义大模型条目编辑对话框（无 Q_OBJECT：纯表单 + exec/lambda 连接，
 //   不进 moc/构建系统）。校验：模型 ID / 接入点必填（空则拦截 accept 并提示）；
 //   其余空值在 Entry() 回默认（API 类型→anthropic-messages，显示名→模型 ID）。
@@ -1167,19 +1138,20 @@ void CSettingsDialog::SetupUi() {
         "开关后也用本表。正本存 exe 同级 config.ini 的 [DshModels]/[PiModels]/\n"
         "[CodexModels]/[HermesModels] 四节同内容）。\n"
         "「当前」列打 ● 的条目生效（各后端参数页的 Provider/模型固定路由不参与）。\n"
-        "双击单元格就地编辑（完整表单含密钥用「编辑…」按钮）；列宽拖表头分隔线可调，自动记忆（双击分隔线自适应内容）"));
-    // 2026.10.15 双击单元格就地编辑（用户需求）：双击列 0~5 直接在单元格内改值，
-    //   itemChanged 落回数据（见 OnDshModelItemChanged）；「当前」列（6）与空表占位
-    //   行不可编辑。完整表单（含密钥）仍走「编辑…」按钮弹对话框——两条入口并存。
-    m_pTreeDshModels->setEditTriggers(QAbstractItemView::DoubleClicked
-                                      | QAbstractItemView::EditKeyPressed);
-    connect(m_pTreeDshModels, &QTreeWidget::itemChanged,
-            this, &CSettingsDialog::OnDshModelItemChanged);
-    // API 类型列（2）候选固定（对话框同款下拉）：就地编辑也用下拉，防自由敲错。
-    m_pTreeDshModels->setItemDelegateForColumn(2, new CModelApiColDelegate(this));
-    // 选中行变化只刷新按钮态（RefreshDshModelList 内部 blockSignals 重建，无重入）
+        "双击条目打开编辑对话框（完整表单含密钥）；列宽拖表头分隔线可调，自动记忆（双击分隔线自适应内容）"));
+    // 2026-10-20 双击条目打开编辑对话框（用户需求：双击进编辑界面，取代 2026-10-15
+    //   的双击单元格就地编辑——就地改值无法改密钥，且易误触提交半截值）；内联编辑
+    //   位全关（NoEditTriggers），itemDoubleClicked 统一走 OnDshModelEdit（空表
+    //   占位行/无选中在其内部已防御）。「编辑…」按钮与双击同一条路。
+    m_pTreeDshModels->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    connect(m_pTreeDshModels, &QTreeWidget::itemDoubleClicked,
+            this, [this](QTreeWidgetItem*, int) { OnDshModelEdit(); });
+    // 选中行变化只刷按钮态（2026-10-20 起不再全表重建：重建在「点击他行 → 双击就地
+    //   编辑」两击之间 clear+重建全部条目——鼠标交互中途销毁光标下条目是现场双击失效
+    //   最可疑的干扰源，且换行重建本无必要（选中不动数据）；offscreen A/B 两种写法均
+    //   通过 testSettingsModelDblClickInlineEdit，保留无重建写法消隐患）。
     connect(m_pTreeDshModels, &QTreeWidget::currentItemChanged,
-            this, [this](QTreeWidgetItem*, QTreeWidgetItem*) { RefreshDshModelList(); });
+            this, [this](QTreeWidgetItem*, QTreeWidgetItem*) { RefreshDshModelButtons(); });
     // 2026-10-08 列表高度随窗口高度自适应：树吃组内富余高度（stretch=1），
     //   组吃页内富余高度（stretch=1，页尾不再 addStretch 抢高度）；
     //   setMinimumHeight(120) 保底不被压没。
@@ -1739,9 +1711,8 @@ void CSettingsDialog::RefreshDshModelList() {
         pItem->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(5, Qt::AlignRight | Qt::AlignVCenter);
         pItem->setTextAlignment(6, Qt::AlignCenter);
-        // 2026.10.15 双击就地编辑：整行开放编辑位；「当前」列（6）的写回遮蔽在
-        //   OnDshModelItemChanged（非法/标记列一律回显原值），占位行不加编辑位。
-        pItem->setFlags(pItem->flags() | Qt::ItemIsEditable);
+        // 2026-10-20 双击改开编辑对话框：不再开内联编辑位（编辑位已无意义，
+        //   editTriggers 也已 NoEditTriggers，见构造函数）。
         m_pTreeDshModels->addTopLevelItem(pItem);
     }
     if (m_aDshModels.isEmpty()) {
@@ -1754,6 +1725,16 @@ void CSettingsDialog::RefreshDshModelList() {
         m_pTreeDshModels->setCurrentItem(m_pTreeDshModels->topLevelItem(iSel));
     }
     m_pTreeDshModels->blockSignals(false);
+    RefreshDshModelButtons();
+}
+
+// 2026-10-20 从 RefreshDshModelList 尾段拆出的按钮态刷新：行选中变化（currentItemChanged）
+//   只调本函数——列表重建照旧走 RefreshDshModelList（数据增删改/设为当前路径），选中
+//   本身不动数据，重建不会打断模态编辑对话框（本函数拆出的动机，见构造函数注释）。
+void CSettingsDialog::RefreshDshModelButtons() {
+    if (m_pTreeDshModels == nullptr) {
+        return;
+    }
     const int iRow = CurDshModelRow();
     const bool bHasSel = (iRow >= 0 && iRow < m_aDshModels.size());
     const bool bEnabled = m_pTreeDshModels->isEnabled();   // 组级开关（UpdateDshEnabled 已设）
@@ -1831,43 +1812,6 @@ void CSettingsDialog::OnDshModelEdit() {
     m_aDshModels[iRow] = dlg.Entry();
     ShareModelsFromPage(0);   // 2026.09.10 公共模型配置：同步其余三页
     UpdateDshEnabled();
-}
-
-// 2026.10.15 条目→单元格规范显示文本（itemChanged 回显/校验回退共用）。
-static QString ModelCellText(const SDshModelEntry& a_stE, int a_iCol) {
-    switch (a_iCol) {
-        case 0:  return a_stE.sDisp;
-        case 1:  return a_stE.sBaseURL;
-        case 2:  return a_stE.sApi;
-        case 3:  return a_stE.sModelId;
-        case 4:  return QString::number(a_stE.iCtx);
-        case 5:  return QString::number(a_stE.iMaxTok);
-        default: return QString();
-    }
-}
-
-// 2026.10.15 模型列表双击就地编辑的落库口（itemChanged）：列→字段映射 + 校验回退。
-//   口径对齐 CDshModelEditDialog::Entry() 兑底：显示名空→回退模型 ID；模型 ID 不可空
-//   （空回退旧值）；上下文/最大输出非正整数回退旧值（单元格重显）；API 列值经下拉
-//   delegate 约束（旧档自由文本动态补入）。非法回退的 setText 会再触发一次本槽——
-//   此时字段已等于旧值且与单元格一致，走「无变化」分支返回，天然无重入。
-void CSettingsDialog::OnDshModelItemChanged(QTreeWidgetItem* a_pItem, int a_iCol) {
-    if (a_pItem == nullptr || m_pTreeDshModels == nullptr) {
-        return;
-    }
-    const int iRow = m_pTreeDshModels->indexOfTopLevelItem(a_pItem);
-    if (iRow < 0 || iRow >= m_aDshModels.size()) {
-        return;   // 空表占位行（无编辑位，防御）
-    }
-    const SDshModelEntry stOld = m_aDshModels.at(iRow);
-    SDshModelEntry stNew = stOld;
-    // 列→字段映射 + 校验回退（纯函数，单测直调；口径注释见 CModelEntry.h）。
-    if (!ApplyModelCellEdit(&stNew, a_iCol, a_pItem->text(a_iCol))) {
-        a_pItem->setText(a_iCol, ModelCellText(stNew, a_iCol));   // 非法/无变化：重显规范值即返
-        return;
-    }
-    m_aDshModels[iRow] = stNew;
-    ShareModelsFromPage(0);   // 同步其余三页副本 + 重建列表（对齐/规范值重显）
 }
 
 void CSettingsDialog::OnDshModelDel() {

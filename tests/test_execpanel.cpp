@@ -3987,8 +3987,8 @@ void TestExecPanel::outputSaveNameAndBatch() {
     QCOMPARE(aFail2.size(), 1);
 }
 
-// 2026.10.15 模型列表双击就地编辑校验（纯函数直调；UI 链 = QTreeWidget 双击编辑
-//   → itemChanged → CSettingsDialog::OnDshModelItemChanged 调本函数后落库刷表）。
+// 2026.10.15 模型列表单元格编辑校验（纯函数直调；2026-10-20 起生产链双击改开编辑
+//   对话框，本函数保留为同口径校验工具，仅测试链路直调）。
 void TestExecPanel::modelCellEditValidation() {
     auto mkE = []() {
         SDshModelEntry e;

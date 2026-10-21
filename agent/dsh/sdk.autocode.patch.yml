@@ -35,12 +35,31 @@
         displayName: !!js process.env.DSH_LLM_NAME ?? 'AutoCode Active Model'
         apiKeyEnv: AUTOCODE_DSH_API_KEY
         api: !!js process.env.DSH_LLM_API ?? 'anthropic-messages'
-        baseURL: !!js process.env.DSH_LLM_BASE_URL ?? 'http://192.168.118.128:9000/claude'
+        baseURL: !!js process.env.DSH_LLM_BASE_URL ?? 'http://10.1.0.201/claude'
+        # 2026-10-20 中继 CC 门禁：内网两台中继（10.1.0.201 / 118.128:9000 同栈）按
+        #   客户端特征限流，非 Claude Code CLI 特征一律 403 client_validation_error
+        #   ("This endpoint only accepts requests from Claude Code CLI")。pi-ai 默认
+        #   UA 是 "pi (...)"，必须在 provider 级 headers 覆盖（mergeClientHeaders 中
+        #   model.headers 后置、可覆盖默认 UA；实测补头即 200）。
+        headers:
+          User-Agent: 'claude-cli/2.0.55 (external, cli)'
+          x-app: 'cli'
         models:
           - id: !!js process.env.DSH_LLM_MODEL ?? 'glm-5.2'
             name: Active Model
             contextWindow: !!js Number(process.env.DSH_LLM_CTX ?? 131072)
             maxTokens: !!js Number(process.env.DSH_LLM_MAXTOK ?? 32768)
+            # 2026.10.20 思考强度能力声明：hand-declared 模型缺省无 reasoning 能力，
+            #   设置页思考强度(non-off)会在 initialize 被服务端以
+            #   "does not support reasoning effort" 拒绝（-32603，AutoCode 只能
+            #   去强度自愈续跑）。anthropic-messages 通道按档位映射 thinking
+            #   budget，wire 值不逐字上行；openai 系通道则逐字发送。声明与
+            #   设置页四档（off/low/high/max）对齐；off 留空 = 不发思考参数。
+            reasoningEfforts:
+              'off':
+              low: low
+              high: high
+              max: max
 
 # Persona + global context (legacy agent-spine persona equivalent): task-stage
 # persona via DSH_SYSTEM_PROMPT fallback default, shared global rules

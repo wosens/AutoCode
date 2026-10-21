@@ -191,12 +191,30 @@ QString CProjectManager::AssistantStateFile() const {
     return AutoDevDir() + QStringLiteral("/assistant.json");
 }
 
+// 2026-10-19 v4.4.390 对话档案覆写前轮换备份（周报工程实害：面板重置态默认助手把
+//   231 块实档覆盖成 311 字节空档，且该档案不进增量备份体系、无法自恢复）。写前把
+//   现档复制为 <file>.bak、旧 .bak 退为 .bak2（保两代；copy 非 rename——覆写中途
+//   失败时本体仍在，.bak 是成功覆写前的最后完好版）。档案小（KB~百 KB 级）、落盘
+//   有 500ms 去抖，轮换开销可忽略。
+static void RotateStateBackup(const QString& a_sPath) {
+    const QFileInfo stInfo(a_sPath);
+    if (!stInfo.exists() || stInfo.size() <= 0) {
+        return;   // 无现档（首次创建）/空档：无需轮换
+    }
+    const QString sBak2 = a_sPath + QStringLiteral(".bak2");
+    const QString sBak  = a_sPath + QStringLiteral(".bak");
+    QFile::remove(sBak2);
+    QFile::rename(sBak, sBak2);   // 无旧 .bak 时失败无妨
+    QFile::copy(a_sPath, sBak);
+}
+
 bool CProjectManager::WriteAssistantState(const QByteArray& a_sData) const {
     if (m_sProjectDir.isEmpty()) {
         return false;
     }
     // const 方法内不能调非 const 的 EnsureAutoDev；直接建父目录（.autodev 通常已存在）。
     QDir().mkpath(AutoDevDir());
+    RotateStateBackup(AssistantStateFile());   // 2026-10-19 覆写前轮换 .bak/.bak2
     QFile stFile(AssistantStateFile());
     // WriteOnly+Truncate 全量覆盖（每次落盘都是最新完整快照）；JSON 无需 BOM。
     if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -248,6 +266,7 @@ bool CProjectManager::WriteTaskAssistantState(const QString& a_sTaskId, const QB
         return false;
     }
     QDir().mkpath(TaskDir(a_sTaskId));   // 确保任务私有目录存在（const 内直接建）
+    RotateStateBackup(TaskAssistantFile(a_sTaskId));   // 2026-10-19 覆写前轮换 .bak/.bak2
     QFile stFile(TaskAssistantFile(a_sTaskId));
     if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return false;
@@ -1812,6 +1831,17 @@ bool CProjectManager::SaveDshProvider(const QString& a_sProvider) {
 
 QString CProjectManager::LoadDshProvider() {
     return LoadDshStrKey(SettingsCfgPath(), L"DshProvider", QStringLiteral("glm-custom"));
+}
+
+// 2026.10.19 DSH 会话权限模式：缺省 danger-full-access（三后端 unrestricted 姿态
+//   对齐）；config.ini [Agent] DshPermissionMode=workspace-write/read-only 可回退。
+bool CProjectManager::SaveDshPermissionMode(const QString& a_sMode) {
+    return SaveDshStrKey(SettingsCfgPath(), L"DshPermissionMode", a_sMode);
+}
+
+QString CProjectManager::LoadDshPermissionMode() {
+    return LoadDshStrKey(SettingsCfgPath(), L"DshPermissionMode",
+                         QStringLiteral("danger-full-access"));
 }
 
 bool CProjectManager::SaveDshModel(const QString& a_sModel) {

@@ -5,6 +5,7 @@
 #include <QRect>
 #include <QPointer>
 #include <QMessageBox>
+#include <QSet>           // 2026-10-19 提权修复会话内抑制集（m_aAclElevateSuppressed）
 #include <QLocalSocket>   // 2026-10-01 SSbxReq（沙箱异步回包）QPointer 成员需完整类型
 #include <QJsonObject>
 #include <memory>
@@ -73,6 +74,9 @@ private slots:
     void OnOrchDesign();
     // 2026.09 后端版本管理对话框（任务 23183ccb）：四后端版本查看/查询/更新入口。
     void OnVersionManage();
+    // 2026.10.21 后端自愈分派（CVersionDialog 右键「自动修复」→ 信号跨窗）：新建/复用
+    //   「后端自愈」助手、绑定修复后端（粘性）并提交自愈提示词。
+    void OnBackendAutoFix(int a_iFaultBackend, int a_iFixBackend, const QString& a_sPrompt);
 
     // 帮助菜单（FR-9）
     void OnHelp();
@@ -235,6 +239,14 @@ private:
     // 弹窗目标字号（FR3，Q13=14pt，全局默认 11pt，+3pt 显著但不夸张）。
     static constexpr int s_kiMsgPt = 14;
 
+    // 2026-10-19 缺写权限 ACE 提权修复公共流（三挂点共用：开工程预检 / 设置页
+    //   ExtraWriteDirs 授权失败 / EnsureProcess 静默自愈失败回调）：抑制集检查 →
+    //   确认框（展示目录清单与将执行的 icacls 命令全文）→ runas 提权执行 + 有界
+    //   等待。返回 true=命令已成功执行（修复复查归调用方，口径随挂点不同）；
+    //   任何未执行/失败路径（No、UAC 被拒、超时、退出码非 0）都会登记抑制集。
+    bool RunAclElevateFlow(const QString& a_sTitle, const QStringList& a_aDirs,
+                           const QString& a_sCmds);
+
     CProjectManager*   m_pPm        = nullptr;
     CTaskOrchestrator* m_pOrch      = nullptr;
     CTaskListPanel*    m_pTaskPanel = nullptr;
@@ -264,6 +276,11 @@ private:
     //   4 个助手整体串档）。仅 OpenProjectDir 内部显式 SaveAssistantState(true) 放行。
     bool               m_bProjectSwitching = false;
     bool               m_bGuideBuilding = false;
+    // 2026-10-19 提权修复会话内抑制集（native 小写目录键）：用户点 No / UAC 被拒 /
+    //   执行失败 / 复查未过的目录登记于此，三挂点共享——同会话不再重复弹窗
+    //   （防每次 submit/开工程骚扰），重开 AutoCode 自然复位。提权成功则不登记
+    //   （幂等复查通过后各挂点不再触发）。
+    QSet<QString>      m_aAclElevateSuppressed;
     // 启动任务时 guide.md 缺失：登记该任务，待 guide 生成完成后自动续跑（初始任务）。
     // QPointer：任务对象销毁时自动置空，避免悬垂。
     QPointer<CTaskInfo> m_pTaskPendingGuide;

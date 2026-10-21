@@ -10,6 +10,8 @@
 #include <QVector>
 #include <QVersionNumber>
 
+#include <functional>
+
 #include "CAgentRunnerBase.h"
 
 // DeepSeekHarness（DSH）JSON-RPC 后端 runner（2026.08.18 多后端支持）。
@@ -83,6 +85,42 @@ public:
     static int ApplyExtraWriteDirs(const QString& a_sWorkDir,
                                   const QStringList& a_aGrant,
                                   const QStringList& a_aRevoke = QStringList());
+    // —— 2026-10-19 缺写权限 ACE 的提权修复支撑（UI 流程经 SetAclElevateHandler 由
+    //    CMainWindow 注入，agent 层自身无任何 UI；背景：UAC FilterAdministratorToken=1
+    //    的过滤令牌下对默认 ACL 工程根 SetNamedSecurityInfoW 返回 Win32 5，静默自愈
+    //    DshEnsureLabelWritable 无法补 ACE——提权 icacls 只授当前用户 (OI)(CI)(F)
+    //    修复「用户无 WRITE_DAC/WRITE_OWNER」根因，随后非提权重跑既有自愈补精确条目；
+    //    人工等价：icacls "<目录>" /grant "*<本机用户SID>:(OI)(CI)(F)"）——
+    // 查询+尝试静默自愈（内部即 DshEnsureLabelWritable）：0=已具备 1=本轮补上 -1=失败（需提权）。
+    static int EnsureDirWriteAce(const QString& a_sDir);
+    // —— 2026-10-21 沙箱关闭（danger-full-access 缺省）时的标签中性恢复：把
+    //    workspace-write 时代遗留的低完整性强制标签（Low/Untrusted，NW 挡一切
+    //    Medium 进程在目录内新建文件）替换为 Medium（标签替换式，子树继承标签
+    //    自动跟随）。工程拷到新机器/老版本升级后无人清理，是「发布后没权限」
+    //    的根子。返回 0=已中性（无标签或 Medium+，幂等）1=本轮已恢复 -1=失败
+    //    （a_pOutCmd 非空时收 icacls 提权命令全文，静默写 SACL 过滤令牌常态失败）。
+    static int RestoreNeutralSecurity(const QString& a_sDir,
+                                      QString* a_pOutCmd = nullptr);
+    // 当前进程令牌用户 SID 字符串（S-1-5-…；失败返回空串）。
+    static QString CurrentUserSidString();
+    // icacls 提权修复命令全文（icacls "<目录>" /grant "*<SID>:(OI)(CI)(F)"）；
+    //   目录不在场 / SID 获取失败返回空串（调用方静默跳过）。
+    static QString BuildIcaclsGrantCmd(const QString& a_sDir);
+    // runas 提权执行 cmd.exe /c <a_sCmd> 并有界等待：false=未启动（UAC 被拒）、
+    //   超时或退出码非 0；a_pdwExit 非空时收退出码（用 unsigned long 而非 DWORD，
+    //   避免头文件引 windows.h）。
+    static bool RunElevatedCmdBlocking(const QString& a_sCmd, int a_iTimeoutMs,
+                                       unsigned long* a_pdwExit = nullptr);
+    // EnsureProcess 静默自愈失败时的提权回调（仅 GUI 线程被调用；参数=目录+命令全文；
+    //   返回 true=已修复且复查通过——调用方信此返回值，不二次复查）。析构方负责清空。
+    static void SetAclElevateHandler(
+        std::function<bool(const QString& a_sDir, const QString& a_sCmd)> a_fn);
+    // 带失败目录清单出参的重载（旧三参签名不动；出参仅收集 DshApplyDirAce 真失败的
+    //   目录——规范根/SID 为空的退化分支不进出参，提权修不了目录级以外的问题）。
+    static int ApplyExtraWriteDirs(const QString& a_sWorkDir,
+                                  const QStringList& a_aGrant,
+                                  const QStringList& a_aRevoke,
+                                  QStringList* a_pOutFailed);
     // 2026.09.10 双布局：上游 dsh-v0.1.2 起移除 packages/examples（jsonrpc-demo/
     //   spine-demo），JSON-RPC SDK 转正为官方 profile（dsh CLI + --profile sdk）。
     //   DshLayoutOf 按 root 内入口文件判型：Legacy=examples/jsonrpc-demo/bin.js，
@@ -133,6 +171,16 @@ public:
     static QString SupportedDshTag();       // "dsh-v0.1.5-alpha.1"（回退/安装命令用）
     static QVersionNumber SupportedDshVersion();   // 0.1.5（数值比较用）
 
+    // —— 2026.10.21 后端可用性探测（版本管理对话框「验证所有后端」）——
+    // DSH 是长驻 JSON-RPC 进程，“可用”的真实验证 = 冷启动 + initialize 握手成功。
+    //   三个静态助手把握手所需的进程参数暴露给对话框（避免对话框复制业务逻辑）：
+    //   DshProbeEnv() = MergedPathEnvironment + 自定义模型槽位（同 EnsureProcess 口径）
+    //   + GLM_CUSTOM_API_KEY 兼容底（见 EnsureProcess 内 2026.10.21 修复注释）；
+    //   DshProbeProvider()/DshProbeModel() = EffectiveProvider/Model 的静态口径。
+    static QProcessEnvironment DshProbeEnv();
+    static QString DshProbeProvider();
+    static QString DshProbeModel();
+
     // ===== 2026.09.01 DSH 环境自愈（版本不兼容自动回滚重建 + credentials 坏格式修复）=====
     // credentials.yaml 坏格式解析/渲染（纯函数，单测靶点）：旧/第三方工具写的
     //   version+refs 包装格式 → DSH credentials-local 期望的平铺映射（键→非空字符串）。
@@ -162,6 +210,11 @@ public:
     static QString DshCordisPath();
     static void SetDshProvider(const QString& a_sProvider);
     static QString DshProvider();
+    // 2026-10-19 会话权限模式（[Agent] DshPermissionMode；danger-full-access/
+    //   workspace-write/read-only，空=缺省 danger-full-access）：EnsureProcess 注入
+    //   DSH_PERMISSION_MODE，dsh 组合层 sandbox-policy/approval 策略同读此变量。
+    static void SetDshPermissionMode(const QString& a_sMode);
+    static QString DshPermissionMode();
     static void SetDshModel(const QString& a_sModel);
     static QString DshModel();
     // 2026.08.18 DSH 计费估算：DSH 协议只报 token 分量不报金额，按单价（$/百万 token）

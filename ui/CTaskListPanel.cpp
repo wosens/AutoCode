@@ -706,7 +706,7 @@ void CTaskListPanel::OnHistoryContextMenu(const QPoint& a_pos) {
     QAction* pActAutoName = menu.addAction(MenuIcon(QStringLiteral("ow-autoname")), QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
     QAction* pActRetry = menu.addAction(MenuIcon(QStringLiteral("ow-rerun")), QStringLiteral("再次执行"));
     menu.addSeparator();   // 删除是破坏性操作，与常规项分隔
-    QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
+    QAction* pActDelete = menu.addAction(MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除"));   // 2026.10.20 补图标（与全应用菜单图标化对齐）
     QAction* pSel = menu.exec(m_pTreeHis->viewport()->mapToGlobal(a_pos));
     if (pSel == pActRetry) {
         emit sigReviveTask(pTask);
@@ -736,7 +736,7 @@ void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     QAction* pActRename = menu.addAction(MenuIcon(QStringLiteral("ow-rename")), QStringLiteral("重命名"));   // 2026.08.20 手动改任务名
     QAction* pActAutoName = menu.addAction(MenuIcon(QStringLiteral("ow-autoname")), QStringLiteral("自动命名"));   // 2026.08.20 复用新建任务自动命名
     QAction* pActRemove = menu.addAction(MenuIcon(QStringLiteral("ow-remove")), QStringLiteral("移除"));
-    QAction* pActDelete = menu.addAction(QStringLiteral("删除"));
+    QAction* pActDelete = menu.addAction(MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除"));   // 2026.10.20 补图标（与全应用菜单图标化对齐）
     QAction* pSel = menu.exec(m_pListCur->viewport()->mapToGlobal(a_pos));
     if (pSel == pActView) {
         emit sigViewTask(pTask);

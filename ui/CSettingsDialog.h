@@ -146,13 +146,13 @@ private:
     void ShareModelsFromPage(int a_iPage);   // 0=DSH 1=Pi 2=Codex 3=Hermes
     // 2026.08.18 自定义大模型列表维护（DSH 页）：列表文本/按钮态刷新 + 增改删/设为当前。
     void RefreshDshModelList();
+    void RefreshDshModelButtons();   // 2026-10-20 列表尾段按钮态拆分（选中变化只刷按钮，不再重建）
     // 2026.08.19 列表改 QTreeWidget 后的当前行号（-1=无/占位行）。
     int CurDshModelRow() const;
     void OnDshModelAdd();
     void OnDshModelEdit();
-    // 2026.10.15 双击单元格就地编辑：itemChanged 落回 m_aDshModels（数字列非法回退旧值；
-    //   显示名清空回退模型 ID、模型 ID 不可空，口径同编辑对话框 Entry() 兑底）。
-    void OnDshModelItemChanged(QTreeWidgetItem* a_pItem, int a_iCol);
+    // 2026-10-20 双击条目打开本编辑对话框（原 2026-10-15 就地编辑链路
+    //   OnDshModelItemChanged/CModelApiColDelegate 一并移除）。
     // 2026.08.27 复制选中条目：预填编辑对话框（显示名加“-副本”后缀，可改），
     //   确认后追加到列表末尾——快速建同网关的多个模型。
     void OnDshModelCopy();

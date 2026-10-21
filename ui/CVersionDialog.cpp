@@ -12,6 +12,7 @@
 #include "CPiAgentRunner.h"
 
 #include <QCoreApplication>
+#include <QColor>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QDir>
@@ -23,7 +24,9 @@
 #include <QHeaderView>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QJsonObject>
 #include <QLabel>
+#include <QMenu>
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
@@ -45,10 +48,19 @@ const int kiColBackend = 0;   // 后端
 const int kiColLocal   = 1;   // 当前版本
 const int kiColLatest  = 2;   // 最新版本
 const int kiColVerdict = 3;   // 结论
-const int kiColAction  = 4;   // 操作
+const int kiColAvail   = 4;   // 2026.10.21 可用（进程级探测结论）
+const int kiColAction  = 5;   // 操作
 
 const int kiClaudeLocalTimeoutMs = 10 * 1000;   // Claude 本地探测硬超时
 const int kiQueryTimeoutMs       = 15 * 1000;   // 联网查询硬超时（npm/ls-remote）
+const int kiProbeTimeoutMs       = 25 * 1000;   // 2026.10.21 CLI 探测硬超时（--version）
+const int kiDshProbeTimeoutMs    = 35 * 1000;   // DSH JSON-RPC 握手硬超时（同 runner 30s+余量）
+
+// 2026.10.21 可用列配色（绿=可用/红=不可用/灰=未验证/黄=验证中，深色底兼容用中明度）。
+const QColor kClrProbeIdle(128, 128, 128);
+const QColor kClrProbeRun(200, 160, 40);
+const QColor kClrProbeOk(40, 160, 80);
+const QColor kClrProbeFail(210, 70, 60);
 
 // package.json → version（open 失败/解析错/无字段→空串）。
 QString fnReadPkgVersion(const QString& a_sPkgPath) {
@@ -94,6 +106,21 @@ CVersionDialog::~CVersionDialog() {
             pTimer->deleteLater();
         }
     }
+    // 2026.10.21 DSH 握手探针专用进程（不入池，独立收敛）：断链→杀→等待。
+    if (m_pDshProbeTm != nullptr) {
+        m_pDshProbeTm->stop();
+        m_pDshProbeTm->deleteLater();
+        m_pDshProbeTm = nullptr;
+    }
+    if (m_pDshProbe != nullptr) {
+        m_pDshProbe->disconnect();
+        if (m_pDshProbe->state() != QProcess::NotRunning) {
+            m_pDshProbe->kill();
+            m_pDshProbe->waitForFinished(2000);
+        }
+        m_pDshProbe->deleteLater();
+        m_pDshProbe = nullptr;
+    }
 }
 
 void CVersionDialog::SetupUi() {
@@ -102,14 +129,15 @@ void CVersionDialog::SetupUi() {
     stFont.setPointSize(11);
     setFont(stFont);
 
-    m_pTable = new QTableWidget(5, 5, this);
+    m_pTable = new QTableWidget(5, 6, this);
     // 2026.09.20 列表字体显式 11 号（用户要求；不依赖继承，若全局默认变动仍恒 11）
     //   + 行高 28px（11 号字舒适行高，防视觉偏小拥挤），窗口高度随行高微增。
     m_pTable->setFont(stFont);
     m_pTable->verticalHeader()->setDefaultSectionSize(28);
     m_pTable->setHorizontalHeaderLabels(QStringList()
         << QStringLiteral("后端") << QStringLiteral("当前版本")
-        << QStringLiteral("最新版本") << QStringLiteral("结论") << QStringLiteral("操作"));
+        << QStringLiteral("最新版本") << QStringLiteral("结论")
+        << QStringLiteral("可用") << QStringLiteral("操作"));
     m_pTable->setVerticalHeaderLabels(QStringList()
         << QStringLiteral("1") << QStringLiteral("2") << QStringLiteral("3")
         << QStringLiteral("4") << QStringLiteral("5"));
@@ -117,10 +145,14 @@ void CVersionDialog::SetupUi() {
     m_pTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_pTable->horizontalHeader()->setStretchLastSection(true);
     m_pTable->verticalHeader()->setVisible(true);
-    const int aiColWidth[5] = { 130, 120, 120, 200, 90 };
-    for (int iCol = 0; iCol < 5; ++iCol) {
+    const int aiColWidth[6] = { 130, 120, 120, 200, 100, 90 };
+    for (int iCol = 0; iCol < 6; ++iCol) {
         m_pTable->setColumnWidth(iCol, aiColWidth[iCol]);
     }
+    // 2026.10.21 行右键菜单（自动修复）：customContextMenuRequested 提供。
+    m_pTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_pTable, &QTableWidget::customContextMenuRequested, this,
+            [this](const QPoint& a_stPos) { ShowRowContextMenu(a_stPos); });
 
     const QString asNames[6] = {
         QString(),
@@ -138,6 +170,8 @@ void CVersionDialog::SetupUi() {
         SetLocalCell(iBackend, QStringLiteral("读取中…"));
         SetLatestCell(iBackend, QStringLiteral("未查询"));
         SetVerdictCell(iBackend, Verdict(QString(), QString(), iBackend));
+        SetAvailCell(iBackend, QStringLiteral("未验证"),
+                     QStringLiteral("点「验证所有后端」做进程级探测"), kClrProbeIdle);
         // 行内更新按钮：可用性随本地安装态联动（UpdateUpdateButtons）。
         m_aBtnUpdate[iBackend] = new QPushButton(QStringLiteral("更新"), m_pTable);
         m_aBtnUpdate[iBackend]->setEnabled(false);
@@ -149,11 +183,16 @@ void CVersionDialog::SetupUi() {
 
     m_pBtnRefresh = new QPushButton(QStringLiteral("刷新版本"), this);
     m_pBtnQuery   = new QPushButton(QStringLiteral("查询最新版(联网)"), this);
+    m_pBtnVerify  = new QPushButton(QStringLiteral("验证所有后端"), this);
     m_pBtnClose   = new QPushButton(QStringLiteral("关闭"), this);
+    m_pBtnVerify->setToolTip(QStringLiteral(
+        "进程级探测各后端是否可用：CLI 可启动且配置完整\n"
+        "（DSH 含 JSON-RPC initialize 握手；不含模型 API 连通性）"));
 
     QHBoxLayout* pBtnRow = new QHBoxLayout();
     pBtnRow->addWidget(m_pBtnRefresh);
     pBtnRow->addWidget(m_pBtnQuery);
+    pBtnRow->addWidget(m_pBtnVerify);
     pBtnRow->addStretch(1);
     pBtnRow->addWidget(m_pBtnClose);
 
@@ -169,6 +208,9 @@ void CVersionDialog::SetupUi() {
     });
     connect(m_pBtnQuery, &QPushButton::clicked, this, [this]() {
         QueryLatestAll();
+    });
+    connect(m_pBtnVerify, &QPushButton::clicked, this, [this]() {
+        VerifyAll();
     });
     connect(m_pBtnClose, &QPushButton::clicked, this, &QDialog::reject);
 
@@ -1031,10 +1073,423 @@ void CVersionDialog::UpdateInfoLine() {
         sInfo = QStringLiteral("尚未查询最新版（「查询最新版(联网)」需网络；结果不落盘）");
     }
     sInfo += QStringLiteral("；更新窗口关闭后请点「刷新版本」重新加载本地版本。");
+    if (m_bProbeActive) {
+        sInfo += QStringLiteral("  正在验证后端可用性…（每后端最多 35 秒）");
+    } else if (m_tProbeAt.isValid()) {
+        sInfo += QStringLiteral("  上次验证：%1（结果仅本次会话有效）")
+                     .arg(m_tProbeAt.toString(QStringLiteral("HH:mm:ss")));
+    }
     m_pLblInfo->setText(sInfo);
 }
 
+// —— 2026.10.21 可用性验证 ——
+
+void CVersionDialog::VerifyAll() {
+    m_bProbeActive = true;
+    m_tProbeAt = QDateTime::currentDateTime();
+    for (int iBackend = 1; iBackend <= 5; ++iBackend) {
+        m_aeProbe[iBackend] = EProbeRunning;
+        m_asProbeDetail[iBackend].clear();
+        SetAvailCell(iBackend, QStringLiteral("验证中…"), QString(), kClrProbeRun);
+        StartProbe(iBackend);
+    }
+    UpdateInfoLine();
+}
+
+void CVersionDialog::StartProbe(int a_iBackend) {
+    // 失败详情统一附输出尾部（StartPooledProcess 已合并双流），裁 240 字符防刷屏。
+    auto fnFailDetail = [](int a_iEc, const QString& a_sOut) -> QString {
+        QString sTail = a_sOut.simplified();
+        if (sTail.size() > 240) {
+            sTail = QStringLiteral("…") + sTail.right(240);
+        }
+        return QStringLiteral("CLI 启动失败（退出码 %1）%2")
+            .arg(a_iEc).arg(sTail.isEmpty() ? QString() : QStringLiteral("：") + sTail);
+    };
+    switch (a_iBackend) {
+    case 1:   // Claude：cmd /c <ClaudeCmd> --version（同本地刷新口径）
+        StartPooledProcess(EProcVerifyClaude, QStringLiteral("cmd.exe"),
+            QStringList() << QStringLiteral("/c") << CClaudeRunner::ClaudeCmd()
+                          << QStringLiteral("--version"),
+            kiProbeTimeoutMs,
+            [this, fnFailDetail](int a_iEc, const QString& a_sOut) {
+                if (a_iEc != 0) {
+                    OnProbeDone(1, false, fnFailDetail(a_iEc, a_sOut));
+                    return;
+                }
+                const QString sVer = CClaudeRunner::ParseClaudeVersionOutput(a_sOut);
+                OnProbeDone(1, true, sVer.isEmpty()
+                    ? QStringLiteral("CLI 可启动")
+                    : QStringLiteral("CLI 可启动（v%1）").arg(sVer));
+            });
+        break;
+    case 2:   // DSH：长驻 JSON-RPC 进程——真实验证 = 冷启动 + initialize 握手
+        if (!CDeepSeekRunner::LooksLikeDshRoot(CDeepSeekRunner::DshRootPath())) {
+            OnProbeDone(2, false, QStringLiteral("未安装/配置的根无效"));
+            break;
+        }
+        StartDshHandshake();
+        break;
+    case 3: { // Pi：配置预检 → node cli.js --version（node+包完整性）
+        const QString sErr = CPiAgentRunner::PiConfigError();
+        if (!sErr.isEmpty()) {
+            OnProbeDone(3, false, sErr.simplified());
+            break;
+        }
+        StartPooledProcess(EProcVerifyPi, CPiAgentRunner::ResolveNodePath(),
+            QStringList() << CPiAgentRunner::ResolveCliJsPath() << QStringLiteral("--version"),
+            kiProbeTimeoutMs,
+            [this, fnFailDetail](int a_iEc, const QString& a_sOut) {
+                OnProbeDone(3, a_iEc == 0, a_iEc == 0
+                    ? QStringLiteral("CLI 可启动") : fnFailDetail(a_iEc, a_sOut));
+            });
+        break;
+    }
+    case 4: { // Codex：配置预检 → node codex.js --version
+        const QString sErr = CCodexRunner::CodexConfigError();
+        if (!sErr.isEmpty()) {
+            OnProbeDone(4, false, sErr.simplified());
+            break;
+        }
+        StartPooledProcess(EProcVerifyCodex, CCodexRunner::ResolveNodePath(),
+            QStringList() << CCodexRunner::ResolveCodexJsPath() << QStringLiteral("--version"),
+            kiProbeTimeoutMs,
+            [this, fnFailDetail](int a_iEc, const QString& a_sOut) {
+                OnProbeDone(4, a_iEc == 0, a_iEc == 0
+                    ? QStringLiteral("CLI 可启动") : fnFailDetail(a_iEc, a_sOut));
+            });
+        break;
+    }
+    case 5: { // Hermes：CLI 探测 + 配置预检 → hermes --version
+        const QString sCli = CHermesRunner::ResolveHermesCli();
+        if (sCli.isEmpty()) {
+            OnProbeDone(5, false, QStringLiteral("未安装（根目录/HERMES_HOME/PATH 均未命中）"));
+            break;
+        }
+        const QString sErr = CHermesRunner::HermesConfigError();
+        if (!sErr.isEmpty()) {
+            OnProbeDone(5, false, sErr.simplified());
+            break;
+        }
+        StartPooledProcess(EProcVerifyHermes, sCli,
+            QStringList() << QStringLiteral("--version"),
+            kiProbeTimeoutMs,
+            [this, fnFailDetail](int a_iEc, const QString& a_sOut) {
+                OnProbeDone(5, a_iEc == 0, a_iEc == 0
+                    ? QStringLiteral("CLI 可启动") : fnFailDetail(a_iEc, a_sOut));
+            });
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void CVersionDialog::OnProbeDone(int a_iBackend, bool a_bOk, const QString& a_sDetail) {
+    if (m_bTearingDown) {
+        return;
+    }
+    m_aeProbe[a_iBackend] = a_bOk ? EProbeOk : EProbeFail;
+    m_asProbeDetail[a_iBackend] = a_sDetail;
+    SetAvailCell(a_iBackend, a_bOk ? QStringLiteral("可用") : QStringLiteral("不可用"),
+                 a_sDetail, a_bOk ? kClrProbeOk : kClrProbeFail);
+    // 全部收束后解除「验证中」态。
+    bool bBusy = false;
+    for (int i = 1; i <= 5; ++i) {
+        if (m_aeProbe[i] == EProbeRunning) { bBusy = true; break; }
+    }
+    m_bProbeActive = bBusy;
+    UpdateInfoLine();
+}
+
+void CVersionDialog::SetAvailCell(int a_iRow, const QString& a_sText,
+                                  const QString& a_sToolTip, const QColor& a_stColor) {
+    const int iRow = a_iRow - 1;
+    QTableWidgetItem* pItem = m_pTable->item(iRow, kiColAvail);
+    if (pItem == nullptr) {
+        pItem = new QTableWidgetItem(a_sText);
+        pItem->setFlags(pItem->flags() & ~Qt::ItemIsEditable);
+        m_pTable->setItem(iRow, kiColAvail, pItem);
+    } else {
+        pItem->setText(a_sText);
+    }
+    pItem->setForeground(a_stColor);
+    pItem->setToolTip(a_sToolTip);
+    pItem->setTextAlignment(Qt::AlignCenter);
+}
+
+void CVersionDialog::StartDshHandshake() {
+    // 同键重入防护：先杀旧探针（断链→杀→等）再起新。
+    if (m_pDshProbeTm != nullptr) {
+        m_pDshProbeTm->stop();
+        m_pDshProbeTm->deleteLater();
+        m_pDshProbeTm = nullptr;
+    }
+    if (m_pDshProbe != nullptr) {
+        m_pDshProbe->disconnect();
+        if (m_pDshProbe->state() != QProcess::NotRunning) {
+            m_pDshProbe->kill();
+            m_pDshProbe->waitForFinished(2000);
+        }
+        m_pDshProbe->deleteLater();
+        m_pDshProbe = nullptr;
+    }
+    m_abDshProbeBuf.clear();
+
+    QProcess* pProc = new QProcess(this);
+    m_pDshProbe = pProc;
+    pProc->setProcessEnvironment(CDeepSeekRunner::DshProbeEnv());
+    pProc->setWorkingDirectory(QCoreApplication::applicationDirPath());
+
+    // 一次性回调收敛（响应行/进程退出/超时三源只放一次；spDone 共享堆标防悬空）。
+    QSharedPointer<bool> spDone(new bool(false));
+    auto fnConverge = [this, spDone](bool a_bOk, const QString& a_sDetail) {
+        if (m_bTearingDown || *spDone) {
+            return;
+        }
+        *spDone = true;
+        FinishDshHandshake(a_bOk, a_sDetail);
+    };
+
+    // 行分帧解析（同 runner 口径：换行分隔 JSON-RPC）；命中 id=1 响应即判。
+    connect(pProc, &QProcess::readyReadStandardOutput, pProc,
+        [this, pProc, fnConverge]() {
+            m_abDshProbeBuf += pProc->readAllStandardOutput();
+            int iNl = 0;
+            while ((iNl = m_abDshProbeBuf.indexOf('\n')) >= 0) {
+                const QByteArray aLine = m_abDshProbeBuf.left(iNl).trimmed();
+                m_abDshProbeBuf.remove(0, iNl + 1);
+                if (aLine.isEmpty()) {
+                    continue;
+                }
+                const QJsonDocument oDoc = QJsonDocument::fromJson(aLine);
+                if (!oDoc.isObject()) {
+                    continue;
+                }
+                const QJsonObject o = oDoc.object();
+                if (o.value(QStringLiteral("id")).toInt() != 1) {
+                    continue;   // 非 initialize 响应（日志/通知帧）忽略
+                }
+                if (o.contains(QStringLiteral("result"))) {
+                    fnConverge(true, QStringLiteral("JSON-RPC 握手成功"));
+                } else {
+                    const QJsonObject oErr = o.value(QStringLiteral("error")).toObject();
+                    fnConverge(false, QStringLiteral("initialize 被拒：%1")
+                                         .arg(oErr.value(QStringLiteral("message")).toString()));
+                }
+                return;
+            }
+        });
+    connect(pProc, &QProcess::finished, pProc,
+        [pProc, fnConverge](int a_iEc, QProcess::ExitStatus) {
+            const QString sErr = QString::fromUtf8(pProc->readAllStandardError());
+            QString sTail = sErr.simplified();
+            if (sTail.size() > 240) {
+                sTail = QStringLiteral("…") + sTail.right(240);
+            }
+            fnConverge(false, QStringLiteral("进程提前退出（码 %1）%2")
+                                 .arg(a_iEc).arg(sTail.isEmpty()
+                                     ? QString() : QStringLiteral("：") + sTail));
+        });
+    connect(pProc, &QProcess::errorOccurred, pProc,
+        [fnConverge](QProcess::ProcessError a_eErr) {
+            fnConverge(false, QStringLiteral("进程启动失败（QProcess 错误 %1）")
+                                 .arg(int(a_eErr)));
+        });
+
+    m_pDshProbeTm = new QTimer(this);
+    m_pDshProbeTm->setSingleShot(true);
+    connect(m_pDshProbeTm, &QTimer::timeout, this,
+        [this, pProc, fnConverge]() {
+            if (pProc->state() != QProcess::NotRunning) {
+                pProc->kill();   // kill → finished → fnConverge(false) 收敛
+            }
+            fnConverge(false, QStringLiteral("initialize 握手超时（%1 秒）")
+                                 .arg(kiDshProbeTimeoutMs / 1000));
+        });
+
+    pProc->start(CDeepSeekRunner::ResolveNodePath(), CDeepSeekRunner::ResolveStartArgs());
+    if (pProc->state() == QProcess::NotRunning) {
+        // FailedToStart 已同步收敛（errorOccurred 路径），不得再启表（悬空捕获）。
+        return;
+    }
+    // 握手帧（同 EnsureProcess：cwd/provider/model；探针不带 effort/maxTokens）。
+    QJsonObject oParams;
+    oParams.insert(QStringLiteral("cwd"), QCoreApplication::applicationDirPath());
+    oParams.insert(QStringLiteral("provider"), CDeepSeekRunner::DshProbeProvider());
+    oParams.insert(QStringLiteral("model"), CDeepSeekRunner::DshProbeModel());
+    QJsonObject oInit;
+    oInit.insert(QStringLiteral("jsonrpc"), QStringLiteral("2.0"));
+    oInit.insert(QStringLiteral("id"), 1);
+    oInit.insert(QStringLiteral("method"), QStringLiteral("initialize"));
+    oInit.insert(QStringLiteral("params"), oParams);
+    pProc->write(QJsonDocument(oInit).toJson(QJsonDocument::Compact)
+                 + QByteArrayLiteral("\n"));
+    m_pDshProbeTm->start(kiDshProbeTimeoutMs);
+}
+
+void CVersionDialog::FinishDshHandshake(bool a_bOk, const QString& a_sDetail) {
+    // 收敛点：停表、杀进程（探针生命周期终结），结果交 OnProbeDone 写行。
+    if (m_pDshProbeTm != nullptr) {
+        m_pDshProbeTm->stop();
+        m_pDshProbeTm->deleteLater();
+        m_pDshProbeTm = nullptr;
+    }
+    if (m_pDshProbe != nullptr) {
+        m_pDshProbe->disconnect();
+        if (m_pDshProbe->state() != QProcess::NotRunning) {
+            m_pDshProbe->kill();
+            m_pDshProbe->waitForFinished(2000);
+        }
+        m_pDshProbe->deleteLater();
+        m_pDshProbe = nullptr;
+    }
+    OnProbeDone(2, a_bOk, a_sDetail);
+}
+
+void CVersionDialog::ShowRowContextMenu(const QPoint& a_stPos) {
+    const int iRow = m_pTable->rowAt(a_stPos.y());
+    if (iRow < 0 || iRow >= m_pTable->rowCount()) {
+        return;
+    }
+    const int iBackend = iRow + 1;
+    const QString asNames[6] = {
+        QString(), QStringLiteral("Claude Code"), QStringLiteral("DeepSeekHarness"),
+        QStringLiteral("PIAgent"), QStringLiteral("CodexHarness"), QStringLiteral("Hermes"),
+    };
+    QMenu menu(this);
+    QFont fMenu = menu.font();
+    fMenu.setPointSize(11);
+    menu.setFont(fMenu);
+
+    QAction* pActProbe = menu.addAction(QStringLiteral("验证此后端"));
+    menu.addSeparator();
+    QAction* pActFix = menu.addAction(QStringLiteral("自动修复（用可用后端自愈）"));
+    // 修复执行者：已验证可用的其他后端，优先 Claude → Pi → Codex → Hermes（DSH 故障
+    //   不能自举；任一其他后端验证可用即可任选，优先取序靠前 者）。
+    int iFix = 0;
+    for (int iCand = 1; iCand <= 5; ++iCand) {
+        if (iCand != iBackend && m_aeProbe[iCand] == EProbeOk) {
+            iFix = iCand;
+            if (iCand == 1) {
+                break;   // Claude 最优先：直接命中即停（否则保留首个可用）
+            }
+        }
+    }
+    pActFix->setEnabled(iFix != 0);
+    if (iFix != 0) {
+        pActFix->setText(QStringLiteral("自动修复（用 %1 自愈）").arg(asNames[iFix]));
+    } else {
+        pActFix->setToolTip(QStringLiteral(
+            "无已验证可用的其他后端：请先修复任一后端或在设置页安装"));
+    }
+
+    QAction* pPicked = menu.exec(m_pTable->viewport()->mapToGlobal(a_stPos));
+    if (pPicked == pActProbe) {
+        m_bProbeActive = true;
+        m_aeProbe[iBackend] = EProbeRunning;
+        m_asProbeDetail[iBackend].clear();
+        SetAvailCell(iBackend, QStringLiteral("验证中…"), QString(), kClrProbeRun);
+        StartProbe(iBackend);
+        UpdateInfoLine();
+        return;
+    }
+    if (pPicked != pActFix || iFix == 0) {
+        return;
+    }
+    // 组装自愈提示词并交主窗口（信号跨到 CMainWindow::OnBackendAutoFix）。
+    QString sLocation;
+    switch (iBackend) {
+    case 1: {
+        const QString sPkg = CClaudeRunner::NpmGlobalClaudePkgPath();
+        sLocation = sPkg.isEmpty()
+            ? QStringLiteral("npm 全局包 @anthropic-ai/claude-code（npm root -g 下）")
+            : QFileInfo(sPkg).absolutePath();
+        break;
+    }
+    case 2: sLocation = CDeepSeekRunner::DshRootPath(); break;
+    case 3: {
+        const QString sRoot = CPiAgentRunner::PiRootPath();
+        sLocation = sRoot.isEmpty() ? CPiAgentRunner::NpmGlobalCliPath() : sRoot;
+        break;
+    }
+    case 4: sLocation = CCodexRunner::CodexRoot(); break;
+    case 5: {
+        const QString sRoot = CHermesRunner::HermesRoot();
+        sLocation = sRoot.isEmpty() ? CHermesRunner::ResolveHermesCli() : sRoot;
+        break;
+    }
+    default: break;
+    }
+    const QString sHarnessMd = QCoreApplication::applicationDirPath()
+                             + QStringLiteral("/harness.md");
+    const QString sPrompt = BuildAutoFixPrompt(iBackend, asNames[iBackend], sLocation,
+                                               m_asProbeDetail[iBackend], sHarnessMd);
+    emit sigAutoFixRequested(iBackend, iFix, sPrompt);
+    QMessageBox::information(this, QStringLiteral("后端自愈"),
+        QStringLiteral("已请求 %1 后端修复 %2（详见新建的「后端自愈」助手）。\n\n"
+                       "修复过程中请勿关闭生成的助手；完成后回到本窗点「验证所有后端」复检。")
+            .arg(asNames[iFix], asNames[iBackend]));
+}
+
 // —— 纯函数（T6 单测靶点，与 UI 解耦零 IO）——
+
+QString CVersionDialog::BuildAutoFixPrompt(int a_iBackend, const QString& a_sName,
+                                           const QString& a_sLocation,
+                                           const QString& a_sDetail,
+                                           const QString& a_sHarnessMdPath) {
+    // 自愈提示词（用户要求的「情况说明」口径）：故障后端 + 现象 + 安装位置 +
+    //   harness.md 索引 + 五步要求（读档→定位→修复→验证→汇报）。纯函数，无 IO。
+    QString sPrompt = QStringLiteral(
+        "【AutoCode 后端自愈】%1 后端出现故障，请进行修复。\n\n"
+        "- 故障后端：%1\n"
+        "- 故障现象：%2\n"
+        "- %1 的安装/代码位置：%3\n"
+        "- 具体所有后端的启动方式、集成逻辑与常见故障见 harness.md 文件：%4\n\n"
+        "请按以下步骤处理：\n"
+        "1. 先读 %4 了解全部后端（Harness）的启动方式、配置来源与常见故障；\n"
+        "2. 定位本次故障的根因（必要时可读 AutoCode 的 agent 层源码与 %1 自身文件）；\n"
+        "3. 就地修复（重装/重建/修配置/修文件均可；只修 %1 与 AutoCode 的集成层，"
+        "不要改动无关内容，不要删除用户数据）；\n"
+        "4. 修复后运行 harness.md 中该后端的验证命令确认已恢复；\n"
+        "5. 汇报根因与修复措施。")
+        .arg(a_sName,
+             a_sDetail.isEmpty() ? QStringLiteral("可用性验证未通过") : a_sDetail,
+             a_sLocation.isEmpty() ? QStringLiteral("（未解析到，请按 harness.md 探测）")
+                                   : a_sLocation,
+             a_sHarnessMdPath);
+    switch (a_iBackend) {   // 补充各后端专属提示（降低误修面）
+    case 1:
+        sPrompt += QStringLiteral("\n\n注意：Claude Code 由 npm 全局包承载，"
+                                  "重装命令形如 npm install -g @anthropic-ai/claude-code@latest。");
+        break;
+    case 2:
+        sPrompt += QStringLiteral("\n\n注意：DSH 为 node 长驻 JSON-RPC 进程"
+                                  "（node <root>\\apps\\cli\\lib\\bin.js --profile sdk"
+                                  " --patch <AutoCode.exe 同级>\\dsh\\sdk.autocode.patch.yml），"
+                                  "可用 initialize 握手帧验证；新版 llm-pi-ai 启动时会为 "
+                                  "settings 里全部 provider 建 adapter，"
+                                  "GLM_CUSTOM_API_KEY 等环境键缺失会导致全部路由注册失败。");
+        break;
+    case 3:
+        sPrompt += QStringLiteral("\n\n注意：PIAgent 为 pi monorepo（<root>\\pi\\packages"
+                                  "\\coding-agent\\dist\\cli.js），模型路由在 ~/.pi/agent/models.json"
+                                  " 的 autocode-* 槽位。");
+        break;
+    case 4:
+        sPrompt += QStringLiteral("\n\n注意：CodexHarness 为 npm 本地工程（锁定版 0.87.0），"
+                                  "修复即 npm install @openai/codex@0.87.0 --save-exact；"
+                                  "模型路由在 ~/.codex/config.toml + auth.json。");
+        break;
+    case 5:
+        sPrompt += QStringLiteral("\n\n注意：Hermes 为 git 部署（hermes.exe / dist\\cli.js），"
+                                  "修复可用 git fetch + reset 或重跑 pnpm 构建。");
+        break;
+    default:
+        break;
+    }
+    return sPrompt;
+}
 
 QString CVersionDialog::PickLatestTag(const QStringList& a_aLines) {
     // tag 全名规则：^(?:dsh-)?v?(\d+(?:\.\d+)*)([-.].*)?$
