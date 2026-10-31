@@ -16,6 +16,12 @@ const QString CGuideFingerprintScanner::s_sEndMarker =
 const QString CGuideFingerprintScanner::s_sChangeLogHeader =
     QStringLiteral("## 变更日志（增量）");
 
+// 2026-10-22 变更日志段保留上限：每次任务启动前指纹同步追加一条，无上限会随任务数
+//   无界增长；日志仅作近期变更检索，更早历史在备份与 record.md 中均有全文。
+namespace {
+constexpr int k_iChangeLogKeep = 30;
+}
+
 // Q1：默认 size+mtime 方案（不读内容，NFR3）。开启哈希需自行在 ScanProject 补实现。
 bool CGuideFingerprintScanner::s_bEnableHash = false;
 
@@ -406,6 +412,36 @@ bool CGuideFingerprintScanner::WriteIncremental(const QString& a_sGuidePath,
             sNewGuide += QLatin1Char('\n');
         }
         sNewGuide += sLogLine + QStringLiteral("\n");
+        // 2026-10-22 变更日志段保留上限（防无界增长）：只保留最近 k_iChangeLogKeep 条；
+        //   日志条目仅作近期变更检索，更早历史在备份与 record.md 中均有全文。
+        {
+            const int iLog = sNewGuide.indexOf(s_sChangeLogHeader);
+            if (iLog >= 0) {
+                const QStringList aTail = sNewGuide.mid(
+                    iLog + s_sChangeLogHeader.length()).split(QLatin1Char('\n'));
+                // 过滤出条目行（- 开头）；条目前的非空行（说明文字）保留，不计入限额。
+                QStringList aHead, aEntries;
+                for (const QString& sLn : aTail) {
+                    if (sLn.startsWith(QLatin1Char('-'))) {
+                        aEntries.append(sLn);
+                    } else if (aEntries.isEmpty() && !sLn.trimmed().isEmpty()) {
+                        aHead.append(sLn);
+                    }
+                }
+                if (aEntries.size() > k_iChangeLogKeep) {
+                    aEntries = aEntries.mid(aEntries.size() - k_iChangeLogKeep);
+                    QString sTrimmed = sNewGuide.left(iLog) + s_sChangeLogHeader;
+                    for (const QString& sH : aHead) {
+                        sTrimmed += QLatin1Char('\n') + sH;
+                    }
+                    for (const QString& sE : aEntries) {
+                        sTrimmed += QLatin1Char('\n') + sE;
+                    }
+                    sTrimmed += QLatin1Char('\n');
+                    sNewGuide = sTrimmed;
+                }
+            }
+        }
     }
 
     // 6) 临时文件 + rename 原子替换（R2）。UTF-8 with BOM，与 guide.md 编码一致。

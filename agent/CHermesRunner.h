@@ -160,6 +160,7 @@ private:
     void Reset();
     void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
     void ApplyUsage(const QJsonObject& oUsage, bool a_bFromResult = false);
+    void FinishTurnOnResult();                     // 2026.10.29 result 后驻留观察期满终态收尾（见 CheckStall）
     double ComputeTurnCost() const;
     void EmitFailed(const QString& a_sMsg);
 
@@ -195,6 +196,7 @@ private:
     qint64      m_iSumOutTok = 0;
     QStringList m_aStderrTail;            // stderr 尾部（失败消息附带）
     QElapsedTimer m_actClock;             // 距上次收到输出（stall 巡检）
+    qint64 m_iResultSeenMs = 0;           // 2026.10.29 result 事件时刻（0=未见；驻留观察收尾基准）
     QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
     quint32     m_uStageSeq = 0;   // 2026-10-07 StartStage 代序（并发模型配置写入的延迟重入守卫：迟发回调发现代序已变/已被 Stop 即放弃）
 };

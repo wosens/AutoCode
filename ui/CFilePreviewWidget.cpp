@@ -16,16 +16,159 @@
 #include <QTextCursor>
 #include <QTextDocument>
 #include <QTextBlock>
+#include <QTextTable>
+#include <QTextTableFormat>
+#include <QTextFrame>
+#include <QFontDatabase>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QEventLoop>
+#include <QElapsedTimer>
+#include <QHash>
+#include <QSet>
+#include <QUrl>
+#include <QStringList>
 #include <QPalette>
 #include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QDir>
 #include "CMenuIcon.h"
+#include "CCodeSyntaxView.h"
+#include "CProjectManager.h"   // 2026-10-31 LoadCodeSyntax（[View] CodeSyntax；target 含 project/ 目录）
 
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
+
+// ————————————————————————————————————————————————
+// Markdown 增强视图（2026-10-26，用户需求：md 文件支持图标和表格）：
+//   ①远程图片 http(s) 拉取——QTextBrowser 默认不取网络资源，shields.io 徽章/
+//     CDN 图标全部裂图；重载 loadResource 同步拉取（嵌套事件循环取图，
+//     ExcludeUserInputEvents 防用户重入）+ 每 URL 一次尝试的失败缓存 + 拉取预算
+//     （单文档 48 张 / 首图起 15s 总时长，防坏链页面卡死）；取图重入用 m_aFetching
+//     哨兵拦截（取图等待期间同 URL 的重入先返空占位，完成后缓存命中）。
+//   ②相对地址解析对齐 baseUrl——markdown ![](rel) 的相对图片/链接由文档 baseUrl
+//     解析（ShowFile 里 setBaseUrl；旧 RewriteLocalUrls 的 src|href 正则碰不到
+//     markdown 语法，相对图片全部裂图）。
+// 注意：加载在布局/绘制路径内同步发生（QTextImageHandler→resource→loadResource），
+//   网络等待期间界面无响应属预期（预算封顶）；单测用本地 QTcpServer 离线覆盖。
+// ————————————————————————————————————————————————
+namespace {
+
+class CMdBrowser : public QTextBrowser {
+public:
+    explicit CMdBrowser(QWidget* a_pParent = nullptr)
+        : QTextBrowser(a_pParent) {
+    }
+
+    QVariant loadResource(int a_iType, const QUrl& a_url) override {
+        if (a_iType == QTextDocument::ImageResource) {
+            QUrl stUrl = a_url;
+            if (stUrl.isRelative() && !stUrl.isEmpty()) {
+                const QUrl stBase = document()->baseUrl();
+                if (!stBase.isEmpty()) {
+                    stUrl = stBase.resolved(stUrl);   // 缓存键/回退类加载均用解析后的绝对 URL
+                }
+            }
+            const QString sScheme = stUrl.scheme().toLower();
+            if (sScheme == QLatin1String("http") || sScheme == QLatin1String("https")) {
+                if (m_aCache.contains(stUrl)) {
+                    return m_aCache.value(stUrl);    // 命中（含失败空占位：每 URL 只拉一次）
+                }
+                if (m_aFetching.contains(stUrl)) {
+                    return QVariant();               // 取图等待期重入（重绘）：本轮空占位
+                }
+                m_aFetching.insert(stUrl);
+                const QVariant stImg = FetchRemote(stUrl);
+                m_aFetching.remove(stUrl);
+                m_aCache.insert(stUrl, stImg);
+                return stImg;
+            }
+        }
+        return QTextBrowser::loadResource(a_iType, a_url);
+    }
+
+private:
+    QVariant FetchRemote(const QUrl& a_url) {
+        // 预算：单文档 48 张 + 首图起 15s 总时长（防坏链/海量远程图卡死预览）
+        if (m_iFetched >= 48) {
+            return QVariant();
+        }
+        if (m_iFetched == 0) {
+            m_tBudget.start();
+        }
+        ++m_iFetched;
+        if (m_tBudget.isValid() && m_tBudget.elapsed() > 15000) {
+            return QVariant();
+        }
+        if (m_pNam == nullptr) {
+            m_pNam = new QNetworkAccessManager(this);
+        }
+        QNetworkRequest stReq(a_url);
+        stReq.setTransferTimeout(5000);          // 单请求 5s 超时
+        stReq.setRawHeader("User-Agent", "AutoCode-FilePreview/1.0");
+        stReq.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                           QNetworkRequest::NoLessSafeRedirectPolicy);
+        QNetworkReply* pReply = m_pNam->get(stReq);
+        QEventLoop stLoop;
+        QObject::connect(pReply, &QNetworkReply::finished, &stLoop, &QEventLoop::quit);
+        stLoop.exec(QEventLoop::ExcludeUserInputEvents);   // 等待期不处理用户输入防重入雪崩
+        pReply->deleteLater();
+        if (pReply->error() != QNetworkReply::NoError) {
+            return QVariant();
+        }
+        QImage stImg;
+        if (!stImg.loadFromData(pReply->readAll())) {
+            return QVariant();                   // 非 PNG/JPG/SVG 可解码体：按失败缓存
+        }
+        return QVariant(stImg);
+    }
+
+    QHash<QUrl, QVariant>   m_aCache;             // 解析后 URL → 结果（含失败空占位）
+    QSet<QUrl>              m_aFetching;          // 取图中哨兵（重入拦截）
+    QNetworkAccessManager*  m_pNam     = nullptr;
+    int                     m_iFetched = 0;
+    QElapsedTimer           m_tBudget;
+};
+
+// markdown 表格样式：Qt 导入器生成的 QTextTable 自带 BorderStyle_Outset（3D 凸边，
+//   视觉上老旧散架）且无内边距，首行表头无标识。归一化为 1px 灰色平面网格 +
+//   单元格内边距 + 表头行加粗/浅灰底；递归覆盖嵌套表。仅在 setMarkdown 后对新
+//   文档调用（幂等：重复调用结果相同，不叠加）。
+void StyleMdTables(QTextFrame* a_pFrame) {
+    for (QTextFrame::iterator it = a_pFrame->begin(); !it.atEnd(); ++it) {
+        QTextFrame* pChild = it.currentFrame();
+        if (pChild == nullptr) {
+            continue;
+        }
+        if (QTextTable* pTable = qobject_cast<QTextTable*>(pChild)) {
+            QTextTableFormat stFmt = pTable->format();
+            stFmt.setBorderStyle(QTextFrameFormat::BorderStyle_Solid);
+            stFmt.setBorderBrush(QColor(0xd0, 0xd7, 0xde));
+            stFmt.setBorder(1);
+            stFmt.setCellSpacing(0);
+            stFmt.setCellPadding(4);
+            pTable->setFormat(stFmt);
+            if (pTable->rows() > 0) {
+                QTextCharFormat stHead;              // 表头行：加粗 + 浅灰底
+                stHead.setFontWeight(QFont::Bold);
+                stHead.setBackground(QColor(0xf6, 0xf8, 0xfa));
+                for (int iCol = 0; iCol < pTable->columns(); ++iCol) {
+                    const QTextTableCell stCell = pTable->cellAt(0, iCol);
+                    QTextCursor stCur = stCell.firstCursorPosition();
+                    stCur.setPosition(stCell.lastCursorPosition().position(),
+                                      QTextCursor::KeepAnchor);
+                    stCur.mergeCharFormat(stHead);
+                }
+            }
+        }
+        StyleMdTables(pChild);                           // 嵌套（表内表/引用块内表）
+    }
+}
+
+} // namespace
 
 // ————————————————————————————————————————————————
 // 十六进制视图：QSplitter 左右双区（等宽 QPlainTextEdit），滚动同步。
@@ -213,11 +356,24 @@ void CFilePreviewWidget::BuildUi() {
     m_pStack->addWidget(m_pText);
 
     // [1] Markdown
-    m_pMd = new QTextBrowser(m_pStack);
+    m_pMd = new CMdBrowser(m_pStack);
     m_pMd->setReadOnly(true);
     m_pMd->setOpenExternalLinks(true);
     QFont fMd;
     fMd.setPointSize(11);
+    // emoji/符号回退链（2026-10-26）：Windows 缺省 UI 字体不含彩色 emoji 字形，
+    //   把 Segoe UI Emoji（彩色）与 Segoe UI Symbol 挂进 families，
+    //   md 里的图标（✅🚀⚠️等）优先走彩色 emoji 字体而非方框；平台无该字体时列表
+    //   退化为单家（offscreen 等无字体环境零影响）
+    QStringList aMdFams;
+    aMdFams << fMd.family();
+    const QStringList aFams = QFontDatabase::families();
+    for (const QString& sCand : {QStringLiteral("Segoe UI Emoji"), QStringLiteral("Segoe UI Symbol")}) {
+        if (!aMdFams.contains(sCand) && aFams.contains(sCand)) {
+            aMdFams << sCand;
+        }
+    }
+    fMd.setFamilies(aMdFams);
     m_pMd->setFont(fMd);
     ApplyFindSelectionPalette(m_pMd);
     m_pStack->addWidget(m_pMd);
@@ -233,6 +389,16 @@ void CFilePreviewWidget::BuildUi() {
     // [3] 十六进制
     m_pHexWrap = new CFileHexView(m_pStack);
     m_pStack->addWidget(m_pHexWrap);
+
+    // [4] 源码语法渲染（2026-10-31 CodeStyle 模块：DLL 缺失/视图名额被占时 IsOk=false，
+    //   ShowFile 对源码后缀自动回退纯文本页；Ctrl+F 快捷键在原生窗口内由
+    //   CCodeSyntaxView 代听转发到本类查找栏）。
+    m_pCode = new CCodeSyntaxView(m_pStack);
+    if (m_pCode->IsOk()) {
+        connect(m_pCode, &CCodeSyntaxView::sigFindRequested,
+                this, &CFilePreviewWidget::OnFindOpen);
+    }
+    m_pStack->addWidget(m_pCode);
 
     // 底部状态栏
     m_pStat = new QLabel(this);
@@ -379,10 +545,20 @@ bool CFilePreviewWidget::FindText(const QString& a_sText, bool a_bBackward,
         return static_cast<CFileHexView*>(m_pHexWrap)
             ->FindText(a_sText, a_bBackward, a_bCase, a_bWrap);
     }
+    // 2026-10-31 源码语法页：Scintilla 目标区搜索（命中选中滚动；循环回卷同口径）。
+    if (pCur == m_pCode && m_pCode != nullptr) {
+        return m_pCode->FindText(a_sText, a_bBackward, a_bCase, a_bWrap);
+    }
     if (QTextBrowser* pView = qobject_cast<QTextBrowser*>(pCur)) {
         return FindInEditor(pView, a_sText, a_bBackward, a_bCase, a_bWrap);
     }
     return false;
+}
+
+// 2026-10-31 源码语法页在用判定（单测/状态观察；未创建/未命中当前页=否）。
+bool CFilePreviewWidget::IsCodeViewActive() const {
+    return (m_pCode != nullptr) && m_pCode->IsOk()
+           && m_pStack->currentWidget() == m_pCode;
 }
 
 void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
@@ -444,16 +620,45 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
     if (bTrunc) {
         sText += QStringLiteral("\n\n……（文件超过 4MB，已截断显示）");
     }
-    // 按后缀分发（md/html 带格式，其余纯文本）
+    // 按后缀分发（md/html 带格式，其余纯文本；源码文件优先语法渲染页）
     if (sSuffix == QStringLiteral("md") || sSuffix == QStringLiteral("markdown")) {
+        // 2026-10-26 md 增强三件：①setBaseUrl——markdown 图片 ![](rel) 相对路径
+        //   解析（旧 RewriteLocalUrls 只重写 src|href（HTML 语法），markdown 语法的
+        //   相对图片全部裂图；baseUrl 同时修正文档内嵌 HTML 的相对资源与锚点）
+        m_pMd->document()->setBaseUrl(
+            QUrl::fromLocalFile(stInfo.absolutePath() + QLatin1Char('/')));
         m_pMd->setMarkdown(RewriteLocalUrls(sText, stInfo.absolutePath()));
+        // ②表格网格线/表头（Qt 导入器生成的表零样式，视觉上散架）
+        StyleMdTables(m_pMd->document()->rootFrame());
+        // ③远程 http(s) 图片同步拉取（徽章/CDN 图标，预算封顶）由 CMdBrowser::loadResource
         m_pStack->setCurrentWidget(m_pMd);
     } else if (sSuffix == QStringLiteral("html") || sSuffix == QStringLiteral("htm")) {
         m_pHtml->setHtml(RewriteLocalUrls(sText, stInfo.absolutePath()));
         m_pStack->setCurrentWidget(m_pHtml);
     } else {
-        m_pText->setPlainText(sText);
-        m_pStack->setCurrentWidget(m_pText);
+        // 2026-10-31 源码文件 → CodeStyle 语法渲染页（设置 [View] CodeSyntax 默认开；
+        //   DLL 缺失/视图不可用/非源码后缀回退纯文本）。文本回编码 UTF-8（GBK 等
+        //   本地编码已探测解码，重编码后字节口径与 Scintilla/spans 天然对齐）。
+        //   ≤1MB 同步做 tree-sitter 语义分档（全量解析无增量，大文件只词法着色）。
+        static const QSet<QString> s_aCodeExt = {
+            QStringLiteral("c"),   QStringLiteral("cpp"), QStringLiteral("cc"),
+            QStringLiteral("cxx"), QStringLiteral("c++"), QStringLiteral("h"),
+            QStringLiteral("hh"),  QStringLiteral("hpp"), QStringLiteral("hxx"),
+            QStringLiteral("h++"), QStringLiteral("inl"), QStringLiteral("ipp"),
+            QStringLiteral("tcc"), QStringLiteral("hm"),
+        };
+        const QByteArray aU8 = sText.toUtf8();
+        if (s_aCodeExt.contains(sSuffix) && CProjectManager::LoadCodeSyntax()
+                && m_pCode != nullptr && m_pCode->IsOk()
+                && m_pCode->ShowSource(aU8, sSuffix != QLatin1String("c"),
+                                       aU8.size() <= 1024 * 1024)) {
+            m_pStat->setText(m_pStat->text()
+                             + QStringLiteral(" · 语法高亮"));
+            m_pStack->setCurrentWidget(m_pCode);
+        } else {
+            m_pText->setPlainText(sText);
+            m_pStack->setCurrentWidget(m_pText);
+        }
     }
 }
 
@@ -565,6 +770,11 @@ void CFilePreviewWidget::ShowHex(const QByteArray& a_aBytes) {
 // 十六进制无行号语义忽略）。当前栈页非文本类时优先在对应浏览器上定位（文件已加载）。
 void CFilePreviewWidget::GotoLine(int a_iLine) {
     if (a_iLine < 1) {
+        return;
+    }
+    // 2026-10-31 源码语法页：Scintilla 行定位（整行选中滚动；审查目标均代码文件）。
+    if (IsCodeViewActive()) {
+        m_pCode->GotoLine(a_iLine);
         return;
     }
     QTextBrowser* pView = qobject_cast<QTextBrowser*>(m_pStack->currentWidget());

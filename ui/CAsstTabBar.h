@@ -18,9 +18,13 @@
 //     热区才 emit tabCloseRequested；
 //   · 双击：mouseDoubleClickEvent 按多行命中自查 → emit tabBarDoubleClicked
 //     （面板接它做助手改名；基类按自身单行布局命中的话会点错页）；
-//   · 拖拽重排：按住拖动超阈值拖起（其余 Tab 按“插入后顺序”滑移让位留洞、
-//     被拖 Tab 半透明跟随光标），松手经 moveTab 落位（emit tabMoved，
-//     QTabWidget 监听该信号同步页序）；
+//   · 拖拽重排（2026-10-23 VS 口径重做）：按住拖动超阈值拖起（被拖 Tab 半透明
+//     浮起跟随光标）；换位判定锚 = 浮动 Tab 几何（中心对中心，视觉过半重叠即
+//     换位，与抓取点无关——旧口径锚光标，抓「x」附近拖动时落点常被带偏）；换位
+//     后其余 Tab 滑移动画让位（150ms OutCubic），对方中心随让位移开约一个被拖
+//     Tab 宽 → 回翻需明显反向拖动，天然迟滞不回抖；松手被拖 Tab 从光标处平滑
+//     滑入落位，moveTab 落位后 emit tabMoved（QTabWidget 监听同步页序）。常规
+//     布局变化（换行/增删/改名变宽）同走滑移动画。
 //   · 基类 tabRect/tabAt 返回的是它自己单行布局的结果，与多行视觉不一致
 //     ——外部定位一律改用本类 TabRectAt/TabAtPos（面板右键菜单与自测钩子）；
 //     tooltip 亦在 event() 里按自绘布局命中自处理。
@@ -34,6 +38,7 @@
 #include <QTabWidget>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QVariantAnimation>   // 2026-10-23 布局位移动画（拖拽让位/落位/换行滑移）
 #include <QSet>
 #include <QVector>
 #include <QStyleOptionTab>
@@ -114,6 +119,13 @@ public:
     int DropInsertAt(const QPoint& a_pt) const;  // 拖拽光标 → 抽出后插入位（moveTab 语义）
     void SyncBlinkTimer();                       // 有运行页 → 启闪点时钟；全停 → 止
 
+    // —— 2026-10-23 布局滑移动画（VS 丝滑三件套之一）——
+    // 当前显示位表：布局 rect 经动画插值（无动画 = 布局位；拖拽中被拖项 = 浮动
+    //   位）。paint/落位起点/重定向起点三处共用。
+    QVector<QRect> CurrentRects() const;
+    // 起新动画段（from→to 按索引对齐；from 越界/空 = 直接出现）。无位移时静默定格。
+    void PlayRectAnim(const QVector<QRect>& aFrom, const QVector<QRect>& aTo);
+
     QTimer m_blinkTimer;       // 闪点变色时钟（500ms/拍，只触发重绘）
     QElapsedTimer m_blinkElapsed;   // 闪点连续运行起点（取模得当前颜色相位）
     QSet<QWidget*> m_runPages; // 运行中的页集合（页指针键，拖动/改名不失效）
@@ -140,6 +152,12 @@ public:
     int m_iDragTo = -1;        // 插入位（抽出后位置，moveTab(from, to) 直用）
     QVector<int> m_dragOrder;  // 插入后显示顺序（含被拖项，滑移让位画洞用）
     LayoutResult m_dragLayout; // 拖拽预览布局（被拖项 rect = 占位洞）
+
+    // —— 2026-10-23 布局滑移动画状态（CurrentRects/PlayRectAnim 驱动）——
+    QVariantAnimation m_rectAnim;   // 进度驱动（0→1，150ms OutCubic，valueChanged → update）
+    QVector<QRect> m_rectAnimFrom;  // 本段动画起点表（按索引；空项 = 直接出现）
+    double m_dAnimProg = 1.0;       // 当前进度（无动画 = 1）
+    bool m_bAnimValid = false;      // 动画段进行中
 };
 
 class CAsstTabWidget : public QTabWidget

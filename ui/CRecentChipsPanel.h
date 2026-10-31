@@ -47,6 +47,13 @@ public:
     //   PM RemoveRecent + 面板 Refresh；空回调 = 右键菜单「删除」项不触发）。
     using FRemoveProject = std::function<void(const QString&)>;
 
+    // 2026-10-31 用户尺寸下限（原 cpp 文件局部常量提升公开）：启动页窗口需按
+    //   面板下限设置显式最小尺寸（面板自身 setFixedSize 会使布局推导的窗口
+    //   最小值=当前尺寸 → 窗口拖边只能调大不能调小，见 CRecentProjectsDialog
+    //   SetupLauncherUi 显式 setMinimumSize 注）。
+    static constexpr int kChipMinW = 360;   // 用户尺寸下限（能容纳 2~3 个按钮列）
+    static constexpr int kChipMinH = 240;   // 下限（状态栏 + 约 6 行）
+
     CRecentChipsPanel(FOpenProject a_fnOpen, FMore a_fnMore,
                       QWidget* a_pParent = nullptr,
                       const FCfgPath& a_fnCfgPath = FCfgPath(),

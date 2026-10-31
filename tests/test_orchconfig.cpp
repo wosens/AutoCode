@@ -35,6 +35,27 @@ int main(int argc, char* argv[]) {
     CHECK(pF0 != nullptr && pF0->aStages.first() == "intake" && pF0->aStages.last() == "test",
           "feature flow order intake..test");
 
+    // ①b 基础档位规范预设（2026-10-23 档位编辑切基础档位联动重置的单一事实源）：
+    //   simple = 全集-{需求评审/设计/设计评审/计划/计划评审/根因核实}；standard = 全集；
+    //   种子三档与之一致（同源生成，永不漂移）。
+    {
+        QStringList aAll;
+        for (const SOrchStage& s : p->aStages) {
+            aAll.append(s.sId);
+        }
+        const QStringList aSimple = COrchConfig::BaseTierPresetStages("simple", aAll);
+        const QStringList aStd = COrchConfig::BaseTierPresetStages("standard", aAll);
+        CHECK(aSimple.size() == 8 && !aSimple.contains("design")
+                  && !aSimple.contains("review_requirements")
+                  && !aSimple.contains("root_cause_verify")
+                  && aSimple.contains("develop") && aSimple.contains("intake"),
+              "base simple preset = 8 stages (skip design chain + root cause verify)");
+        CHECK(aStd == aAll, "base standard preset = full set");
+        const SOrchTier* pT0 = p->FindTierCfg("simple");
+        CHECK(pT0 != nullptr && pT0->aStages == aSimple,
+              "seed simple tier == base preset (same source)");
+    }
+
     // ② 动态注册前：自定义枚举不可见；注册一个自定义阶段
     SOrchStage stCustom;
     stCustom.sId = "deploy"; stCustom.sName = QStringLiteral("部署");

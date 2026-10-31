@@ -1,5 +1,7 @@
 #include "CCodexProxy.h"
 
+#include <QDir>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkProxy>
@@ -25,6 +27,87 @@ QByteArray CCodexProxy::RewriteChatRequestBody(const QByteArray& a_sBody, int a_
     return QJsonDocument(oRoot).toJson(QJsonDocument::Compact);
 }
 
+qint64 CCodexProxy::EstimatePromptTokens(const QByteArray& a_sBody) {
+    // 2026-10-31 上下文估算（口径标定见头文件注释）：请求体字节/4。非 JSON
+    //   /非 chat 载荷同样按字节估（调用方仅在 chat 转发路径使用）。
+    return a_sBody.size() / 4;
+}
+
+// —— 2026-10-31 响应侧 SSE workdir 消毒（OpenCompare 实害 os error 267）——
+
+QString CCodexProxy::SanitizeToolArguments(const QString& a_sArgs, const QString& a_sBaseDir,
+                                           QString* a_pBadDir) {
+    if (a_pBadDir != nullptr) {
+        a_pBadDir->clear();
+    }
+    QJsonParseError stErr;
+    const QJsonDocument oDoc = QJsonDocument::fromJson(a_sArgs.toUtf8(), &stErr);
+    if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
+        return a_sArgs;   // 非 JSON 对象（工具参数非惯例形态）：原样
+    }
+    QJsonObject o = oDoc.object();
+    const QJsonValue v = o.value(QStringLiteral("workdir"));
+    if (!v.isString()) {
+        return a_sArgs;   // 无 workdir / 非字符串：无需消毒
+    }
+    QString sDir = v.toString().trimmed();
+    if (sDir.isEmpty()) {
+        return a_sArgs;
+    }
+    // 绝对路径直接验存在；相对路径以会话目录为基准（基准未知时放行，不误杀）。
+    if (!QDir::isAbsolutePath(sDir) && a_sBaseDir.isEmpty()) {
+        return a_sArgs;
+    }
+    const QString sAbs = QDir::isAbsolutePath(sDir)
+                         ? sDir : QDir(a_sBaseDir).filePath(sDir);
+    if (QDir(sAbs).exists()) {
+        return a_sArgs;   // 目录存在（含模型正常切子目录）：放行
+    }
+    if (a_pBadDir != nullptr) {
+        *a_pBadDir = sDir;
+    }
+    o.remove(QStringLiteral("workdir"));
+    return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+
+QByteArray CCodexProxy::BuildArgsDeltaChunk(int a_iChoice, int a_iTc, const QString& a_sId,
+                                             const QString& a_sModel, qint64 a_llCreated,
+                                             const QString& a_sArgs) {
+    QJsonObject oFn;
+    oFn.insert(QStringLiteral("arguments"), a_sArgs);
+    QJsonObject oTc;
+    oTc.insert(QStringLiteral("index"), a_iTc);
+    oTc.insert(QStringLiteral("function"), oFn);
+    QJsonObject oDelta;
+    oDelta.insert(QStringLiteral("tool_calls"), QJsonArray{ oTc });
+    QJsonObject oChoice;
+    oChoice.insert(QStringLiteral("index"), a_iChoice);
+    oChoice.insert(QStringLiteral("delta"), oDelta);
+    QJsonObject oRoot;
+    if (!a_sId.isEmpty()) {
+        oRoot.insert(QStringLiteral("id"), a_sId);
+    }
+    if (!a_sModel.isEmpty()) {
+        oRoot.insert(QStringLiteral("model"), a_sModel);
+    }
+    if (a_llCreated > 0) {
+        oRoot.insert(QStringLiteral("created"), double(a_llCreated));
+    }
+    oRoot.insert(QStringLiteral("object"), QStringLiteral("chat.completion.chunk"));
+    oRoot.insert(QStringLiteral("choices"), QJsonArray{ oChoice });
+    return QStringLiteral("data: %1\n\n")
+               .arg(QString::fromUtf8(QJsonDocument(oRoot).toJson(QJsonDocument::Compact)))
+               .toUtf8();
+}
+
+// chunked 帧包装（消毒路径重编码用；帧内容非空才发）。
+static QByteArray WrapChunked(const QByteArray& a_sData) {
+    if (a_sData.isEmpty()) {
+        return QByteArray();
+    }
+    return QByteArray::number(a_sData.size(), 16) + "\r\n" + a_sData + "\r\n";
+}
+
 CCodexProxy::CCodexProxy(QObject* a_pParent)
     : QObject(a_pParent) {
     m_pServer = new QTcpServer(this);
@@ -37,10 +120,12 @@ CCodexProxy::~CCodexProxy() {
     Shutdown();
 }
 
-bool CCodexProxy::Start(const QUrl& a_sTargetBase, int a_iMaxTokens) {
+bool CCodexProxy::Start(const QUrl& a_sTargetBase, int a_iMaxTokens,
+                        const QString& a_sWorkDir) {
     Shutdown();
     m_urlTarget = a_sTargetBase;
     m_iMaxTokens = a_iMaxTokens;
+    m_sWorkDir = a_sWorkDir;
     m_aUpTail.clear();
     if (!m_pServer->listen(QHostAddress::LocalHost, 0)) {
         return false;
@@ -189,6 +274,11 @@ void CCodexProxy::TryForward(SConn* a_pConn) {
             }
             sNewHead += "\r\n";   // 头/体分隔空行
             sOut = sNewHead + sBody;
+            // 2026-10-31 请求时估算 prompt token（上下文条兑底数据源）：网关对
+            //   大会话流常在尾部 usage 块前掐断连接（OpenCompare 实害：193 次
+            //   请求零 usage、实际 95 万 token 时条上只显 148）——估算仅作用于
+            //   上下文显示/闸门，费用统计仍只认真实 usage（sigUsage），不双计。
+            emit sigPromptEstimate(EstimatePromptTokens(sBody));
         } else {
             sOut = a_pConn->reqHead + a_pConn->buf;
             a_pConn->buf.clear();
@@ -200,23 +290,35 @@ void CCodexProxy::TryForward(SConn* a_pConn) {
         if (!m_aConns.contains(a_pConn) || a_pConn->pClient == nullptr) {
             return;
         }
+        // 2026-10-31 chunked+SSE 响应进入消毒重写路径（workdir 幻觉拦截），
+        //   其余（头未收全/非 chunked/非 SSE）盲转发字节级透传。
         const QByteArray aChunk = pUp->readAll();
-        a_pConn->pClient->write(aChunk);   // 响应（含 SSE 流）原样回客户端
-        ScanUsage(aChunk);                 // 顺带提取真实 usage（任务统计）
+        a_pConn->pClient->write(ProcessUpstream(a_pConn, aChunk));
     });
     connect(pUp, &QTcpSocket::disconnected, this, [this, a_pConn]() {
         if (!m_aConns.contains(a_pConn)) {
             return;
         }
-        // 上游关连接（网关 connection: close）：回写收尾后关客户端。
+        // 上游关连接（网关 connection: close）：重写模式下先冲刷扣留的
+        //   tool_call 参数并补终止帧（codex 能拿到完整参数执行），再回写收尾。
+        if (a_pConn->pClient != nullptr && a_pConn->eResp == 2) {
+            a_pConn->pClient->write(FlushHeld(a_pConn) + "0\r\n\r\n");
+        }
         if (a_pConn->pClient != nullptr) {
             a_pConn->pClient->flush();
             a_pConn->pClient->disconnectFromHost();
         }
     });
     connect(pUp, &QTcpSocket::errorOccurred, this,
-            [this, a_pConn](QTcpSocket::SocketError) {
+            [this, a_pConn](QTcpSocket::SocketError a_eError) {
         if (!m_aConns.contains(a_pConn)) {
+            return;
+        }
+        // 2026-10-31 网关正常关连接（Connection: close）在部分时序下会先报
+        //   RemoteHostClosedError——若走 FailConn 会往已完整回写的响应尾部追加
+        //   一段垃圾 502 响应，污染 codex 的 HTTP 流（疑似进程退出码 -1 成因）。
+        //   远端关闭交由 disconnected 处理器（冲刷扣留 + 收尾）。
+        if (a_eError == QTcpSocket::RemoteHostClosedError) {
             return;
         }
         FailConn(a_pConn, QStringLiteral("上游连接失败"));
@@ -236,6 +338,221 @@ void CCodexProxy::FailConn(SConn* a_pConn, const QString& a_sWhy) {
     }
     CleanupConn(a_pConn);
     Q_UNUSED(a_sWhy);
+}
+
+QByteArray CCodexProxy::FlushHeld(SConn* a_pConn) {
+    // 冲刷全部扣留的 tool_call arguments：逐个消毒（幻觉 workdir 剔除 + 留痕）
+    //   后合成完整 arguments 块（codex 按 index 归并到已收到的 id/name 上）。
+    //   先取副本再清空：sigWorkdirGuard 同步进入 runner/UI，防重入改表。  
+    if (a_pConn->aHeld.isEmpty()) {
+        return QByteArray();
+    }
+    const QList<SHeldArgs> aHeld = a_pConn->aHeld;
+    a_pConn->aHeld.clear();
+    QByteArray aOut;
+    for (const SHeldArgs& st : aHeld) {
+        QString sBad;
+        const QString sArgs = SanitizeToolArguments(st.sArgs, m_sWorkDir, &sBad);
+        if (!sBad.isEmpty()) {
+            emit sigWorkdirGuard(sBad);
+        }
+        aOut += WrapChunked(BuildArgsDeltaChunk(st.iChoice, st.iTc, st.sId, st.sModel,
+                                                st.llCreated, sArgs));
+    }
+    return aOut;
+}
+
+QByteArray CCodexProxy::ProcessSseLine(SConn* a_pConn, const QByteArray& a_sLine) {
+    const QByteArray sTrim = a_sLine.trimmed();
+    if (!sTrim.startsWith("data:")) {
+        return a_sLine;   // 空行 / 注释 / event: 等透传
+    }
+    QByteArray sPayload = sTrim.mid(5);
+    if (sPayload.startsWith(' ')) {
+        sPayload.remove(0, 1);
+    }
+    const bool bDone = sPayload == "[DONE]";
+    // finish 块（非 null）意味着本 choice 流收尾：先冲刷扣留参数再放行，保序。
+    const bool bFinish = !bDone && sPayload.contains("\"finish_reason\"")
+                         && !sPayload.contains("\"finish_reason\":null");
+    QJsonParseError stErr;
+    const QJsonDocument oDoc = QJsonDocument::fromJson(sPayload, &stErr);
+    if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
+        return (bDone ? FlushHeld(a_pConn) : QByteArray()) + a_sLine;
+    }
+    QJsonObject oRoot = oDoc.object();
+    const QJsonValue vChoices = oRoot.value(QStringLiteral("choices"));
+    if (!vChoices.isArray()) {
+        return (bDone || bFinish ? FlushHeld(a_pConn) : QByteArray()) + a_sLine;
+    }
+    QJsonArray aChoices = vChoices.toArray();
+    bool bModified = false;
+    for (int iC = 0; iC < aChoices.size(); ++iC) {
+        QJsonObject oChoice = aChoices.at(iC).toObject();
+        QJsonObject oDelta = oChoice.value(QStringLiteral("delta")).toObject();
+        const QJsonValue vTcs = oDelta.value(QStringLiteral("tool_calls"));
+        if (!vTcs.isArray()) {
+            continue;
+        }
+        QJsonArray aTcsNew;
+        bool bTcMod = false;
+        for (int iT = 0; iT < vTcs.toArray().size(); ++iT) {
+            QJsonObject oTc = vTcs.toArray().at(iT).toObject();
+            QJsonObject oFn = oTc.value(QStringLiteral("function")).toObject();
+            if (!oFn.contains(QStringLiteral("arguments"))) {
+                aTcsNew.append(oTc);   // 无 arguments 增量（id/name 行）：原样
+                continue;
+            }
+            // 扣留 arguments 增量（按 choice+tc 索引归并；首个块顺带记录 id/model）。
+            const int iTcIdx = oTc.value(QStringLiteral("index")).toInt(iT);
+            SHeldArgs* pHeld = nullptr;
+            for (SHeldArgs& st : a_pConn->aHeld) {
+                if (st.iChoice == iC && st.iTc == iTcIdx) {
+                    pHeld = &st;
+                    break;
+                }
+            }
+            if (pHeld == nullptr) {
+                SHeldArgs stNew;
+                stNew.iChoice = iC;
+                stNew.iTc = iTcIdx;
+                stNew.sId = oRoot.value(QStringLiteral("id")).toString();
+                stNew.sModel = oRoot.value(QStringLiteral("model")).toString();
+                stNew.llCreated = qint64(oRoot.value(QStringLiteral("created")).toDouble());
+                a_pConn->aHeld.append(stNew);
+                pHeld = &a_pConn->aHeld.last();
+            }
+            pHeld->sArgs += oFn.value(QStringLiteral("arguments")).toString();
+            // 重建本 tc 条目（去 arguments，保留 id/type/name 供 codex 归位）；
+            //   剥后字段全空则整条丢弃（纯参数增量块不透传，冲刷时统一回填）。
+            oFn.remove(QStringLiteral("arguments"));
+            if (!oFn.isEmpty()) {
+                oTc.insert(QStringLiteral("function"), oFn);
+            } else {
+                oTc.remove(QStringLiteral("function"));
+            }
+            if (!oTc.isEmpty()) {
+                aTcsNew.append(oTc);
+            }
+            bTcMod = true;
+        }
+        if (!bTcMod) {
+            continue;
+        }
+        if (aTcsNew.isEmpty()) {
+            oDelta.remove(QStringLiteral("tool_calls"));
+        } else {
+            oDelta.insert(QStringLiteral("tool_calls"), aTcsNew);
+        }
+        oChoice.insert(QStringLiteral("delta"), oDelta);
+        aChoices.replace(iC, oChoice);
+        bModified = true;
+    }
+    QByteArray aFlush;
+    if (bDone || bFinish) {
+        aFlush = FlushHeld(a_pConn);
+    }
+    if (!bModified) {
+        return aFlush + a_sLine;   // 与工具参数无关：字节级透传
+    }
+    oRoot.insert(QStringLiteral("choices"), aChoices);
+    return aFlush + "data: "
+           + QJsonDocument(oRoot).toJson(QJsonDocument::Compact) + "\n";
+}
+
+QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChunk) {
+    if (a_pConn->eResp == 1) {
+        ScanUsage(a_pChunk);
+        return a_pChunk;   // 盲转发（非 chunked / 非 SSE / 帧异常降级）
+    }
+    QByteArray aOut;
+    if (a_pConn->eResp == 0) {
+        // —— 头阶段：收全 \r\n\r\n 后判定响应模式 ——
+        a_pConn->aRespHead += a_pChunk;
+        const int iEnd = a_pConn->aRespHead.indexOf("\r\n\r\n");
+        if (iEnd < 0) {
+            return QByteArray();
+        }
+        const QByteArray sHead = a_pConn->aRespHead.left(iEnd + 4);
+        a_pConn->aUpIn = a_pConn->aRespHead.mid(iEnd + 4);
+        a_pConn->aRespHead.clear();
+        const QByteArray sHeadLow = sHead.toLower();
+        const bool bChunked = sHeadLow.contains("transfer-encoding")
+                              && sHeadLow.contains("chunked");
+        const bool bSse = sHeadLow.contains("content-type")
+                          && sHeadLow.contains("text/event-stream");
+        aOut += sHead;
+        a_pConn->eResp = (bChunked && bSse) ? 2 : 1;
+        if (a_pConn->eResp == 1) {
+            ScanUsage(a_pConn->aUpIn);
+            aOut += a_pConn->aUpIn;
+            a_pConn->aUpIn.clear();
+            return aOut;
+        }
+    } else {
+        a_pConn->aUpIn += a_pChunk;
+    }
+    // —— 重写模式：chunked 解码 → SSE 行消毒 → 重编码 ——
+    QByteArray aBody;
+    while (true) {
+        if (a_pConn->llChunkRemain == -1) {
+            const int iCrlf = a_pConn->aUpIn.indexOf("\r\n");
+            if (iCrlf < 0) {
+                break;   // 尺寸行未收全（跨读保留）
+            }
+            const QByteArray sSize = a_pConn->aUpIn.left(iCrlf).split(';').first().trimmed();
+            a_pConn->aUpIn.remove(0, iCrlf + 2);
+            bool bOk = false;
+            const qint64 llSize = sSize.toLongLong(&bOk, 16);
+            if (!bOk) {
+                // 帧损坏（不应发生）：先补发已积累 body 再降级盲转发保连通
+                a_pConn->eResp = 1;
+                ScanUsage(a_pConn->aUpIn);
+                aOut += WrapChunked(aBody) + a_pConn->aUpIn;
+                a_pConn->aUpIn.clear();
+                return aOut;
+            }
+            if (llSize == 0) {
+                // 终止帧：先补发已消毒重编码的 body（终端路径从循环内 return，
+                //   不得绕过尾部 WrapChunked）→ 冲刷扣留 → 回写 0 帧 + trailer
+                //   原样 → 后续盲转发。
+                aOut += WrapChunked(aBody) + FlushHeld(a_pConn)
+                        + "0\r\n" + a_pConn->aUpIn;
+                a_pConn->aUpIn.clear();
+                a_pConn->eResp = 1;
+                return aOut;
+            }
+            a_pConn->llChunkRemain = llSize;
+        } else if (a_pConn->llChunkRemain == -3) {
+            if (a_pConn->aUpIn.size() < 2) {
+                break;   // 帧尾 CRLF 未到齐
+            }
+            a_pConn->aUpIn.remove(0, 2);
+            a_pConn->llChunkRemain = -1;
+            continue;
+        }
+        const qint64 llTake = qMin<qint64>(a_pConn->llChunkRemain,
+                                           qint64(a_pConn->aUpIn.size()));
+        if (llTake <= 0) {
+            break;
+        }
+        const QByteArray aData = a_pConn->aUpIn.left(int(llTake));
+        a_pConn->aUpIn.remove(0, int(llTake));
+        a_pConn->llChunkRemain -= llTake;
+        if (a_pConn->llChunkRemain == 0) {
+            a_pConn->llChunkRemain = -3;   // 待帧尾 CRLF
+        }
+        ScanUsage(aData);   // 解码后的 SSE 字节喂 usage 扫描（不受分帧影响）
+        a_pConn->aSseLine += aData;
+        int iNl = 0;
+        while ((iNl = a_pConn->aSseLine.indexOf('\n')) >= 0) {
+            const QByteArray sLine = a_pConn->aSseLine.left(iNl + 1);
+            a_pConn->aSseLine.remove(0, iNl + 1);
+            aBody += ProcessSseLine(a_pConn, sLine);
+        }
+    }
+    aOut += WrapChunked(aBody);
+    return aOut;
 }
 
 void CCodexProxy::ScanUsage(const QByteArray& a_pChunk) {

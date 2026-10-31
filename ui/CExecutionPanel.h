@@ -102,6 +102,10 @@ public:
     void OnAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult);
     void OnAdhocLog(const QString& a_sAsstId, const QString& a_sLine);
     void OnAdhocEvent(const QString& a_sAsstId, const QString& a_sKind, const QString& a_sText);
+    // 2026-10-29 新提示词链起点（编排器 sigAdhocChainStart 转发）：重锚该助手链钟。
+    //   链内轮（专家链规划/验证/修复/续跑/纠偏/压缩）不发 → done 耗时覆盖整链
+    //   （用户需求：专家助手完成时耗时含实施轮）。
+    void OnAdhocChainStart(const QString& a_sAsstId);
     // 2026.09.18 暂存提示词生命周期（编排器 sigAdhocPendingStarted/Dropped 连接；主窗口接线）。
     void OnAdhocPendingStarted(const QString& a_sAsstId, const QString& a_sText);
     void OnAdhocPendingDropped(const QString& a_sAsstId);
@@ -127,6 +131,16 @@ public:
     bool AsstRunning(const QString& a_sAsstId) const;      // 指定助手是否运行中
     bool AnyAsstRunning() const;                            // 是否有任一助手运行中（旧 m_bAdhocRunning 语义）
     QStringList RunningAsstIds() const;                     // 2026-10-02 运行中助手 id 表（孤儿 busy 看门狗用）
+    // 2026-10-31 上次未执行完检测（用户需求：启动时提示是否继续执行）：
+    //   PendAsstIds = 档残留 pend 标记且当前非运行中且非已关闭的本档助手；
+    //   ResumePendAsst = 以「继续执行上次中断的指令」为提示词走正常发送链；
+    //   ClearAsstPend = 用户明确拒绝后续跑（防每次启动都问）；
+    //   AsstLastUserPrompt / AsstNameOf 供提示框展示（最后一条用户提示词/名字）。
+    QStringList PendAsstIds() const;
+    void ResumePendAsst(const QString& a_sId);
+    void ClearAsstPend(const QStringList& a_aIds);
+    QString AsstLastUserPrompt(const QString& a_sId) const;
+    QString AsstNameOf(const QString& a_sId) const;
     // 2026-10-09 孤儿看门狗自愈配套：解除首条命名挂起（bSendAfterAutoName——
     //   OnAdhocFinished 已丢失永不再补发）并把暂存指令退回输入框（同「提交被拒
     //   退回输入框」口径），否则后续发送永远只暂存不提交（另机实测「输入继续
@@ -269,6 +283,9 @@ signals:
     void sigAsstForeignActivated(const QString& a_sOwnerKey);
     void sigAsstForeignFinished(const QString& a_sAsstId);
     void sigAdhocBlocksChanged();                         // 助手流变化（#1 存盘）
+    // 2026-10-31 在途轮标记变化（SetAsstRunning 真实跳变沿）：主窗口据此落盘
+    //   assistant.json（"pend" 键），供下次启动检测「上次未执行完成」的助手。
+    void sigAsstPendChanged();
     // 2026.08.22 多助手事件：新增/删除/切换/重命名/拖动排序 → 主窗口换载编排器会话或落盘。
     void sigAsstAdded(const QString& a_sId);                          // 新增助手（已激活）
     void sigAsstRemoved(const QString& a_sId, const QString& a_sNewActive);   // 删除助手
@@ -445,6 +462,9 @@ public:
         QJsonArray            aStack;         // 撤销栈 JSON（prompt,sid 链）
         qint64                iCtxFill = 0;   // 上下文占用快照（恢复进度条用）
         bool                  bRunning = false;  // 2026.09.03 多助手并发：该助手运行中（Tab ●、按钮态）
+        // 2026-10-31 在途轮标记（档持久化 "pend"）：SetAsstRunning(true) 置、
+        //   (false) 清；异常退出/运行中关闭时磁盘残留 true → 下次启动提示继续执行。
+        bool                  bPend = false;
         QString               sModel;            // 2026.09.03 该助手最近所用模型名（切 Tab 还原上下文窗口显示）
         // 2026.08.27 未选任务时的独立消耗累计（选任务时消耗归任务，不进这里）
         double                dCost = 0.0;
@@ -476,6 +496,7 @@ public:
         CBusyIndicator*       pBusy = nullptr;   // 2026.09.05 v2.0.120 该助手执行态指示器（统计栏费用前：运行转圈/空闲灰点）
         QElapsedTimer         tClock;                  // 本轮起始钟（耗时实时跳动，per-助手：并发助手各自计时）
         QElapsedTimer         tRound;                  // 2026.09.19 当前提示词轮起点（每轮 StartAdhocStage 广播 SetAsstRunning(true) 时重锚，含自动续发/压缩；done 事件读它算本轮耗时）
+        QElapsedTimer         tChain;                  // 2026-10-29 整链锚（sigAdhocChainStart 重锚；链内轮不动）——done 耗时优先用它：专家链规划+实施+验证+回炉全部计入
         QToolButton*          pBtnPrompts = nullptr;  // FR-3 右上角提示词按钮（parent=pView）
         QToolButton*          pBtnBottom  = nullptr;  // 提示词按钮正下方「↓」按钮（点击滚动到日志最底）
         // 2026.09.18 运行中暂存提示词折叠框（日志区右下角，parent=pView）：

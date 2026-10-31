@@ -274,6 +274,280 @@ private slots:
     // ============ 2026.09.26 专家助手深度模式纯函数（验证轮结论/验收标准提取） ============
     //   ParseDeepVerdict：1=PASS / 0=FAIL（出同行原因）/ -1=无判定行；FAIL 优先。
     //   ExtractDeepCriteria：「## 验收标准」段提取，缺失回退整份计划，恒截 2000。
+    // ============ 2026-10-29 专家链提示词收尾清理（用户需求：专家轮清理临时文件）+ 链耗时锚 ============
+    //   stub 端到端：深度链规划→执行→验证三分支 stub CLI；断言执行轮 prompt 带
+    //   【收尾要求】（清理临时文件）、验证轮 prompt 带"收尾清理"、链起点信号
+    //   sigAdhocChainStart 每次新提示词恰发一次（链内轮不发——执行/验证轮不再发）。
+    void deepChainCleanupPromptsAndChainAnchor() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 深度链用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/stub_calls.log");
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            // 按 prompt 关键字三分支：规划轮→吐计划；执行轮→吐工具事件+文本；
+            // 验证轮→吐 VERIFY:PASS。各延时 300ms 保轮次窗口。
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "require('fs').appendFileSync(%1,'===\\n'+s+'\\n');"
+                "setTimeout(()=>{"
+                "if(s.includes('规划轮')){"
+                "console.log(JSON.stringify({type:'assistant',text:'## 目标\\n实现X\\n## 实施步骤\\n1. 改 a.cpp\\n## 验收标准\\n1. 工程可编译',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'planned'}));"
+                "}else if(s.includes('验证轮')){"
+                "console.log(JSON.stringify({type:'assistant',text:'（过程稿）逐项核对中：已编译、已读 a.cpp。\\nVERIFY:PASS',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'【综合结果】完成播放防抖：a.cpp 新增拦截、新增测试。\\n【验证结论】已编译并逐项核对验收标准。\\nVERIFY:PASS'}));"
+                "}else{"
+                "console.log(JSON.stringify({type:'tool',tool:'Edit',input:{file_path:'a.cpp'}}));"
+                "console.log(JSON.stringify({type:'assistant',text:'已按计划完成实现：a.cpp 新增播放防抖拦截',model:'stub-model',usage:{input:20,output:8}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'实施报告：1) a.cpp 新增播放防抖拦截；2) 新增单元测试 MediaHelpTest；无遗留问题。'}));"
+                "}"
+                "},300);"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        CTaskOrchestrator::SetAdhocDeepOverride(1);   // 强制深度链
+        int iFinished = 0;
+        int iChainStart = 0;
+        QStringList aEvents;
+        QStringList aTexts;   // 2026-10-30 静默输出观测：而板上屏的 assistant 文本
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iFinished; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocChainStart,
+                         [&](const QString&) { ++iChainStart; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString&) {
+                             aEvents << sKind; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocAssistantText,
+                         [&](const QString&, const QString& sText) { aTexts << sText; });
+
+        stOrch.SubmitAdhoc(QStringLiteral("asst-deep"), QStringLiteral("实现登录功能"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        // 收敛：深度链 PASS → sigAdhocFinished（DeferredDrain 1.5s 无队列 no-op）。
+        for (int iWait = 0; iWait < 800 && iFinished < 1; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iFinished, 1);
+        QVERIFY(aEvents.contains(QStringLiteral("deep_verify_pass")));
+        QVERIFY(aEvents.contains(QStringLiteral("done")));
+
+        // 链起点恰 1 次（SubmitAdhoc 发；规划/执行/验证轮不发）。
+        QCOMPARE(iChainStart, 1);
+
+        // stub 三次调用：#2 执行轮 prompt 含计划+收尾清理要求；#3 验证轮含收尾清理。
+        QFile fLog(sLog);
+        QVERIFY(fLog.open(QIODevice::ReadOnly));
+        const QString sCalls = QString::fromUtf8(fLog.readAll());
+        fLog.close();
+        QCOMPARE(sCalls.count(QStringLiteral("===")), 3);
+        const int iM1 = static_cast<int>(sCalls.indexOf(QStringLiteral("===")));
+        const int iM2 = static_cast<int>(sCalls.indexOf(QStringLiteral("==="), iM1 + 3));
+        const int iM3 = static_cast<int>(sCalls.lastIndexOf(QStringLiteral("===")));
+        const QString sExecCall = sCalls.mid(iM2, iM3 - iM2);
+        const QString sVerifyCall = sCalls.mid(iM3);
+        QVERIFY2(sExecCall.contains(QStringLiteral("【专家模式·实施计划】")),
+                 "执行轮应携带规划产出的实施计划");
+        QVERIFY2(sExecCall.contains(QStringLiteral("【收尾要求】"))
+                     && sExecCall.contains(QStringLiteral("临时文件")),
+                 "执行轮 prompt 应带收尾清理要求（2026-10-29 用户需求）");
+        QVERIFY2(sExecCall.contains(QStringLiteral("【实施报告要求】")),
+                 "执行轮 prompt 应带实施报告口径（不面向用户叙述，2026-10-30）");
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("收尾清理"))
+                     && sVerifyCall.contains(QStringLiteral("临时文件")),
+                 "验证轮 prompt 应带收尾清理要求");
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("VERIFY:PASS")),
+                 "验证轮按验收标准判定");
+        // 2026-10-30 深链静默输出 + 专家轮统一输出口径：验证轮 prompt 注入执行轮
+        //   实施报告并要求两段式综合报告；执行/验证轮流式文本不上屏，链尾由验证轮
+        //   终答（综合结果+验证结论）统一外显。
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("【执行Agent实施报告】"))
+                     && sVerifyCall.contains(QStringLiteral("实施报告：1) a.cpp")),
+                 "验证轮 prompt 应注入执行轮 result 终答（实施报告）");
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("【综合结果】"))
+                     && sVerifyCall.contains(QStringLiteral("【验证结论】")),
+                 "验证轮 prompt 应要求两段式综合报告结构");
+        const QString sAllTexts = aTexts.join(QLatin1Char('\n'));
+        QVERIFY2(!sAllTexts.contains(QStringLiteral("已按计划完成实现")),
+                 "执行轮流式文本应被静默（不上屏）");
+        QVERIFY2(!sAllTexts.contains(QStringLiteral("（过程稿）")),
+                 "验证轮流式文本应被静默（不上屏）");
+        QCOMPARE(sAllTexts.count(QStringLiteral("【综合结果】")), 1);   // 仅 PASS 报告一次
+
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+
+    // ============ 2026-10-30 深链静默输出·零工具兑底补发（用户需求：执行结果改由专家轮统一输出） ============
+    //   零工具执行轮（纯问答）→ deep_skip_verify：无验证轮呈现结果，静默文本必须
+    //   兑底补发（否则答案因静默机制丢失）。对照：deepChainCleanupPromptsAndChainAnchor
+    //   证明链成功路径静默丢弃+验证轮终答统一外显。
+    void deepChainMutedFlushOnSkipVerify() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 深度链用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        {
+            // 零工具分支：只出 assistant 文本+result（无 tool 事件，文本>6 字防确认语
+            //   纠偏 nudge）→ 执行轮零工具 → deep_skip_verify → 静默文本兑底补发。
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{setTimeout(()=>{"
+                "console.log(JSON.stringify({type:'assistant',text:'直接回答：该接口在 v3 中已移除，替代方案是 XAdapter。',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-skip-1',text:'直接回答：该接口在 v3 中已移除，替代方案是 XAdapter。'}));"
+                "},300);});")
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        CTaskOrchestrator::SetAdhocDeepOverride(1);
+        int iFinished = 0;
+        QStringList aEvents;
+        QStringList aTexts;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iFinished; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString&) {
+                             aEvents << sKind; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocAssistantText,
+                         [&](const QString&, const QString& sText) { aTexts << sText; });
+        stOrch.SubmitAdhoc(QStringLiteral("asst-skip"), QStringLiteral("实现播放防抖功能"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        for (int iWait = 0; iWait < 800 && iFinished < 1; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iFinished, 1);
+        QVERIFY(aEvents.contains(QStringLiteral("deep_skip_verify")));
+        // 规划轮压缩上屏 1 次（DeepPlan 分支）+ 零工具兑底补发 1 次（FlushDeepMuted）
+        //   ——执行轮答案不因静默机制丢失。
+        QCOMPARE(aTexts.join(QLatin1Char('\n')).count(QStringLiteral("直接回答")), 2);
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+
+    void taskChainIdleSemantics() {
+#ifdef Q_OS_WIN
+        // 2026-10-30 任务运行态孤儿看门狗配套：IsTaskChainIdle 语义锁死——助手会话
+        //   与任务推进链正交（助手在跑而任务链静止仍属任务悬挂，不得因助手活跃把
+        //   链误判为忙，否则孤儿任务永远检测不到）；空闲基线=true。
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 任务链静止用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        {
+            // 慢 stub：2s 后回 result，保轮次窗口稳定可观测。
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{setTimeout(()=>{"
+                "console.log(JSON.stringify({type:'session',sessionId:'stub-idle-1'}));"
+                "console.log(JSON.stringify({type:'assistant',text:'stub',"
+                "model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',"
+                "sessionId:'stub-idle-1',text:'已完成'}));"
+                "},2000);});")
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CTaskOrchestrator::SetAdhocDeepOverride(0);
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        QVERIFY(stOrch.IsTaskChainIdle());   // 空闲基线：无任务/无 runner/无备份
+        QVERIFY(!stOrch.IsRunnerBusy());
+
+        int iFinished = 0;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iFinished; });
+        stOrch.SubmitAdhoc(QStringLiteral("asst-idle"), QStringLiteral("检查任务链静止判定"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        // 轮进行中（慢 stub 2s）：助手在跑 ≠ 任务链忙——正交语义不得回退。
+        QTest::qWait(800);
+        QVERIFY(stOrch.IsAnyAdhocRunning());
+        QVERIFY(stOrch.IsTaskChainIdle());
+        for (int iWait = 0; iWait < 80 && iFinished < 1; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iFinished, 1);
+        QVERIFY(stOrch.IsTaskChainIdle());   // 轮结束：回到静止
+
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+
     void testDeepVerdictParse() {
         // ① 标准末行 PASS（含前置证据正文）。
         QCOMPARE(CTaskOrchestrator::ParseDeepVerdict(
@@ -1050,6 +1324,48 @@ private slots:
             return a_s.mid(iB, (iE + CGuideFingerprintScanner::s_sEndMarker.length()) - iB);
         };
         QCOMPARE(ExtractTable(sGuideBefore), ExtractTable(sGuideAfter));
+        Wipe(sRoot);
+    }
+
+    // ============ 2026-10-22 变更日志段保留上限（防无界增长）============
+    // 40 条旧日志 + 追加 1 条 → 只保留最近 30 条（含新追加的）；正文与指纹表不受影响。
+    void testWriteIncrementalChangeLogPrune() {
+        const QString sRoot = MakeSandbox();
+        WriteFile(sRoot, QStringLiteral("a.cpp"), "aaaa");
+        QList<SFileFingerprint> aFp = CGuideFingerprintScanner::ScanProject(sRoot);
+        const QString sGuidePath = sRoot + QStringLiteral("/.autodev/guide.md");
+        QString sGuide = WriteGuideWithFp(sRoot, aFp);
+        // 追加 40 条历史变更日志。
+        sGuide += QStringLiteral("\n## 变更日志（增量）\n");
+        for (int i = 1; i <= 40; ++i) {
+            sGuide += QStringLiteral("- [2026-10-%1T00:00:00] 修改：f%1.cpp\n")
+                          .arg(i, 2, 10, QLatin1Char('0'));
+        }
+        {
+            QFile f(sGuidePath);
+            f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+            f.write(sGuide.toUtf8());
+            f.close();
+        }
+        // 触发一次有变化的追加（新增 z.cpp）。
+        SGuideChangeSet stCh;
+        stCh.aAdded << MkFp(QStringLiteral("z.cpp"), 10, 10);
+        QVERIFY(CGuideFingerprintScanner::WriteIncremental(
+                    sGuidePath, aFp, stCh, QStringLiteral("2026-10-22T12:00:00")));
+        QFile f2(sGuidePath);
+        f2.open(QIODevice::ReadOnly | QIODevice::Text);
+        const QString sAfter = QTextStream(&f2).readAll();
+        const int iLog = sAfter.indexOf(CGuideFingerprintScanner::s_sChangeLogHeader);
+        QVERIFY(iLog >= 0);
+        const QStringList aEntries = sAfter.mid(
+            iLog + CGuideFingerprintScanner::s_sChangeLogHeader.length())
+            .split(QLatin1Char('\n'), Qt::SkipEmptyParts)
+            .filter(QStringLiteral("-"));
+        QCOMPARE(aEntries.size(), 30);                       // 只剩 30 条
+        QCOMPARE(aEntries.last(), QStringLiteral("- [2026-10-22T12:00:00] 新增：z.cpp"));
+        QVERIFY(!aEntries.contains(QStringLiteral("- [2026-10-11T00:00:00] 修改：f11.cpp")));  // 第 11 条已裁
+        QVERIFY(aEntries.contains(QStringLiteral("- [2026-10-12T00:00:00] 修改：f12.cpp")));   // 第 12 条恰保留
+        QVERIFY(sAfter.contains(QStringLiteral("一些描述文字")));   // 正文不受影响
         Wipe(sRoot);
     }
 

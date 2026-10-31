@@ -544,6 +544,11 @@ public:
     bool    SaveViewEngine(const QString& a_sEngine);
     static QString LoadViewEngine();   // 静态（面板构造期无实例可读）
     static bool IsModelViewEngine(const QString& a_sEngine);   // "ModelView" 严格等值判定
+    // 2026-10-31 源码预览语法高亮（[View] CodeSyntax，界面态键不随任务覆盖）：
+    //   1=文件预览对 .c/.cpp/.h 等源码后缀用 CodeStyle 模块渲染（CodeParser.dll +
+    //   CodeView.dll 动态加载，缺 DLL 自动回退纯文本）；0=恒纯文本。缺省 1。
+    bool    SaveCodeSyntax(bool a_bOn);
+    static bool LoadCodeSyntax();   // 静态（CFilePreviewWidget 无实例可调，ShowFile 现读）
     // 2026-10-17 全局 config.ini 路径静态版（ConfigFilePath 自此抽壳转发）。
     static QString GlobalConfigPath();
 
@@ -649,9 +654,6 @@ private:
     // guide.md 增量同步水位线（.autodev/guide_sync.json）：已同步到的 record.md 行数。
     //   SyncGuideAsync 仅处理水位线之后的新增 record 行；BuildGuideAsync 全量重生成后重置为当前行数。
     QString GuideSyncFile() const;
-    int  LoadGuideSyncLines() const;
-    void SaveGuideSyncLines(int a_iLines);
-
     // 取 exe 同级 config.ini 全路径（GetModuleFileName 去文件名 + "config.ini"）。
     // 2026.08.20 转公开：主窗口 QFileSystemWatcher 盯此文件做多实例配置热重载。
 public:
@@ -659,6 +661,14 @@ public:
     // 2026.08.29 备份中止窄接口（编排器析构/快照换班用；BackupStore() 本体保持私有）。
     void RequestBackupAbort();
     void ResetBackupAbort();
+    // 2026-10-22 guide.md 篇幅约束四件套转公开（离线单测直达；纯字符串/json 助手，无副作用）。
+    //   水位线 Load/Save 一并转公开：测试需要协同验证两键共存。
+    QString GuideBodyText(const QString& a_sGuide) const;
+    bool GuideOverBudget(const QString& a_sGuide) const;
+    QString LoadGuideCompactHash() const;
+    void SaveGuideCompactHash(const QString& a_sHash);
+    int  LoadGuideSyncLines() const;
+    void SaveGuideSyncLines(int a_iLines);
 private:
     // FR-6：取任务备份根目录 .autodev/tasks/<id>/backups。
     QString BackupsDir(const QString& a_sTaskId) const;
@@ -692,6 +702,12 @@ private:
     static QString NormalizePath(const QString& a_sDir);
     // 把 m_aRecentProjects 落盘到 config.ini（落盘失败不抛、不退出）。
     void SaveRecent();
+    // 2026-10-31 v5.2.456 config.ini 编码自愈（LoadRecent 首调）：检出「UTF-8 化」的
+    //   config（系统 Beta UTF-8 开关期间被 Windows profile API 按当轮 ACP 整文件重写
+    //   的产物；特征=全文件 UTF-8 严格合法且含非 ASCII，GBK 中文档几乎不可能整段合法
+    //   UTF-8）先备份再转回 GBK 重写——中文键值本次载入即已可读，且后续 Windows
+    //   profile 写（ACP=936 常态）不再二次损坏。UTF-16 BOM 档/GBK 档/纯 ASCII 档不动。
+    void SanitizeConfigEncoding();
 
     QString       m_sProjectDir;
     CAgentRunnerBase* m_pGuideRunner = nullptr;       // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选

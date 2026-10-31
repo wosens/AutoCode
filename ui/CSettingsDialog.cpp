@@ -521,6 +521,10 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
         m_pComboViewEngine->setCurrentIndex(
             CProjectManager::IsModelViewEngine(sDefViewEngine) ? 1 : 0);
     }
+    // 2026-10-31 源码预览语法高亮预填（[View] CodeSyntax，缺省开）。
+    if (m_pChkCodeSyntax != nullptr) {
+        m_pChkCodeSyntax->setChecked(CProjectManager::LoadCodeSyntax());
+    }
     // 2026-09-26 内置测试沙箱回填。
     m_pChkSbxEnable->setChecked(bDefSbxEnable);
     m_pChkSbxAuto->setChecked(bDefSbxAuto);
@@ -956,6 +960,18 @@ void CSettingsDialog::SetupUi() {
         "双击助手消息拖选复制、链接单击打开）。\n"
         "切换保存后对新建立的会话页生效（重开助手 Tab / 重启程序全部生效）"));
     fnAddPair(pRowViewEngine, QStringLiteral("日志渲染引擎："), m_pComboViewEngine);
+    pRowViewEngine->addSpacing(12);
+    // 2026-10-31 源码预览语法高亮（[View] CodeSyntax，默认开）：与渲染引擎同属界面态
+    //   视图项，合入本行压缩纵向占用；模块缺 DLL 时预览自动回退纯文本，不弹错。
+    m_pChkCodeSyntax = new QCheckBox(QStringLiteral("源码语法高亮"), pGroupReview);
+    m_pChkCodeSyntax->setChecked(true);
+    m_pChkCodeSyntax->setToolTip(QStringLiteral(
+        "文件预览对 .c/.cpp/.h 等源码文件用 CodeStyle 模块渲染（exe 同目录"
+        " CodeParser.dll + CodeView.dll 动态加载，\nScintilla 词法着色 + "
+        "tree-sitter 语义分档，支持 F2 同名词联动 / F3 括号配对）；\n"
+        "关闭则回纯文本预览。DLL 缺失时自动回退纯文本（不报错）。"
+        "（[View] CodeSyntax，默认开；下一个打开的文件即生效）"));
+    pRowViewEngine->addWidget(m_pChkCodeSyntax);
     pRowViewEngine->addStretch(1);
 
     // —— 目录排除（2026-10-08 指纹扫描/资源管理器两项合一行，备份恢复默认值最长保持整行）——
@@ -2344,6 +2360,11 @@ QString CSettingsDialog::ViewEngine() const {
     // 2026-10-17 对话日志渲染引擎（[View] Engine）——两态归一化（"Legacy"/"ModelView"）。
     return (m_pComboViewEngine != nullptr && m_pComboViewEngine->currentIndex() == 1)
         ? QStringLiteral("ModelView") : QStringLiteral("Legacy");
+}
+
+bool CSettingsDialog::CodeSyntax() const {
+    // 2026-10-31 源码预览语法高亮（[View] CodeSyntax；未创建控件时兜底默认开）。
+    return (m_pChkCodeSyntax == nullptr) || m_pChkCodeSyntax->isChecked();
 }
 
 // —— 内置测试沙箱（2026-09-26；未创建控件时兜底默认值）——

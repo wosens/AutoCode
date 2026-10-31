@@ -1566,9 +1566,18 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sK
     if (a_sKind == QStringLiteral("done")) {
         const QString sNow = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
         const SAsst* pAsst = AsstById(a_sAsstId);
-        if (pAsst != nullptr && pAsst->tRound.isValid() && pAsst->tRound.elapsed() > 0) {
+        // 2026-10-29 耗时口径升级（用户需求：专家链完成时耗时含实施轮）：优先链钟
+        //   tChain（SubmitAdhoc 新提示词时锚，链内轮——专家链规划/验证/修复/续跑/
+        //   纠偏/压缩——不重锚 → 耗时覆盖整链）；无链锚（旧档恢复后首次/异常路径）
+        //   退 tRound（旧口径：最近一轮）。
+        const qint64 iDoneMs = (pAsst != nullptr && pAsst->tChain.isValid()
+                                    && pAsst->tChain.elapsed() > 0)
+                                   ? pAsst->tChain.elapsed()
+                                   : (pAsst != nullptr && pAsst->tRound.isValid()
+                                          ? pAsst->tRound.elapsed() : 0);
+        if (pAsst != nullptr && iDoneMs > 0) {
             st.sText = QStringLiteral("%1（%2，耗时 %3）")
-                           .arg(a_sText, sNow, FormatElapsed(pAsst->tRound.elapsed()));
+                           .arg(a_sText, sNow, FormatElapsed(iDoneMs));
         } else {
             st.sText = QStringLiteral("%1（%2）").arg(a_sText, sNow);
         }
@@ -1576,6 +1585,16 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sK
         st.sText = sEvText;
     }
     AppendAdhocBlock(st, a_sAsstId);
+}
+
+void CExecutionPanel::OnAdhocChainStart(const QString& a_sAsstId)
+{
+    // 2026-10-29 新提示词链起点（编排器 SubmitAdhoc 经 sigAdhocChainStart）。
+    //   只重锚链钟 tChain；tRound（每轮锚）不动——done 事件耗时优先用 tChain，
+    //   专家链的规划/实施/验证/回炉各轮（不经 SubmitAdhoc）不再稀释耗时。
+    if (SAsst* pAsst = AsstById(a_sAsstId)) {
+        pAsst->tChain.start();
+    }
 }
 
 void CExecutionPanel::OnAdhocPendingStarted(const QString& a_sAsstId, const QString& a_sText) {
@@ -2466,13 +2485,16 @@ void CExecutionPanel::UpdateAdhocInputState(const QString& a_sAsstId) {
             st.pBtnSend->setToolTip(
                 QStringLiteral("向正在执行的助手轮追加指令（立即注入/排队续发）"));
             st.pBtnSend->setEnabled(true);
-            st.pBtnSend->setStyleSheet(
-                QStringLiteral("QPushButton{background:#2563eb;color:white;}"));
+            // 2026-10-28 不用白字（用户反馈：部分机器背景样式不生效时白字不可见）。
+            //   浅色底+深色字+彩色描边：背景被吃也保有对比度，描边保住状态色语义。
+            st.pBtnSend->setStyleSheet(QStringLiteral(
+                "QPushButton{background:#dbeafe;color:#1d4ed8;border:1px solid #2563eb;}"));
         } else if (bRun) {
             st.pBtnSend->setText(QStringLiteral("⏹ 停止"));
             st.pBtnSend->setToolTip(QStringLiteral("停止当前助手轮"));
             st.pBtnSend->setEnabled(true);
-            st.pBtnSend->setStyleSheet(QStringLiteral("QPushButton{background:#dc2626;color:white;}"));
+            st.pBtnSend->setStyleSheet(QStringLiteral(
+                "QPushButton{background:#fee2e2;color:#b91c1c;border:1px solid #dc2626;}"));
         } else {
             st.pBtnSend->setText(QStringLiteral("发送"));
             st.pBtnSend->setToolTip(QString());
@@ -2553,6 +2575,13 @@ void CExecutionPanel::SetAsstRunning(const QString& a_sAsstId, bool a_bRunning) 
     }
     const bool bChanged = (pAsst->bRunning != a_bRunning);
     pAsst->bRunning = a_bRunning;
+    // 2026-10-31 在途轮标记随真实跳变置/清（自动续发/压缩等同 true 重入不改值）：
+    //   置位后立即落盘（sigAsstPendChanged→SaveAssistantState）——异常退出/被杀时
+    //   磁盘已带 pend=true，下次启动可检测；收尾清位同样落盘。
+    if (bChanged) {
+        pAsst->bPend = a_bRunning;
+        emit sigAsstPendChanged();
+    }
     if (a_bRunning) {
         // 2026.09.19 重锚本轮提示词起点：编排器每轮 StartAdhocStage 都广播
         //   sigAdhocRunning（自动续发/压缩时 bRunning 已 true、无状态跳变也要重锚），
@@ -2876,6 +2905,83 @@ bool CExecutionPanel::AsstHasUserPrompt(const SAsst& a_st) {
                            return b.eKind == CMessageBlock::Event &&
                                   b.sEventKind == QStringLiteral("user");
                        });
+}
+
+// —— 2026-10-31 上次未执行完续跑（用户需求：启动时提示是否继续执行）——
+QStringList CExecutionPanel::PendAsstIds() const {
+    // 档残留 pend 标记（上次运行中退出/异常退出）且当前非运行中（幽灵摘挂后仍在跑
+    //   的不算残留）、非已关闭、本档（外档不可达防御）的助手 id。
+    QStringList aIds;
+    for (const SAsst& st : std::as_const(m_aAssts)) {
+        if (st.bPend && !st.bRunning && !st.bClosed
+                && st.sOwnerKey == m_sViewKey) {
+            aIds.append(st.sId);
+        }
+    }
+    return aIds;
+}
+
+void CExecutionPanel::ClearAsstPend(const QStringList& a_aIds) {
+    // 用户在启动提示框明确拒绝续跑：清标记（主窗口随后落盘，防每次启动都问）。
+    for (const QString& sId : a_aIds) {
+        if (SAsst* p = AsstById(sId)) {
+            p->bPend = false;
+        }
+    }
+}
+
+QString CExecutionPanel::AsstNameOf(const QString& a_sId) const {
+    const SAsst* p = AsstById(a_sId);
+    return p != nullptr ? p->sName : QString();
+}
+
+QString CExecutionPanel::AsstLastUserPrompt(const QString& a_sId) const {
+    // 流内最后一条用户提示词原文（去「[日期 时间]」戳前缀，供续跑指令/提示框展示）。
+    const SAsst* p = AsstById(a_sId);
+    if (p == nullptr || !p->pStream) {
+        return QString();
+    }
+    const QList<SBlockData>& aBlocks = p->pStream->Blocks();
+    for (auto it = aBlocks.crbegin(); it != aBlocks.crend(); ++it) {
+        if (it->eKind == CMessageBlock::Event
+                && it->sEventKind == QStringLiteral("user")) {
+            static const QRegularExpression reStamp(
+                QStringLiteral("^\\[[^\\]]*\\]\\s*"));
+            QString sText = it->sText;
+            sText.remove(reStamp);
+            return sText;
+        }
+    }
+    return QString();
+}
+
+void CExecutionPanel::ResumePendAsst(const QString& a_sId) {
+    // 续跑 = 以「继续执行上次中断的指令」为新提示词走正常发送链（DoAdhocSend：
+    //   用户块上屏、运行态置位、sigAdhocSubmit → 编排器按该会话 sSid fork 续接
+    //   上下文）。中断轮的新 sid 未落盘（收尾才回写），fork 基点=上一完成轮，故
+    //   续跑指令必须携带原提示词全文（同任务侧中断续跑口径）。
+    SAsst* p = AsstById(a_sId);
+    if (p == nullptr || p->bRunning || p->bClosed) {
+        return;
+    }
+    if (p->pPage != nullptr && p->pInput == nullptr) {
+        // 非激活助手视图惰性重建：先切到其 Tab（currentChanged 同步补建输入栏）。
+        m_pTabs->setCurrentWidget(p->pPage);
+        p = AsstById(a_sId);   // 链上数组可能重排，重取
+        if (p == nullptr) {
+            return;
+        }
+    }
+    if (p->pInput == nullptr) {
+        return;   // 兕底：控件不可用不强行发（输入框语义丢失，宁可不发）
+    }
+    const QString sLast = AsstLastUserPrompt(a_sId);
+    const QString sText = sLast.isEmpty()
+        ? QStringLiteral("继续完成上次中断时尚未完成的工作，从中断处接着做，不要重复已完成的改动。")
+        : QStringLiteral("继续执行上次中断的指令：%1\n（上次 AutoCode 退出时该指令尚未完成，请从中断处继续，不要重复已完成的改动。）")
+              .arg(sLast);
+    p->pInput->setPlainText(sText);
+    DoAdhocSend(a_sId);   // 内部切 Tab、置运行态、提交后清输入框
 }
 
 void CExecutionPanel::RebuildPromptList() {
@@ -3374,6 +3480,11 @@ QJsonArray CExecutionPanel::AssistantsToJson() const {
         if (st.bModelOv) {
             o[QStringLiteral("modelOv")] = ModelOvToJson(st.stModelOv);
         }
+        // 2026-10-31 在途轮标记（仅在途写 true；收尾不写键，旧档兼容）——启动检测
+        //   「上次未执行完成」的数据源。
+        if (st.bPend) {
+            o[QStringLiteral("pend")] = true;
+        }
         // 2026.08.27 助手独立流量记录（未选任务时累计，随档持久化）
         QJsonObject oUsage;
         oUsage[QStringLiteral("cost")]   = st.dCost;
@@ -3418,6 +3529,11 @@ QJsonArray CExecutionPanel::AssistantsJsonOf(const QString& a_sOwnerKey) const
         // 2026-10-07 对话级模型覆盖（仅本助手生效的模型快照；未设覆盖不写键，旧档兼容）
         if (st.bModelOv) {
             o[QStringLiteral("modelOv")] = ModelOvToJson(st.stModelOv);
+        }
+        // 2026-10-31 在途轮标记（同 AssistantsToJson：外档幽灵在跑跨档时其归属档
+        //   同样需要 pend 残留，防杀进程后丢失续跑机会）。
+        if (st.bPend) {
+            o[QStringLiteral("pend")] = true;
         }
         QJsonObject oUsage;
         oUsage[QStringLiteral("cost")] = st.dCost;
@@ -3619,6 +3735,9 @@ void CExecutionPanel::LoadAssistantsFromJson(const QJsonArray& a_aAssts, const Q
             st.sName = QStringLiteral("助手1");
         }
         st.sBackend = o.value(QStringLiteral("backend")).toString();   // 2026.09.20 粘性后端
+        // 2026-10-31 在途轮标记恢复（旧档无键=false；启动后无 runner，bRunning 恒
+        //   false，bPend 即为「上次未执行完」残留，由主窗口 PromptResumePendAssts 消费）。
+        st.bPend = o.value(QStringLiteral("pend")).toBool(false);
         st.sOwnerKey = m_sViewKey;   // 2026-10-02 归属本次载入的存档 key（外档幽灵经 Attach 另挂）
         st.sOwnerName.clear();
         st.sDesc = o.value(QStringLiteral("desc")).toString();   // 2026-09-22 助手说明（旧档无键回空）
@@ -4642,8 +4761,25 @@ void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
     }
     // 切 Tab：当前页是助手页 → 激活切换（非助手页如日志/产物/预览不改激活助手）。
     SAsst* pAsst = AsstByPage(m_pTabs->widget(a_iIdx));
-    if (pAsst == nullptr || pAsst->sId == m_sActiveAsst) {
+    if (pAsst == nullptr) {
         return;
+    }
+    // 2026-10-23 自愈兑底：切回"本就激活"的助手页（切日志/产物页再切回）也按需
+    //   重建——单助手未投影空白的唯一恢复通道（旧版 sId==m_sActiveAsst 提前
+    //   return 永不 Rebuild，用户只能干瞪眼；主修在 CStreamPresenter::Append
+    //   首块安全投影，此处覆盖其他未投影路径的兑底）。Legacy 引擎 WidgetCount>0
+    //   时 bNeedsBuild=false 天然不受影响。
+    const bool bSameActive = (pAsst->sId == m_sActiveAsst);
+    const bool bNeedsBuild = AsstViewBuilt(*pAsst)
+        && (!pAsst->pStream
+            || (pAsst->pStream->ModelView()
+                ? (!pAsst->pStream->Projected() && pAsst->pStream->Count() > 0)
+                : (pAsst->pStream->WidgetCount() == 0 && pAsst->pStream->Count() > 0)));
+    if (bSameActive) {
+        if (bNeedsBuild) {
+            RebuildAdhocView();
+        }
+        return;   // 同激活：只做投影自愈，不重走激活切换链（提示词按钮可见性等已就位）
     }
     const QString sOld = m_sActiveAsst;
     m_sActiveAsst = pAsst->sId;
@@ -4651,11 +4787,6 @@ void CExecutionPanel::OnAsstTabCurrentChanged(int a_iIdx) {
     //   2026.09.03 件状态在流内：未建流/无件 且有数据 → 重建（旧：aWidgets 空且 aBlocks 非空）。
     //   2026-10-17 双引擎：ModelView 用 Projected()（数据已投影进模型）判定——
     //   WidgetCount 恒 0 不再是「未建」信号。
-    const bool bNeedsBuild = AsstViewBuilt(*pAsst)
-        && (!pAsst->pStream
-            || (pAsst->pStream->ModelView()
-                ? (!pAsst->pStream->Projected() && pAsst->pStream->Count() > 0)
-                : (pAsst->pStream->WidgetCount() == 0 && pAsst->pStream->Count() > 0)));
     if (bNeedsBuild) {
         RebuildAdhocView();
     } else {

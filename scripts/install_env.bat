@@ -6,6 +6,8 @@ setlocal EnableDelayedExpansion
 :: 缓存初始进程 PATH（winget 在 WindowsApps 等），RefreshPath 后追加回防丢失。
 set "_ORIG_PATH=!PATH!"
 
+call :RegisterWerLocalDumps
+
 :: ---- 参数：/dsh = 只安装 DeepSeekHarness（设置页「安装 DeepSeekHarness」按钮调用）----
 set "DSH_ONLY=0"
 if /i "%~1"=="/dsh" set "DSH_ONLY=1"
@@ -1450,4 +1452,18 @@ goto :eof
 :InstallGitDl
 :: 无 winget 时从 GitHub git-for-windows latest release 取 64-bit 安装包静默安装。
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { $r=Invoke-RestMethod https://api.github.com/repos/git-for-windows/git/releases/latest; $a=$r.assets|Where-Object{$_.name -like '*-64-bit.exe' -and $_.name -notlike '*mini*'}|Select-Object -First 1; Write-Host ('Git '+$a.name); $p=$env:TEMP+'\git-setup.exe'; Invoke-WebRequest $a.browser_download_url -OutFile $p; Write-Host 'Installing...'; Start-Process $p -ArgumentList '/VERYSILENT','/NORESTART','/SP-' -Wait } catch { Write-Host ('[错误] '+$_.Exception.Message) }"
+goto :eof
+
+:: ---- Register WER LocalDumps (silent-exit hardening 2026-10-28) ----
+:: Qt qFatal __fastfail bypasses SEH/WER events; LocalDumps mostly catches
+:: 0xC0000409 dumps. Dump goes to dump\ next to this script (exe side).
+:: Register both common image names; tolerate failure (non-admin continues).
+:RegisterWerLocalDumps
+set "QTL_DUMPDIR=%~dp0dump"
+if "%QTL_DUMPDIR:~-1%"=="\" set "QTL_DUMPDIR=%QTL_DUMPDIR:~0,-1%"
+for %%n in (AutoCode.exe AutoCode1.exe) do (
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\%%n" /v DumpFolder /t REG_EXPAND_SZ /d "%QTL_DUMPDIR%" /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\%%n" /v DumpType /t REG_DWORD /d 2 /f >nul 2>&1
+    reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\%%n" /v DumpCount /t REG_DWORD /d 10 /f >nul 2>&1
+)
 goto :eof

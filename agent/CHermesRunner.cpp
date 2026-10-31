@@ -827,6 +827,7 @@ CHermesRunner::~CHermesRunner() {
 void CHermesRunner::Reset() {
     m_buf.clear();
     m_bFinished = false;
+    m_iResultSeenMs = 0;   // 2026.10.29 新轮清 result 驻留基准
     m_bSawSession = false;
     m_bSawAssistant = false;
     m_sLastSubtype.clear();
@@ -1293,7 +1294,9 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
         //   影响 sigFinished 结果文本与自动命名/压缩摘要取值）。
         m_sLastEventText = LocalizeHermesCapText(
             o.value(QStringLiteral("text")).toString());
-        return;   // 终态在进程退出时统一上抛（slotOnFinished）
+        m_iResultSeenMs = QDateTime::currentMSecsSinceEpoch();   // 2026.10.29 记 result 时刻：
+        //   进入驻留观察（CheckStall 5min 零 stdout 事件才收尾）——多阶段轮的
+   //   中途 result 不再立即终结轮次（v5.1.436 立即收尾误伤实测）
     }
     // 未知事件：原始透传 sigInfo（前向兼容，真实格式落定后在此扩展分支）。
     emit sigInfo(QString::fromUtf8(a_sLine));
@@ -1348,6 +1351,46 @@ void CHermesRunner::slotOnStdErr() {
         m_aStderrTail.removeFirst();   // 尾部 20 行（失败消息附带）
     }
     emit sigInfo(QStringLiteral("[hermes][stderr] ") + sErr.trimmed());
+}
+
+// 2026.10.29 result 事件到达即终态收尾（装配逻辑同 slotOnFinished，无退出码项——
+//   进程驻留照看后台任务时不再阻塞运行态；其真正退出时 slotOnFinished 的
+//   m_bFinished 防重复保护直接返回。触发场景见 HandleLine result 分支注释。）
+void CHermesRunner::FinishTurnOnResult() {
+    if (m_bFinished) {
+        return;
+    }
+    m_bFinished = true;
+    m_pStallTimer->stop();
+    if (!m_sPromptTmpFile.isEmpty()) {   // 长 prompt 临时文件随手清（同出口径）
+        QFile::remove(m_sPromptTmpFile);
+        m_sPromptTmpFile.clear();
+    }
+    if (!m_buf.isEmpty()) {              // 残留缓冲先分发（同出口径）
+        HandleLine(m_buf.trimmed());
+        m_buf.clear();
+    }
+    if (m_bExeForm && !m_aPlainOut.isEmpty()) {
+        m_bSawAssistant = true;
+        m_sLastEventText = LocalizeHermesCapText(m_aPlainOut.join(QChar::LineFeed));
+        emit sigAssistantText(m_sLastEventText);
+        m_aPlainOut.clear();
+    }
+    const bool bOk = (m_sLastSubtype.isEmpty() || m_sLastSubtype == QStringLiteral("success"))
+                     && m_bSawAssistant;
+    QString sResult;
+    if (bOk) {
+        sResult = m_sLastEventText.isEmpty() ? QStringLiteral("完成") : m_sLastEventText;
+    } else {
+        sResult = QStringLiteral("Hermes result（subtype %1）：%2").arg(
+            m_sLastSubtype.isEmpty() ? QStringLiteral("无") : m_sLastSubtype,
+            m_sLastEventText.isEmpty()
+                ? (m_bSawAssistant ? QStringLiteral("无 result 事件")
+                                   : QStringLiteral("本轮无 assistant 输出"))
+                : m_sLastEventText);
+    }
+    emit sigFinished(bOk, sResult, m_iSumPlainInTok + m_iSumCacheReadTok + m_iSumCacheWriteTok,
+                     m_iSumOutTok, ComputeTurnCost(), m_sLastSessionId);
 }
 
 void CHermesRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus) {
@@ -1439,6 +1482,16 @@ void CHermesRunner::CheckStall() {
                 m_actClock.start();
             }
         }
+    }
+    // 2026.10.29 v2 result 后驻留收尾：result 已到 + 此后 5 分钟零 stdout 事件
+    //   （工具/阶段事件都刷新 m_actClock）→ 判轮次真结束、进程转后台照看——
+    //   图标/占用不再被驻留进程钉死；多阶段轮期间事件持续流动不误伤（v5.1.436
+    //   立即收尾误伤实测：中途 result 后工作继续，轮被提前终结图标先停）。
+    //   真退出仍走 slotOnFinished（m_bFinished 防重复）。
+    if (m_iResultSeenMs > 0 && m_actClock.isValid()
+            && m_actClock.elapsed() > 5 * 60 * 1000) {
+        FinishTurnOnResult();
+        return;
     }
     if (m_actClock.isValid() && m_actClock.elapsed() > iLimitMs) {
         m_sLastSubtype = QStringLiteral("stall");   // 复用基类词汇（watchdog 终止可续跑）

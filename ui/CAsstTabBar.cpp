@@ -24,6 +24,37 @@ constexpr int kBlinkMs = 500;       // 闪点换色间隔（与旧 QLabel 方案
 const char* const k_aszDotColors[] = { "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6" };
 constexpr int k_iDotColorCount = static_cast<int>(sizeof(k_aszDotColors) / sizeof(k_aszDotColors[0]));
 constexpr double kFloatOpacity = 0.75;      // 拖拽浮动 Tab 不透明度
+constexpr int kAnimMs = 150;                // 2026-10-23 布局滑移动画时长（VS 丝滑量级）
+
+// 2026-10-23 两 rect 线性插值（位置与尺寸都过渡：改名变宽/闪点变宽也平滑）
+QRect LerpRect(const QRect& a, const QRect& b, double a_t)
+{
+    const double t = qBound(0.0, a_t, 1.0);
+    return QRect(qRound(a.x() + (b.x() - a.x()) * t),
+                 qRound(a.y() + (b.y() - a.y()) * t),
+                 qRound(a.width() + (b.width() - a.width()) * t),
+                 qRound(a.height() + (b.height() - a.height()) * t));
+}
+
+// 2026-10-23 按 QTabBar::moveTab(from,to) 的列表移动语义同步移位显示位表
+//   （松手落位动画的起点表要跟着内容走：索引 i 的起点 = 该内容项松手前的显示位）
+void ShiftRects(QVector<QRect>& a_rc, int a_iFrom, int a_iTo)
+{
+    const int n = a_rc.size();
+    if (a_iFrom == a_iTo || a_iFrom < 0 || a_iFrom >= n
+        || a_iTo < 0 || a_iTo >= n) {
+        return;
+    }
+    const QRect rc = a_rc.at(a_iFrom);
+    if (a_iFrom < a_iTo) {
+        for (int i = a_iFrom; i < a_iTo; ++i)
+            a_rc[i] = a_rc.at(i + 1);
+    } else {
+        for (int i = a_iFrom; i > a_iTo; --i)
+            a_rc[i] = a_rc.at(i - 1);
+    }
+    a_rc[a_iTo] = rc;
+}
 } // namespace
 
 CAsstTabBar::CAsstTabBar(QWidget* a_pParent)
@@ -31,6 +62,22 @@ CAsstTabBar::CAsstTabBar(QWidget* a_pParent)
 {
     m_blinkTimer.setInterval(kBlinkMs);
     connect(&m_blinkTimer, &QTimer::timeout, this, [this]() { update(); });
+    // 2026-10-23 布局滑移动画驱动：进度 0→1，帧回调只标脏（paint 里按
+    //   m_rectAnimFrom/当前布局插值）；stop+start 即重定向（从当前位置滑向新目标）
+    m_rectAnim.setDuration(kAnimMs);
+    m_rectAnim.setStartValue(0.0);
+    m_rectAnim.setEndValue(1.0);
+    m_rectAnim.setEasingCurve(QEasingCurve::OutCubic);
+    connect(&m_rectAnim, &QVariantAnimation::valueChanged, this,
+            [this](const QVariant& a_v) {
+                m_dAnimProg = a_v.toDouble();
+                update();
+            });
+    connect(&m_rectAnim, &QVariantAnimation::finished, this, [this]() {
+        m_bAnimValid = false;
+        m_dAnimProg = 1.0;
+        update();
+    });
     // 多行接管：不再要基类的滚动箭头（放不下改为换行）；开鼠标跟踪供悬停
     setUsesScrollButtons(false);
     setMouseTracking(true);
@@ -204,11 +251,19 @@ CAsstTabBar::LayoutResult CAsstTabBar::CalcLayout(const QVector<int>& a_order) c
 void CAsstTabBar::ApplyLayout()
 {
     const int iOldH = m_layout.iRows * m_layout.iRowH;
+    // 2026-10-23 先取当前显示位（旧布局 + 在途动画插值）作新动画段起点，再更新
+    //   布局——起点必须在新布局算出前取（CurrentRects 以旧 m_layout 插值）。
+    const QVector<QRect> rcFrom = CurrentRects();
     m_naturalOrder = NaturalOrder();
     m_layout = CalcLayout(m_naturalOrder);
     if (m_layout.iRows * m_layout.iRowH != iOldH)
         updateGeometry();   // 总高变了：让 QTabWidget/上层布局重取 sizeHint 修正页区
-    update();
+    // 拖拽中显示走 dragLayout（UpdateDrag 自管动画），此处只刷缓存不插动画段，
+    //   避免两套目标位打架；非拖拽时换行/增删/改名变宽全部平滑滑移
+    if (!m_bDragging)
+        PlayRectAnim(rcFrom, m_layout.rectOf);
+    else
+        update();
 }
 
 QSize CAsstTabBar::sizeHint() const
@@ -250,6 +305,60 @@ int CAsstTabBar::TabAtPos(const QPoint& a_pt) const
     return -1;
 }
 
+// ── 2026-10-23 布局滑移动画（VS 丝滑：换行/增删/拖拽让位/松手落位全走这里）——
+
+QVector<QRect> CAsstTabBar::CurrentRects() const
+{
+    // 每个可见 Tab 的当前显示位：布局 rect 经动画插值；拖拽中被拖项 = 浮动位
+    //   （跟随光标）。paint 每帧调（O(n)，n≤几十无压力），也是新动画段的起点源：
+    //   动画中重定向（布局又变）时从当前插值位继续滑向新目标，不断蟹。
+    const bool bDrag = m_bDragging && m_iDragFrom >= 0;
+    const LayoutResult& ly = bDrag ? m_dragLayout : m_layout;
+    QVector<QRect> aRc;
+    aRc.reserve(count());
+    for (int i = 0; i < count(); ++i) {
+        if (!isTabVisible(i)) {
+            aRc << QRect();               // 不可见：空位（动画起点表里表示「直接出现」）
+            continue;
+        }
+        QRect rc = (i < ly.rectOf.size()) ? ly.rectOf.at(i) : QRect();
+        if (m_bAnimValid && i < m_rectAnimFrom.size()
+            && !m_rectAnimFrom.at(i).isNull()) {
+            rc = LerpRect(m_rectAnimFrom.at(i), rc, m_dAnimProg);
+        }
+        if (bDrag && i == m_iDragFrom) {  // 被拖项：浮起跟随光标（尺寸 = 洞位尺寸）
+            const QSize szHole = (i < m_dragLayout.rectOf.size())
+                                     ? m_dragLayout.rectOf.at(i).size() : QSize();
+            rc = QRect(m_ptDragCur - m_ptDragGrab, szHole);
+        }
+        aRc << rc;
+    }
+    return aRc;
+}
+
+void CAsstTabBar::PlayRectAnim(const QVector<QRect>& aFrom, const QVector<QRect>& aTo)
+{
+    // 无位移（含首次布局：from 空 = 直接出现）时静默定格，不起时钟。
+    bool bMoved = false;
+    for (int i = 0; i < aTo.size() && !bMoved; ++i) {
+        const QRect rcF = (i < aFrom.size()) ? aFrom.at(i) : QRect();
+        if (!rcF.isNull() && rcF != aTo.at(i))
+            bMoved = true;
+    }
+    m_rectAnimFrom = aFrom;
+    if (!bMoved) {
+        m_rectAnim.stop();
+        m_bAnimValid = false;
+        m_dAnimProg = 1.0;
+        update();
+        return;
+    }
+    m_bAnimValid = true;
+    m_dAnimProg = 0.0;
+    m_rectAnim.stop();
+    m_rectAnim.start();
+}
+
 // ── 绘制 ────────────────────────────────────────────────────────────────────
 
 void CAsstTabBar::paintEvent(QPaintEvent* a_pEvent)
@@ -258,6 +367,7 @@ void CAsstTabBar::paintEvent(QPaintEvent* a_pEvent)
     const bool bDrag = m_bDragging && m_iDragFrom >= 0;
     const LayoutResult& ly = bDrag ? m_dragLayout : m_layout;
     const QVector<int>& order = bDrag ? m_dragOrder : m_naturalOrder;
+    const QVector<QRect> aShow = CurrentRects();   // 显示位（动画插值/被拖项浮动）
     QPainter stPainter(this);
     stPainter.setClipRect(rect());
     // 底基线：非文档模式时末行下缘一条分隔线，衔接 QTabWidget 页面边框
@@ -282,14 +392,12 @@ void CAsstTabBar::paintEvent(QPaintEvent* a_pEvent)
                 eFloatPos = ePos;
                 continue;
             }
-            PaintTab(stPainter, i, ly.rectOf.at(i), ePos, false);
+            PaintTab(stPainter, i, aShow.at(i), ePos, false);
         }
     }
     if (bDrag) {
         // 浮动 Tab：保持拖起时抓取点的相对偏移，半透明跟随光标
-        const QRect rcHole = m_dragLayout.rectOf.at(m_iDragFrom);
-        const QRect rcFloat(m_ptDragCur - m_ptDragGrab, rcHole.size());
-        PaintTab(stPainter, m_iDragFrom, rcFloat, eFloatPos, true);
+        PaintTab(stPainter, m_iDragFrom, aShow.at(m_iDragFrom), eFloatPos, true);
     }
 }
 
@@ -479,6 +587,9 @@ void CAsstTabBar::mouseReleaseEvent(QMouseEvent* a_pEvent)
         }
         const int iFrom = m_iDragFrom;
         const int iTo = m_iDragTo;
+        // 2026-10-23 松手落位动画起点 = 拖拽态显示位（被拖项 = 光标处浮动位）。
+        //   要在清拖拽态前取：清后 CurrentRects 改按常规布局插值，浮动位就丢了。
+        QVector<QRect> rcFrom = CurrentRects();
         m_bDragging = false;
         m_iDragFrom = m_iDragTo = -1;
         m_dragOrder.clear();
@@ -486,10 +597,22 @@ void CAsstTabBar::mouseReleaseEvent(QMouseEvent* a_pEvent)
         m_iPress = -1;
         m_bPressClose = false;
         m_bPressMoved = false;
-        if (iFrom >= 0 && iTo >= 0 && iTo != iFrom)
+        const int iOldH = m_layout.iRows * m_layout.iRowH;
+        if (iFrom >= 0 && iTo >= 0 && iTo != iFrom) {
+            // 起点表随 moveTab 同步移位：松手后索引 i 的内容 = 移位前另一索引的
+            //   内容，让位滑移画的是「内容从旧显示位滑向新位」（含被拖项从光标
+            //   处滑入落位，VS 松手吸附同款）
+            ShiftRects(rcFrom, iFrom, iTo);
             moveTab(iFrom, iTo);      // → emit tabMoved → QTabWidget 同步页序
-        ApplyLayout();   // 2026.09.28 移到 moveTab 之后：m_layout 按各索引当前内容算宽，
-                         //   先 Apply 再 moveTab 会按旧索引-内容映射算宽（宽文本进窄格被截）
+        }
+        // 2026.09.28 教训保持：布局在 moveTab 之后按各索引当前内容算宽（先
+        //   Apply 再 moveTab 会按旧索引-内容映射算宽，宽文本进窄格被截）。
+        //   不调 ApplyLayout（它会再取一次起点）：此处自算布局 + 起点一次到位。
+        m_naturalOrder = NaturalOrder();
+        m_layout = CalcLayout(m_naturalOrder);
+        if (m_layout.iRows * m_layout.iRowH != iOldH)
+            updateGeometry();
+        PlayRectAnim(rcFrom, m_layout.rectOf);
         update();
         return;
     }
@@ -542,6 +665,9 @@ void CAsstTabBar::StartDrag(const QPoint& a_pt)
     m_dragLayout = m_layout;
     grabMouse();
     m_bGrabbed = true;
+    // 2026-10-23 在途的常规滑移动画（换行/增删刚触发）衔接滑向拖拽洞布局——
+    //   洞 = 被拖项原位（拖起瞬间未换位），其余项继续滑向各自最终位，无跳变
+    PlayRectAnim(CurrentRects(), m_dragLayout.rectOf);
     UpdateDrag(a_pt);
 }
 
@@ -551,6 +677,8 @@ void CAsstTabBar::UpdateDrag(const QPoint& a_pt)
     const int iTo = DropInsertAt(a_pt);
     if (iTo >= 0 && iTo != m_iDragTo) {
         m_iDragTo = iTo;
+        // 2026-10-23 先取当前显示位（旧洞布局 + 在途动画插值）作让位滑移动画起点
+        const QVector<QRect> rcFrom = CurrentRects();
         // 重建插入后顺序：抽出被拖项再插到 iTo，其余 Tab 按此顺序滑移让位
         m_dragOrder.clear();
         for (int i = 0; i < count(); ++i)
@@ -559,6 +687,8 @@ void CAsstTabBar::UpdateDrag(const QPoint& a_pt)
                 m_dragOrder << i;
         m_dragOrder.insert(iTo, m_iDragFrom);
         m_dragLayout = CalcLayout(m_dragOrder);
+        // 其他 Tab 从当前位置滑向新让位（含洞位迁移），非瞬移
+        PlayRectAnim(rcFrom, m_dragLayout.rectOf);
     }
     update();
 }
@@ -568,9 +698,17 @@ int CAsstTabBar::DropInsertAt(const QPoint& a_pt) const
     const int n = m_dragOrder.size();
     if (n <= 0 || m_iDragFrom < 0)
         return -1;
-    // 光标定行（越界钳到首/末行），再在行内按 x 找缝：命中项左半 → 其前，
-    // 右半 → 其后，行末空档 → 行末之后；缝换算为「抽出被拖项后的插入位」
-    const int iRow = qBound(0, a_pt.y() / m_dragLayout.iRowH, m_dragLayout.iRows - 1);
+    // 2026-10-23 VS 口径：判定锚从「光标」改为「浮动 Tab 几何」——换位发生在被
+    //   拖 Tab 与对方 Tab 视觉过半重叠（中心对中心）时，与抓取点无关。旧口径锚
+    //   光标：抓 Tab 右缘（「x」附近）拖动时换位点被抓取点带偏约半宽，落点常
+    //   「过头」；锚浮动几何后无论抓哪拖，都是「拖到重叠过半才换」。换位后对方
+    //   Tab 滑移让位、中心随之移开约一个被拖 Tab 宽 → 回翻需明显反向拖动，
+    //   天然迟滞不回抖（旧中线判定在临界处轻微晃动即来回翻转）。
+    const QSize szHole = m_dragLayout.rectOf.at(m_iDragFrom).size();
+    const QRect rcFloat(m_ptDragCur - m_ptDragGrab, szHole);
+    const QPoint ptAnchor = rcFloat.center();  // 行取浮动 Tab 垂直中心，缝取水平中心
+    const int iRow = qBound(0, ptAnchor.y() / m_dragLayout.iRowH,
+                            m_dragLayout.iRows - 1);
     int iFirst = -1;                  // 行首项在 m_dragOrder 中的位
     QVector<int> rowPos;              // 该行各项在 m_dragOrder 中的位（行内显示序）
     for (int d = 0; d < n; ++d) {
@@ -585,7 +723,7 @@ int CAsstTabBar::DropInsertAt(const QPoint& a_pt) const
     int s = iFirst + rowPos.size();   // 缺省缝 = 行末之后
     for (int k = 0; k < rowPos.size(); ++k) {
         const QRect& r = m_dragLayout.rectOf.at(m_dragOrder.at(rowPos.at(k)));
-        if (a_pt.x() < r.center().x()) {
+        if (ptAnchor.x() < r.center().x()) {
             s = iFirst + k;
             break;
         }

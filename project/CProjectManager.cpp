@@ -1,8 +1,10 @@
-#include "CProjectManager.h"
+﻿#include "CProjectManager.h"
 
 #include <QDir>
 #include <QCoreApplication>
 #include <QFile>
+#include <QSaveFile>
+#include <QStringDecoder>
 #include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QTextStream>
@@ -30,6 +32,94 @@
 #include "agent/CAgentRunnerFactory.h"
 #include "core/CTaskInfo.h"
 #include "core/StageDef.h"
+
+// ———— 2026-10-31 v5.2.456 config.ini 编码自愈三件（[Recent] 乱码根治）————
+//   事故链：系统「Beta: Unicode UTF-8」开关实验期间 ACP=65001，Windows profile 写
+//   API 按当前 ACP 整文件重写把 GBK 中文 UTF-8 化（误读字节→U+FFFD 不可逆丢失），
+//   开关回退 936 后启动页中文全「锟斤拷」；[Recent] 读写自此改为字节级自管（固定
+//   GBK，与 ACP 无关），启动时检出 UTF-8 化的 config 自动转正回 GBK。
+namespace {
+
+// QString → GBK 字节（固定 936，与 ACP 无关；不可编码字符替换 '?' 防中断）。
+QByteArray GbkFromQString(const QString& a_sText) {
+#ifdef Q_OS_WIN
+    const std::wstring ws = a_sText.toStdWString();
+    const int n = WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                                     nullptr, 0, nullptr, nullptr);
+    if (n <= 0) {
+        return a_sText.toLocal8Bit();
+    }
+    QByteArray aOut(n, Qt::Uninitialized);
+    WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                        aOut.data(), n, nullptr, nullptr);
+    return aOut;
+#else
+    return a_sText.toLocal8Bit();
+#endif
+}
+
+// 字节 → QString（双口径：UTF-8 严格优先，非法回 GBK 宽松。UTF-8 严格性用
+//   MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS) 判定——QStringDecoder
+//   .hasError() 实测对 0x80..0xBF 开头的非法序列不置错（Qt 6.8 宽松替换不报），Windows API 严格拒绝非法前导字节，与 DetectAndDecode 的
+//   GB 校验同机制。a_pWasUtf8 可空（回带命中口径）。
+QString QStringFromConfigBytes(const QByteArray& a_aBytes, bool* a_pWasUtf8 = nullptr) {
+#ifdef Q_OS_WIN
+    const int nW = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                       a_aBytes.constData(), int(a_aBytes.size()),
+                                       nullptr, 0);
+    if (nW > 0 || (nW == 0 && a_aBytes.isEmpty())) {
+        std::wstring sBuf(nW, L'\0');
+        if (nW > 0) {
+            MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                a_aBytes.constData(), int(a_aBytes.size()),
+                                sBuf.data(), nW);
+        }
+        if (a_pWasUtf8 != nullptr) {
+            *a_pWasUtf8 = true;
+        }
+        return QString::fromStdWString(sBuf);
+    }
+    if (a_pWasUtf8 != nullptr) {
+        *a_pWasUtf8 = false;
+    }
+    {
+        const int nG = MultiByteToWideChar(936, 0, a_aBytes.constData(),
+                                           int(a_aBytes.size()), nullptr, 0);
+        if (nG > 0 || (nG == 0 && a_aBytes.isEmpty())) {
+            std::wstring sBuf(nG, L'\0');
+            if (nG > 0) {
+                MultiByteToWideChar(936, 0, a_aBytes.constData(),
+                                    int(a_aBytes.size()), sBuf.data(), nG);
+            }
+            return QString::fromStdWString(sBuf);
+        }
+    }
+    return QString::fromLocal8Bit(a_aBytes);
+#else
+    if (a_pWasUtf8 != nullptr) {
+        *a_pWasUtf8 = false;
+    }
+    return QString::fromLocal8Bit(a_aBytes);
+#endif
+}
+
+// 字节串是否严格合法 UTF-8（含非 ASCII 才有意义；SanitizeConfigEncoding 用）。
+bool IsValidStrictUtf8(const QByteArray& a_aBytes) {
+#ifdef Q_OS_WIN
+    if (a_aBytes.isEmpty()) {
+        return true;
+    }
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                               a_aBytes.constData(), int(a_aBytes.size()),
+                               nullptr, 0) > 0;
+#else
+    QStringDecoder d(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+    d.decode(a_aBytes);
+    return !d.hasError();
+#endif
+}
+
+} // namespace
 
 CProjectManager::CProjectManager(QObject* a_pParent)
     : QObject(a_pParent) {
@@ -383,7 +473,12 @@ void CProjectManager::BuildGuideAsync() {
         "- 只创建 `.autodev/guide.md` 这一个文件，不要修改任何业务代码。\n"
         "- 内容要准确、基于真实扫描结果，不要臆造。\n"
         "- 若工程很大，聚焦主要源码目录，忽略 build/.git/node_modules 等。\n"
-        "- 优先读取文本文件（.md/.txt/.h/.cpp 等），非文本文件不要逐个打开。\n");
+        "- 优先读取文本文件（.md/.txt/.h/.cpp 等），非文本文件不要逐个打开。\n"
+        "- 篇幅预算（重要，2026-10-22）：正文控制在 150 行 / 6000 字符以内——"
+        "目录结构只列关键目录与一级要点（不逐文件罗列，源码文件清单交给指纹表）；"
+        "模块清单每个模块 1~3 行（位置/职责/关键调用关系）；概述 ≤8 行；"
+        "写现状不写过程（不要逐版本流水/临时细节）。这份指南会随任务增量同步，"
+        "只在精炼篇幅内才能长期维持，宁缺毋溢。\n");
 
     emit sigGuideLog(QStringLiteral(">>> 开始扫描工程并生成 guide.md ..."));
     m_pGuideRunner->StartStage(m_sProjectDir, sPrompt,
@@ -447,10 +542,27 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
     for (int i = iLast; i < aAllLines.size(); ++i) {
         aNewLines.append(aAllLines.at(i));
     }
+    // 2026-10-22 超预算纯压缩轮：无新记录但正文超预算（历史膨胀存量，如 HotNews 207KB）
+    //   时自动跑一轮压缩；哈希门控（上次尝试时的文件哈希）防 agent 压不动时无限重试——
+    //   尝试即记哈希，文件未再变则不再重入；压缩有效但仍超预算则文件已变、下轮继续收敛。
+    bool bCompactOnly = false;
     if (aNewLines.isEmpty()) {
-        // 无新改动：不起 agent。任务 Done / 助手提交后高频触发，无新行时静默跳过。
-        emit sigGuideSyncFinished(false, QStringLiteral("guide.md 已是最新（record.md 无新增改动）"));
-        return;
+        const QString sGuideCur = ReadGuide();
+        if (!sGuideCur.isEmpty() && GuideOverBudget(sGuideCur)) {
+            const QString sHash = QString::fromLatin1(
+                QCryptographicHash::hash(sGuideCur.toUtf8(), QCryptographicHash::Sha256).toHex());
+            if (sHash != LoadGuideCompactHash()) {
+                bCompactOnly = true;
+                SaveGuideCompactHash(sHash);
+                emit sigGuideLog(QStringLiteral(
+                    ">>> guide.md 正文超篇幅预算（>300 行或 >10000 字符），启动压缩整理轮 ..."));
+            }
+        }
+        if (!bCompactOnly) {
+            // 无新改动：不起 agent。任务 Done / 助手提交后高频触发，无新行时静默跳过。
+            emit sigGuideSyncFinished(false, QStringLiteral("guide.md 已是最新（record.md 无新增改动）"));
+            return;
+        }
     }
 
         // 2026.08.18 后端漂移重建：非运行中才换（运行中由 OnSettings 拦截 + 双保险）。
@@ -471,7 +583,30 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
     }
 
     // deny "Bash,Write"：禁跑命令、禁建新文件；放行 Read/Grep/Glob/Edit/MultiEdit（Edit 改 guide.md）。
-    const QString sPrompt = QStringLiteral(
+    // 2026-10-22 篇幅预算：正文（机器段之外）≤300 行 / ≤10000 字符——同步提示词带压缩职责，
+    //   超预算且无新记录时走纯压缩轮（bCompactOnly）。只增不删会让 guide 无限膨胀，
+    //   助手首次会话全文投喂一次性吃掉数万 token（HotNews 实害 207KB/12.7万字符）。
+    QString sPrompt;
+    if (bCompactOnly) {
+        sPrompt = QStringLiteral(
+            "你是项目指南维护助手。`.autodev/guide.md` 正文篇幅已超出预算"
+            "（应 ≤300 行 / ≤10000 字符），本轮没有新改动记录，请做一次纯压缩整理：\n"
+            "1. 用 Read 读取当前 `.autodev/guide.md`。\n"
+            "2. 在保留信息密度的前提下把正文压回预算内：\n"
+            "   - 必须保留：整体结构、各模块位置/职责/关键调用关系、"
+            "构建运行方式、编码规范声明。\n"
+            "   - 压缩手段：合并重复或相似条目；逐版本/逐次同步的流水折叠成一两句现状描述；"
+            "目录结构只列关键目录与一级要点（不逐文件罗列）；已过时或一次性的过程细节直接删除。\n"
+            "3. 压缩后的正文必须准确反映项目现状，不得臆造或丢失关键架构信息。\n\n"
+            "约束（重要）：\n"
+            "- 只允许编辑 `.autodev/guide.md` 这一个文件，用 Edit/MultiEdit 就地修改；"
+            "不得新建或改动其它任何文件，尤其不要写 `.autodev/record.md`。\n"
+            "- guide.md 的「文件指纹表」段（介于 `<!-- AUTOCODE_FINGERPRINTS_BEGIN -->` 与"
+            " `<!-- AUTOCODE_FINGERPRINTS_END -->` 之间）与「## 变更日志（增量）」段"
+            "由系统维护，禁止改动。\n"
+        );
+    } else {
+    sPrompt = QStringLiteral(
         "你是项目指南维护助手。工程自上次同步 `.autodev/guide.md` 后，产生了以下新的改动记录"
         "（来自 `.autodev/record.md`，每行一条，含时间/来源/摘要）：\n\n"
         "```\n%1\n```\n\n"
@@ -491,10 +626,15 @@ void CProjectManager::SyncGuideAsync(const QString& a_sTaskId) {
         "- 只允许编辑 `.autodev/guide.md` 这一个文件，用 Edit/MultiEdit 就地修改；"
         "不得新建或改动其它任何文件，尤其不要写 `.autodev/record.md`。\n"
         "- 保留 guide.md 的整体结构与既有正确内容，只更新受影响部分，不要推倒重写。\n"
+        "- 篇幅预算（重要）：正文应保持在 300 行 / 10000 字符以内；本次更新若会使正文"
+        "超出预算，必须同步压缩——合并重复条目、把逐版本流水折叠为现状描述、删除过时细节。"
+        "增量更新不是只增不删，为控篇幅删减冗余是每次同步的固定职责。\n"
         "- 内容基于真实文件，不得臆造。\n"
         "- guide.md 末尾的「文件指纹表」段（介于 `<!-- AUTOCODE_FINGERPRINTS_BEGIN -->` 与"
-        " `<!-- AUTOCODE_FINGERPRINTS_END -->` 之间）由系统维护，禁止改动。\n"
+        " `<!-- AUTOCODE_FINGERPRINTS_END -->` 之间）与「## 变更日志（增量）」段"
+        "由系统维护，禁止改动。\n"
     ).arg(aNewLines.join(QLatin1Char('\n')));
+    }
 
     emit sigGuideLog(QStringLiteral(">>> 按 record.md 新增记录同步 guide.md ..."));
     // autocompact 兜底：record 累积多 / 需 Read 核实多个文件时上下文可能逼近窗口；
@@ -572,13 +712,84 @@ int CProjectManager::LoadGuideSyncLines() const {
 
 void CProjectManager::SaveGuideSyncLines(int a_iLines) {
     // 落盘失败不抛（水位线最多落后一次，下次多同步一轮，无损正确性）。
+    // 2026-10-22 保留 lastCompactHash：两个键共存于同一 json（互不覆盖）。
     QDir().mkpath(AutoDevDir());
+    QJsonObject o;
+    {
+        CFrwDevice stOld(GuideSyncFile());
+        if (stOld.open(QIODevice::ReadOnly)) {
+            o = QJsonDocument::fromJson(stOld.readAll()).object();
+        }
+    }
+    o[QStringLiteral("lastSyncLines")] = a_iLines;
     QFile stFile(GuideSyncFile());
     if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         return;
     }
+    stFile.write(QJsonDocument(o).toJson());
+}
+
+// ---- 2026-10-22 guide.md 篇幅约束（防无限增长膨胀上下文）----
+// 实害：HotNews 工程 guide.md 增长到 207KB/12.7万字符——每次同步 agent 只增不删，
+//   §概述 3万字符、§目录树 6.3万字符、版本流水逐次追加；助手首次会话全文投喂时
+//   一次性吃掉 6万+ token。约束三件套：①生成/同步提示词带预算与压缩职责；
+//   ②正文超预算且无新记录时自动跑纯压缩轮；③首次投喂超上限改自取（见编排器）。
+namespace {
+// 正文（剥机器段后）预算：行数与字符双口径，任一超限即超预算。
+constexpr int k_iGuideBudgetLines = 300;
+constexpr int k_iGuideBudgetChars = 10000;
+}   // namespace
+
+QString CProjectManager::GuideBodyText(const QString& a_sGuide) const {
+    // 剥离指纹表段（BEGIN..END 含标记）与机器变更日志段（标题行到文末）。
+    QString sBody = a_sGuide;
+    const int iBegin = sBody.indexOf(CGuideFingerprintScanner::s_sBeginMarker);
+    if (iBegin >= 0) {
+        const int iEnd = sBody.indexOf(CGuideFingerprintScanner::s_sEndMarker, iBegin);
+        if (iEnd > iBegin) {
+            sBody.remove(iBegin, iEnd - iBegin
+                + CGuideFingerprintScanner::s_sEndMarker.length());
+        } else {
+            sBody.remove(iBegin, sBody.length() - iBegin);   // 只有 BEGIN：其后全算机器段
+        }
+    }
+    const int iLog = sBody.indexOf(CGuideFingerprintScanner::s_sChangeLogHeader);
+    if (iLog >= 0) {
+        sBody.truncate(iLog);
+    }
+    return sBody;
+}
+
+bool CProjectManager::GuideOverBudget(const QString& a_sGuide) const {
+    const QString sBody = GuideBodyText(a_sGuide);
+    return sBody.count(QLatin1Char('\n')) + 1 > k_iGuideBudgetLines
+        || sBody.size() > k_iGuideBudgetChars;
+}
+
+QString CProjectManager::LoadGuideCompactHash() const {
+    CFrwDevice stFile(GuideSyncFile());
+    if (!stFile.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    const QJsonValue v = QJsonDocument::fromJson(stFile.readAll()).object()
+                             .value(QStringLiteral("lastCompactHash"));
+    return v.isString() ? v.toString() : QString();
+}
+
+void CProjectManager::SaveGuideCompactHash(const QString& a_sHash) {
+    QDir().mkpath(AutoDevDir());
     QJsonObject o;
-    o[QStringLiteral("lastSyncLines")] = a_iLines;
+    {
+        CFrwDevice stOld(GuideSyncFile());
+        if (stOld.open(QIODevice::ReadOnly)) {
+            o = QJsonDocument::fromJson(stOld.readAll()).object();
+        }
+    }
+    o[QStringLiteral("lastCompactHash")] = a_sHash;
+    QFile stFile(GuideSyncFile());
+    if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return;
+    }
     stFile.write(QJsonDocument(o).toJson());
 }
 
@@ -1275,79 +1486,219 @@ void CProjectManager::SyncModelTableToGlobal(const wchar_t* a_pSect,
     SaveModelsTo(sGlobal, a_pSect, aMerged, iMergedActive);
 }
 
+// 2026-10-31 v5.2.456 config.ini 编码自愈：UTF-8 化档（Beta UTF-8 开关期间被 Windows
+//   profile API 整文件重写的产物）转回 GBK。详见头文件注释。判定序：
+//   ① UTF-16 BOM → 不动（Windows API 自管口径，读写自洽）；
+//   ② 全 ASCII → 不动（无编码敏感内容）；
+//   ③ UTF-8 严格全文件合法且含非 ASCII → 备份 + 转回 GBK（QSaveFile 原子替换）；
+//   ④ 其余（GBK 态/混合损坏体）→ 不动（保守，防误伤）。
+void CProjectManager::SanitizeConfigEncoding() {
+    const QString sPath = GlobalConfigPath();
+    if (sPath.isEmpty()) {
+        return;
+    }
+    QFile fCfg(sPath);
+    if (!fCfg.exists() || !fCfg.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    const QByteArray aAll = fCfg.readAll();
+    fCfg.close();
+    // ① UTF-16 BOM：Windows profile API 的 Unicode 档，读写自洽，不碰。
+    if (aAll.startsWith("\xff\xfe") || aAll.startsWith("\xfe\xff")) {
+        return;
+    }
+    // ② 全 ASCII：无编码敏感内容。
+    bool bAsciiOnly = true;
+    for (char c : aAll) {
+        if (static_cast<uchar>(c) > 0x7f) {
+            bAsciiOnly = false;
+            break;
+        }
+    }
+    if (bAsciiOnly) {
+        return;
+    }
+    // ③ UTF-8 严格全文件合法（IsValidStrictUtf8）→ UTF-8 化档（GBK 中文档几乎
+    //   不可能整段合法 UTF-8）。
+    if (IsValidStrictUtf8(aAll)) {
+        const QString sAll = QStringFromConfigBytes(aAll);
+        const QString sBak = sPath + QStringLiteral(".bak-encoding-")
+            + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+        QFile::copy(sPath, sBak);   // 转正前备份（失败不阻断：转正本身可逆）
+        QSaveFile fOut(sPath);
+        if (fOut.open(QIODevice::WriteOnly)) {
+            fOut.write(GbkFromQString(sAll));
+            fOut.commit();
+        }
+        return;
+    }
+    // ④ 其余：GBK 态（常态）或混合损坏体（历史遗留，不动防误伤）。
+}
+
 void CProjectManager::SaveRecent() {
-    // 落盘失败不抛、不退出（NFR-3.3）；内存列表已更新，本会话仍可用。
+    // 2026-10-31 v5.2.456 [Recent] 改字节级自管（GBK 固定，ACP 免疫）：曾发生实害——
+    //   系统「Beta: Unicode UTF-8」开关实验期间 ACP=65001，WritePrivateProfileSectionW
+    //   按当前 ACP 重写全文件把 GBK 中文 UTF-8 化（误读字节→U+FFFD 不可逆丢失），
+    //   开关回退 936 后启动页中文全「锟斤拷」。自此读写不再经 Windows profile API
+    //   （其整文件重写必按当前 ACP 转码，口径不可控）：
+    //   ①本函数字节级定位并替换 [Recent] 节（其它节字节原样保留，不受 ACP 影响）；
+    //   ②行文本固定 GBK 编码；③QSaveFile 原子替换（多实例并发写窗口最小化，
+    //   竞态软后果=MRU 少一条，可再生产）。
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    const std::wstring wsSect = std::wstring(L"Recent");
-
-    // 2026.09.09 v2.1.140 改 WritePrivateProfileSectionW 整节替换：旧版逐键写只增不删，
-    //   列表缩短后高位残留键永留文件（[Recent] 膨胀事故里 1.1MB 残体正是这么留下的，
-    //   profile 每次读都要扫全段）；整节替换会把未出现在新缓冲里的键全部删除（MSDN），
-    //   一次调用收敛文件——旧实例投毒后的高位键在本实例下一次保存时即被清干净。
-    //   缓冲格式："k=v\0k=v\0...\0\0"（wstring 自带尾部终止符补出双 null）。
-    // ini 中 1 = 最近（MRU），索引 0 → key "1"；打开次数 → 附加键 "C<i>"（2026.09.20，
-    //   用于统计各工程使用/修改频率；整节替换会同步清掉高位残留的旧 C 键）。
-    QString sBody = QStringLiteral("Count=%1").arg(m_aRecentProjects.size());
+    // 新节文本：Count + N=路径 + CN=计数（计数与路径表长度对齐，缺省 1）。
+    QString sSect = QStringLiteral("Count=%1").arg(m_aRecentProjects.size());
     for (int i = 0; i < m_aRecentProjects.size(); ++i) {
-        sBody += QChar(u'\0');
-        sBody += QStringLiteral("%1=%2").arg(i + 1).arg(m_aRecentProjects.at(i));
-        sBody += QChar(u'\0');
-        sBody += QStringLiteral("C%1=%2").arg(i + 1)
+        sSect += QStringLiteral("\r\n%1=%2").arg(i + 1).arg(m_aRecentProjects.at(i));
+        sSect += QStringLiteral("\r\nC%1=%2")
+                     .arg(i + 1)
                      .arg(i < m_aiRecentOpens.size() ? m_aiRecentOpens.at(i) : 1);
     }
-    const std::wstring wsBody = sBody.toStdWString();
-    WritePrivateProfileSectionW(wsSect.c_str(), wsBody.c_str(), wsPath.c_str());
+    const QByteArray aSect = GbkFromQString(sSect);   // 固定 GBK（与 ACP 无关；
+    // 纯 ASCII 路径不受影响，中文目录名在中文系统闭环）。
+    QFile fCfg(sPath);
+    QByteArray aAll;
+    if (fCfg.exists()) {
+        if (!fCfg.open(QIODevice::ReadOnly)) {
+            return;   // 落盘失败不抛不退出（NFR-3.3），内存列表本会话仍可用
+        }
+        aAll = fCfg.readAll();
+        fCfg.close();
+    }
+    // 字节级定位 [Recent] 节：节头行 → 下一个行首 '[' 或文件尾。支持 \r\n/\n。
+    const QByteArray aHeadMark = QByteArrayLiteral("[Recent]");
+    qsizetype iSect = aAll.indexOf('\n' + aHeadMark);
+    qsizetype iOff = 0;
+    bool bFound = false;
+    if (iSect >= 0) {
+        iOff = iSect + 1 + aHeadMark.size();
+        bFound = true;
+    } else if (aAll.startsWith(aHeadMark)) {
+        iOff = aHeadMark.size();
+        bFound = true;
+    }
+    // iOff 对齐到节头行之后的首个内容字节（跳过行尾 \r\n；粘连档（无行尾）安全前造）。
+    if (bFound) {
+        const qsizetype iNl = aAll.indexOf('\n', iOff);
+        iOff = (iNl < 0) ? aAll.size() : iNl + 1;
+    }
+    QByteArray aOut;
+    if (!bFound) {
+        // 无节：追加到文件尾（保持原有节顺序；空文件=新建首节，勿漏节头）。
+        aOut = aAll;
+        if (!aOut.isEmpty() && !aOut.endsWith('\n')) {
+            aOut += '\r';
+            aOut += '\n';
+        }
+        aOut += aHeadMark;
+        aOut += '\r';
+        aOut += '\n';
+    } else {
+        qsizetype iNext = aAll.indexOf("\n[", iOff);
+        if (iNext < 0) {
+            iNext = aAll.size();
+        }
+        aOut = aAll.left(iOff) + aSect + '\r' + '\n' + aAll.mid(iNext + 1);
+    }
+    QSaveFile fOut(sPath);
+    if (fOut.open(QIODevice::WriteOnly)) {
+        fOut.write(aOut);
+        fOut.commit();   // 原子替换（失败不抛，内存列表仍有效）
+    }
 }
 
 void CProjectManager::LoadRecent() {
-    // config.ini 不存在 → GetPrivateProfileInt 返回默认值 0 → 列表空（NFR-2.4）。
-    // 2026.09.09 v2.1.139 修「启动极慢 + 最近列表膨胀到两万条」勿回退：
-    //   ① 先 clear()——旧版直接在既有列表上 prepend，而 v2.1.123 起 OnConfigFileChanged
-    //     热同步会多次调本函数，多实例共享 config 时每次热重载都把全量列表再叠一遍
-    //     （内存滚雪球，叠出重复项后被 SaveRecent 全量落盘——副本 config 实测膨胀到
-    //     21744 条/1.1MB，启动仅 LoadRecent 就要两万余次 profile 读）；
-    //   ② 载入即按 NormalizePath 去重（保首个＝MRU 最新），旧档里的历史重复项自此
-    //     自愈，配合 AddRecent/RemoveRecent 的「删全部匹配」双保险。
+    // 2026-10-31 v5.2.456 载入前先做 config 编码自愈（详见 SanitizeConfigEncoding 注释）：
+    //   检出「UTF-8 化」的 config（Beta UTF-8 开关期间被 Windows profile API 整文件
+    //   重写的产物）自动转正回 GBK，中文路径名在本次载入即已可读。
+    SanitizeConfigEncoding();
+    // config.ini 不存在 → 空表（NFR-2.4）。
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return;
     }
-    const std::wstring wsPath = sPath.toStdWString();
-    const std::wstring wsSect = std::wstring(L"Recent");
-
-    const int iCountCfg = GetPrivateProfileIntW(wsSect.c_str(), L"Count", 0, wsPath.c_str());
+    // 2026-10-31 v5.2.456 [Recent] 改字节级自解析（不再经 GetPrivateProfileStringW：
+    //   ①其对 ANSI 文件按当前 ACP 解码，UTF-8 化档直接读出「锟斤拷」；②MAX_PATH=260
+    //   缓冲截长路径；自解析行级双口径解码（UTF-8 严格优先，见 QStringFromConfigBytes）
+    //   且无长度限制）。键收集：N=路径 / CN=计数 / Count。
+    QFile fCfg(sPath);
+    if (!fCfg.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    const QByteArray aAll = fCfg.readAll();
+    fCfg.close();
+    const QByteArray aHeadMark = QByteArrayLiteral("[Recent]");
+    qsizetype iSect = aAll.indexOf('\n' + aHeadMark);
+    qsizetype iOff = 0;
+    if (iSect >= 0) {
+        iOff = iSect + 1 + aHeadMark.size();
+    } else if (!aAll.startsWith(aHeadMark)) {
+        return;   // 无 [Recent] 节（首次运行）
+    } else {
+        iOff = aHeadMark.size();
+    }
+    qsizetype iNext = aAll.indexOf("\n[", iOff);
+    if (iNext < 0) {
+        iNext = aAll.size();
+    }
+    QMap<int, QString> mapPaths;
+    QMap<int, int> mapOpens;
+    int iCountCfg = 0;
+    {
+        const QList<QByteArray> aLines = aAll.mid(iOff, iNext - iOff).split('\n');
+        for (QByteArray aLine : aLines) {
+            aLine = aLine.trimmed();
+            if (aLine.isEmpty() || aLine.startsWith(';')) {
+                continue;
+            }
+            const qsizetype iEq = aLine.indexOf('=');
+            if (iEq <= 0) {
+                continue;
+            }
+            const QByteArray aKey = aLine.left(iEq).trimmed();
+            const QByteArray aVal = aLine.mid(iEq + 1).trimmed();
+            if (aKey == QByteArrayLiteral("Count")) {
+                iCountCfg = QString::fromLatin1(aVal).toInt();
+                continue;
+            }
+            if (aKey.startsWith('C')) {
+                // CN=计数（C 前缀 + 序号；须先于纯数字分支判，否则 toInt 短路）。
+                bool bOkIdx = false;
+                const int iIdx = QString::fromLatin1(aKey.mid(1)).toInt(&bOkIdx);
+                const int iVal = QString::fromLatin1(aVal).toInt();
+                if (bOkIdx && iIdx > 0) {
+                    mapOpens.insert(iIdx, iVal > 0 ? iVal : 1);
+                }
+                continue;
+            }
+            bool bOk = false;
+            const int iKey = QString::fromLatin1(aKey).toInt(&bOk);
+            if (bOk && iKey > 0) {
+                mapPaths.insert(iKey, QStringFromConfigBytes(aVal));
+            }
+        }
+    }
+    auto fnReadKey = [&mapPaths](int a_iIdx) -> QString {
+        return mapPaths.value(a_iIdx, QString());
+    };
+    // 2026.09.20 打开次数键 "C<i>"（旧档无此键 → 1：能在列表里即被打开过至少一次）。
+    auto fnReadOpens = [&mapOpens](int a_iIdx) -> int {
+        return mapOpens.value(a_iIdx, 1);
+    };
+    // 2026.09.09 v2.1.139 载入即按 NormalizePath 去重（保首个＝MRU 最新）；
+    //   Count 键丢失/损坏兑底：顺序探测编号键重建（首个缺号即止，上限 1000 防坏档拖死）。
     m_aRecentProjects.clear();
-    m_aiRecentOpens.clear();   // 2026.09.20 计数随列表同清（热同步重入安全）
-
+    m_aiRecentOpens.clear();
     QStringList aLoaded;
     QList<int> aLoadedOpens;
     QSet<QString> aSeen;
-    auto fnReadKey = [&wsSect, &wsPath](int a_iIdx) -> QString {
-        wchar_t szBuf[MAX_PATH] = {0};
-        const DWORD dwCopied = GetPrivateProfileStringW(
-            wsSect.c_str(),
-            QString::number(a_iIdx).toStdWString().c_str(),
-            L"",
-            szBuf, MAX_PATH, wsPath.c_str());
-        return dwCopied == 0 ? QString()
-                              : QString::fromWCharArray(szBuf, static_cast<int>(dwCopied));
-    };
-    // 2026.09.20 打开次数键 "C<i>"（旧档无此键 → 1：能在列表里即被打开过至少一次）。
-    auto fnReadOpens = [&wsSect, &wsPath](int a_iIdx) -> int {
-        const int iVal = GetPrivateProfileIntW(
-            wsSect.c_str(),
-            QStringLiteral("C%1").arg(a_iIdx).toStdWString().c_str(),
-            1, wsPath.c_str());
-        return iVal > 0 ? iVal : 1;
-    };
+    const int iLimit = iCountCfg > 0 ? iCountCfg : 1000;
     // ini 中 1 = 最近（MRU）；顺序读入保序，重复路径（规范化后相同）只留首个
     //   （计数取重复项最大——叠加 bug 副本同源，取最大最接近真实）。
     if (iCountCfg > 0) {
-        for (int i = 1; i <= iCountCfg; ++i) {
+        for (int i = 1; i <= iLimit; ++i) {
             const QString sVal = fnReadKey(i);
             if (sVal.isEmpty()) {
                 continue;
@@ -2950,6 +3301,31 @@ QString CProjectManager::LoadViewEngine()
         L"View", L"Engine", L"Legacy", szBuf, 64, sPath.toStdWString().c_str());
     const QString sVal = QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
     return IsModelViewEngine(sVal) ? sVal : QStringLiteral("Legacy");
+}
+
+// 2026-10-31 源码预览语法高亮（[View] CodeSyntax，界面态键不随任务覆盖；口径同
+//   Engine：Save 用实例 ConfigFilePath，Load 静态读 GlobalConfigPath——预览控件
+//   无 pm 指针，ShowFile 每次现读即生效（设置保存后下一个打开的文件即新状态）。
+bool CProjectManager::SaveCodeSyntax(bool a_bOn)
+{
+    const QString sPath = GlobalConfigPath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    WritePrivateProfileStringW(L"View", L"CodeSyntax", a_bOn ? L"1" : L"0",
+                               sPath.toStdWString().c_str());
+    return true;
+}
+
+bool CProjectManager::LoadCodeSyntax()
+{
+    // 无 config.ini / 缺键 → 默认开（1）；仅认 0 为关。
+    const QString sPath = GlobalConfigPath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    return GetPrivateProfileIntW(L"View", L"CodeSyntax", 1,
+                                 sPath.toStdWString().c_str()) != 0;
 }
 
 QStringList CProjectManager::BackupExcludeDirs() const {    // FR-6（Q4 默认排除清单）：.autodev（含 backups 自身，防递归）、build、Execute、

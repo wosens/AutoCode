@@ -116,9 +116,19 @@ void CStreamPresenter::Append(const SBlockData& a_stData) {
     //   未投影窗口（Bind 后未 Rebuild——跨档幽灵 Tab 建页即 Bind 不 Rebuild）：
     //   与 Legacy「未重建前不显示」同语义——只入数据不投影，切 Tab 惰性 Rebuild
     //   全量对齐（期间投影会造成模型内数据下标错位、回填 miss）。
+    //   2026-10-23 修复「激活页首块不显示」（用户实害：发提示词后日志空白，
+    //   单助手切走再切回也不显示——切回同激活页 OnAsstTabCurrentChanged 提前
+    //   return 永不 Rebuild）：空数据建页（新建助手/新任务重置/重开空助手，
+    //   Bind 不 Rebuild）后首块到达时，模型必为空（Unbind ClearDisplay 保证）
+    //   且数据仅此 1 块——投影下标天然对齐，投影后置位进入持续同步态；
+    //   载入即有数据的页（跨档幽灵/载档未预建，size>1）保持惰性 Rebuild 语义
+    //   不变（旧守卫的存在理由：错位/回填 miss）。
     if (m_pModel != nullptr) {
         if (m_bProjected) {
             m_pModel->AppendBlock(a_stData);
+        } else if (m_aBlocks.size() == 1) {
+            m_pModel->AppendBlock(a_stData);   // 首块安全投影（模型空+数据仅此 1 块）
+            m_bProjected = true;               // 进入持续同步态（后续块增量投影）
         }
         return;
     }

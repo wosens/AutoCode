@@ -1,6 +1,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
@@ -507,9 +508,16 @@ int main(int argc, char* argv[]) {
         CCodexProxy proxy;
         qint64 spyIn = -1, spyOut = -1;
         int spyCount = 0;
+        qint64 spyEst = -1;
+        int spyEstCount = 0;
         QObject::connect(&proxy, &CCodexProxy::sigUsage, &proxy,
                          [&](qint64 a_iIn, qint64 a_iOut) {
                              spyIn = a_iIn; spyOut = a_iOut; ++spyCount;
+                         });
+        // 2026-10-31 上下文估算信号（网关 usage 尾块被掐时的兑底数据源）。
+        QObject::connect(&proxy, &CCodexProxy::sigPromptEstimate, &proxy,
+                         [&](qint64 a_iTokens) {
+                             spyEst = a_iTokens; ++spyEstCount;
                          });
         Check(proxy.Start(QUrl(QStringLiteral("http://127.0.0.1:%1/openai/v1")
                                    .arg(gw.serverPort())), 32768),
@@ -552,6 +560,229 @@ int main(int argc, char* argv[]) {
         Check(oSeen.value(QStringLiteral("stream_options")).toObject()
                   .value(QStringLiteral("include_usage")).toBool(),
               QStringLiteral("代理应注入 stream_options.include_usage"));
+        Check(spyEstCount == 1 && spyEst == qint64(gwBody.size()) / 4
+                  && spyEst > 0,
+              QStringLiteral("代理应发请求体估算（次数=%1 估=%2 期望=%3）")
+                  .arg(spyEstCount).arg(spyEst).arg(gwBody.size() / 4));
+        proxy.Shutdown();
+    }
+
+    // —— 7. SanitizeToolArguments（workdir 幻觉消毒纯函数，2026-10-31）——
+    {
+        const QString sBase = QCoreApplication::applicationDirPath();   // 真实存在目录
+        QString sBad;
+        // ① 幻觉绝对目录（OpenCompare 实害原样 E:\wososens）→ 剔除 workdir 键。
+        {
+            const QString sIn = QStringLiteral(
+                "{\"command\":[\"powershell.exe\",\"-Command\",\"dir\"],"
+                "\"timeout_ms\":30000,\"workdir\":\"E:\\\\wososens\"}");
+            const QString sOut = CCodexProxy::SanitizeToolArguments(sIn, sBase, &sBad);
+            const QJsonObject o = QJsonDocument::fromJson(sOut.toUtf8()).object();
+            Check(!o.contains(QStringLiteral("workdir")),
+                  QStringLiteral("幻觉绝对目录应剔除 workdir"));
+            Check(o.value(QStringLiteral("command")).isArray()
+                      && o.value(QStringLiteral("timeout_ms")).toInt() == 30000,
+                  QStringLiteral("剔除 workdir 不应伤及其他字段"));
+            Check(sBad == QStringLiteral("E:\\wososens"),
+                  QStringLiteral("应回带被剔除目录（实际 %1）").arg(sBad));
+        }
+        // ② 存在的绝对目录（本程序目录）→ 放行原样。
+        {
+            const QString sIn = QStringLiteral(
+                "{\"command\":[\"dir\"],\"workdir\":\"%1\"}").arg(sBase);
+            sBad.clear();
+            Check(CCodexProxy::SanitizeToolArguments(sIn, QString(), &sBad) == sIn
+                      && sBad.isEmpty(),
+                  QStringLiteral("存在的绝对目录应原样放行"));
+        }
+        // ③ 相对目录：基准空放行；基准给定且拼接后不存在 → 剔除。
+        {
+            const QString sIn = QStringLiteral("{\"command\":[\"dir\"],\"workdir\":\"src\"}");
+            sBad.clear();
+            Check(CCodexProxy::SanitizeToolArguments(sIn, QString(), &sBad) == sIn,
+                  QStringLiteral("基准空时相对路径应放行"));
+            const QString sOut = CCodexProxy::SanitizeToolArguments(
+                sIn, QStringLiteral("Z:/__autocode_no_such__"), &sBad);
+            Check(!QJsonDocument::fromJson(sOut.toUtf8()).object()
+                      .contains(QStringLiteral("workdir"))
+                      && sBad == QStringLiteral("src"),
+                  QStringLiteral("基准下不存在的相对目录应剔除"));
+        }
+        // ④ 非 JSON / 无 workdir / 空 workdir → 原样。
+        Check(CCodexProxy::SanitizeToolArguments("not json", sBase, &sBad) == "not json"
+                  && sBad.isEmpty(),
+              QStringLiteral("非 JSON 参数应原样"));
+        Check(CCodexProxy::SanitizeToolArguments("{\"command\":[\"dir\"]}", sBase, &sBad)
+                  == "{\"command\":[\"dir\"]}",
+              QStringLiteral("无 workdir 应原样"));
+    }
+
+    // —— 8. BuildArgsDeltaChunk 形状（冲刷合成块可被 codex 归并）——
+    {
+        const QByteArray aChunk = CCodexProxy::BuildArgsDeltaChunk(
+            0, 1, QStringLiteral("chatcmpl-x"), QStringLiteral("glm-5.3"),
+            1793379882, QStringLiteral("{\"a\":1}"));
+        Check(aChunk.startsWith("data: ") && aChunk.endsWith("\n\n"),
+              QStringLiteral("合成块应为 data: 行"));
+        const QJsonObject o = QJsonDocument::fromJson(
+            aChunk.mid(6, aChunk.size() - 8)).object();
+        const QJsonObject oTc = o.value(QStringLiteral("choices")).toArray().at(0)
+            .toObject().value(QStringLiteral("delta")).toObject()
+            .value(QStringLiteral("tool_calls")).toArray().at(0).toObject();
+        Check(o.value(QStringLiteral("id")).toString() == QStringLiteral("chatcmpl-x")
+                  && o.value(QStringLiteral("model")).toString() == QStringLiteral("glm-5.3"),
+              QStringLiteral("合成块应带 id/model"));
+        Check(oTc.value(QStringLiteral("index")).toInt() == 1
+                  && oTc.value(QStringLiteral("function")).toObject()
+                      .value(QStringLiteral("arguments")).toString()
+                  == QStringLiteral("{\"a\":1}"),
+              QStringLiteral("合成块应为指定 tc 索引携带完整 arguments"));
+    }
+
+    // —— 9. chunked SSE 消毒端到端（本地回环：幻觉 workdir 被剔 + 流序完整）——
+    {
+        #include <QTcpServer>
+        #include <QTcpSocket>
+        #include <QTimer>
+        #include <QUrl>
+        // 伪造网关：chunked SSE 分帧发工具调用增量（首块 id/name+空参，两块参数增量
+        //   携带幻觉 workdir，finish 块收尾）——模拟 glm 真实输出形态。
+        QTcpServer gw;
+        QObject::connect(&gw, &QTcpServer::newConnection, &gw, [&]() {
+            QTcpSocket* pSock = gw.nextPendingConnection();
+            pSock->setParent(&gw);
+            QObject::connect(pSock, &QTcpSocket::readyRead, pSock, [pSock]() {
+                pSock->setProperty("buf", pSock->property("buf").toByteArray()
+                                          + pSock->readAll());
+                if (!pSock->property("buf").toByteArray().contains("\r\n\r\n")) {
+                    return;   // 等头收全即回（不看请求体）
+                }
+                const auto frame = [](const QByteArray& aBody) {
+                    return QByteArray::number(aBody.size(), 16) + "\r\n" + aBody + "\r\n";
+                };
+                QByteArray aBody;
+                aBody += "data: {\"id\":\"c1\",\"created\":1,\"model\":\"glm-5.3\","
+                         "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":"
+                         "[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\","
+                         "\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]}}]}\n\n";
+                const auto argsChunkLine = [](const QString& a_sFrag) {
+                    QJsonObject oFn;
+                    oFn.insert(QStringLiteral("arguments"), a_sFrag);
+                    QJsonObject oTc;
+                    oTc.insert(QStringLiteral("index"), 0);
+                    oTc.insert(QStringLiteral("function"), oFn);
+                    QJsonObject oDelta;
+                    oDelta.insert(QStringLiteral("tool_calls"), QJsonArray{ oTc });
+                    QJsonObject oChoice;
+                    oChoice.insert(QStringLiteral("index"), 0);
+                    oChoice.insert(QStringLiteral("delta"), oDelta);
+                    QJsonObject oRoot;
+                    oRoot.insert(QStringLiteral("id"), QStringLiteral("c1"));
+                    oRoot.insert(QStringLiteral("choices"), QJsonArray{ oChoice });
+                    return "data: "
+                        + QJsonDocument(oRoot).toJson(QJsonDocument::Compact) + "\n\n";
+                };
+                // 参数分两个增量：携幻觉 workdir 的前半 + 补齐后半（跨块拼接 + 嵌套转义）
+                aBody += argsChunkLine(QStringLiteral(
+                    "{\"command\":[\"dir\"],\"workdir\":\"E:\\\\wososens\""));
+                aBody += argsChunkLine(QStringLiteral(",\"timeout_ms\":30000}"));
+                aBody += "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},"
+                         "\"finish_reason\":\"tool_calls\"}]}\n\n";
+                aBody += "data: [DONE]\n\n";
+                const QByteArray sResp = "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n"
+                    "Connection: close\r\n\r\n" + frame(aBody) + "0\r\n\r\n";
+                pSock->write(sResp);
+                pSock->flush();
+                pSock->disconnectFromHost();
+            });
+        });
+        Check(gw.listen(QHostAddress::LocalHost, 0),
+              QStringLiteral("消毒用伪造网关应可监听"));
+        CCodexProxy proxy;
+        QString sGuard;
+        int iGuard = 0;
+        QObject::connect(&proxy, &CCodexProxy::sigWorkdirGuard, &proxy,
+                         [&](const QString& a_sBad) { sGuard = a_sBad; ++iGuard; });
+        Check(proxy.Start(QUrl(QStringLiteral("http://127.0.0.1:%1/v1")
+                                   .arg(gw.serverPort())), 32768,
+                          QStringLiteral("E:/wosens/Programs/VisualC++/QT/OpenCompare")),
+              QStringLiteral("消毒代理 Start 应成功"));
+        QTcpSocket cli;
+        QByteArray cliRecv;
+        QEventLoop loop;
+        QTimer tmOut;
+        tmOut.setSingleShot(true);
+        QObject::connect(&tmOut, &QTimer::timeout, &loop, &QEventLoop::quit);
+        QObject::connect(&cli, &QTcpSocket::connected, &cli, [&]() {
+            const QByteArray sBody = R"({"model":"glm-5.3","messages":[{"role":"user","content":"hi"}],"stream":true})";
+            const QByteArray sHead = "POST /v1/chat/completions HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                "Content-Length: " + QByteArray::number(sBody.size()) + "\r\n\r\n";
+            cli.write(sHead + sBody);
+        });
+        QObject::connect(&cli, &QTcpSocket::readyRead, &cli, [&]() {
+            cliRecv += cli.readAll();
+        });
+        QObject::connect(&cli, &QTcpSocket::disconnected, &loop, &QEventLoop::quit);
+        cli.connectToHost(QHostAddress::LocalHost, int(proxy.Port()));
+        tmOut.start(5000);
+        loop.exec();
+        // ① chunked 帧合法：能解出全部 body 且含终止帧。
+        const int iBodyAt = cliRecv.indexOf("\r\n\r\n");
+        Check(iBodyAt > 0, QStringLiteral("应收到响应头"));
+        QByteArray aBody, aRest = cliRecv.mid(iBodyAt + 4);
+        bool bTerminal = false;
+        while (!aRest.isEmpty()) {
+            const int iCrlf = aRest.indexOf("\r\n");
+            if (iCrlf < 0) { break; }
+            const qint64 llSz = aRest.left(iCrlf).split(';').first().trimmed()
+                                    .toLongLong(nullptr, 16);
+            aRest.remove(0, iCrlf + 2);
+            if (llSz == 0) { bTerminal = true; break; }
+            aBody += aRest.left(int(llSz));
+            aRest.remove(0, int(llSz) + 2);
+        }
+        Check(bTerminal && aBody.contains("[DONE]"),
+              QStringLiteral("重编码后的 chunked 帧应可解析且含终止帧"));
+        // ② 首块 id/name 即时透传且不含 arguments。
+        Check(aBody.contains("\"call_x\"") && aBody.contains("\"shell\""),
+              QStringLiteral("id/name 行应透传"));
+        // ③ 冲刷的完整参数：含 command/timeout，不含幻觉 workdir。
+        int iArgsJson = -1;
+        {
+            const QList<QByteArray> aLines = aBody.split('\n');
+            for (const QByteArray& sLine : aLines) {
+                if (!sLine.startsWith("data: ")) { continue; }
+                const QByteArray sPay = sLine.mid(6).trimmed();
+                if (sPay.isEmpty() || sPay == "[DONE]") { continue; }
+                const QJsonObject o = QJsonDocument::fromJson(sPay).object();
+                const auto aTcs = o.value(QStringLiteral("choices")).toArray().at(0)
+                    .toObject().value(QStringLiteral("delta")).toObject()
+                    .value(QStringLiteral("tool_calls")).toArray();
+                if (aTcs.isEmpty()) { continue; }
+                const QString sArgs = aTcs.at(0).toObject()
+                    .value(QStringLiteral("function")).toObject()
+                    .value(QStringLiteral("arguments")).toString();
+                if (!sArgs.isEmpty()) {
+                    const QJsonObject oArgs = QJsonDocument::fromJson(sArgs.toUtf8()).object();
+                    if (oArgs.contains(QStringLiteral("command"))) {
+                        iArgsJson = 1;
+                        Check(oArgs.value(QStringLiteral("command")).toArray().at(0)
+                                  .toString() == QStringLiteral("dir")
+                              && oArgs.value(QStringLiteral("timeout_ms")).toInt() == 30000,
+                              QStringLiteral("冲刷参数应含跨增量拼接的 command/timeout"));
+                        Check(!oArgs.contains(QStringLiteral("workdir")),
+                              QStringLiteral("冲刷参数不应再含幻觉 workdir"));
+                    }
+                }
+            }
+        }
+        Check(iArgsJson == 1, QStringLiteral("应存在携带完整参数的冲刷块"));
+        // ④ 拦截留痕信号。
+        Check(iGuard == 1 && sGuard == QStringLiteral("E:\\wososens"),
+              QStringLiteral("sigWorkdirGuard 应发 1 次且目录正确（次=%1 目录=%2）")
+                  .arg(iGuard).arg(sGuard));
         proxy.Shutdown();
     }
 

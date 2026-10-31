@@ -758,8 +758,28 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
                         }
                         emit sigUsageDelta(a_iIn, a_iOut);
                     });
+            // 2026-10-31 上下文条兑底：网关大会话流尾常被掐（usage 块到不了），
+            //   代理的请求体估算成为唯一可用口径——仅驱动上下文显示/闸门，
+            //   不进费用统计（真实 usage 到达时后到覆盖，顺序：请求时估→响应尾真）。
+            connect(m_pProxy, &CCodexProxy::sigPromptEstimate, this,
+                    [this](qint64 a_iEst) {
+                        if (a_iEst > 0 && a_iEst != m_iLastContextFill) {
+                            m_iLastContextFill = a_iEst;
+                            emit sigContextFill(a_iEst);
+                        }
+                    });
+            // 2026-10-31 workdir 幽觉拦截留痕（OpenCompare 实害 os error 267：
+            //   模型凭记忆拼错 E:\wosens → E:\wososens，codex 按不存在目录
+            //   spawn 命令报「目录名称无效」）：代理消毒剔除后向用户报一声。
+            connect(m_pProxy, &CCodexProxy::sigWorkdirGuard, this,
+                    [this](const QString& a_sBadDir) {
+                        emit sigInfo(QStringLiteral(
+                            "[system/codex] ⚠ 已拦截模型幻觉 workdir「%1」"
+                            "（目录不存在，会导致命令报「目录名称无效 os error 267」），"
+                            "已改按工程目录执行").arg(a_sBadDir));
+                    });
         }
-        if (m_pProxy->Start(urlBase, CodexEffMaxTokensFor(pAct))) {
+        if (m_pProxy->Start(urlBase, CodexEffMaxTokensFor(pAct), a_sWorkDir)) {
             aArgs << "-c" << QStringLiteral("model_providers.%1.base_url=%2")
                          .arg(CodexEffProviderFor(pAct, iUse), m_pProxy->ProxyBaseUrl());
             emit sigInfo(QStringLiteral("[system/codex] 本地输出上限代理：127.0.0.1:%1 → %2"
@@ -807,6 +827,13 @@ void CCodexRunner::StartStage(const QString& a_sWorkDir,
         emit sigInfo(QStringLiteral("[system/codex] 已注入技能清单（%1 字符）")
                          .arg(QString::number(sSkillCatalog.size())));
     }
+    // 2026-10-31 workdir 幻觉防线（OpenCompare 实害：模型凭记忆把 E:\wosens 拼成
+    //   E:\wososens → codex 按不存在目录 spawn 报「目录名称无效 os error 267」）：
+    //   一行工具约定前置（本地代理仅能拦 http+chat 路由，此处对全部路由生效）。
+    sPrompt.prepend(QStringLiteral(
+        "【工具约定】调用 shell 工具时不要传 workdir 字段（工作目录已固定为"
+        "工程根目录）；需要引用路径时必须逐字符复制上下文已有路径，禁止凭记忆"
+        "拼写。\n\n---\n\n"));
     const QString sGlobalCtx = CAgentRunnerBase::SharedGlobalContextContent();
     if (!sGlobalCtx.isEmpty()) {
         sPrompt.prepend(QStringLiteral(
@@ -1081,15 +1108,32 @@ void CCodexRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatu
     if (sErrAll.contains(QStringLiteral("ran out of room in the model's context window"),
                          Qt::CaseInsensitive)) {
         sMsg += QStringLiteral(
-            "\n处理：chat 模式下该报错多为**单轮输出超限**——网关默认输出上限 4096 token，"
-            "codex 把截断（finish_reason=length）误报为上下文耗尽。可："
-            "① 设置 → CodexHarness 自定义模型表，调大该条目「最大输出」列"
-            "（AutoCode 已自动经本地代理注入 max_tokens，重启后生效）；"
-            "② 若确为输入超窗：核对条目「上下文」列与模型真实窗口一致后拆小阶段重跑。");
+            "\n处理：chat 模式无自动压缩，该报错有两种成因——"
+            "① 输入侧（长会话常见）：本轮对话累计 token 已逼近条目「上下文」窗口"
+            "（codex 每轮全量重发历史+思考，累计远超直觉）。可：右键上下文进度条"
+            "「立即压缩上下文」后重发；或拆小任务分轮执行；核对条目「上下文」列"
+            "与模型真实窗口一致（配大不配小、也勿虚配）；"
+            "② 输出侧（少见，代理已注入 max_tokens 防护）：确认条目「最大输出」已调大"
+            "（网关上限 131072）。若 stderr 含「目录名称无效 (os error 267)」——那是 codex "
+            "单次命令启动的瞬时失败（模型重试即成功），非本轮失败原因，可忽略。");
     } else {
         sMsg += QStringLiteral("\n处理：检查 CodexHarness 根目录/模型/BaseUrl 与 API key 配置"
                                "（设置 → CodexHarness 参数，保存时写入 ~/.codex）；"
-                               "或重跑「安装 CodexHarness…」。");
+                               "或重跑「安装 CodexHarness…」。"
+                               // 2026-10-31 267 瞬态说明（OpenCompare 实害）：stderr 带
+                               //「目录名称无效 (os error 267)」多为模型幻觉 workdir 的
+                               // 单次命令瞬时失败（模型重试即恢复，本地代理已自动拦截），
+                               // 并非进程退出原因——防用户被尾部日志误导去查配置。
+                               "\n说明：stderr 中「目录名称无效 (os error 267)」是模型"
+                               "凭记忆拼错 workdir 的单次命令瞬时失败（模型重试即恢复，"
+                               "本地代理已自动拦截该字段），不是进程退出原因；");
+        if (a_iExitCode == -1 && m_sErrorEvent.isEmpty()) {
+            sMsg += QStringLiteral("退出码 -1 且无 error 事件多为网关/链路中断"
+                                   "（连接被重置）——直接在助手发「继续」即可断点续跑，"
+                                   "无需改配置。");
+        } else {
+            sMsg += QStringLiteral("若反复失败再核对网关/模型可用性。");
+        }
     }
     EmitFailed(sMsg);
 }

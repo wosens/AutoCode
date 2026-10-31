@@ -43,6 +43,15 @@
 #include "ui/CFilePreviewWidget.h"
 #include <QTextBrowser>   // 2026.09.22 文件内查找：选中验证
 #include <QTextCursor>
+#include <QTextDocument>  // 2026-10-26 md 增强：baseUrl/资源解析断言
+#include <QTextTable>     // 2026-10-26 md 增强：表格样式断言
+#include <QTextTableFormat>
+#include <QTextFrame>
+#include <QTcpServer>     // 2026-10-26 md 增强：远程图拉取离线服务
+#include <QTcpSocket>
+#include <QHostAddress>
+#include <QImage>
+#include <QBuffer>   // 2026-10-26 md 增强：运行时生成测试 PNG
 #include <QTemporaryFile>
 #include "ui/CMessageView.h"
 #include "ui/CAskUserDialog.h"   // 2026-09-13 助手提问对话框尺寸自适应回归
@@ -91,6 +100,16 @@ private slots:
     void filePreviewEncoding();
     // 2026.09.22 文件内查找（工具栏/Ctrl+F）：向下/向上/循环/区分大小写 + 命中选中。
     void filePreviewFind();
+    // 2026-10-26 md 增强（用户需求：md 支持图标和表格）：表格网格/表头样式、
+    //   相对图片 baseUrl 解析、远程 http 图片本地 TCP 服务离线拉取。
+    void filePreviewMdEnhance();
+    // 2026-10-31 源码语法渲染页（CodeStyle 模块动态加载）：.cpp 后缀走语法页
+    //   （模块在位时；缺 DLL 自动回退纯文本不崩）；查找/GotoLine 在两种页态下均可用。
+    void filePreviewCodeSyntax();
+    // 2026-10-29 done 耗时整链口径（用户需求：专家链完成时耗时含实施轮）：
+    //   链锚 tChain（OnAdhocChainStart）优先——链内轮（规划/验证/修复/续跑）不重锚
+    //   → done 耗时覆盖整链；无链锚退 tRound（旧口径兼容）。
+    void doneElapsedCoversChain();
     void viewPagination();
     // 2026-10-15 远跳窗口回归：提示词下拉点远处旧提问 → EnsureCoverage 远距分流整窗
     //   跳建（O(200) 不随会话长度增长）；窗口尾后数据-only，AppendNewer 分轮补到尾对齐。
@@ -108,6 +127,7 @@ private slots:
     // 2026.09.05 per-助手控件隔离：输入框/发送按钮/统计栏随助手 Tab 页切换（独立实例），
     //   助手消耗不再并入任务统计（面板底栏仅任务侧）。
     void perAsstInputAndStats();
+    void sendBtnRunningStylesNoWhite();
     // 2026.09.05 v2.0.120 per-助手执行态指示器：统计栏费用前的转圈指示器只随【该助手】
     //   起停（A 跑 B 不转）；任务侧底部指示器只看任务运行态（助手跑不转，防误读）。
     void asstBusyIndicator();
@@ -179,6 +199,10 @@ private slots:
     //   挂起不提交；命名期间追加只暂存；命名收尾统一转正补发（多条合并）；
     //   停止撤销挂起退回输入框。
     void asstAutoNameRenameFirstOnSend();
+    // 2026-10-31 上次未执行完续跑回归：档残留 pend 标记 → PendAsstIds 检出
+    //   （已关闭排除）；SetAsstRunning 置/清 ↔ JSON pend 键写/不写；
+    //   ResumePendAsst 以「继续执行上次中断的指令」走正常发送链；ClearAsstPend 清空。
+    void asstPendResumeOnLoad();
     // 2026-10-08 提示词长度闸门：占比/token 双约束取小；超限不提交改上抛
     //   sigAsstRefinePrompt（原文+限额+权限快照）；关闸门直发；token 约束独立生效。
     void promptGateRefineFlow();
@@ -193,6 +217,9 @@ private slots:
     //   （软换行视觉行计高；封顶 10 行；清空回单行；宽度变窄重算更高）。
     void adhocInputAutoGrowOnInject();
     void foreignPhantomLifecycle();
+    // 2026-10-26 跨档幽灵切回归属档后视图空白（用户实害：工程档助手运行中→点任务→
+    //   取消选择切回工程，助手日志空白不刷新）——ModelView 引擎全链复现。
+    void foreignGhostReturnBlankView();
     // 2026.09.20 最近打开对话框几何持久化（[Layout] RecentWin 往返/坏档/出屏收口）。
     void recentDialogGeometryPersist();
     // 2026.09.25 v3.1.230 回归：窗口「每开一次上漂一个标题栏高度」——构造期
@@ -516,6 +543,217 @@ void TestExecPanel::filePreviewFind() {
     QVERIFY(!w.FindText(QStringLiteral("zzz-none"), false, false, true));
     QVERIFY(!w.FindText(QString(), false, false, true));
 }
+// 2026-10-26 md 增强（用户需求：md 文件支持图标和表格）：
+//   ①GFM 表格 → QTextTable 网格线 + 表头加粗/浅灰底（Qt 导入器零样式）
+//   ②相对图片 ![](rel) 由文档 baseUrl 解析（旧版裂图）
+//   ③远程 http 图片经 CMdBrowser::loadResource 同步拉取——本地 QTcpServer
+//     假冒徽章服务器离线覆盖（不依赖外网）。
+void TestExecPanel::filePreviewMdEnhance() {
+    // 1x1 PNG：运行时用 QImage::save 生成（与运行时 Qt 编解码器自洽，
+    //   手写定长字节流对解码器版本敏感，不采）
+    QByteArray aPng;
+    {
+        QImage stOne(1, 1, QImage::Format_ARGB32);
+        stOne.fill(QColor(0x3b, 0x82, 0xf6));
+        QBuffer stBuf(&aPng);
+        QVERIFY(stBuf.open(QIODevice::WriteOnly));
+        QVERIFY(stOne.save(&stBuf, "PNG"));
+        QVERIFY(aPng.size() > 8);
+    }
+
+    QTemporaryDir oTmp;
+    QVERIFY(oTmp.isValid());
+    const QString sDir = oTmp.path();
+    {
+        QFile fImg(sDir + QStringLiteral("/preview1.png"));
+        QVERIFY(fImg.open(QIODevice::WriteOnly));
+        QCOMPARE(fImg.write(aPng), qint64(aPng.size()));
+    }
+
+    // 本地 HTTP 服务（127.0.0.1 随机端口）：一次请求回一张 1x1 PNG
+    QTcpServer oSrv;
+    QVERIFY(oSrv.listen(QHostAddress(QHostAddress::LocalHost), 0));
+    QObject::connect(&oSrv, &QTcpServer::newConnection, [&oSrv, &aPng]() {
+        while (QTcpSocket* pSock = oSrv.nextPendingConnection()) {
+            QObject::connect(pSock, &QTcpSocket::disconnected, pSock, &QTcpSocket::deleteLater);
+            QObject::connect(pSock, &QTcpSocket::readyRead, pSock, [pSock, &aPng]() {
+                const QByteArray aReq = pSock->readAll();
+                if (!aReq.contains("\r\n\r\n")) {
+                    return;   // 请求头未收全
+                }
+                QByteArray aResp = QByteArrayLiteral(
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\nConnection: close\r\n");
+                aResp += QStringLiteral("Content-Length: %1\r\n\r\n").arg(aPng.size()).toLatin1();
+                aResp += aPng;
+                pSock->write(aResp);
+            });
+        }
+    });
+    const QString sRemote = QStringLiteral("http://127.0.0.1:%1/badge.png").arg(oSrv.serverPort());
+
+    const QString sMd = QStringLiteral(
+        "| 功能 | 状态 |\n|---|---|\n| 表格 | 支持 |\n\n"
+        "![local](preview1.png)\n\n"
+        "![remote](%1)\n").arg(sRemote);
+    {
+        QFile fMd(sDir + QStringLiteral("/readme.md"));
+        QVERIFY(fMd.open(QIODevice::WriteOnly));
+        fMd.write(sMd.toUtf8());
+    }
+
+    CFilePreviewWidget w;
+    w.ShowFile(sDir + QStringLiteral("/readme.md"));
+    w.resize(800, 600);
+    w.show();
+    for (int i = 0; i < 5; ++i) {
+        QApplication::processEvents();   // 触发布局/绘制：图片经 QTextImageHandler→
+                                         // requestResource→QTextBrowser::loadResource 实际加载
+    }
+    QTextBrowser* pMd = w.MdView();
+    QVERIFY(pMd != nullptr);
+    QTextDocument* pDoc = pMd->document();
+
+    // ① baseUrl 指向文件所在目录（相对图片解析的前提）
+    QCOMPARE(pDoc->baseUrl().toLocalFile(),
+             QDir(sDir).absolutePath() + QStringLiteral("/"));
+
+    // ② 表格结构 + 网格样式 + 表头加粗
+    int iTables = 0;
+    const QTextFrame* pRoot = pDoc->rootFrame();
+    for (QTextFrame::iterator it = pRoot->begin(); !it.atEnd(); ++it) {
+        if (QTextTable* pTable = qobject_cast<QTextTable*>(it.currentFrame())) {
+            ++iTables;
+            QCOMPARE(pTable->format().borderStyle(), QTextFrameFormat::BorderStyle_Solid);
+            QVERIFY(pTable->format().border() > 0);
+            QCOMPARE(pTable->columns(), 2);
+            QVERIFY(pTable->rows() >= 2);
+            // 表头首格光标处字符格式：加粗 + 浅灰底
+            const QTextTableCell stCell = pTable->cellAt(0, 0);
+            const QTextCharFormat stCh = stCell.firstCursorPosition().charFormat();
+            QCOMPARE(stCh.fontWeight(), static_cast<int>(QFont::Bold));
+            QCOMPARE(stCh.background().color(), QColor(0xf6, 0xf8, 0xfa));
+        }
+    }
+    QCOMPARE(iTables, 1);
+
+    // ③ 相对图片解析加载（旧版此处裂图：markdown 相对路径无 baseUrl 可解析）。
+    //    观察点用 QTextBrowser::loadResource（布局引擎 requestResource 实际走的
+    //    解析+加载链路；public QTextDocument::resource() 不经浏览器加载器）。
+    const QUrl stLoc = pDoc->baseUrl().resolved(QUrl(QStringLiteral("preview1.png")));
+    const QVariant vLoc = pMd->loadResource(QTextDocument::ImageResource, stLoc);
+    QVERIFY(!vLoc.isNull());
+    // Qt 6.8 loadResource 对图片可返回 QImage 或未解码的 QByteArray（绘制引擎延迟解码），
+    //   两种都是“加载成功”；QByteArray 转 QImage 验证字节有效性
+    const QImage stLocImg = vLoc.userType() == QMetaType::QImage
+        ? vLoc.value<QImage>() : QImage::fromData(vLoc.toByteArray());
+    QVERIFY(!stLocImg.isNull());
+    QCOMPARE(stLocImg.width(), 1);
+    QCOMPARE(stLocImg.height(), 1);
+
+    // ④ 远程 http 图片同步拉取（走 CMdBrowser::loadResource 预算/缓存链路）
+    const QVariant vRem = pMd->loadResource(QTextDocument::ImageResource, QUrl(sRemote));
+    QVERIFY(!vRem.isNull());
+    const QImage stRemImg = vRem.userType() == QMetaType::QImage
+        ? vRem.value<QImage>() : QImage::fromData(vRem.toByteArray());
+    QVERIFY(!stRemImg.isNull());
+    QCOMPARE(stRemImg.width(), 1);
+    QCOMPARE(stRemImg.height(), 1);
+
+    // ⑤ emoji 回退链：平台有 Segoe UI Emoji 时挂进 families（offscreen 无字体时跳过）
+    QFont fView = pMd->font();
+    const QStringList aFamsAll = QFontDatabase::families();
+    if (aFamsAll.contains(QStringLiteral("Segoe UI Emoji"))) {
+        QVERIFY(fView.families().contains(QStringLiteral("Segoe UI Emoji")));
+    }
+}
+
+// 2026-10-31 源码语法渲染页（CodeStyle 模块动态加载，设置 [View] CodeSyntax 默认开）：
+//   ① .cpp 后缀 → 模块在位时切语法页（IsCodeViewActive）；缺 DLL 时回退纯文本页且
+//     内容完整（功能闸门，不弹错不崩）——两条路径都在测试进程内成立（Execute 目录
+//     已随部署拷入四 DLL；CI 环境缺 DLL 走回退分支同样断言通过）。
+//   ② FindText：语法页（Scintilla 目标区搜索）与回退页（QTextBrowser::find）均命中。
+//   ③ GotoLine：语法页行定位不崩；.txt 回退页整行选中口径不变（既有 filePreviewFind 覆盖）。
+//   环境：个别开发机直接运行（非 ctest）时 QTemporaryDir 可因安全策略建目录失败
+//   （既有 filePreviewMdEnhance 同症状），此处用 MakeTempDir 兑底手工建目录，
+//   让真实窗口平台的语法页路径同样可跑。
+static QString MakeTempDir() {
+    // 手工建唯一目录（不用 QTemporaryDir：msys/CI 环境 TMP 可指向不存在目录，
+    //   且返回 path 后临时对象析构会自动删目录；此处路径含时间戳+PID，
+    //   测试不主动清理也无害，重复运行互不干扰）。
+    const QString sDir = QDir::temp().absoluteFilePath(QStringLiteral(
+        "autocode_test_codesyn_%1_%2")
+            .arg(QDateTime::currentMSecsSinceEpoch())
+            .arg(QCoreApplication::applicationPid()));
+    if (!QDir().mkpath(sDir)) {
+        // tmp 根不可用时兑底到当前目录（ctest 工作目录 build/ 可写）。
+        QDir().mkpath(QStringLiteral("."));
+        return QDir::current().absoluteFilePath(
+            QStringLiteral("autocode_test_codesyn_%1")
+                .arg(QDateTime::currentMSecsSinceEpoch()));
+    }
+    return sDir;
+}
+
+void TestExecPanel::filePreviewCodeSyntax() {
+    const QString sTmpRoot = MakeTempDir();
+    QVERIFY2(QDir(sTmpRoot).exists(),
+             QStringLiteral("临时目录不可用：%1 (tmp=%2)")
+                 .arg(sTmpRoot, QDir::tempPath()).toUtf8().constData());
+    const QString sCpp = sTmpRoot + QStringLiteral("/demo.cpp");
+    const QString sBody = QStringLiteral(
+        "// demo\n"
+        "#include <cstdio>\n"
+        "int main() {\n"
+        "    const char* sName = \"AutoCode\";\n"
+        "    std::printf(\"hello %s\\n\", sName);\n"
+        "    return 0;\n"
+        "}\n");
+    {
+        QFile f(sCpp);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(sBody.toUtf8());
+    }
+
+    CFilePreviewWidget w;
+    w.resize(600, 400);
+    w.show();
+    w.ShowFile(sCpp);
+    QApplication::processEvents();
+
+    if (w.IsCodeViewActive()) {
+        // 模块在位：当前页=语法页，查找（Scintilla）命中两处 AutoCode 之一。
+        QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, false));
+        QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, true));   // 循环回卷再命中
+        w.GotoLine(4);   // 行定位（整行选中滚动）不崩即过（原生窗口无 Qt 光标可查）
+        QApplication::processEvents();
+    } else {
+        // 缺 DLL 回退：纯文本页内容完整（功能闸门）。
+        QTextBrowser* pView = nullptr;
+        const auto aViews = w.findChildren<QTextBrowser*>();
+        for (QTextBrowser* p : aViews) {
+            if (p->isVisible()) {
+                pView = p;
+                break;
+            }
+        }
+        QVERIFY(pView != nullptr);
+        QVERIFY(pView->toPlainText().contains(QStringLiteral("std::printf")));
+        QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, false));
+    }
+
+    // 换非源码文件（.txt）：恒纯文本页，不受语法页影响。
+    {
+        const QString sTxt = sTmpRoot + QStringLiteral("/note.txt");
+        QFile f(sTxt);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(QStringLiteral("plain text note\n").toUtf8());
+        f.close();
+        w.ShowFile(sTxt);
+        QVERIFY(!w.IsCodeViewActive());
+        QVERIFY(w.FindText(QStringLiteral("note"), false, false, false));
+    }
+}
+
 
 // 2026.09.03 反向分页回归：助手流 260 块 → 初始只建最近 200 块；滚动到顶自动补建
 //   更早一段（60 块一次补齐）→ 活件数从全量降为窗口+翻页量；数据层（落盘 JSON）不变。
@@ -956,7 +1194,71 @@ void TestExecPanel::perAsstInputAndStats() {
     panel.hide();
 }
 
-// 2026.09.05 v2.0.120 per-助手执行态指示器回归：①每个助手页统计栏费用前有独立指示器；
+// 2026.10.28 运行态发送钮配色回归（用户反馈：白字在部分机器背景样式不生效时完全不可见）：
+//   运行两态（有字=「➤ 追加指令」/空字=「⏹ 停止」）不得再用 color:white——改浅色底
+//   +深色字+彩色描边（背景被系统样式吃掉时深字仍可读，描边保住状态色语义）。
+void TestExecPanel::sendBtnRunningStylesNoWhite() {
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手A"), 2));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+
+    QPushButton* pBtn = nullptr;
+    QPlainTextEdit* pIn = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手A"))) {
+            QWidget* pPage = pTabs->widget(i);
+            pIn = pPage->findChild<QPlainTextEdit*>();
+            const QList<QPushButton*> aBtns = pPage->findChildren<QPushButton*>();
+            for (QPushButton* pB : aBtns) {
+                if (pB->text() == QStringLiteral("发送")
+                    || pB->text() == QStringLiteral("⏹ 停止")
+                    || pB->text() == QStringLiteral("➤ 追加指令")) {
+                    pBtn = pB;
+                }
+            }
+        }
+    }
+    QVERIFY(pBtn != nullptr && pIn != nullptr);
+
+    // 空字运行态 =「⏹ 停止」：浅红底+深红字+红描边，无白字。
+    panel.SetAsstRunning(panel.ActiveAsstId(), true);
+    QTest::qWait(30);
+    QCOMPARE(pBtn->text(), QStringLiteral("⏹ 停止"));
+    const QString sQssStop = pBtn->styleSheet();
+    QVERIFY2(!sQssStop.contains(QLatin1String("white"), Qt::CaseInsensitive),
+             qPrintable(sQssStop));
+    QVERIFY2(sQssStop.contains(QLatin1String("#fee2e2"))
+             && sQssStop.contains(QLatin1String("#b91c1c"))
+             && sQssStop.contains(QLatin1String("#dc2626")),
+             qPrintable(sQssStop));
+
+    // 有字运行态 =「➤ 追加指令」：浅蓝底+深蓝字+蓝描边，无白字。
+    pIn->setPlainText(QStringLiteral("追加点活"));
+    QTest::qWait(30);
+    QCOMPARE(pBtn->text(), QStringLiteral("➤ 追加指令"));
+    const QString sQssApp = pBtn->styleSheet();
+    QVERIFY2(!sQssApp.contains(QLatin1String("white"), Qt::CaseInsensitive),
+             qPrintable(sQssApp));
+    QVERIFY2(sQssApp.contains(QLatin1String("#dbeafe"))
+             && sQssApp.contains(QLatin1String("#1d4ed8"))
+             && sQssApp.contains(QLatin1String("#2563eb")),
+             qPrintable(sQssApp));
+
+    // 复位（停跑+清空）=「发送」回默认样式，三态循环无残留。
+    pIn->clear();
+    panel.SetAsstRunning(panel.ActiveAsstId(), false);
+    QTest::qWait(30);
+    QCOMPARE(pBtn->text(), QStringLiteral("发送"));
+    panel.hide();
+}
 //   ②指示器只随【该助手】运行态起停（A 跑 B 不转）；③任务侧底部指示器只看任务运行态
 //   （助手跑不转，任务跑才转——统计与指示器成对，防「助手跑任务闲」误读为任务在跑）。
 void TestExecPanel::asstBusyIndicator() {
@@ -2288,15 +2590,22 @@ void TestExecPanel::asstTabBarMultiRow() {
     QApplication::sendEvent(pBare, &evDbl);
     QCOMPARE(aSpyDbl.count(), 1);
     QCOMPARE(aSpyDbl.takeFirst().at(0).toInt(), iDblIdx);
-    // 拖动换位：按住页1拖到页2位置 → tabMoved(1,2)，文本序互换。
+    // 拖动换位（2026-10-23 VS 口径：判定锚 = 浮动 Tab 几何，与对方视觉过半重叠
+    //   即对方中心被越过才换位，与抓取点无关）：按住页1拖过页2中心 → 松手
+    //   tabMoved(1,2)，文本序互换；回拖不过对方新中心 → 迟滞不回翻。
     QSignalSpy aSpyMoved(pBare, &QTabBar::tabMoved);
     const QPoint ptA = pBare->TabRectAt(1).center();
-    const QPoint ptB = pBare->TabRectAt(2).center();
+    const QRect rcTgt = pBare->TabRectAt(2);
+    const QPoint ptB = rcTgt.center() + QPoint(rcTgt.width() / 4, 0);   // 过对方中心 1/4 宽（>半重叠）
     QTest::mousePress(pBare, Qt::LeftButton, Qt::NoModifier, ptA);
-    for (int s = 1; s <= 12; ++s) {   // 分步越过拖起阈值，模拟真实拖拽
+    for (int s = 1; s <= 12; ++s) {   // 分步越过拖起阈值，模拟真实拖拽（过半处即触发让位滑移）
         QTest::mouseMove(pBare, ptA + (ptB - ptA) * s / 12);
         QTest::qWait(10);
     }
+    QCOMPARE(pBare->DropInsertAt(ptB), 2);   // 拖拽态：插入位已越过页2（a_pt 仅兼容旧签名，判定走浮动几何）
+    const QPoint ptBack = ptB - QPoint(rcTgt.width() / 3, 0);
+    QTest::mouseMove(pBare, ptBack);         // 回拖但未越过对方滑移后的新中心：迟滞不回翻
+    QCOMPARE(pBare->DropInsertAt(ptBack), 2);
     QTest::mouseRelease(pBare, Qt::LeftButton, Qt::NoModifier, ptB);
     QCOMPARE(aSpyMoved.count(), 1);
     QCOMPARE(aSpyMoved.takeFirst().at(0).toInt(), 1);
@@ -2788,6 +3097,29 @@ void TestExecPanel::recentDialogLauncherMode() {
         fChk.close();
         QVERIFY(sIni.contains(QStringLiteral("RecentChipsSize=560,")));
         QVERIFY(sIni.contains(QStringLiteral("RecentLauncherPos=")));
+        // ⑤-1 2026-10-31 回归（用户报「启动窗口只能调大不能调小」）：面板
+        //   setFixedSize 使布局推导的窗口最小尺寸=当前尺寸 → 拖边/程序化缩小
+        //   均被钉；修复 = 窗口显式最小 = 面板下限 360x240 + 横幅 100 + 底钮
+        //   （布局 SetDefaultConstraint 不覆盖显式 min）。缩小放行 + 面板
+        //   实时跟随 + 落盘。
+        QCOMPARE(stDlg.minimumSize().width(), CRecentChipsPanel::kChipMinW);
+        QVERIFY(stDlg.minimumSize().height() > 100
+                    + CRecentChipsPanel::kChipMinH);          // 横幅100+底钮>0
+        QVERIFY(stDlg.minimumSize().height() < stDlg.height()); // ≠当前尺寸
+        stDlg.show();
+        QTest::qWait(30);
+        stDlg.resize(430, 470);
+        QTest::qWait(30);
+        QCOMPARE(stDlg.width(), 430);             // 缩小未被钉回（修复前恒 560）
+        QCOMPARE(pChips->width(), 430);           // 面板跟随缩小
+        QVERIFY(pChips->height() >= CRecentChipsPanel::kChipMinH);
+        stDlg.hide();
+        QTest::qWait(30);
+        QFile fChk2(sCfg);
+        QVERIFY(fChk2.open(QIODevice::ReadOnly));
+        const QString sIni2 = QString::fromUtf8(fChk2.readAll());
+        fChk2.close();
+        QVERIFY(sIni2.contains(QStringLiteral("RecentChipsSize=430,")));
         // ⑤ 右键删除链：从数据源移除并上报。
         stDlg.show();
         QTest::qWait(20);
@@ -2803,7 +3135,7 @@ void TestExecPanel::recentDialogLauncherMode() {
                                     CRecentProjectsDialog::EMode::kLauncher);
         auto* pChips = stDlg.findChild<CRecentChipsPanel*>();
         QVERIFY(pChips != nullptr);
-        QCOMPARE(pChips->width(), 560);
+        QCOMPARE(pChips->width(), 430);
         QCOMPARE(stDlg.pos(), QPoint(40, 30));
         // close() → closeEvent → ExitRequested 置位（同「退出」按钮语义）。
         stDlg.show();
@@ -3084,6 +3416,87 @@ void TestExecPanel::asstAutoNameDeferredWhileRunning() {
     QVERIFY(panel.TriggerAsstAutoRename(sId));
     QCOMPARE(spyRename.count(), 2);
     panel.hide();
+}
+
+void TestExecPanel::asstPendResumeOnLoad() {
+    // 2026-10-31 回归（用户需求：助手上次没执行完，启动时提示是否继续执行）：
+    //   ① 档残留 pend:true → PendAsstIds 检出；已关闭的 pend 助手排除；
+    //   ② SetAsstRunning 真实跳变置/清 bPend → AssistantsToJson 写/不写 pend 键；
+    //   ③ ClearAsstPend（用户拒绝续跑）→ PendAsstIds 清空；
+    //   ④ ResumePendAsst：以「继续执行上次中断的指令」走正常发送链——
+    //      sigAdhocSubmit 携带原提示词全文+续跑口径、运行态置位、输入框清空。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTest::qWait(50);
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    // 助手A：非默认名（绕开「先改名后执行」链）+ user 块（带时间戳前缀）+ pend。
+    QJsonObject oA = MakeAsst(QStringLiteral("回归助手"), 2);
+    oA["pend"] = true;
+    oA["backend"] = QStringLiteral("claude");
+    {
+        QJsonObject oU;
+        oU["kind"] = "event";
+        oU["eventKind"] = "user";
+        oU["text"] = QStringLiteral("[2026-10-31 10:00:00] 帮我修复登录页崩溃");
+        QJsonArray aB = oA["blocks"].toArray();
+        aB.append(oU);
+        oA["blocks"] = aB;
+    }
+    // 助手B：已关闭 + pend（应被 PendAsstIds 排除）。
+    QJsonObject oB = MakeAsst(QStringLiteral("旧助手"), 1);
+    oB["closed"] = true;
+    oB["pend"] = true;
+    QJsonArray aAssts;
+    aAssts.append(oA);
+    aAssts.append(oB);
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    // ① 检出（仅打开的 pend 助手）。
+    const QStringList aIds = panel.PendAsstIds();
+    QCOMPARE(aIds.size(), 1);
+    const QString sId = aIds.at(0);
+    QCOMPARE(panel.AsstNameOf(sId), QStringLiteral("回归助手"));
+    QCOMPARE(panel.AsstLastUserPrompt(sId), QStringLiteral("帮我修复登录页崩溃"));
+    // ② 运行态跳变 ↔ pend 键。
+    panel.SetAsstRunning(sId, true);
+    bool bHasPend = false;
+    for (const QJsonValue& v : panel.AssistantsToJson()) {
+        const QJsonObject o = v.toObject();
+        if (o.value(QStringLiteral("id")).toString() == sId) {
+            bHasPend = o.value(QStringLiteral("pend")).toBool(false);
+        }
+    }
+    QVERIFY(bHasPend);
+    panel.SetAsstRunning(sId, false);
+    for (const QJsonValue& v : panel.AssistantsToJson()) {
+        QVERIFY(!v.toObject().contains(QStringLiteral("pend")));
+    }
+    // ④ 续跑：正常发送链（原提示词全文 + 续跑口径）。
+    QSignalSpy spySubmit(&panel, &CExecutionPanel::sigAdhocSubmit);
+    panel.ResumePendAsst(sId);
+    QCOMPARE(spySubmit.count(), 1);
+    const QString sSent = spySubmit.at(0).at(1).toString();
+    QVERIFY(sSent.contains(QStringLiteral("继续执行上次中断的指令")));
+    QVERIFY(sSent.contains(QStringLiteral("帮我修复登录页崩溃")));
+    QVERIFY(sSent.contains(QStringLiteral("不要重复已完成的改动")));
+    QVERIFY(panel.AsstRunning(sId));
+    // 输入框已清（DoAdhocSend 提交后清空）。
+    QPlainTextEdit* pIn = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("回归助手"))) {
+            pIn = pTabs->widget(i)->findChild<QPlainTextEdit*>();
+            break;
+        }
+    }
+    QVERIFY(pIn != nullptr);
+    QCOMPARE(pIn->toPlainText(), QString());
+    // ③ 拒绝续跑：清标记（收尾后 pend 本已随运行态清零，模拟拒绝路径直接调）。
+    panel.SetAsstRunning(sId, false);
+    panel.ClearAsstPend(QStringList{sId});
+    QVERIFY(panel.PendAsstIds().isEmpty());
 }
 
 void TestExecPanel::asstAutoNameRenameFirstOnSend() {
@@ -3855,6 +4268,143 @@ void TestExecPanel::foreignPhantomLifecycle() {
     panel.RemoveAsstEntry(sIdA1);
     QCOMPARE(panel.AllAsstsSnapshot().size(), 1);
     QVERIFY(!panel.AsstForeignById(sIdA1));
+}
+
+// 2026-10-26 跨档幽灵切回归属档后视图空白（用户实害：工程档助手运行中→点任务→
+//   取消选择切回工程，助手日志空白不刷新）——ModelView 引擎全链复现：
+//   主窗口档切换序列 = SetViewKey → TakeRunningForReload → LoadAssistantsFromJson
+//   （文件版重建+预建视图）→ DropAsstEntries（文件版让位）→ AttachForeignAssistants
+//   （幽灵挂回，页建+Bind 但不投影）→ SetCurrentTask(nullptr)（置空→激活助手页）。
+//   断言：收尾后该助手 ModelView 视图必须已投影且有内容。
+void TestExecPanel::foreignGhostReturnBlankView()
+{
+    // 双引擎矩阵：MV=true + Legacy=false（2026-10-26：Legacy 下 Attach 幽灵页 Bind 新
+    // 视图但流内旧件（aWidgets）仍挂在已 deleteLater 的旧视图上，WidgetCount>0 使
+    // OnAsstTabCurrentChanged 的 Legacy 自愈（WidgetCount==0）不触发 → 旧件不可见
+    // 新页无件 = 空白不刷新——用户主实例（Legacy）实害机理）
+    for (int iEngine = 0; iEngine <= 1; ++iEngine) {
+    CExecutionPanel panel(nullptr, /*a_bEngineMV=*/iEngine == 1);
+    panel.resize(1100, 700);
+    panel.show();
+    QTest::qWait(80);
+
+    // —— 工程档（视图 key 空）：助手 A，有历史块，运行中 ——
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手A"), 3));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(80);
+    const QString sIdA = panel.AllAsstsSnapshot().at(0).sId;
+    panel.SetAsstRunning(sIdA, true);
+
+    // —— 点任务：切任务档（主窗口 LoadAssistantState 序列）——
+    panel.SetViewKey(QStringLiteral("taskA"));
+    QList<CExecutionPanel::SAsst> aTaken = panel.TakeRunningForReload();
+    QCOMPARE(aTaken.size(), 1);
+    QJsonArray aTaskAssts;
+    aTaskAssts.append(MakeAsst(QStringLiteral("任务助手T1"), 1));
+    panel.LoadAssistantsFromJson(aTaskAssts, QString());
+    QTest::qWait(80);
+    panel.AttachForeignAssistants(aTaken, QStringLiteral("任务A"));
+    QTest::qWait(80);
+
+    // 运行中轮次继续产出新块（块持续入幽灵流；public 信号入口 OnAdhocAssistantText）
+    panel.OnAdhocAssistantText(sIdA, QStringLiteral("运行中的新输出"));
+    QTest::qWait(80);
+
+    // —— 取消任务选择：切回工程档（主窗口序列）——
+    panel.SetViewKey(QString());
+    QList<CExecutionPanel::SAsst> aTaken2 = panel.TakeRunningForReload();   // 摘幽灵（本档运行者）
+    QCOMPARE(aTaken2.size(), 1);
+    QJsonObject oFileA = MakeAsst(QStringLiteral("助手A"), 3);
+    oFileA["id"] = sIdA;   // 档文件版与幽灵同 id（真实落盘语义：SaveAssistantState 写同 id）
+    QJsonArray aProj;
+    aProj.append(oFileA);
+    panel.LoadAssistantsFromJson(aProj, sIdA);             // 激活=助手A（档里 active）
+    QTest::qWait(80);
+    panel.DropAsstEntries(QStringList{ sIdA });            // 文件版让位
+    panel.AttachForeignAssistants(aTaken2, QString());     // 幽灵挂回转正
+    QTest::qWait(80);
+
+    // —— 主窗口收尾：SetCurrentTask(nullptr)（置空→激活助手页）——
+    panel.SetCurrentTask(nullptr);
+    QTest::qWait(120);
+
+    // 断言：助手 A 页 ModelView 视图已投影且有内容
+    const QList<CExecutionPanel::SAsst> aSnap = panel.AllAsstsSnapshot();
+    QCOMPARE(aSnap.size(), 1);
+    const CExecutionPanel::SAsst& stA = aSnap.at(0);
+    QVERIFY(stA.pStream != nullptr);
+    if (iEngine == 1) {                      // ModelView：投影+模型条目
+        QVERIFY(stA.pView2 != nullptr);
+        QVERIFY(stA.pModel != nullptr);
+        QVERIFY2(stA.pStream->Projected(),
+                 "幽灵转正后流未投影（日志空白）");
+        QVERIFY2(stA.pModel->rowCount() > 0,
+                 "幽灵转正后模型无条目（日志空白）");
+    } else {                                 // Legacy：新视图上必须有件（旧件挂死旧视图=空白）
+        QVERIFY(stA.pView != nullptr);
+        QVERIFY2(stA.pStream->WidgetCount() > 0,
+                 "Legacy 幽灵转正后新视图无件（日志空白）");
+    }
+    QVERIFY(!panel.AsstForeignById(sIdA));   // 已转正
+    }   // 双引擎循环
+}
+
+// 2026-10-29 done 耗时整链口径（用户需求：专家助手完成时耗时需包含实施轮耗时）：
+//   链钟 tChain 只在新提示词链起点（OnAdhocChainStart——编排器 SubmitAdhoc 广播）
+//   重锚；专家链的规划/执行/验证/回炉各轮不发 → done 事件耗时=整链（规划+实施+
+//   验证），不再只显示最后一轮。无链锚（旧档恢复后首次/异常）退 tRound 旧口径。
+void TestExecPanel::doneElapsedCoversChain()
+{
+    CExecutionPanel panel(nullptr, /*a_bEngineMV=*/false);
+    panel.resize(900, 600);
+    panel.show();
+    QTest::qWait(60);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("链耗时助手"), 1));
+    aAssts.append(MakeAsst(QStringLiteral("退路助手"), 1));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(60);
+    const QString sChain = panel.AllAsstsSnapshot().at(0).sId;
+    const QString sFallb = panel.AllAsstsSnapshot().at(1).sId;
+
+    // ① 链锚优先：ChainStart(T0) → 1.1s → SetAsstRunning(true)(T1 重锚 tRound)
+    //   → 60ms → done → 耗时应 ≈1.16s（"0:01"）；旧口径（tRound=60ms）会显示 "0:00"。
+    panel.OnAdhocChainStart(sChain);
+    QTest::qWait(1100);
+    panel.SetAsstRunning(sChain, true);
+    QTest::qWait(60);
+    panel.OnAdhocEvent(sChain, QStringLiteral("done"), QStringLiteral("已完成"));
+    {
+        const auto aBlocks = panel.AllAsstsSnapshot().at(0).pStream->Blocks();
+        const QString sDone = aBlocks.last().sText;
+        QVERIFY2(sDone.contains(QStringLiteral("已完成（")),
+                 qPrintable(QStringLiteral("done 文本=%1").arg(sDone)));
+        QVERIFY2(sDone.contains(QStringLiteral("耗时 00:01")),
+                 qPrintable(QStringLiteral("应为链耗时≈1.16s（0:01），实际=%1").arg(sDone)));
+    }
+    panel.SetAsstRunning(sChain, false);
+
+    // ② 无链锚退路（旧口径兼容）：新档载入的第三助手（从未收到 ChainStart）→ tRound。
+    QJsonArray aThird;
+    aThird.append(MakeAsst(QStringLiteral("无锚助手"), 1));
+    panel.LoadAssistantsFromJson(aThird, QString());
+    QTest::qWait(60);
+    const QString sFresh = panel.AllAsstsSnapshot().at(0).sId;
+    panel.SetAsstRunning(sFresh, true);
+    QTest::qWait(1100);
+    panel.OnAdhocEvent(sFresh, QStringLiteral("done"), QStringLiteral("已完成"));
+    {
+        const auto aSnap = panel.AllAsstsSnapshot();
+        QString sDone;
+        for (const auto& st : aSnap) {
+            if (st.sId == sFresh && st.pStream) {
+                sDone = st.pStream->Blocks().last().sText;
+            }
+        }
+        QVERIFY2(sDone.contains(QStringLiteral("耗时 00:01")),
+                 qPrintable(QStringLiteral("退路 tRound≈1.1s 应显示 0:01，实际=%1").arg(sDone)));
+    }
 }
 
 void TestExecPanel::adhocInputAutoGrowOnInject() {

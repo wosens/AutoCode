@@ -20,6 +20,9 @@ CAskUserDialog::CAskUserDialog(const QString& a_sQuestion,
     : QDialog(a_pParent) {
     setWindowTitle(QStringLiteral("助手提问"));
     resize(480, 360);
+    // 2026-10-31 置顶（HarnessGateway 实害：助手两次 ask_user 各等 600s 超时，
+    //   对话框藏在其他窗口后面用户从未看到——提问是阻塞链，必须可见）。
+    setWindowFlag(Qt::WindowStaysOnTopHint, true);
 
     m_pLblQuestion = new QLabel(this);
     m_pLblQuestion->setWordWrap(true);

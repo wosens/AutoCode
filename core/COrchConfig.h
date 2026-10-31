@@ -79,6 +79,11 @@ public:
     // 基础类型/档位字符串映射（未知回退 Feature / Standard）
     static ETaskType BaseToType(const QString& a_sBase);
     static ETier     BaseToTier(const QString& a_sBase);
+    // 基础档位的规范默认勾选集（2026-10-23 档位编辑切基础档位联动用，与
+    //   SeedDefaults 同源）：simple = 全集-{需求评审/设计/设计评审/计划/计划评审/
+    //   根因核实}；standard/strict = 全集。a_aAllIds 传当前阶段全表 id（表序保持）。
+    static QStringList BaseTierPresetStages(const QString& a_sBase,
+                                            const QStringList& a_aAllIds);
 
     int  iVersion = 1;
 

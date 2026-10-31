@@ -42,6 +42,25 @@ ETier COrchConfig::BaseToTier(const QString& a_sBase) {
     return ETier::Standard;
 }
 
+// 基础档位规范预设（单一事实源）：SeedDefaults 种子与档位编辑切基础档位联动共用。
+QStringList COrchConfig::BaseTierPresetStages(const QString& a_sBase,
+                                              const QStringList& a_aAllIds) {
+    static const QSet<QString> setSimpleSkip = {
+        QStringLiteral("review_requirements"), QStringLiteral("design"),
+        QStringLiteral("review_design"),       QStringLiteral("plan"),
+        QStringLiteral("review_plan"),         QStringLiteral("root_cause_verify")
+    };
+    const bool bSimple = a_sBase.compare(QLatin1String("simple"),
+                                         Qt::CaseInsensitive) == 0;
+    QStringList aOut;
+    for (const QString& sId : a_aAllIds) {
+        if (!bSimple || !setSimpleSkip.contains(sId)) {
+            aOut.append(sId);
+        }
+    }
+    return aOut;
+}
+
 // —— 查询辅助 ——
 SOrchStage* COrchConfig::FindStageCfg(const QString& a_sId) {
     for (SOrchStage& s : aStages) {
@@ -154,23 +173,14 @@ void COrchConfig::SeedDefaults() {
 
     // 档位：简单 = 全集 - {需求评审/设计/设计评审/计划/计划评审/根因核实}
     //   （与任务类型流取交集后即原 Simple 预设：feature 跳设计链、bugfix 跳根因核实）；
-    //   标准/严格 = 全集（差异只在评审策略 base）。
+    //   标准/严格 = 全集（差异只在评审策略 base）。预设集由 BaseTierPresetStages
+    //   统一生成（与档位编辑切基础档位的联动重置同源，两处永不漂移）。
     {
         QStringList aAll;
         for (const SOrchStage& s : aStages) {
             aAll.append(s.sId);
         }
-        QStringList aSimple;
-        const QSet<QString> setSkip = {
-            QStringLiteral("review_requirements"), QStringLiteral("design"),
-            QStringLiteral("review_design"),       QStringLiteral("plan"),
-            QStringLiteral("review_plan"),         QStringLiteral("root_cause_verify")
-        };
-        for (const QString& sId : aAll) {
-            if (!setSkip.contains(sId)) {
-                aSimple.append(sId);
-            }
-        }
+        const QStringList aSimple = BaseTierPresetStages(QStringLiteral("simple"), aAll);
         auto fnTier = [&aAll](const QString& sId, const QString& sName,
                               const QString& sBase, const QStringList& aStages) {
             SOrchTier t;

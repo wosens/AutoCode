@@ -44,6 +44,7 @@
 #include <QHBoxLayout>
 #include <QToolButton>
 #include <QPainter>
+#include <QPainterPath>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QJsonDocument>
@@ -662,6 +663,18 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     connect(m_pAdhocHealthTm, &QTimer::timeout, this, &CMainWindow::OnAdhocHealthCheck);
     m_pAdhocHealthTm->start();
 
+    // 2026-10-28 运行态窗口图标动画：任务/助手执行中，整幅重绘窗口图标——上 2/3
+    //   AutoCode 图标居中 + 下 1/3 横向进度条（任务栏 + 自绘标题栏同步）。定时器不常开
+    //   ——由 StartBusyIconWatch 在各执行入口按需启动，tick 检测到空闲自动停表并恢复
+    //   静态图标。
+    m_iconOrig = windowIcon();   // main.cpp 已 setWindowIcon；兑底直取资源
+    if (m_iconOrig.isNull()) {
+        m_iconOrig = QIcon(QStringLiteral(":/icons/app.ico"));
+    }
+    m_pBusyIconTm = new QTimer(this);
+    m_pBusyIconTm->setInterval(250);
+    connect(m_pBusyIconTm, &QTimer::timeout, this, &CMainWindow::OnBusyIconTick);
+
     // 编排器 → 执行面板
     connect(m_pOrch, &CTaskOrchestrator::sigStageLog,   this, &CMainWindow::OnStageLog);
     connect(m_pOrch, &CTaskOrchestrator::sigStageEvent, this, &CMainWindow::OnStageEvent);
@@ -729,6 +742,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             m_pExecPanel->UpdateAsstBackend(a_sAsstId, m_pOrch->AsstAdhocBackend(a_sAsstId));
         }
     });
+    // 2026-10-29 新提示词链起点（用户需求：专家链 done 耗时含实施轮）：面板重锚链钟
+    //   tChain——链内轮（规划/验证/修复/续跑/纠偏/压缩）不发，done 耗时覆盖整链。
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocChainStart,
+            m_pExecPanel, &CExecutionPanel::OnAdhocChainStart);
     // 面板输入栏 → 编排器（经本窗口转发）
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocSubmit,
             this, &CMainWindow::OnAdhocSubmit);
@@ -773,6 +790,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     //   2026-10-04 lambda 包一层：SaveAssistantState 带 a_bForce 参数后，带默认参的
     //   成员函数指针不能直接连参更少的信号（Qt 指针连接不用默认参）。
     connect(m_pExecPanel, &CExecutionPanel::sigAdhocBlocksChanged,
+            this, [this]() { SaveAssistantState(); });
+    // 2026-10-31 在途轮标记变化（起跑置位/收尾清除）→ 立即落盘：异常退出/被杀时
+    //   磁盘已带 pend=true，下次启动检测「上次未执行完」。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstPendChanged,
             this, [this]() { SaveAssistantState(); });
     // 2026.08.22 多助手事件：切助手换载编排器会话；增删/改名/排序 → 落盘。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstSwitched,
@@ -1776,6 +1797,7 @@ void CMainWindow::OnGenerateGuide() {
         return;
     }
     m_bGuideBuilding = true;
+    StartBusyIconWatch();   // 2026-10-27 图标运行态动画：guide 生成期即任务运行期
     SetStatus(QStringLiteral("正在生成 guide.md ..."));
     m_pPm->BuildGuideAsync();
 }
@@ -1840,6 +1862,7 @@ void CMainWindow::OnGuideFinished(bool a_bOk, const QString& a_sMsg) {
         m_pExecPanel->AppendEvent(pPending->Id(), QStringLiteral("init_guide"),
             QStringLiteral("初始任务：guide.md 就绪，启动任务"));
         m_pOrch->StartTask(pPending);   // 内部 RunCurrentStage 会重新置 Running 并刷新 UI
+        StartBusyIconWatch();   // 2026-10-27 图标运行态动画：guide→runner 空档可能已停表，续跑补拉
         return;
     }
 
@@ -2130,6 +2153,8 @@ void CMainWindow::OnSettings() {
                     .arg(sName), 8000);
         }
     }
+    // 2026-10-31 源码预览语法高亮（[View] CodeSyntax）：ShowFile 现读即生效，无需热应用。
+    m_pPm->SaveCodeSyntax(stDlg.CodeSyntax());
     // 2026-09-26 内置测试沙箱：落盘 + 热应用到管理器（开关/帧率即时生效，
     //   录像开关对后续新收纳窗口生效；存量窗口录像保持原状）。
     m_pPm->SaveSandboxEnable(stDlg.SandboxEnable());
@@ -2708,12 +2733,14 @@ void CMainWindow::OnStartTask(CTaskInfo* a_pTask) {
         m_pExecPanel->AppendEvent(a_pTask->Id(), QStringLiteral("init_guide"),
             QStringLiteral("初始任务：工程缺少 guide.md，开始自动扫描生成..."));
         OnGenerateGuide();   // 异步扫描；完成后 OnGuideFinished 自动续跑
+        StartBusyIconWatch();   // 2026-10-27 图标运行态动画：初始任务 guide 生成期（无 runner）
         a_pTask->SetStatus(ETaskStatus::Running);   // 生成期即任务运行期（并入首阶段）
         OnTaskChanged(a_pTask);   // 刷新按钮/指示器/阶段表；续跑由 OnGuideFinished 决定
         return;   // guide 未就绪前不进入编排器（其 StartTask 的 guard 也会把任务置 Paused）
     }
 
     m_pOrch->StartTask(a_pTask);
+    StartBusyIconWatch();   // 2026-10-27 图标运行态动画：任务启动
 }
 
 void CMainWindow::OnPauseTask(CTaskInfo* a_pTask) {
@@ -3319,6 +3346,7 @@ void CMainWindow::OnAdhocSubmit(const QString& a_sAsstId, const QString& a_sText
         CTaskInfo* pSel = (m_pExecPanel != nullptr) ? m_pExecPanel->CurrentTask() : m_pCur;
         m_pOrch->SubmitAdhoc(a_sAsstId, a_sText, a_iPerm,
                              pSel != nullptr ? pSel->Id() : QString(), &aTranscript);
+        StartBusyIconWatch();   // 2026-10-27 图标运行态动画：助手提交
     }
 }
 
@@ -3337,6 +3365,8 @@ void CMainWindow::OnAsstAutoRename(QString a_sAsstId, QString a_sPrompts) {
             m_pExecPanel->ApplyAsstAutoName(a_sAsstId, false, QString(),
                 QStringLiteral("当前无可用的空闲助手会话（或工程未打开），请稍后再试"));
         }
+    } else {
+        StartBusyIconWatch();   // 2026-10-27 图标运行态动画：自动命名借会话轮也在执行
     }
 }
 
@@ -3660,6 +3690,60 @@ void CMainWindow::OnSbxWatchdog() {
     }
 }
 
+namespace {
+// 2026-10-27 运行态图标动画常量：单程帧数（250ms × 8 = 2s 走完一越；三角波来回
+//   摇摆一周期 4s）。帧序号域扩为 [0, 2k)，绘制端折算行程比例。
+constexpr int kBusyFrames = 8;
+
+// 2026-10-28 运行态图标改版二（用户反馈：①整图标缩放进上 2/3 太小——改为截取原
+//   图标中部与目标区同 3:2 比例的居中区带放大铺满上 2/3；②进度条未占满下 1/3——
+//   改为整带铺满，描边内缩防裁边；③滑块到底瞬间回卷生硬——改为来回摇摆）。
+//   整幅重绘：清透明底 → 上 2/3 铺中部截取 → 下 1/3 整带深色圆角轨道 + 金黄滑块
+//   （三角波：a_iFrame 归一化到 [0,2k) 后前半程 0→1、后半程 1→0，来回摇摆）。
+void PaintBusyProgressFrame(QPixmap* a_pPm, const QIcon& a_icon, int a_iFrame) {
+    if (a_pPm == nullptr || a_pPm->isNull() || a_icon.isNull()) {
+        return;
+    }
+    const int iW = a_pPm->width();
+    const int iH = a_pPm->height();
+    a_pPm->fill(Qt::transparent);
+    QPainter p(a_pPm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    // ── 上 2/3：截原图标中部（与目标区同 3:2 比例的居中区带）放大铺满 ──
+    const QRectF rcTop(0.0, 0.0, iW, iH * 2.0 / 3.0);
+    const QPixmap pmSrc = a_icon.pixmap(96, 96);   // 取较大源图再缩放，小尺寸平滑
+    if (!pmSrc.isNull()) {
+        const QRectF rcSrc(0.0, pmSrc.height() / 6.0, pmSrc.width(),
+                           pmSrc.height() * 2.0 / 3.0);   // 居中 3:2 区带
+        p.drawPixmap(rcTop, pmSrc, rcSrc);
+    }
+    // ── 下 1/3：横向进度条整带铺满（描边内缩半笔宽防裁边）──
+    const QRectF rcBot(0.0, iH * 2.0 / 3.0, iW, iH / 3.0);
+    const qreal dPen  = qMax<qreal>(0.8, iW / 30.0);
+    const QRectF rcBar = rcBot.adjusted(dPen / 2.0, dPen / 2.0, -dPen / 2.0, -dPen / 2.0);
+    // 轨道：深色圆角 + 白描边（沿用旧沙漏底衬配色，任何图标底色上可辨）
+    p.setPen(QPen(Qt::white, dPen));
+    p.setBrush(QColor(22, 28, 38, 216));
+    p.drawRoundedRect(rcBar, rcBar.height() / 2.0, rcBar.height() / 2.0);
+    // 滑块：金黄圆角块，占轨道 40% 宽；三角波来回摇摆（0→1→0，不生硬回卷）
+    const int iN = ((a_iFrame % (2 * kBusyFrames)) + 2 * kBusyFrames) % (2 * kBusyFrames);
+    const qreal f = (iN < kBusyFrames)
+        ? iN / static_cast<qreal>(kBusyFrames)
+        : (2 * kBusyFrames - iN) / static_cast<qreal>(kBusyFrames);
+    const qreal dSeg  = rcBar.width() * 0.40;
+    const qreal dSegH = qMax<qreal>(1.2, rcBar.height() - dPen * 2.0);
+    QPainterPath clp;
+    clp.addRoundedRect(rcBar, rcBar.height() / 2.0, rcBar.height() / 2.0);
+    p.setClipPath(clp);
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0xFF, 0xC6, 0x4C));
+    p.drawRoundedRect(QRectF(rcBar.left() + (rcBar.width() - dSeg) * f,
+                             rcBar.center().y() - dSegH / 2.0, dSeg, dSegH),
+                      dSegH / 2.0, dSegH / 2.0);
+}
+}   // namespace
+
 void CMainWindow::OnAdhocHealthCheck() {
     // 2026-10-02 孤儿 busy 看门狗：面板 bRunning=true 但编排器侧会话不存在/runner
     //   无活性（进程已终、无宽限/重试）＝结束信号在某一环节丢失（实测：档切换竞态
@@ -3696,6 +3780,111 @@ void CMainWindow::OnAdhocHealthCheck() {
             ++it;
         }
     }
+
+    // 2026-10-30 任务运行态孤儿看门狗（用户实害：任务 Status==Running 而编排器推进链
+    //   完全静止——runner 结束信号丢失/外部杀进程竞态——任务内部指示器一直转、窗口
+    //   图标静止、StartTask 早退拒续，任务永久悬挂）：链静止（无 runner/构建/阶段备份/
+    //   SDK 静态预审/启动预备）且非 guide 生成期时，连续两轮（≥20s）命中即自愈为
+    //   Paused 并留痕，用户可点「启动/继续」重跑当前阶段。助手会话不计入（助手在跑
+    //   而任务链静止仍属任务悬挂，不能漏判）。
+    if (m_pOrch != nullptr && !m_bGuideBuilding && m_pOrch->IsTaskChainIdle()) {
+        for (CTaskInfo* pTask : m_aTasks) {
+            if (pTask == nullptr) {
+                continue;
+            }
+            if (pTask->Status() != ETaskStatus::Running) {
+                m_aTaskOrphanSuspect.remove(pTask->Id());   // 非运行态：撤销嫌疑
+                continue;
+            }
+            if (!m_aTaskOrphanSuspect.contains(pTask->Id())) {
+                m_aTaskOrphanSuspect.insert(pTask->Id());   // 首次命中：待下轮复确认
+                continue;
+            }
+            m_aTaskOrphanSuspect.remove(pTask->Id());
+            pTask->SetStatus(ETaskStatus::Paused);
+            if (m_pExecPanel != nullptr) {
+                m_pExecPanel->AppendEvent(pTask->Id(),
+                    QStringLiteral("task_orphan_heal"),
+                    QStringLiteral("⚠ 检测到任务运行态孤儿（运行信号丢失：编排器已空闲"
+                                   "而任务仍标记运行，可能因后端进程被外部终止后结束"
+                                   "信号未达），已自动恢复为暂停；点击「启动/继续」"
+                                   "可重跑当前阶段"));
+            }
+            OnTaskChanged(pTask);   // 刷新按钮/执行态指示器（转圈停）与任务列表
+        }
+    } else {
+        // 链在忙或 guide 生成期（合法无 runner 窗口）：全部撤销嫌疑
+        m_aTaskOrphanSuspect.clear();
+    }
+    // 2026-10-27 图标运行态动画兑底：万一某执行入口漏挂 StartBusyIconWatch（新增启动
+    //   路径未接），这里 10s 内补拉起；tick 空闲自停，代价为零。
+    if (AnyWorkRunning()) {
+        StartBusyIconWatch();
+    }
+}
+
+bool CMainWindow::AnyWorkRunning() const {
+    // 2026-10-27 与 closeEvent 退出确认同口径：流水线 runner / 任一助手 / 阶段前备份；
+    //   另含 guide 生成期（初始任务首阶段，此时无 runner）。同步的 rollback-pre 快照
+    //   阻塞事件循环，定时器无法走帧，不计入。
+    if (m_bGuideBuilding) {
+        return true;
+    }
+    if (m_pOrch != nullptr
+        && (m_pOrch->IsRunnerBusy() || m_pOrch->IsAnyAdhocRunning()
+            || m_pOrch->IsBackupRunning())) {
+        return true;
+    }
+    // 2026-10-30 一致性修复（用户实害：任务在跑、内部指示器转圈、窗口图标却静止）：
+    //   任一活跃任务 Status==Running 即视为有工作——与任务列表/阶段表指示器同源
+    //   （task 状态），覆盖启动预备/阶段间隙/SDK 预审等合法无 runner 窗口与推进信号
+    //   丢失的悬挂期；悬挂由 OnAdhocHealthCheck 任务看门狗自愈为 Paused 后自然停。
+    for (CTaskInfo* pTask : m_aTasks) {
+        if (pTask != nullptr && pTask->Status() == ETaskStatus::Running) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CMainWindow::StartBusyIconWatch() {
+    if (m_pBusyIconTm != nullptr && !m_pBusyIconTm->isActive()) {
+        m_iBusyIconFrame = 0;
+        m_pBusyIconTm->start();
+    }
+}
+
+void CMainWindow::OnBusyIconTick() {
+    // 空闲：停表 + 恢复静态图标与标题栏图标（去重，避免反复 WM_SETICON）
+    if (!AnyWorkRunning()) {
+        if (m_pBusyIconTm != nullptr) {
+            m_pBusyIconTm->stop();
+        }
+        if (m_bBusyIconOn) {
+            m_bBusyIconOn = false;
+            setWindowIcon(m_iconOrig);
+            if (m_pTitleBar != nullptr) {
+                m_pTitleBar->SetBusyPixmap(QPixmap());
+            }
+        }
+        return;
+    }
+    // 运行中：整幅重绘——上 2/3 AutoCode 图标居中 + 下 1/3 进度条滑块，16/24/32/48
+    //   各组一帧 addPixmap（任务栏/Alt-Tab 按需取尺寸）；自绘标题栏同步同帧（24px）。
+    m_bBusyIconOn = true;
+    QIcon iconBusy;
+    for (int iSz : {16, 24, 32, 48}) {
+        QPixmap pm(iSz, iSz);
+        PaintBusyProgressFrame(&pm, m_iconOrig, m_iBusyIconFrame);
+        iconBusy.addPixmap(pm);
+    }
+    setWindowIcon(iconBusy);
+    if (m_pTitleBar != nullptr) {
+        QPixmap pmTb(24, 24);
+        PaintBusyProgressFrame(&pmTb, m_iconOrig, m_iBusyIconFrame);
+        m_pTitleBar->SetBusyPixmap(pmTb);
+    }
+    m_iBusyIconFrame = (m_iBusyIconFrame + 1) % (2 * kBusyFrames);   // 三角波来回域
 }
 
 void CMainWindow::OnReviveTask(CTaskInfo* a_pTask) {
@@ -3761,6 +3950,7 @@ void CMainWindow::OnReviveTask(CTaskInfo* a_pTask) {
     m_pTaskPanel->SelectTask(pTask);
     m_pExecPanel->SetCurrentTask(pTask);   // SelectTask 未命中行时的兑底（正常路径重复 no-op）
     m_pOrch->StartTask(pTask);
+    StartBusyIconWatch();   // 2026-10-27 图标运行态动画：历史任务再次执行
     ReloadHistory();
 }
 
@@ -4111,12 +4301,71 @@ void CMainWindow::LoadAssistantState(bool a_bProjectSwitch) {
     if (!aPhantoms.isEmpty()) {
         m_pExecPanel->AttachForeignAssistants(aPhantoms, sOldTaskName);
     }
+    // 2026-10-31 上次未执行完检测（仅工程打开链=启动/切工程；任务切档不打扰）：
+    //   载档收尾后延迟到事件循环弹框——避免在 OpenProjectDir 同步链里重入（弹框
+    //   内用户操作可能触发切档/保存）。Phantom 挂回若仍在跑，其 pend 由
+    //   PendAsstIds 的 !bRunning 过滤自然豁免。
+    if (a_bProjectSwitch) {
+        QTimer::singleShot(0, this, [this]() { PromptResumePendAssts(); });
+    }
     // 2026-10-15 模型恢复后同步上下文窗口（用户反馈：重启后进度条仍显 128K，右键
     //   重选模型才对）：助手档案不存模型名，恢复后 sModel 为空/旧值，而共享表推送
     //   只在构造期跑过一次（当时面板尚未创建被跳过）。此处助手已全部就位，补一次
     //   推送 → SetSharedModels 把非覆盖助手 sModel 归一到激活条目并全量刷新进度条，
     //   分母即条目 iCtx（ContextWindowForModel 条目优先）。幂等，切工程/切任务同链。
     ApplySharedModelsToRunners();
+}
+
+void CMainWindow::PromptResumePendAssts() {
+    // 2026-10-31 上次未执行完检测（用户需求：助手上次没执行完，启动时提示是否继续）：
+    //   工程打开载档完成后，档里残留 pend 标记（上次运行中退出/异常退出）且当前
+    //   非运行中的助手非空 → 弹框列出（名字+后端+最后一条提示词摘要）：
+    //   · 全部继续执行：逐个以「继续执行上次中断的指令：<原提示词>」走正常发送链
+    //     （编排器按该会话 sSid fork 续接上下文，同任务侧中断续跑口径）；
+    //   · 暂不：清 pend 标记落盘（防每次启动都问；原提示词仍在历史列表可手动重发）。
+    if (m_pExecPanel == nullptr || m_pOrch == nullptr) {
+        return;
+    }
+    const QStringList aIds = m_pExecPanel->PendAsstIds();
+    if (aIds.isEmpty()) {
+        return;
+    }
+    QStringList aLines;
+    for (const QString& sId : aIds) {
+        const QString sName = m_pExecPanel->AsstNameOf(sId);
+        const QString sBe = m_pExecPanel->AsstBackend(sId);
+        const QString sBeTail = sBe.isEmpty()
+            ? QString() : QStringLiteral("（%1）").arg(
+                  CAgentRunnerFactory::DisplayNameOf(sBe));
+        QString sPrompt = m_pExecPanel->AsstLastUserPrompt(sId);
+        if (sPrompt.size() > 60) {
+            sPrompt = sPrompt.left(60) + QStringLiteral("…");
+        }
+        aLines.append(QStringLiteral("● %1%2：%3").arg(
+            sName, sBeTail,
+            sPrompt.isEmpty() ? QStringLiteral("（无提示词记录）") : sPrompt));
+    }
+    QMessageBox stBox(this);
+    QFont stF = stBox.font();
+    stF.setPointSize(11);   // 全局 UI 11 号字体
+    stBox.setFont(stF);
+    stBox.setWindowTitle(QStringLiteral("继续执行未完成的指令？"));
+    stBox.setIcon(QMessageBox::Question);
+    stBox.setText(QStringLiteral(
+        "检测到 %1 个助手在上次退出时仍在执行中（本次启动未自动恢复）：").arg(aIds.size()));
+    stBox.setInformativeText(aLines.join(QLatin1Char('\n')));
+    QPushButton* pBtnGo = stBox.addButton(QStringLiteral("全部继续执行"),
+                                          QMessageBox::YesRole);
+    stBox.addButton(QStringLiteral("暂不执行"), QMessageBox::NoRole);
+    stBox.exec();
+    if (stBox.clickedButton() == pBtnGo) {
+        for (const QString& sId : aIds) {
+            m_pExecPanel->ResumePendAsst(sId);   // 逐个续跑（各助手独立会话/进程）
+        }
+    } else {
+        m_pExecPanel->ClearAsstPend(aIds);
+        SaveAssistantState();   // 明确拒绝：清标记落盘，下次启动不再问
+    }
 }
 
 void CMainWindow::SyncOrchToPanel(const QString& a_sAsstId) {

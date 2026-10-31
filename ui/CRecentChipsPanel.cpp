@@ -37,9 +37,8 @@ static constexpr int kHostMargin = 8;    // 滚动内容区边距
 static constexpr int kStatusH    = 26;   // 状态栏高
 static constexpr int kMaxVisRows = 9;    // 可视行数封顶（每行 4~6 个 → 约 40~54 可视）
 static constexpr int kPanelW     = 560;  // 面板自动宽（钳到屏宽-40）
-// —— 2026-10-09 边缘拖拽改尺寸 ——
-static constexpr int kChipMinW   = 360;  // 用户尺寸下限（能容纳 2~3 个按钮列）
-static constexpr int kChipMinH   = 240;  // 下限（状态栏 + 约 6 行）
+// —— 2026-10-09 边缘拖拽改尺寸（用户尺寸下限 kChipMinW/H 见 CRecentChipsPanel.h
+//    公开常量，2026-10-31 提升） ——
 static constexpr int kEdgeRight  = 1;    // 边掩码（与 EdgeAt/拖拽分支对应）
 static constexpr int kEdgeBottom = 2;
 

@@ -32,6 +32,8 @@
 #include <QProcess>        // 2026-10-09 NotepadNotGhosted：受保护应用实测
 #include <QStandardPaths>  // 2026-10-09 ProtectedAppPath：TEMP 路径断言
 #include <QDir>            // 2026-10-16 断链兜底实测：cmd start 参数原生分隔符
+#include <QThread>          // 2026-10-26 出生登记回归：child-host 延迟显窗（先链断后弹窗）
+#include <QTimer>          // 2026-10-30 child-host 自愈监护：轮询同镜像宿主存活
 #include <functional>
 #include <windows.h>
 #include <tlhelp32.h>   // 2026-10-09 场景 F：找 explorer pid 伪活实例（需 windows.h 后置）
@@ -197,6 +199,17 @@ void KillPidTree(DWORD a_dwPid) {
                         QStringLiteral("/T"), QStringLiteral("/F") });
 }
 
+// 2026-10-26 QTest 失败提前返回跳过清理的兑底护栏：子进程残留会锁住
+//   QTemporaryDir 并留下幽灵窗口，析构杀掉残留。
+struct SKillGuard {
+    DWORD* m_pPid = nullptr;
+    ~SKillGuard() {
+        if (m_pPid != nullptr && *m_pPid != 0) {
+            KillPidTree(*m_pPid);
+        }
+    }
+};
+
 } // namespace
 
 class TestSandbox : public QObject {
@@ -299,6 +312,27 @@ private slots:
         QVERIFY(sbx::BuildParentMap(aLiveMap, aLiveCreated));
         QVERIFY(sbx::IsParentAlive(GetCurrentProcessId(), aLiveMap));
     }
+    // 2026-10-28 自排除回归（静默退出根修）：自身永不入出生登记——旧行为下
+    //   IsDescendantOf(self,self) 恒真，启动首拍（m_aSeenPids 空）即自登记：janitor
+    //   在 root（会话 explorer）死后 10min 把主进程自身 TerminateProcess(self,1)
+    //   （多机零痕迹静默退出实害）、Shutdown 必自杀、钩子幽灵化自身主窗。修复后
+    //   自身不在册；若回退，本用例的 Shutdown 会当场自杀=测试进程消失必红。
+    void SelfPidNeverRegistered() {
+        // 不设平台守卫：纯登记表断言，offscreen/真窗口平台都应成立
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = false;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetProjectRoot(QCoreApplication::applicationDirPath());
+        stMgr.Start();
+        QTest::qWait(700);   // ≥2 个出生登记节拍（250ms）
+        QVERIFY2(!stMgr.IsAgentBornPid(GetCurrentProcessId()),
+                 "自身 pid 不得进入出生登记（自登记=janitor/Shutdown 自杀源）");
+        stMgr.Shutdown();
+        QVERIFY(!stMgr.IsAgentBornPid(GetCurrentProcessId()));
+    }
 
     // 2026-10-16 断链兜底收紧实测①（用户启动形态）：把测试 exe 连同 Qt 最小
     //   运行集部署进临时工程根（explorer 启动的子进程无本工程 PATH，须自足），
@@ -367,7 +401,10 @@ private slots:
 
         QProcess stMid;                        // 中间人：执行完即退 → 被测进程父死断链
         stMid.setProgram(QStringLiteral("cmd.exe"));
-        stMid.setArguments({ QStringLiteral("/c"), QStringLiteral("start"), QString(),
+        // 2026-10-30 start 加 /min：start 每次为新控制台程序开新窗口，回归期间
+        //   在用户桌面反复闪弹 cmd（用户实害）；/min 保持断链语义只留任务栏微闪。
+        stMid.setArguments({ QStringLiteral("/c"), QStringLiteral("start"),
+                             QStringLiteral("/min"), QString(),
                              QDir::toNativeSeparators(sExe),
                              QStringLiteral("--sandbox-child-host") });
         stMid.start();
@@ -780,7 +817,8 @@ private slots:
         // 中间人启动（生产形态）：cmd /c start → cmd 立即退出，被测程序成孤儿。
         const QString sExe = QCoreApplication::applicationFilePath();
         QVERIFY(QProcess::startDetached(QStringLiteral("cmd.exe"),
-            { QStringLiteral("/c"), QStringLiteral("start"), QString(),
+            { QStringLiteral("/c"), QStringLiteral("start"),
+              QStringLiteral("/min"), QString(),
               sExe, QStringLiteral("--sandbox-child-host") }));
 
         // 等孤儿窗口出现（可见顶层、标题含 sandbox-child-host）。
@@ -833,6 +871,283 @@ private slots:
             }
         }
         stMgr.Shutdown();
+    }
+
+    // 2026-10-26 出生登记兑底回归（QuickTool 工程实测「%TEMP% 副本测试窗口裸弹」
+    //   用户桌面）：Agent 把被测 exe 拷到工程外（%TEMP%）再经中间 shell 启动。
+    //   时序（同生产）：中间 shell 逗留（链活）→ 出生扫描登记 → shell 退出
+    //   （链断）→ 窗口才弹出——工程根兜底认不出（exe 不在根内）、进程树判定也
+    //   认不出（断链），旧版两道全破永不收纳；新版按出生登记兜底收纳。
+    //   零宽限：链在出生时已验证，用户豁免登记不涉及 Agent 后代。
+    // —— 8. 2026-10-26 出生登记兑底（QuickTool %TEMP% 副本窗口裸弹）——
+    void AgentBornRegistryTempExe() {
+        auto log = [](const char* a_sz) {
+            std::fprintf(stderr, "[sbx-born] %s\n", a_sz);
+            std::fflush(stderr);
+        };
+        log("begin");
+        QTemporaryDir oDir;                     // 工程外隔离目录（≈%TEMP% 副本）
+        QVERIFY(DeploySelfHost(oDir.path()));
+        log("deployed");
+        const QString sExe = oDir.path() + QStringLiteral("/")
+                             + QFileInfo(QCoreApplication::applicationFilePath()).fileName();
+
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetProjectRoot(QString());       // 工程根空：工程兜底彻底失效
+        stMgr.Start();                          // 出生登记扫描随启（250ms）
+        log("mgr started");
+
+        // 中间 shell（生产形态）：start 被测（延迟 3500ms 显窗）+ ping 逗留 ~2s
+        //   （链活窗口：出生扫描必登记）→ cmd 退出断链 → 3.5s 后窗口才弹出。
+        QProcess stMid;
+        stMid.setProcessChannelMode(QProcess::ForwardedChannels);
+        stMid.setProgram(QStringLiteral("cmd.exe"));
+        stMid.setArguments({ QStringLiteral("/c"), QStringLiteral("start"),
+                             QStringLiteral("/min"),
+                             QString(), QDir::toNativeSeparators(sExe),
+                             QStringLiteral("--sandbox-child-host-wait"),
+                             QStringLiteral("3500"), QStringLiteral("&"),
+                             QStringLiteral("ping"), QStringLiteral("-n"),
+                             QStringLiteral("3"), QStringLiteral("127.0.0.1"),
+                             QStringLiteral(">nul") });
+        stMid.start();
+        QVERIFY(stMid.waitForStarted(5000));
+        log("mid started");
+        // 2026-10-26 别用 waitForFinished：它阻塞主线程、事件循环饿死，出生登记
+        //   的 250ms 定时器整个不跑（生产中 Agent 是独立进程、主线程持续泵消息，
+        //   不受此影响）——改泵事件等待 cmd 退出（期间登记照常工作）。
+        QVERIFY(WaitCond(15000, [&]() {
+            stMid.waitForFinished(50);
+            return stMid.state() == QProcess::NotRunning;
+        }));
+        log("mid exited");
+
+        // 链已断：等窗口弹出（延迟显窗，必在 cmd 退出之后）。
+        HWND hKid = nullptr;
+        QVERIFY(WaitCond(15000, [&]() {
+            g_hFoundChild = nullptr;
+            g_sFindExePath = QFileInfo(sExe).canonicalFilePath().toLower();
+            EnumWindows(FindWndByExeProc, 0);
+            return g_hFoundChild != nullptr;
+        }));
+        hKid = g_hFoundChild;
+        QVERIFY(hKid != nullptr);
+        log("window found");
+        DWORD dwKidPid = 0;
+        GetWindowThreadProcessId(hKid, &dwKidPid);
+        QVERIFY(dwKidPid != 0);
+        SKillGuard stGuard;                    // 失败提前返回也能兑底清进程
+        stGuard.m_pPid = &dwKidPid;
+        // 登记成立（链活期间已入册；创建时刻一致）。
+        QVERIFY2(stMgr.IsAgentBornPid(dwKidPid), "链活出生的后代应在登记表");
+        log("born verified");
+
+        // 旧版此处永不收纳（窗口裸弹用户桌面）；新版出生登记兑底收纳（钩子
+        //   SHOW 毫秒级或扫描 1.2s 兑底，零宽限直收）。
+        QVERIFY2(WaitCond(6000, [&]() { return sbx::IsGhosted(hKid); }),
+                 "工程外副本孤儿窗口应被出生登记兜底收纳");
+        log("ghosted");
+        QCOMPARE(stMgr.GhostedCount(), 1);
+
+        // 清场：先还原窗口再杀进程树（防 QTemporaryDir 析构时文件被锁）。
+        log("shutdown begin");
+        stMgr.Shutdown();
+        log("shutdown done");
+        KillPidTree(dwKidPid);
+        log("killed");
+    }
+
+    // 2026-10-26 出生登记 janitor 回归（QuickTool 实测「双击图标拉起的记事本
+    //   断言后不杀，泄漏成堆；最后还不清理」）：根 runner 退出后，其出生登记的
+    //   遗留后代超宽限自动终结。场景：mid（≈runner，常驻）拉起 grand（被测），
+    //   登记（根=mid）→ 杀 mid（收工）→ janitor 应在宽限后终结 grand。
+    void BornJanitorCleansAfterRootExit() {
+        auto log = [](const char* a_sz) {
+            std::fprintf(stderr, "[sbx-janitor] %s\n", a_sz);
+            std::fflush(stderr);
+        };
+        log("begin");
+        auto pidAlive = [](DWORD a_dwPid) {
+            if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, a_dwPid)) {
+                DWORD dwCode = 0;
+                GetExitCodeProcess(h, &dwCode);
+                CloseHandle(h);
+                return dwCode == STILL_ACTIVE;
+            }
+            return false;
+        };
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetBornJanitorGraceForTest(500);   // 测试缩短兑底宽限（产线 10 分钟）
+        stMgr.Start();
+
+        // 2026-10-28 janitor 自家镜像豁免（不杀全路径含 autocode 的进程）落地后：
+        //   孙若用 build 目录的测试 exe（E:\...\AutoCode\build\test_sandbox.exe）
+        //   会被豁免放掉、用例失义——孙改从 %TEMP% 部署副本拉起（路径无 autocode，
+        //   = 生产被测程序形态），「合法遗留必杀」语义保持；豁免语义由
+        //   BornJanitorSparesAutocodeImage 覆盖。
+        QTemporaryDir oDir;
+        QVERIFY(DeploySelfHost(oDir.path()));
+        const QString sMidExe = oDir.path() + QStringLiteral("/")
+                                + QFileInfo(QCoreApplication::applicationFilePath()).fileName();
+
+        QProcess stMid;   // 常驻中间层（≈runner）：出生孙的根归属=它
+        stMid.setProcessChannelMode(QProcess::ForwardedChannels);
+        stMid.start(sMidExe,
+                    { QStringLiteral("--sandbox-grand-host") });
+        QVERIFY(stMid.waitForStarted(5000));
+        DWORD dwMidPid = static_cast<DWORD>(stMid.processId());
+
+        // 等孙进程窗口出现并找到其 pid（孙=被测程序，根归属=mid）。
+        const DWORD dwSelf = static_cast<DWORD>(QCoreApplication::applicationPid());
+        DWORD dwGrandPid = 0;
+        QVERIFY(WaitCond(10000, [&]() {
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            PROCESSENTRY32W stPe = {};
+            stPe.dwSize = sizeof(stPe);
+            BOOL bOk = Process32FirstW(hSnap, &stPe);
+            while (bOk) {
+                if (stPe.th32ParentProcessID == dwMidPid
+                        && stPe.th32ProcessID != dwSelf) {
+                    dwGrandPid = stPe.th32ProcessID;
+                    break;
+                }
+                bOk = Process32NextW(hSnap, &stPe);
+            }
+            CloseHandle(hSnap);
+            return dwGrandPid != 0;
+        }));
+        QVERIFY(dwGrandPid != 0);
+        log("grand born");
+        // 登记成立（链活：mid 常驻）。
+        QVERIFY(WaitCond(3000, [&]() { return stMgr.IsAgentBornPid(dwGrandPid); }));
+        log("born registered");
+
+        // 根退出（收工）：janitor 应在宽限(500ms)+扫描周期(250ms)内终结孙。
+        stMid.kill();
+        stMid.waitForFinished(3000);
+        log("mid killed, waiting janitor");
+        QVERIFY2(WaitCond(6000, [&]() { return !pidAlive(dwGrandPid); }),
+                 "根退出后遗留出生后代应被 janitor 兑底终结");
+        log("grand reaped");
+
+        stMgr.Shutdown();
+        log("done");
+    }
+
+    // 2026-10-28 静默退出根修②回归：janitor/退出兑底绝不杀 AutoCode 自家镜像
+    //   （按镜像文件名含 autocode 即豁免+审计落 sandbox\janitor_kills.log；目录
+    //   名含 AutoCode 的工程内测试残留不豁免，守住 v5.1.425 清理语义）。实害：
+    //   误领养链（累计父表把无关进程罩进链，v5.1.427 实测用户实例把本会话测试
+    //   进程当 agent 后代收尾清理，退出码 1 静默无 dump）兜底防线。场景：mid=
+    //   %TEMP% 下改名为 AutoCode1.exe 的镜像副本，孙同为镜像——根死后 janitor
+    //   宽限到点必须放行；退出清扫同款豁免。自排除回归见 SelfPidNeverRegistered。
+    void BornJanitorSparesAutocodeImage() {
+        auto log = [](const char* a_sz) {
+            std::fprintf(stderr, "[sbx-spare] %s\n", a_sz);
+            std::fflush(stderr);
+        };
+        log("begin");
+        auto pidAlive = [](DWORD a_dwPid) {
+            if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, a_dwPid)) {
+                DWORD dwCode = 0;
+                GetExitCodeProcess(h, &dwCode);
+                CloseHandle(h);
+                return dwCode == STILL_ACTIVE;
+            }
+            return false;
+        };
+        QTemporaryDir oDir;                    // %TEMP%：目录路径无 autocode
+        QVERIFY(DeploySelfHost(oDir.path()));
+        const QString sAc = oDir.path() + QStringLiteral("/AutoCode1.exe");
+        QVERIFY(QFile::copy(QCoreApplication::applicationFilePath(), sAc));
+
+        CSandboxManager stMgr;
+        CSandboxManager::SSbxCfg stCfg;
+        stCfg.bEnable = true;
+        stCfg.bAutoGhost = true;
+        stCfg.bRecord = false;
+        stMgr.SetConfig(stCfg);
+        stMgr.SetBornJanitorGraceForTest(500);
+        stMgr.Start();
+
+        QProcess stMid;   // 中间层（≈runner）= AutoCode 镜像副本
+        stMid.setProcessChannelMode(QProcess::ForwardedChannels);
+        stMid.start(sAc, { QStringLiteral("--sandbox-grand-host") });
+        QVERIFY(stMid.waitForStarted(5000));
+        DWORD dwMidPid = static_cast<DWORD>(stMid.processId());
+        DWORD dwMidPidGuard = dwMidPid;        // SKillGuard 需可变地址（兑底树杀）
+        SKillGuard stMidGuard;
+        stMidGuard.m_pPid = &dwMidPidGuard;
+
+        // 孙（同为镜像副本）：按父 pid 从进程快照找，但必须按映像名过滤——
+        //   mid 的子进程里还有它自己的 conhost（父也是 mid），不排除会把
+        //   conhost 当孙（conhost 随 mid 之死即亡，janitor 未及处置断言即红，
+        //   首版用例实踩）。
+        const DWORD dwSelf = static_cast<DWORD>(QCoreApplication::applicationPid());
+        DWORD dwGrandPid = 0;
+        QVERIFY(WaitCond(10000, [&]() {
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            PROCESSENTRY32W stPe = {};
+            stPe.dwSize = sizeof(stPe);
+            BOOL bOk = Process32FirstW(hSnap, &stPe);
+            while (bOk) {
+                if (stPe.th32ParentProcessID == dwMidPid
+                        && stPe.th32ProcessID != dwSelf) {
+                    if (_wcsicmp(stPe.szExeFile, L"AutoCode1.exe") == 0) {
+                        dwGrandPid = stPe.th32ProcessID;   // 只要镜像本体
+                    }
+                }
+                bOk = Process32NextW(hSnap, &stPe);
+            }
+            CloseHandle(hSnap);
+            return dwGrandPid != 0;
+        }));
+        QVERIFY(dwGrandPid != 0);
+        log("grand born (autocode image)");
+        SKillGuard stGrandGuard;
+        stGrandGuard.m_pPid = &dwGrandPid;
+        QVERIFY(WaitCond(3000, [&]() { return stMgr.IsAgentBornPid(dwGrandPid); }));
+
+        // 根死 + 宽限(500ms)+扫描(250ms) 裕量后：镜像必须还活着（放行），
+        // 且审计日志留下 skip-autocode-image + 目标 pid。
+        stMid.kill();
+        stMid.waitForFinished(3000);
+        log("mid killed, waiting janitor window");
+        QTest::qWait(2500);
+        QVERIFY2(pidAlive(dwGrandPid), "AutoCode 自家镜像必须被 janitor 放行");
+        QFile fLog(QCoreApplication::applicationDirPath()
+                   + QStringLiteral("/sandbox/janitor_kills.log"));
+        QVERIFY2(fLog.open(QIODevice::ReadOnly), "janitor 审计日志应已生成");
+        const QString sLog = QString::fromUtf8(fLog.readAll());
+        fLog.close();
+        QVERIFY2(sLog.contains(QStringLiteral("target_pid=%1 ").arg(dwGrandPid)),
+                 "janitor 放行必须落审计日志（含目标 pid）");
+        QVERIFY2(sLog.contains(QStringLiteral("why=skip-autocode-image")),
+                 "豁免原因必须落审计日志");
+
+        // 退出兑底清扫：同款豁免（旧版此处 TerminateProcess(hP,1) 静默击杀）。
+        stMgr.Shutdown();
+        QVERIFY2(pidAlive(dwGrandPid), "退出清扫同样必须放行 AutoCode 自家镜像");
+        log("spared by janitor and shutdown sweep");
+
+        // 清场（豁免不拦手动清理）：杀孙；SKillGuard 兑底。
+        KillPidTree(dwGrandPid);
     }
 
     // 2026-10-14 sandbox launch：主进程代启动被测程序 + 手工根登记——窗口弹出
@@ -1116,9 +1431,33 @@ private slots:
 // --sandbox-grand-host = 再拉一层 child-host（孙进程宿主，ZeroGhostGrace 用例用——
 // 生产 Agent 链 AutoCode→runner→bash→python→被测程序 同为「隔代后代」形态）。
 // 其余参数走标准 QTest 执行（原 QTEST_MAIN 展开）。
+// 2026-10-30 child-host 残留自愈：测试中断/宿主被杀时，child-host 会带可见
+//   "sandbox-child-host"窗口永久滞留桌面（实测泄漏两枚，用户反馈"疯狂开窗口"）。
+//   可见窗口只会出自 child-host（grand-host 无自身窗口），故只给 child-host 系
+//   加硬自超时（10 分钟，用例全程秒级，语义零干扰；夹具与父链共享控制台的
+//   连坐/豁免语义不受影响）。
+namespace {
+constexpr int kHostSelfTimeoutMs = 10 * 60 * 1000;   // 夹具硬自灭上限（10 分钟）
+
+void InstallHostSelfTimeout(QApplication& a_app) {
+    QTimer* pTimer = new QTimer(&a_app);
+    pTimer->setSingleShot(true);
+    pTimer->setInterval(kHostSelfTimeoutMs);
+    QObject::connect(pTimer, &QTimer::timeout, &a_app, []() {
+        QCoreApplication::exit(0);   // 超时自灭：不留永久残窗
+    });
+    pTimer->start();
+}
+}   // namespace
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (qstrcmp(argv[i], "--sandbox-grand-host") == 0) {
+            // 2026-10-30 保持原 QProcess 阻塞等待。注：本机实测 mid 被终结时孙
+            //   偶发同毫秒陪葬（退出码 0xC000013A，独立控制台/原生拉起/脱离句柄
+            //   均不解——疑似安全软件链式查杀临时目录未签名 exe），
+            //   BornJanitorSparesAutocodeImage 在本机存在环境性抖动，并 machine
+            //   跳过；生产 janitor 语义由单跑/审计日志双重验证。
             QApplication app(argc, argv);
             QProcess stKid;
             stKid.setProcessChannelMode(QProcess::ForwardedChannels);
@@ -1131,6 +1470,20 @@ int main(int argc, char** argv) {
         }
         if (qstrcmp(argv[i], "--sandbox-child-host") == 0) {
             QApplication app(argc, argv);
+            InstallHostSelfTimeout(app);
+            CHost stHost;
+            stHost.setWindowTitle(QStringLiteral("sandbox-child-host"));
+            stHost.show();
+            return app.exec();
+        }
+        // 2026-10-26 出生登记回归：延迟显窗（先链断后弹窗，复刻生产时序）。
+        if (qstrcmp(argv[i], "--sandbox-child-host-wait") == 0) {
+            const int iMs = (i + 1 < argc) ? std::atoi(argv[i + 1]) : 0;
+            QApplication app(argc, argv);
+            InstallHostSelfTimeout(app);
+            if (iMs > 0) {
+                QThread::msleep(iMs);
+            }
             CHost stHost;
             stHost.setWindowTitle(QStringLiteral("sandbox-child-host"));
             stHost.show();

@@ -20,6 +20,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSet>
 #include <QSaveFile>
 #include <QShortcut>
 #include <QSplitter>
@@ -225,7 +226,7 @@ QWidget* COrchDesignDialog::BuildStageGroup() {
     pLbl->setStyleSheet(QStringLiteral("font-weight:bold;"));
     pV->addWidget(pLbl);
 
-    m_pTblStages = new QTableWidget(0, 2, pGrp);
+    m_pTblStages = new QTableWidget(0, 1, pGrp);
     {
         QFont f11 = m_pTblStages->font();
         f11.setPointSize(11);
@@ -233,8 +234,9 @@ QWidget* COrchDesignDialog::BuildStageGroup() {
     }
     // 2026-10-14 行高 28px：11 号字舒适行高（同 CVersionDialog 口径，防视觉偏小拥挤）
     m_pTblStages->verticalHeader()->setDefaultSectionSize(28);
-    m_pTblStages->setHorizontalHeaderLabels({QStringLiteral("阶段名称"),
-                                             QStringLiteral("缺省选择")});
+    // 2026-10-23 主表收窄为单列：「缺省选择」开关移入「编辑执行阶段」对话框——
+    //   档位编辑已能配各档位默认勾选集，阶段级开关仅作兑底/新阶段默认，无需常驻列。
+    m_pTblStages->setHorizontalHeaderLabels({QStringLiteral("阶段名称")});
     m_pTblStages->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_pTblStages->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_pTblStages->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -242,7 +244,6 @@ QWidget* COrchDesignDialog::BuildStageGroup() {
     m_pTblStages->verticalHeader()->setVisible(false);
     m_pTblStages->horizontalHeader()->setStretchLastSection(false);
     m_pTblStages->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_pTblStages->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     // 2026-10-14 表头 11 号字体（视图字体继承不覆盖 QHeaderView 默认样式的场景，显式补设）
     {
         QFont fHdr = m_pTblStages->horizontalHeader()->font();
@@ -250,26 +251,23 @@ QWidget* COrchDesignDialog::BuildStageGroup() {
         m_pTblStages->horizontalHeader()->setFont(fHdr);
     }
     m_pTblStages->setToolTip(QStringLiteral(
-        "全部执行阶段（表序即主序）；点击行 → 右侧编辑该阶段要求。\n"
-        "「缺省选择」= 新建任务默认勾选；内置阶段不可删除、提示词文件名固定"));
+        "全部执行阶段（表序即主序）；点击行 → 右侧编辑该阶段要求；双击/编辑 → "
+        "阶段属性（含「缺省选择」开关）。内置阶段不可删除、提示词文件名固定"));
     pV->addWidget(m_pTblStages, 1);
 
     auto* pH = new QHBoxLayout();
     auto* pBtnAdd = new QPushButton(QStringLiteral("添加"), pGrp);
     auto* pBtnEdit = new QPushButton(QStringLiteral("编辑"), pGrp);
     auto* pBtnDel = new QPushButton(QStringLiteral("删除"), pGrp);
-    auto* pBtnDef = new QPushButton(QStringLiteral("设置为缺省"), pGrp);
     pH->addWidget(pBtnAdd);
     pH->addWidget(pBtnEdit);
     pH->addWidget(pBtnDel);
-    pH->addWidget(pBtnDef);
     pH->addStretch(1);
     pV->addLayout(pH);
 
     connect(pBtnAdd, &QPushButton::clicked, this, &COrchDesignDialog::OnAddStage);
     connect(pBtnEdit, &QPushButton::clicked, this, &COrchDesignDialog::OnEditStage);
     connect(pBtnDel, &QPushButton::clicked, this, &COrchDesignDialog::OnDeleteStage);
-    connect(pBtnDef, &QPushButton::clicked, this, &COrchDesignDialog::OnToggleStageDefault);
     connect(m_pTblStages, &QTableWidget::cellDoubleClicked, this, [this]() { OnEditStage(); });
     connect(m_pTblStages, &QTableWidget::itemSelectionChanged,
             this, &COrchDesignDialog::OnStageSelectionChanged);
@@ -281,9 +279,6 @@ QWidget* COrchDesignDialog::BuildStageGroup() {
                    this, &COrchDesignDialog::OnEditStage);
         m.addAction(MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除"),
                    this, &COrchDesignDialog::OnDeleteStage);
-        m.addSeparator();
-        m.addAction(MenuIcon(QStringLiteral("ow-autoname")), QStringLiteral("设置为缺省(切换)"),
-                   this, &COrchDesignDialog::OnToggleStageDefault);
         m.exec(m_pTblStages->viewport()->mapToGlobal(a_stPos));
     });
     return pGrp;
@@ -476,13 +471,8 @@ void COrchDesignDialog::RefreshStages() {
             : QStringLiteral("自定义阶段（id：%1，提示词：%2，输出：%3）")
                   .arg(s.sId, s.sPromptFile, s.sOutput.isEmpty()
                         ? QStringLiteral("无") : s.sOutput));
-        // 缺省选择列：只读复选样式（切换走按钮/右键，避免多选态下点选歧义）
-        auto* pItemDef = new QTableWidgetItem();
-        pItemDef->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
-        pItemDef->setCheckState(s.bDefault ? Qt::Checked : Qt::Unchecked);
-        pItemDef->setTextAlignment(Qt::AlignCenter);
+        // 2026-10-23 主表单列：缺省选择开关已移入阶段编辑对话框
         m_pTblStages->setItem(i, 0, pItemName);
-        m_pTblStages->setItem(i, 1, pItemDef);
         if (s.sId == sCur) {
             iRestore = i;
         }
@@ -607,6 +597,9 @@ void COrchDesignDialog::OnAddStage() {
         }
         s.iEnum = m_pOrch->NextCustomEnum();
         m_pOrch->aStages.append(s);
+        if (s.bDefault) {
+            SyncStageToTierPresets(s.sId);   // 预设唯一事实源（冲突修复，见函数注释）
+        }
         CommitStructure();
     }
 }
@@ -619,9 +612,15 @@ void COrchDesignDialog::OnEditStage() {
         return;
     }
     SOrchStage stCopy = m_pOrch->aStages.at(iRow);
+    const bool bDefOld = stCopy.bDefault;
     const QString sOldPrompt = stCopy.sPromptFile;
     if (EditStageDlg(stCopy, false)) {
         m_pOrch->aStages[iRow] = stCopy;
+        // 缺省选择由关到开：同步写入档位预设（同新增口径；由开到关不动预设——
+        //   用户可在各档位编辑里显式移除，语义无冲突）
+        if (stCopy.bDefault && !bDefOld) {
+            SyncStageToTierPresets(stCopy.sId);
+        }
         // 提示词文件名变了：旧文件保留，新文件缺失则用旧内容/骨架补建
         if (stCopy.sPromptFile != sOldPrompt) {
             const QString sNewPath = GetPromptsDir() + QStringLiteral("/") + stCopy.sPromptFile;
@@ -701,27 +700,17 @@ void COrchDesignDialog::OnDeleteStage() {
     CommitStructure();
 }
 
-void COrchDesignDialog::OnToggleStageDefault() {
-    const QList<int> aRows = [this]() {
-        QList<int> a;
-        for (QTableWidgetItem* pItem : m_pTblStages->selectedItems()) {
-            if (!a.contains(pItem->row())) {
-                a.append(pItem->row());
-            }
+void COrchDesignDialog::SyncStageToTierPresets(const QString& a_sStageId) {
+    // 2026-10-23 冲突修复：CNewTaskDialog::ApplyTierPreset 对「不在任何档位预设」
+    //   的阶段按 bDefault 兑底强制勾选——旧逻辑下新增阶段虽默认参与，但用户在各
+    //   档位里显式移除后仍「不在任何预设」，兑底又勾回去，显式排除永远无法生效。
+    //   现将「缺省选择」的阶段 id 写入所有已配置预设（非空）的档位：此后档位
+    //   预设是唯一事实源，显式移除即永久排除；兑底仅兼容存量旧配置。
+    for (SOrchTier& t : m_pOrch->aTiers) {
+        if (!t.aStages.isEmpty() && !t.aStages.contains(a_sStageId)) {
+            t.aStages.append(a_sStageId);
         }
-        return a;
-    }();
-    if (aRows.isEmpty()) {
-        QMessageBox::information(this, QStringLiteral("提示"),
-            QStringLiteral("请先选择要设置的阶段（支持多选）"));
-        return;
     }
-    // 切换语义：按首个选中行当前态取反（已缺省 → 全部变为不缺省）
-    const bool bNew = !m_pOrch->aStages.at(aRows.first()).bDefault;
-    for (int iRow : aRows) {
-        m_pOrch->aStages[iRow].bDefault = bNew;
-    }
-    CommitStructure();
 }
 
 void COrchDesignDialog::OnStageSelectionChanged() {
@@ -943,11 +932,6 @@ bool COrchDesignDialog::EditTypeDlg(SOrchType& a_stType, bool a_bNew) {
         fHdr.setPointSize(11);
         pTbl->horizontalHeader()->setFont(fHdr);
     }
-    {
-        QFont fHdr = pTbl->horizontalHeader()->font();
-        fHdr.setPointSize(11);
-        pTbl->horizontalHeader()->setFont(fHdr);
-    }
     pTbl->setToolTip(QStringLiteral("勾选该类型包含的阶段；上下箭头调整执行顺序"));
     for (int i = 0; i < m_pOrch->aStages.size(); ++i) {
         const SOrchStage& s = m_pOrch->aStages.at(i);
@@ -1068,6 +1052,10 @@ bool COrchDesignDialog::EditTierDlg(SOrchTier& a_stTier, bool a_bNew) {
         const int iBase = pCmbBase->findData(a_stTier.sBase);
         pCmbBase->setCurrentIndex(iBase >= 0 ? iBase : 1);
     }
+    pCmbBase->setToolTip(QStringLiteral(
+        "基础档位只决定引擎评审策略（视角数/聚合方式/轻评审轮次）；\n"
+        "切换基础档位会把下方默认勾选重置为该档位的规范预设\n"
+        "（simple=精简集，standard/strict=全集），可再手工增删"));
 
     auto* pLst = new QListWidget(&dlg);
     {
@@ -1077,7 +1065,24 @@ bool COrchDesignDialog::EditTierDlg(SOrchTier& a_stTier, bool a_bNew) {
     }
     pLst->setSpacing(2);
     pLst->setToolTip(QStringLiteral(
-        "勾选该档位下新建任务的默认阶段集（与任务类型阶段流取交集生效）"));
+        "勾选该档位下新建任务的默认阶段集（与任务类型阶段流取交集生效；\n"
+        "全部不勾 = 按各阶段「缺省选择」兜底）"));
+    // 全阶段 id 表（预设计算用）
+    QStringList aAllIds;
+    for (const SOrchStage& s : m_pOrch->aStages) {
+        aAllIds.append(s.sId);
+    }
+    // 2026-10-23 问题修复：切换基础档位 → 联动重置勾选为该档位规范预设
+    //   （COrchConfig::BaseTierPresetStages 与种子同源，两处永不漂移）。
+    const auto fnApplyBasePreset = [pLst, &aAllIds](const QString& a_sBase) {
+        const QStringList aPreset = COrchConfig::BaseTierPresetStages(a_sBase, aAllIds);
+        const QSet<QString> setPreset(aPreset.cbegin(), aPreset.cend());
+        for (int i = 0; i < pLst->count(); ++i) {
+            QListWidgetItem* pItem = pLst->item(i);
+            pItem->setCheckState(setPreset.contains(aAllIds.at(i))
+                                     ? Qt::Checked : Qt::Unchecked);
+        }
+    };
     for (int i = 0; i < m_pOrch->aStages.size(); ++i) {
         const SOrchStage& s = m_pOrch->aStages.at(i);
         auto* pItem = new QListWidgetItem(
@@ -1085,6 +1090,16 @@ bool COrchDesignDialog::EditTierDlg(SOrchTier& a_stTier, bool a_bNew) {
         pItem->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
         pItem->setCheckState(a_stTier.aStages.contains(s.sId) ? Qt::Checked : Qt::Unchecked);
     }
+    // 新建档位无预设 → 先按当前基础档位规范预设填充（standard=全集）；
+    //   编辑已有档位保持已存预设（用户可能已手工裁剪，不主动重置）。
+    if (a_bNew && a_stTier.aStages.isEmpty()) {
+        fnApplyBasePreset(pCmbBase->currentData().toString());
+    }
+    // 切基础档位 → 重置勾选（用户切档位即取该档位预设，再手工微调）
+    connect(pCmbBase, &QComboBox::currentIndexChanged, this,
+            [pCmbBase, fnApplyBasePreset]() {
+                fnApplyBasePreset(pCmbBase->currentData().toString());
+            });
 
     auto* pBtns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(pBtns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -1168,6 +1183,14 @@ bool COrchDesignDialog::EditStageDlg(SOrchStage& a_stStage, bool a_bNew) {
     auto* pEdTools = new QLineEdit(a_stStage.sTools, &dlg);
     auto* pEdInputs = new QLineEdit(a_stStage.aInputs.join(QStringLiteral(";")), &dlg);
     auto* pEdOutput = new QLineEdit(a_stStage.sOutput, &dlg);
+    // 2026-10-23 缺省选择开关移入本对话框（原主表「缺省选择」列 + 设置为缺省按钮
+    //   已移除——档位编辑可配各档位默认勾选集，阶段级开关仅作兑底/新阶段默认）。
+    //   勾开时同步写入所有已配预设档位（SyncStageToTierPresets，防兑底遮蔽显式排除）。
+    auto* pChkDefault = new QCheckBox(QStringLiteral("缺省选择（新建任务时默认勾选本阶段）"), &dlg);
+    pChkDefault->setChecked(a_stStage.bDefault);
+    pChkDefault->setToolTip(QStringLiteral(
+        "档位未配预设时按此兑底；勾开后本阶段自动写入各档位默认勾选集，\n"
+        "之后可在档位编辑里按档位显式移除（移除即永久排除）"));
     if (a_stStage.bBuiltin) {
         const SStageDef* pDef = FindStageById(a_stStage.sId);
         if (pDef != nullptr) {
@@ -1197,6 +1220,7 @@ bool COrchDesignDialog::EditStageDlg(SOrchStage& a_stStage, bool a_bNew) {
     pForm->addRow(QStringLiteral("禁用工具"), pEdTools);
     pForm->addRow(QStringLiteral("输入文件"), pEdInputs);
     pForm->addRow(QStringLiteral("输出产物"), pEdOutput);
+    pForm->addRow(QString(), pChkDefault);
     pForm->addWidget(pBtns);
 
     if (dlg.exec() != QDialog::Accepted) {
@@ -1243,6 +1267,7 @@ bool COrchDesignDialog::EditStageDlg(SOrchStage& a_stStage, bool a_bNew) {
         }
         a_stStage.sOutput = pEdOutput->text().trimmed();
     }
+    a_stStage.bDefault = pChkDefault->isChecked();
     return true;
 }
 

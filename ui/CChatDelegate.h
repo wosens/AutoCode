@@ -73,6 +73,12 @@ public:
     int EstimateHeight(const SDisplayItem& a_it, int a_iWidth) const;    // 纯算术（测试可直接断言）
     int CachedHeight(int a_iRow) const;                   // 测试断言（resize 失效验证）；0=未缓存
     QString ToolTipAt(const QModelIndex& a_oIndex, const QPoint& a_oPos) const;  // 视图 viewportEvent(ToolTip) 转发
+    bool IsHeaderHit(const QModelIndex& a_oIndex, const QPoint& a_oPos) const;
+    // 折叠头命中（ToolUse/System）：双击开复制层与折叠翻转碰撞消歧（头区双击归折叠，
+    // 2026-10-22）；非折叠类条目恒 false
+    QString PlainTextAt(const QModelIndex& a_oIndex) const;
+    // 条目→可复制纯文本（2026-10-22 双击复制层非 Assistant 数据源：Event/Error→正文，
+    // System→逐行，ToolUse→逐条目入参/结果；Assistant 走池 Markdown doc 不从这取）
 
 private:
     const SDisplayItem* itemOf(const QModelIndex& a_oIndex) const;

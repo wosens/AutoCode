@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QFont>
 #include <QIcon>
+#include <QPixmap>
 #include <QPoint>
 #include <QRect>
 #include <QMouseEvent>
@@ -107,6 +108,16 @@ void CTitleBar::SetMaximized(bool a_bMaximized) {
         m_pBtnMax->setText(a_bMaximized ? QStringLiteral("□") : QStringLiteral("❐"));
         m_pBtnMax->setToolTip(a_bMaximized ? QStringLiteral("还原") : QStringLiteral("最大化"));
     }
+}
+
+void CTitleBar::SetBusyPixmap(const QPixmap& a_pm) {
+    // 2026.10.27 运行态图标动画：空 pixmap = 动画结束，恢复静态应用图标。
+    if (m_pIcon == nullptr) {
+        return;
+    }
+    m_pIcon->setPixmap(a_pm.isNull()
+        ? QIcon(QStringLiteral(":/icons/app.ico")).pixmap(20, 20)
+        : a_pm);
 }
 
 CTitleBar::EHitZone CTitleBar::HitTest(const QPoint& a_stScreenPos) const {

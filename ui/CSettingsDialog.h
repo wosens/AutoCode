@@ -120,6 +120,9 @@ public:
     // 2026-10-17 对话日志渲染引擎（[View] Engine："Legacy"=卡片流缺省 /
     //   "ModelView"=Model/View 自绘链——归一化两值，双引擎灰度开关）。
     QString ViewEngine() const;
+    // 2026-10-31 源码预览语法高亮（[View] CodeSyntax，默认开）：文件预览对源码
+    //   后缀用 CodeStyle 模块（CodeParser/CodeView.dll 动态加载）渲染。
+    bool CodeSyntax() const;
     // 2026-09-26 内置测试沙箱（[Sandbox]：Agent 后代 GUI 窗口自动收纳/录像）。
     bool SandboxEnable() const;
     bool SandboxAutoGhost() const;
@@ -287,6 +290,7 @@ private:
     QLineEdit*  m_pEditBackupDirs   = nullptr;
     QLineEdit*  m_pEditExplHidden   = nullptr;   // 2026.09.23 资源管理器隐藏目录（[Explorer] HiddenDirs）
     QComboBox*  m_pComboViewEngine  = nullptr;   // 2026-10-17 对话日志渲染引擎（[View] Engine：Legacy/ModelView）
+    QCheckBox*  m_pChkCodeSyntax   = nullptr;   // 2026-10-31 源码预览语法高亮（[View] CodeSyntax）
     // 2026-09-26 内置测试沙箱（[Sandbox]）
     QCheckBox*  m_pChkSbxEnable   = nullptr;   // 总开关
     QCheckBox*  m_pChkSbxAuto     = nullptr;   // 自动收纳新窗口

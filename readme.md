@@ -8,7 +8,7 @@
 
 一句需求，一条流水线，五个 AI Agent 后端为你交付代码。
 
-![Version](https://img.shields.io/badge/version-v4.4.389-3b82f6)
+![Version](https://img.shields.io/badge/version-v5.0.412-3b82f6)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows)
 ![C++](https://img.shields.io/badge/C%2B%2B-MSVC-00599C?logo=cplusplus)
 ![Qt](https://img.shields.io/badge/Qt-6.8-41CD52?logo=qt)
@@ -27,7 +27,7 @@
 
 它把五个异构 Agent CLI —— **Claude Code、DeepSeek Harness、PiAgent、Codex、Hermes** —— 统一收进同一套 Runner 抽象：统一的事件流解析、工具卡展示、token / 费用计量、上下文监控、会话管理与自愈。切换后端，只是换一个下拉选项。
 
-它为**真实工程的长期开发**而设计：CAS 增量备份与双粒度时光回退、跨会话工程记忆（guide / record / memory）、任务级配置覆盖、多实例在席锁、崩溃转储精确到行——大量在实害中打磨出的工程化细节。
+它为**真实工程的长期开发**而设计：CAS 增量备份与双粒度时光回退、跨会话工程记忆（guide / record / memory）、任务级配置覆盖、多实例在席锁、崩溃转储精确到行——大量在实战中打磨出的工程化细节。
 
 ---
 
@@ -44,7 +44,7 @@
 | 🛡️ | **隐藏 UI 测试沙箱** | Ghost 窗口 + 消息级输入模拟 + 离屏截屏 + 过程录制，Agent 自测 GUI 不抢真实键鼠、不闪窗口 |
 | 🔍 | **内建代码审查** | ReviewSdk 审查服务、多窗口并行审查、未改码复用上次结果、一键「按建议修复」注入助手 |
 | 🩹 | **深度自愈** | 悬空会话重建、坏凭据迁移、上下文超限自动压缩、网关限流长退避、历史库损坏自动重建……十余处运行时自愈点 |
-| 🖥️ | **工程化底座** | 崩溃转储精确到函数行、多实例在席锁（内核对象信号）、任务级配置覆盖、配置便携三处落盘、`fileread.dll` 统一磁盘读取 |
+| 🖥️ | **工程化底座** | 崩溃转储精确到行、多实例在席锁（内核对象信号）、任务级配置覆盖、配置便携三处落盘、`fileread.dll` 统一磁盘读取 |
 
 ---
 
@@ -151,7 +151,7 @@ flowchart LR
 | **Claude Code** | `claude` CLI（Node） | 自身登录 / 共享表跟随开关 | 悬空会话自动重建、运行中轮中注入、上下文占用精确计量 |
 | **DeepSeek Harness** | `bin.js`（Legacy / SDK 双布局） | 组合层模板 + 环境变量注入 | 版本不兼容五步自愈流水线、握手诊断、坏凭据迁移 |
 | **PiAgent** | `pi` CLI（RPC 常驻管道） | `~/.pi` 模型表合成写 | `steer` 轮中注入即时生效、限流长退避自动重试、超限自动压缩 |
-| **Codex** | `codex` CLI（锁 0.87.0） | 本地代理注入 `max_tokens` / usage 计量 | anthropic-messages 条目自动兑底同名 chat 端点 |
+| **Codex** | `codex` CLI（锁 0.87.0） | 本地代理注入 `max_tokens` / usage 计量 | anthropic-messages 条目自动兜底同名 chat 端点 |
 | **Hermes** | Node Harness / venv exe 双形态 | 部署根 `config.yaml` 幂等注入 | oneshot 事件补丁流（工具卡 / 思考流 / 进度）、`TERMINAL_CWD` 工作区锚定 |
 
 **模型配置一份通用**：DSH / Pi / Codex / Hermes 四后端共享同一份「自定义大模型」列表与当前项；上下文占用条右键还能为**单个助手**对话级切换模型，不动全局缺省。
@@ -200,7 +200,7 @@ flowchart LR
 <details>
 <summary><b>为长跑生产环境打磨的细节（点开）</b></summary>
 
-- **稳定性**：崩溃转储落 `<exe>\dump\`（Release 现产完整 PDB，栈可精确到行）；历史库 SQLite 损坏自动收档重建；十余处运行时自愈（悬空会话 / 坏凭据 / 超限上下文 / 限流退避 / 缺表回写……）
+- **稳定性**：崩溃转储落 `<exe>\dump\`（Release 构建随附完整 PDB，栈可精确到行）；历史库 SQLite 损坏自动收档重建；十余处运行时自愈（悬空会话 / 坏凭据 / 超限上下文 / 限流退避 / 缺表回写……）
 - **便携性**：自有配置只落三处——exe 同级 `config.ini`、Hermes 部署根 `config.yaml`、工程 `.autodev/`；不写注册表、不污染用户主目录
 - **多实例**：`Global\AutoCodeSeat_v1_*` 内核对象在席锁 + PID / 创建时刻交叉验证，双开同工程可靠拦截、崩溃残留锁自动接管
 - **统一磁盘读取**：全工程文件读取统一走 `fileread.dll`（`CFrwDevice` 适配器），单一读取口径可审计
@@ -271,7 +271,7 @@ cd build && ctest -C Release   # 必须带 -C
 
 <div align="center">
 
-**AutoCode** · 多 Agent 自动化编码任务编排器 · v4.4.389
+**AutoCode** · 多 Agent 自动化编码任务编排器 · v5.0.412
 
 *Pipeline · Five Backends · One Cockpit*
 

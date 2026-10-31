@@ -7,6 +7,7 @@
 #include <QMessageBox>
 #include <QSet>           // 2026-10-19 提权修复会话内抑制集（m_aAclElevateSuppressed）
 #include <QLocalSocket>   // 2026-10-01 SSbxReq（沙箱异步回包）QPointer 成员需完整类型
+#include <QIcon>          // 2026-10-27 运行态图标动画：静态图标值成员（m_iconOrig）
 #include <QJsonObject>
 #include <memory>
 
@@ -207,6 +208,10 @@ private:
     // a_bProjectSwitch=true：切工程专用——不做跨档幽灵摘挂（外工程助手绝不跟进新工程，
     //   防 ownerKey 同为空串被当作本档本地助手落盘 → 跨工程污染 assistant.json）。
     void LoadAssistantState(bool a_bProjectSwitch = false);   // 读对应档 → 恢复助手会话链与对话流；无档显式清空（#1）
+    // 2026-10-31 上次未执行完检测（用户需求：启动提示是否继续执行）：工程打开载档
+    //   完成后查 PendAsstIds，非空弹框（全部继续/暂不）——继续=以续跑指令重发，
+    //   拒绝=清标记落盘防每次启动都问。
+    void PromptResumePendAssts();
     // 2026.08.22 多助手会话换载：编排器单会话 ↔ 面板各助手会话态互转。
     void SyncOrchToPanel(const QString& a_sAsstId);   // 编排器 sid/栈/guideHash → 回填该助手
     void LoadOrchFromPanel(const QString& a_sAsstId); // 该助手会话态 → 换载进编排器
@@ -326,8 +331,24 @@ private:
     //   与编排器 IsAsstAdhocRunning，连续两次不健康即自动恢复并记事件。
     QTimer*             m_pAdhocHealthTm = nullptr;
     QSet<QString>       m_aAdhocSuspect;             // 首次不健康待复确认（防同轮瞬态空档）
+    QSet<QString>       m_aTaskOrphanSuspect;        // 2026-10-30 任务运行态孤儿首次命中待复确认
+                                                    //（Running 而推进链静止，连续两轮才自愈）
     void OnAdhocHealthCheck();
     void OnAsstForeignActivated(const QString& a_sOwnerKey);   // 2026-10-02 幽灵 Tab 点击 → 切回归属
     void OnAsstForeignFinished(const QString& a_sAsstId);      // 2026-10-02 幽灵轮次结束 → 落盘除名
     qint64              m_iCfgSelfSaveMs = 0;       // 自身最近一次保存时刻（ms；<2s 内的变更跳过）
+
+    // 2026-10-28 运行态窗口图标动画（用户需求：沙漏样式不好，改为整幅重绘——上 2/3
+    //   AutoCode 图标居中，下 1/3 横向进度条不定态跑马灯）：250ms 帧定时器仅在执行期
+    //   活跃；tick 自检运行态（runner/任一助手/阶段备份/guide 生成，与 closeEvent
+    //   退出确认同口径），空闲即自动停表并恢复静态图标——结束路径零挂点、永不漏恢复。
+    //   启动点只在各执行入口挂 StartBusyIconWatch，另由 OnAdhocHealthCheck（10s 常开
+    //   看门狗）兑底漏挂。
+    QTimer*            m_pBusyIconTm   = nullptr;   // 帧定时器（250ms；仅运行态活跃）
+    QIcon              m_iconOrig;                 // 静态应用图标（动画重绘源+恢复用）
+    int                m_iBusyIconFrame = 0;       // 当前进度条帧（0..kBusyFrames-1 循环）
+    bool               m_bBusyIconOn   = false;    // 窗口图标是否处于动画态（恢复去重）
+    bool               AnyWorkRunning() const;     // 运行态检测（tick/兑底共用）
+    void               StartBusyIconWatch();       // 启动帧定时器（已活跃 no-op）
+    void               OnBusyIconTick();           // 换帧/恢复（定时器槽）
 };

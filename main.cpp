@@ -2,6 +2,8 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFont>
+#include <QMessageBox>   // 2026-10-31 启动 Low 完整性自检告警（部署标签竞态）
+#include <vector>
 #include <QIcon>
 #include <cstring>
 
@@ -9,11 +11,13 @@
 #include "ui/CAppStyle.h"   // 2026.10.16 菜单图标列 20px 代理样式
 #include "agent/CMcpAskServer.h"
 #include "core/CCrashDump.h"
+#include "core/CFatalWitness.h"   // 2026.10.28 qFatal 见证：fastfail 零痕迹死亡的唯一遗言（静默退出排查与加固方案）
 #include "sandbox/CSandboxCore.h"   // 2026-09-26 --sandbox 命令解析（sbx::ParseCli）
 #include <windows.h>   // v2.2.146 诊断模式 ExitProcess 直退（析构拆序段错误兑底）
 #include "ui/CSettingsDialog.h"
 #include "ui/CRecentProjectsDialog.h"   // 2026.10.09 启动界面（launcher 模式）
 #include "project/CProjectManager.h"
+#include "core/CTempPaths.h"   // 2026.10.28 临时文件统一根 exe同级~Temperary（启动清扫）
 #include "core/COrchConfig.h"   // 2026-10-14 任务编排配置（启动加载+动态阶段注册）
 #include <QTabWidget>
 #include <QTreeWidget>
@@ -304,6 +308,9 @@ int main(int argc, char* argv[]) {
     // 2026.08.22 崩溃转储：崩溃/abort/purecall/std::terminate 等异常退出时
     //   在 <exe 目录>\dump\ 落 MiniDump（最先装，覆盖后续所有路径，含 --mcp-ask-server 模式）。
     CCrashDump::Install();
+    // 2026.10.28 qFatal 见证（静默退出排查与加固方案改动一）：必须在任何 QApplication
+    //   构造前安装，覆盖 --mcp-ask-server/--ask/--sandbox/--diag-settings 全部模式分支
+    CFatalWitness::Install();
     // MCP ask-user server 模式：claude 经 --mcp-config 以子进程拉起本 exe，
     // 跑 stdio JSON-RPC（暴露 ask_user 工具），不启动 GUI。
     for (int i = 1; i < argc; ++i) {
@@ -340,6 +347,14 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("AutoCode"));
     app.setOrganizationName(QStringLiteral("AutoCode"));
+
+    // 2026.10.28 临时文件统一根清扫：exe同级~Temperary 内超 30 天的残留文件/
+    //   目录（崩溃/跳过收尾的泄漏）及系统临时目录历史遗留 autocode_* 一并
+    //   清除（用户指令）；启动时一次即可，目录小扫得快不碍启动。
+    const int iSwept = CTempPaths::SweepExpired(30);
+    if (iSwept > 0) {
+        qDebug() << "[CTempPaths] swept" << iSwept << "expired temp entries";
+    }
 
     // 2026.10.16 菜单图标尺寸升级：QMenu 图标列 16→20px（与 11pt 菜单字体行高匹配，
     //   代理样式只覆盖「菜单上下文」的 PM_SmallIconSize，其余 metric 全透传基础样式）。
@@ -420,6 +435,44 @@ int main(int argc, char* argv[]) {
     //   默认编排）并注册自定义阶段（EStage≥100）进运行期定义表——后续任何
     //   FindStage/新建任务对话框/执行引擎均即刻可见；设计窗口保存后再增量重注册。
     COrchConfig::Instance()->ApplyToRuntime();
+
+    // 2026-10-31 部署标签竞态自检（提测资料实害）：副本目录刻意 Low（沙箱可写面，
+    //   OI 继承）——新落 exe 生即 Low，在守卫 5 分钟拍点前启动的实例整进程 Low，
+    //   其 agent 子进程受 No-Write-Up 限制无法写任何 Medium 工程（"连文件都无法创建"）。
+    //   检测到即告警引导重启（exe 标签此刻已被守卫修复，重启即恢复 Medium）。
+    {
+        HANDLE hTok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+            DWORD dwNeed = 0;
+            GetTokenInformation(hTok, TokenIntegrityLevel, nullptr, 0, &dwNeed);
+            if (dwNeed > 0) {
+                std::vector<char> aBuf(dwNeed);
+                if (GetTokenInformation(hTok, TokenIntegrityLevel, aBuf.data(),
+                                        dwNeed, &dwNeed)) {
+                    const auto* pLabel =
+                        reinterpret_cast<TOKEN_MANDATORY_LABEL*>(aBuf.data());
+                    const DWORD dwSub = *GetSidSubAuthorityCount(pLabel->Label.Sid);
+                    const DWORD dwIl = *GetSidSubAuthority(pLabel->Label.Sid,
+                                                           int(dwSub) - 1);
+                    if (dwIl < SECURITY_MANDATORY_MEDIUM_RID) {
+                        QMessageBox stWarn;
+                        stWarn.setIcon(QMessageBox::Warning);
+                        QFont fWarn = stWarn.font();
+                        fWarn.setPointSize(11);   // 全局 UI 11 号
+                        stWarn.setFont(fWarn);
+                        stWarn.setWindowTitle(QStringLiteral("程序完整性异常"));
+                        stWarn.setText(QStringLiteral(
+                            "AutoCode 当前以 Low 完整性运行（exe 部署标签竞态），"
+                            "助手将无法写入任何工程文件（创建文件会被直接拒绝）。\n"
+                            "exe 标签已由守卫任务自动修复——请关闭本窗口后"
+                            "重新启动 AutoCode 即可恢复。"));
+                        stWarn.exec();
+                    }
+                }
+            }
+            CloseHandle(hTok);
+        }
+    }
 
     CMainWindow window;
     window.show();

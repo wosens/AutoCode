@@ -21,6 +21,29 @@
 //   管理器析构期间钩子线程可读到旧指针对销毁中的对象 invokeMethod（use-after-free 窗口）。
 static std::atomic<CSandboxManager*> g_pSbxMgrForHook { nullptr };
 
+// —— 2026-10-28 janitor/退出兑底击杀审计日志：exe 同级 sandbox\janitor_kills.log ——
+// 每次真实击杀（或 AutoCode 自家镜像拦截）一行：时刻+杀手+目标+镜像+根+原因。
+// 背景：v5.1.425 出生登记自登记漏洞导致主进程被自身 janitor 零痕迹击杀（多机实害），
+// 修复后留审计口供回溯。写失败静默（审计不得反噬主流程）。
+static void JanitorKillLog(DWORD a_dwTargetPid, const QString& a_sImg, DWORD a_dwRoot,
+                           const QString& a_sWhy)
+{
+    const QString sDir = QCoreApplication::applicationDirPath() + QStringLiteral("/sandbox");
+    QDir().mkpath(sDir);
+    QFile fLog(sDir + QStringLiteral("/janitor_kills.log"));
+    if (!fLog.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+    const QString sLine = QStringLiteral("[%1] killer_pid=%2 target_pid=%3 img=%4 root=%5 why=%6\r\n")
+        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+        .arg(QCoreApplication::applicationPid())
+        .arg(a_dwTargetPid)
+        .arg(a_sImg.isEmpty() ? QStringLiteral("?") : a_sImg)
+        .arg(a_dwRoot)
+        .arg(a_sWhy);
+    fLog.write(sLine.toUtf8());
+}
+
 class CSbxHookThread : public QThread {
 public:
     using QThread::QThread;
@@ -182,6 +205,11 @@ CSandboxManager::CSandboxManager(QObject* a_pParent)
     : QObject(a_pParent) {
     m_tSweep.setInterval(1200);
     connect(&m_tSweep, &QTimer::timeout, this, &CSandboxManager::OnSweep);
+    // 2026-10-26 出生登记（机制见头文件注释）：趁 Agent 进程链活着发现新出生
+    //   后代。250ms：Agent 脚本 Start-Process 后多带 Start-Sleep（链活数秒），
+    //   快照/toolhelp 全表 ~1ms，常态占用可忽略。
+    m_tBirth.setInterval(250);
+    connect(&m_tBirth, &QTimer::timeout, this, &CSandboxManager::OnBirthScan);
 }
 
 CSandboxManager::~CSandboxManager() {
@@ -328,11 +356,52 @@ void CSandboxManager::Start() {
             pHook->start();
         }
         m_tSweep.start();
+        m_tBirth.start();   // 2026-10-26 出生登记扫描（与收纳同步开关）
     }
 }
 
 void CSandboxManager::Shutdown() {
     m_tSweep.stop();
+    m_tBirth.stop();   // 2026-10-26 出生登记随停
+    QList<DWORD> aBornPids;
+    {
+        QMutexLocker oL(&m_mtxBorn);
+        aBornPids = m_aAgentBorn.keys();
+        m_aAgentBorn.clear();   // 重启后旧登记不可信（进程树已换）
+        m_aBornRoot.clear();
+        m_aSeenPids.clear();
+    }
+    // 2026-10-26 退出兑底清理：AutoCode 退出 = 全部 Agent 已停，出生登记中
+    //   仍存活的被测/拉起进程（pwsh 断链脱管的记事本、测试实例等）一并终结
+    //   （KillProcTree 只能杀 runner 树，pwsh 秒退后的孙子管不到——QuickTool
+    //   实测记事本残留即此形态）。用户自己开的程序从未入册，不受影响。
+    for (const DWORD dwPid : aBornPids) {
+        // 2026-10-28 双保险：绝不自缴/绝不杀 AutoCode 自家进程（同 janitor，静默退出根修）
+        if (dwPid == GetCurrentProcessId()) {
+            continue;
+        }
+        const QString sImg = sbx::ExePathOfPid(dwPid);
+        // 只匹配镜像文件名（同 janitor，防全路径误豁免）
+        if (QFileInfo(sImg).fileName().contains(QLatin1String("autocode"), Qt::CaseInsensitive)) {
+            JanitorKillLog(dwPid, sImg, 0, QStringLiteral("skip-autocode-image"));
+            continue;
+        }
+        // 2026-10-30 永不杀 conhost：杀控制台宿主 = 向所有挂靠进程发控制台关闭，
+        //   连坐杀掉共享同控制台的无幸进程（实测 janitor 击杀 grand 挂靠的
+        //   conhost → 被豁免的 AutoCode 镜像退出码 0xC000013A 连带死亡，
+        //   BornJanitorSparesAutocodeImage 三连跑红）。控制台随最后一个挂靠
+        //   进程退出自然消亡，无需也不可显式终结。
+        if (QString::compare(QFileInfo(sImg).fileName(), QLatin1String("conhost.exe"),
+                             Qt::CaseInsensitive) == 0) {
+            JanitorKillLog(dwPid, sImg, 0, QStringLiteral("skip-console-host"));
+            continue;
+        }
+        if (HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, dwPid)) {
+            TerminateProcess(hP, 1);
+            CloseHandle(hP);
+            JanitorKillLog(dwPid, sImg, 0, QStringLiteral("shutdown-sweep"));
+        }
+    }
     g_pSbxMgrForHook.store(nullptr, std::memory_order_release);
     m_aPendingGhosts.clear();   // 宽限期待定作废（定时器 lambda 有窗口有效性复判）
     // 停钩子线程（SetWinEventHook 要求安装线程自己 Unhook）。
@@ -378,8 +447,12 @@ void CSandboxManager::ReloadConfig() {
         if (!m_tSweep.isActive()) {
             m_tSweep.start();
         }
+        if (!m_tBirth.isActive()) {
+            m_tBirth.start();
+        }
     } else {
         m_tSweep.stop();
+        m_tBirth.stop();
     }
     m_bRecOn = m_stCfg.bRecord;
 }
@@ -391,6 +464,10 @@ bool CSandboxManager::TreePid(DWORD a_dwPid) {
     if (m_aManualRoots.contains(a_dwPid)) {
         return true;
     }
+    // 2026-10-26 并发写防护：钩子/UI/工作线程都会触发重建，QHash 并发写损坏
+    //   结构会死循环（出生登记 250ms 扫描实测必现挂死）——pid 表统一 m_mtxPidMap
+    //   串行化；锁序恒为 m_mtxState → m_mtxPidMap → m_mtxBorn（绝不反向嵌套）。
+    QMutexLocker oMap(&m_mtxPidMap);
     const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
     if (m_oParentMap.isEmpty() || iNow - m_iMapBuiltMs > 500) {
         sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
@@ -398,6 +475,169 @@ bool CSandboxManager::TreePid(DWORD a_dwPid) {
     }
     return sbx::IsDescendantOf(a_dwPid, GetCurrentProcessId(), m_oParentMap,
                                m_oParentCreated);
+}
+
+// pid 父查询（2026-10-26 并发写防护：全部 m_oParentMap 读写统一走 m_mtxPidMap）。
+DWORD CSandboxManager::ParentOfPid(DWORD a_dwPid) const {
+    QMutexLocker oMap(&m_mtxPidMap);
+    return m_oParentMap.value(a_dwPid, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 2026-10-26 出生登记（机制见头文件注释）：链活期间发现 Agent 后代新进程。
+//   UI 线程定时器；全量快照 + 差分；登记表跨线程（UI写/钩子读）用 m_mtxBorn。
+// ---------------------------------------------------------------------------
+void CSandboxManager::OnBirthScan() {
+    if (!m_stCfg.bEnable || !m_bStarted) {
+        return;
+    }
+    // pid→(创建时刻, 根 runner)：根 = 出生时链上最顶祖先（父==本进程的那个），
+    // janitor 按它判定「这个 Agent 已收工」。
+    QHash<DWORD, QPair<qint64, DWORD>> aNewBorn;
+    QSet<DWORD> aNow;
+    {
+        // 2026-10-26 并发写防护：与 TreePid/兑底判定同一 m_mtxPidMap 串行化。
+        QMutexLocker oMap(&m_mtxPidMap);
+        sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
+        m_iMapBuiltMs = QDateTime::currentMSecsSinceEpoch();
+        const DWORD dwSelf = GetCurrentProcessId();
+        for (auto it = m_oParentMap.constBegin(); it != m_oParentMap.constEnd(); ++it) {
+            aNow.insert(it.key());
+        }
+        for (const DWORD dwPid : aNow) {
+            if (m_aSeenPids.contains(dwPid)) {
+                continue;   // 非新增（首次启动时全表均新，但非后代会被下面过滤）
+            }
+            // 2026-10-28 自 exclusion（静默退出根修）：IsDescendantOf(自身,自身) 恒为 TRUE，启动后
+            //   首拍扫描（m_aSeenPids 空）必然把自己登记为“agent 后代”——root=explorer
+            //   常态被 janitor 豁免，但会话 explorer（RustDesk/RDP 会话壳）一旦退出 root 判死，
+            //   宽限(10min)到点 janitor 即把主进程自身 TerminateProcess(self,1)——零痕迹静默
+            //   退出（多机同签名实害）；且 self 在册时 IsAgentBornPid(self) 恒真，钩子会把
+            //   自己主窗幽灵化（表现为界面消失/无响应）。自身永不入册。
+            if (dwPid == dwSelf) {
+                continue;
+            }
+            // 直接子（父=本进程）= 用户经 UI ShellExecuteEx 启动的形态，不登记
+            //（与宽限期 bUserLaunchLike 启发同口径；sandbox launch 走手工根另册）。
+            if (m_oParentMap.value(dwPid, 0) == dwSelf) {
+                continue;
+            }
+            if (!sbx::IsDescendantOf(dwPid, dwSelf, m_oParentMap, m_oParentCreated)) {
+                continue;
+            }
+            DWORD dwRoot = dwPid;
+            for (int g = 0; g < 32; ++g) {   // 链爬到父==self 的那层即根
+                const DWORD p = m_oParentMap.value(dwRoot, 0);
+                if (p == 0 || p == dwSelf) {
+                    break;
+                }
+                dwRoot = p;
+            }
+            aNewBorn.insert(dwPid, {m_oParentCreated.value(dwPid, 0), dwRoot});
+        }
+    }
+    m_aSeenPids = aNow;
+    // 2026-10-26 janitor：根 runner 已退出（快照无根）且登记超宽限的遗留后代
+    //   → 兑底终结（QuickTool 实测：助手测「双击图标拉起程序」拉起的记事本
+    //   断言后不杀，泄漏成堆；用户明确要求收尾清理）。终结在 born/pidMap 锁外
+    //   做（TerminateProcess 可能慢）；终结前比对创建时刻防 pid 复用误杀。
+    QList<DWORD> aKill;
+    {
+        QMutexLocker oL(&m_mtxBorn);
+        for (auto it = aNewBorn.constBegin(); it != aNewBorn.constEnd(); ++it) {
+            m_aAgentBorn.insert(it.key(), it.value().first);
+            m_aBornRoot.insert(it.key(), it.value().second);
+        }
+        const qint64 iNowMs = QDateTime::currentMSecsSinceEpoch();
+        for (auto it = m_aAgentBorn.begin(); it != m_aAgentBorn.end();) {
+            if (!aNow.contains(it.key())) {
+                // 进程退出（快照消失）→ 除名；pid 复用由创建时刻匹配兑底。
+                m_aBornRoot.remove(it.key());
+                it = m_aAgentBorn.erase(it);
+                continue;
+            }
+            const DWORD dwRoot = m_aBornRoot.value(it.key(), 0);
+            const bool bRootDead = (dwRoot == 0) || !aNow.contains(dwRoot);
+            if (bRootDead && iNowMs - it.value() > m_iBornJanitorGraceMs) {
+                aKill.append(it.key());
+            }
+            ++it;
+        }
+    }
+    for (const DWORD dwPid : aKill) {
+        qint64 iBornAt = 0;
+        DWORD dwRootNow = 0;
+        {
+            QMutexLocker oL(&m_mtxBorn);   // 先 born 后 pidMap，两段不嵌套（锁序）
+            iBornAt = m_aAgentBorn.value(dwPid, 0);
+            dwRootNow = m_aBornRoot.value(dwPid, 0);
+        }
+        // 2026-10-30 死循环根修：skip/不匹配的条目必须除名——登记表只在进程退出时
+        //   除名，若此处 continue 留册，每轮 sweep（125ms）都会重新判定「根死+超宽限」
+        //   → 再次进 aKill → 再次 skip，实测 8 条/秒无限刷日志（QuickTool 实例 78
+        //   分钟刷 3.7 万条 janitor_kills.log 至 7MB）。除名后 m_aSeenPids 仍含该
+        //   pid（存活期间不会重新登记），一次判存、永不重试。
+        auto fnUnregister = [this](DWORD a_dwPid) {
+            QMutexLocker oL(&m_mtxBorn);
+            m_aAgentBorn.remove(a_dwPid);
+            m_aBornRoot.remove(a_dwPid);
+        };
+        bool bMatch = false;
+        {
+            QMutexLocker oMap(&m_mtxPidMap);
+            bMatch = (iBornAt != 0) && m_oParentCreated.value(dwPid, 0) == iBornAt;
+        }
+        if (!bMatch) {
+            fnUnregister(dwPid);   // pid 复用/信息缺失：除名防无限重试
+            continue;
+        }
+        // 2026-10-28 双保险：绝不自缴；绝不杀 AutoCode 自家进程（误领养链在会话
+        //   explorer 死亡等场景下可能罩住主程序/兄弟实例——janitor 职责只是清理
+        //   助手拉起的测试残留进程）。击杀落审计日志供回溯。
+        if (dwPid == GetCurrentProcessId()) {
+            fnUnregister(dwPid);
+            continue;
+        }
+        const QString sImg = sbx::ExePathOfPid(dwPid);
+        // 只匹配镜像文件名（全路径含项目目录名 AutoCode 会误豁免工程内测试残留）
+        if (QFileInfo(sImg).fileName().contains(QLatin1String("autocode"), Qt::CaseInsensitive)) {
+            JanitorKillLog(dwPid, sImg, dwRootNow, QStringLiteral("skip-autocode-image"));
+            fnUnregister(dwPid);   // 自家镜像永不杀：一次判存即除名，不再重试
+            continue;
+        }
+        // 2026-10-30 永不杀 conhost（同 Shutdown 扫描，连坐风险见彼处注）：控制台
+        //   宿主挂靠进程全部退出后自然消亡，显式终结会连带杀死共享控制台的
+        //   无幸进程（被测程序/助手拉起的工具等）。
+        if (QString::compare(QFileInfo(sImg).fileName(), QLatin1String("conhost.exe"),
+                             Qt::CaseInsensitive) == 0) {
+            JanitorKillLog(dwPid, sImg, dwRootNow, QStringLiteral("skip-console-host"));
+            fnUnregister(dwPid);
+            continue;
+        }
+        if (HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, dwPid)) {
+            TerminateProcess(hP, 1);
+            CloseHandle(hP);
+            JanitorKillLog(dwPid, sImg, dwRootNow, QStringLiteral("janitor-root-dead"));
+        }
+    }
+}
+
+bool CSandboxManager::IsAgentBornPid(DWORD a_dwPid) const {
+    if (a_dwPid == 0) {
+        return false;
+    }
+    qint64 iBornAt = 0;
+    {
+        QMutexLocker oL(&m_mtxBorn);
+        const auto it = m_aAgentBorn.constFind(a_dwPid);
+        if (it == m_aAgentBorn.constEnd()) {
+            return false;
+        }
+        iBornAt = it.value();
+    }
+    // 创建时刻必须仍一致（pid 复用防护；在 pid 表锁下比对，不与 born 嵌套）。
+    QMutexLocker oMap(&m_mtxPidMap);
+    return m_oParentCreated.value(a_dwPid, 0) == iBornAt;
 }
 
 bool CSandboxManager::IsProjectTestPid(DWORD a_dwPid) {
@@ -429,6 +669,9 @@ bool CSandboxManager::IsProjectTestPid(DWORD a_dwPid) {
     }
     // 父表防陈旧（与 TreePid 同一守卫）：表早于进程创建会把活父判成断链（值查
     //   不到→误兑底），判否前超 500ms 先重建再查。
+    // 父表防陈旧（与 TreePid 同一守卫；2026-10-26 同入 m_mtxPidMap 串行化）：
+    //   表早于进程创建会把活父判成断链（值查不到→误兑底），判否前重建再查。
+    QMutexLocker oMap(&m_mtxPidMap);
     const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
     if (m_oParentMap.isEmpty() || iNow - m_iMapBuiltMs > 500) {
         sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
@@ -529,7 +772,13 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     if (!TreePid(dwPid)) {
         bProjFallback = IsProjectTestPid(dwPid);
         if (!bProjFallback) {
-            return false;
+            // 2026-10-26 出生登记兑底：Agent 把被测 exe 拷到工程外（%TEMP%）
+            //   启动、中间 shell 退出断链——两道判定全破的场景，链活期间已登记
+            //   （OnBirthScan）则收纳（与树内同零宽限直收：链在出生时验证过，
+            //   用户豁免登记不涉及 Agent 后代）。
+            if (!IsAgentBornPid(dwPid)) {
+                return false;
+            }
         }
     }
     // 2026.09.26 用户启动豁免（TreePid 之后判定，复用刚刷新的父表）：命中登记根
@@ -538,6 +787,7 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     {
         QMutexLocker oL(&UserRootsMtx());
         PruneUserRoots();
+        QMutexLocker oMap(&m_mtxPidMap);   // 2026-10-26 并发写防护（锁序：born内层）
         for (const auto& pr : std::as_const(UserRoots())) {
             if (dwPid == pr.first
                 || sbx::IsDescendantOf(dwPid, pr.first, m_oParentMap, m_oParentCreated)) {
@@ -565,7 +815,7 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
     //   宽限等待）；链上隔了 runner（cmd/claude/hermes→bash→python→被测程序）
     //   = Agent 后代，豁免登记永不涉及 → 立即收纳。
     const bool bUserLaunchLike =
-        (m_oParentMap.value(dwPid, 0) == GetCurrentProcessId()) || bProjFallback;
+        (ParentOfPid(dwPid) == GetCurrentProcessId()) || bProjFallback;
     if (!a_bFinal && bUserLaunchLike && m_stCfg.bAutoGhost
             && !m_aManualRoots.contains(dwPid)) {   // launch 登记根：主进程亲自启动，
         // 豁免登记永不涉及，零闪现直收（不走 800ms 宽限）。

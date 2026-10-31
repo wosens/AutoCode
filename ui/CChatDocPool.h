@@ -27,8 +27,10 @@ public:
     QTextDocument* Acquire(int a_iItem, const QString& a_sMarkdown, int a_iWidth);
     // 池命中时校验内容快照（流式追加正文变化 → setMarkdown 重材化 + fnDocReady 高度
     // 回调，实时刷新；否则已材化条目冻结在首帧片段）与宽度（不同宽重排）；
-    // 未命中同步材化（setMarkdown+setTextWidth）入池。超限按 LRU 逐出至满足两上限
-    // （永不逐出本次 Acquire 的条目，除非它自身独占超限）。
+    // 未命中同步材化（setMarkdown+setTextWidth）入池——首次材化同样回调 fnDocReady
+    //（2026-10-22：估高→实高校正链不能只靠内容变化路径，一次性整段回复只有一次
+    // Acquire，不回调则行高永停估高、后续条目叠画其上）。超限按 LRU 逐出至满足
+    // 两上限（永不逐出本次 Acquire 的条目，除非它自身独占超限）。
     // 返回值与传给 fnDocReady 的 doc 均为局部指针快照：命中路径不持 QHash 条目引用
     // 跨回调/逐出的 remove（回填搬移/重入插入 rehash 会使引用失效乃至字节级损坏，
     // 快照后正确性由构造保证）
@@ -48,6 +50,14 @@ public:
     // OnWidthChanged 已先收集后回调，重入不破坏正确性
     std::function<QString(int a_iItem)> fnFetchText;
     // 条目→Markdown 正文（视图注入；返回空串 = 该条目无需 doc，非 Assistant 条目）
+
+    std::function<void(int a_iItem)> fnDocAboutToDelete;
+    // 2026-10-23 新增（v5.0.412 崩溃实害：复制浮层裸持池 doc，池逐出/Clear 删 doc
+    // 前无任何通知 → 浮层后续绘制/析构访问已删 doc = QTextDocument UAF；
+    // Qt6Gui QTextDocument::documentLayout+0x11 0xC0000005 实证）。语义：池在
+    // delete 某行 doc 之前回调（evictLru 逐出与 Clear 全路径）——持有者（浮层）
+    // 在此窗口内摘除引用（closeOverlay 换自持空 doc），随后才 delete。
+    // 契约：回调内禁止销毁本池/调用 Clear；其余池接口可重入
 
     static constexpr int k_iMaxDocs = 64;
     static constexpr qint64 k_iMaxBytes = 32 * 1024 * 1024;

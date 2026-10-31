@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+﻿cmake_minimum_required(VERSION 3.21)
 
 # 提示：若 CMake 找不到 Qt6，使用 CMakePresets.json 的 "qt6" preset，
 # 或显式 -DCMAKE_PREFIX_PATH=D:/ProgramData/QT6.8.3/6.8.3/msvc2022_64
@@ -39,6 +39,8 @@ qt_add_executable(AutoCode WIN32
     main.cpp
     core/CCrashDump.h
     core/CCrashDump.cpp
+    core/CFatalWitness.h
+    core/CFatalWitness.cpp
     core/TaskTypes.h
     core/CModelEntry.h
     core/CVersion.h
@@ -131,6 +133,8 @@ qt_add_executable(AutoCode WIN32
     ui/CDiffViewDialog.cpp
     ui/CFilePreviewWidget.h
     ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
     ui/CAboutDialog.h
     ui/CAboutDialog.cpp
     ui/CTipStyle.h
@@ -384,9 +388,30 @@ qt_add_executable(test_execpanel
     ui/CArtifactView.cpp
     ui/CFilePreviewWidget.h
     ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
     ui/CTipStyle.h
     ui/CTipStyle.cpp
+    # 2026-10-31 文件预览语法页读 [View] CodeSyntax（CFilePreviewWidget →
+    #   CProjectManager::LoadCodeSyntax 静态；口径同 test_projectmanager/test_rollback
+    #   的多目标编译——工厂引用四 Runner 构造，全 Runner 需一并编入）
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
     agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
     agent/CAgentRunnerBase.h
     agent/CAgentRunnerBase.cpp
     agent/CClaudeRunner.h   # 2026.10.15 CExecutionPanel::AsstContextLimit 引用 ContextWindowForModel
@@ -401,6 +426,8 @@ target_include_directories(test_execpanel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/agent
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project   # 2026-10-31 CProjectManager.h（语法高亮开关读取）
+    ${ZSTD_INCLUDE_DIR}   # 2026-10-31 CProjectManager.cpp 备份压缩依赖（口径同 test_rollback）
     ${CMAKE_BINARY_DIR}/gen   # 2026.10.11 AutoCodeVersion.h（启动页版本号经 CRecentProjectsDialog 源问入）
 )
 target_link_libraries(test_execpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
@@ -588,6 +615,8 @@ qt_add_executable(test_rollback
     ui/CDiffViewDialog.cpp
     ui/CFilePreviewWidget.h
     ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
     project/CProjectManager.h
     project/CProjectManager.cpp
     project/CGuideFingerprintScanner.h
@@ -628,6 +657,8 @@ set_target_properties(test_rollback PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_rollback COMMAND test_rollback)
+
+
 
 # ---- 一次性 / 批量导入工具（把工程 .autodev/tasks 灌进全局历史库 history.db）----
 # 开发期辅助工具，非测试、非主程序；仅 CMake 目标，不入 vcxproj。
@@ -1013,6 +1044,47 @@ set_target_properties(test_chatmodel PROPERTIES
 )
 add_test(NAME test_chatmodel COMMAND test_chatmodel)
 
+# ==== 栈溢出复现探针（2026-10-23 三连崩 0xC00000FD：切助手同步递归 resize→重排→校正→resize）====
+qt_add_executable(probe_sorec
+    tests/probe_sorec.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+)
+target_include_directories(probe_sorec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(probe_sorec PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets frwdevice)
+set_target_properties(probe_sorec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# ==== qFatal 见证链路验证探针（2026-10-28 静默退出加固：装见证→qFatal→验遗言文件）====
+# 手动运行（不挂 ctest——它故意 fastfail 退 3）：Execute\probe_qtwitness.exe 运行后
+# 进程即逝，验证同目录 dump\_qfatal_witness.txt 出现 witness-probe 行即链路通。
+qt_add_executable(probe_qtwitness
+    tests/probe_qtwitness.cpp
+    core/CFatalWitness.h
+    core/CFatalWitness.cpp
+)
+target_include_directories(probe_qtwitness PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(probe_qtwitness PRIVATE Qt6::Core)
+set_target_properties(probe_qtwitness PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
 # ---- 测试统一无头运行：Qt 控件测试（如 test_execpanel 实例化 CExecutionPanel 面板）
 # 在 offscreen 平台跑，不再弹出真实窗口抢占桌面焦点；QTest 事件模拟照常工作 ----
 set_tests_properties(
@@ -1048,4 +1120,3 @@ qt_add_executable(test_orchconfig
 target_include_directories(test_orchconfig PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_orchconfig PRIVATE Qt6::Core)
 add_test(NAME test_orchconfig COMMAND test_orchconfig)
-

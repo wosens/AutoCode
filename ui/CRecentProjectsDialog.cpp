@@ -298,6 +298,16 @@ void CRecentProjectsDialog::SetupLauncherUi(QVBoxLayout* a_pMainLay) {
     //   不伸缩）→ SyncPanelToWindow 的目标尺寸恒等于面板当前值（幂等死锁），
     //   窗口拖大后面板永不跟随。固定后富余只留给面板（sync 随后填满）。
     m_pBtnRow->setFixedHeight(m_pBtnRow->sizeHint().height());
+    // 2026-10-31 修「启动页窗口只能调大不能调小」：面板 setFixedSize 使布局推导的
+    //   窗口最小尺寸恒等于当前尺寸（min=max=面板当前值），OS 拖边受 WM_GETMINMAXINFO
+    //   针制 → 无法缩小；调大后面板跟随变大、最小值又跟着变大，永远回不去。
+    //   解法：窗口显式最小 = 面板下限 + 横幅 + 底钮（qlayout.cpp SetDefaultConstraint
+    //   分支：explicitMinSize 按轴优先于 totalMinimumSize，不会被布局覆盖）；
+    //   拖小过程中 resizeEvent → SyncPanelToWindow 实时缩面板（ApplyWindowSize
+    //   内部 qBound 钉在 kChipMinW/H 下限）。
+    setMinimumSize(CRecentChipsPanel::kChipMinW,
+                   CRecentChipsPanel::kChipMinH + kTitleBannerH
+                       + m_pBtnRow->sizeHint().height());
     a_pMainLay->addWidget(m_pBtnRow);
 
     // 窗口初始尺寸 = 面板初始固定尺寸 + Title + 底钮（SyncWindowToPanel 复用）；

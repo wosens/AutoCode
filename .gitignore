@@ -5,3 +5,16 @@ build
 Execute
 *.log
 .codereview
+rescue-20261019
+
+# 2026-10-30 编译无关产物与游离文件（清理轮）
+.vs/
+ipch/
+nul
+*.user
+*.bak*
+audit_tmp.txt
+qd3err.txt
+txt
+file
+CodeStyle/

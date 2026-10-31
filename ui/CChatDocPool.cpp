@@ -69,6 +69,8 @@ void CChatDocPool::evictLru(int a_iSkipItem)
             const SEntry& e = m_aDocs[iVictim];     // 统一「先取值后 remove」纪律：
             const int iPrev = e.iPrev, iNextV = e.iNext;   // remove 后 e 失效，只许用局部
             m_iEstTotal -= e.iEst;
+            if (fnDocAboutToDelete)          // 删除前通知（2026-10-23：浮层摘引用防 UAF）
+                fnDocAboutToDelete(iVictim);
             delete e.pDoc;                          // 逐出即 delete
             m_aDocs.remove(iVictim);
             m_aDocs[iPrev].iNext = iNextV;          // iPrev ≥ 0（victim 前方必有保护对象）
@@ -81,6 +83,8 @@ void CChatDocPool::evictLru(int a_iSkipItem)
         SEntry& e = m_aDocs[iKey];
         const int iNextKey = e.iNext;
         m_iEstTotal -= e.iEst;
+        if (fnDocAboutToDelete)              // 删除前通知（2026-10-23：浮层摘引用防 UAF）
+            fnDocAboutToDelete(iKey);
         delete e.pDoc;
         m_aDocs.remove(iKey);               // remove 后 e 失效，先取 iNextKey
         m_iKeyLru = iNextKey;
@@ -139,9 +143,19 @@ QTextDocument* CChatDocPool::Acquire(int a_iItem, const QString& a_sMarkdown, in
     e.iEst = static_cast<qint64>(a_sMarkdown.size()) * 2 + 4096;
     m_aDocs.insert(a_iItem, e);
     m_iEstTotal += e.iEst;
+    QTextDocument* const pRet = e.pDoc;     // 先取局部指针快照（与命中路径同款纪律：
+                                            // fnDocReady 回调链若重入池（插入/逐出）
+                                            // 不持 QHash 条目引用跨 remove/rehash）
     pushMru(a_iItem);                       // 新条目不在链表中，直接接 MRU 端
+    // 2026-10-22 首次材化也回调高度校正（实害：一次性整段回复（claude/pi/hermes
+    // 单条 sigAssistantText）只有一次 Acquire，旧版仅内容变化路径回调 → 算术估高
+    // 永不被实高校正，doc 绘制溢出行矩形，后续「已完成」等事件行叠画在回复尾部上。
+    // 回调链只碰 delegate 高度缓存 + 视图布局（TouchSizeHint→dataChanged 为惰性
+    // 重排），不重入池插入/逐出——契约「其余池接口可重入」不受影响。
+    if (fnDocReady)
+        fnDocReady(a_iItem, pRet);
     evictLru(a_iItem);                      // 新条目受保护，逐出旧条目至上限内
-    return e.pDoc;
+    return pRet;
 }
 
 QTextDocument* CChatDocPool::Peek(int a_iItem) const
@@ -217,8 +231,13 @@ void CChatDocPool::OnWidthChanged(int a_iNewWidth)
 
 void CChatDocPool::Clear()
 {
-    for (auto it = m_aDocs.begin(); it != m_aDocs.end(); ++it)
+    // 2026-10-23 删除前通知（fnDocAboutToDelete）：浮层等引用者在 delete 前摘引用
+    //（防 v5.0.412 类 UAF：绘制/析构访问已删 doc）
+    for (auto it = m_aDocs.begin(); it != m_aDocs.end(); ++it) {
+        if (fnDocAboutToDelete)
+            fnDocAboutToDelete(it.key());
         delete it.value().pDoc;             // doc 以池为 parent，显式 delete 后析构不再二次释放
+    }
     m_aDocs.clear();
     m_iKeyMru = m_iKeyLru = -1;
     m_iEstTotal = 0;

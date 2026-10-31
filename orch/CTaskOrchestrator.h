@@ -143,6 +143,14 @@ public:
     // 互斥守卫用（备份期间 IsRunnerBusy 可能为 false，需单独挡住，防回退与并发备份同写统一库）。
     bool IsBackupRunning() const { return m_bBackupRunning.load(); }
 
+    // 2026-10-30 任务运行态孤儿检测（CMainWindow::OnAdhocHealthCheck 看门狗用）：任务
+    // 推进链完全静止＝无 runner（含构建门/宽限/重试）/ 阶段备份 / SDK 静态预审 /
+    // 启动预备在途。Running 任务长时间处于此态＝推进信号丢失（runner 结束事件未达、
+    // 外部杀进程竞态等），由 UI 侧看门狗自愈为 Paused——否则任务永远悬在 Running
+    //（内部指示器一直转、StartTask 早退拒续）。助手会话不计入（与任务链正交：
+    // 助手在跑而任务链静止仍属任务悬挂）。
+    bool IsTaskChainIdle() const;
+
     // 2026.08.20 (Agent 起名) 右键「自动命名」/新建任务 Intake 后触发：任务内容 +
     //   guide.md 拼提示词经 adhoc 助手（只读、独立 AutoNaming 模式）交 Agent 生成一句话
     //   简短名称，OnAdhocFinished 清洗后 SetName 回填并发 sigAutoNameDone；助手忙时
@@ -235,6 +243,7 @@ signals:
     void sigAdhocUndo(const QString& a_sAsstId);                       // 撤销该助手最后一条提问（面板清尾块）
     void sigAdhocFinished(const QString& a_sAsstId);                   // 该助手一次调用结束（启用输入栏）
     void sigAdhocRunning(const QString& a_sAsstId);                    // 2026.08.19 一次助手调用开始（面板进运行态；自动续发排队指令时面板无法从 UI 事件感知）
+    void sigAdhocChainStart(const QString& a_sAsstId);                 // 2026-10-29 新提示词链起点（面板重锚链钟：done 耗时含专家链规划/实施/验证全部轮次；链内轮不发）
     void sigAdhocStateChanged(const QString& a_sAsstId);               // 该助手 sid/撤销栈变化（#1 存盘触发）
     // 2026.08.15 一次成功助手调用的消耗（输入含缓存读/写，与账单同口径）+ 本次调用耗时（ms）
     //   + API 请求数，由 CMainWindow 归集到当前档任务（助手档按任务分档，消耗跟随档走）。
@@ -449,6 +458,10 @@ private:
         QString               sLastTaskId;     // 最近一次 Submit 的任务档 id（续发记忆沿用）
         QDateTime             dtStart;         // 本轮起点（耗时归集）
         int                   iResume = 0;     // max-turns 自动续跑计数（上限 2，新提问清零）
+        // 2026-10-29 整链耗时锚（用户需求：专家链 done 耗时含实施轮）：SubmitAdhoc
+        //   （新提示词链唯一入口）记时刻；链内轮（规划/验证/修复/续跑/纠偏/压缩）
+        //   不更新 → done 耗时覆盖整链。经 sigAdhocChainStart 同步面板 SAsst::tChain。
+        qint64                iChainStartMs = 0;
         // 2026.09.23 v3.0.219 工作量评估：本条提问的轮次预算（SubmitAdhoc 按提示词
         //   启发式估算——编号子任务/点名文件/重活关键词/文本长度；0=未设回退全局基值）。
         //   续跑/纠偏/压缩重发沿用同一预算（同一条提问的工作量不变）。
@@ -485,6 +498,14 @@ private:
         QString               sDeepFailSummary;
         int                   iDeepRetry = 0;
         int                   iDeepRestart = 0;
+        // 2026-10-30 深链静默输出（用户需求：执行轮不再直接输出执行结果，改由验证轮
+        //   统一输出综合结果+验证结论，避免结论分散两处每次翻找）：aDeepMuted=深链
+        //   执行/修复/验证轮被静默（不上屏）的 assistant 文本缓存——链成功丢弃（内容
+        //   已由验证轮综合报告覆盖），异常终局（停止/链失败/零工具跳过验证）兜底补发；
+        //   sDeepExecReport=执行/修复轮 result 终答（实施报告，注入验证轮
+        //   【执行Agent实施报告】供验证者整合进面向用户的综合结果）。
+        QStringList            aDeepMuted;
+        QString                sDeepExecReport;
     };
     SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
     void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
@@ -502,6 +523,10 @@ private:
     void StartDeepPlan(SAdhocSession& a_S);
     // 深度链第 3 步：验证轮（fork 一次性分支；独立验证者只核验不修复，结论 VERIFY:PASS/FAIL）。
     void StartDeepVerify(SAdhocSession& a_S);
+    // 2026-10-30 深链静默文本兜底补发：链未走到验证 PASS（用户停止/最终失败/零工具
+    //   跳过验证）时把被静默的执行/修复/验证轮文本补发面板，信息不丢；链成功路径
+    //   不调用（报告已由验证轮终答统一呈现，静默过程文本按用户需求丢弃）。
+    void FlushDeepMuted(SAdhocSession& a_S);
     // 回炉耗尽/执行中断时的重启判定：累积教训 → 未超 [Adhoc] ExpertRestarts 则重置回炉
     //   计数并重新「规划→执行→验证」；超限 → FinishAdhocFailure 保留断点收尾。
     void DeepChainRestart(SAdhocSession& a_S, const QString& a_sWhy, const QString& a_sReasons);
@@ -526,6 +551,9 @@ private:
     // 启动预备（guide 指纹增量同步 + 任务目录初始化）与改码前全量备份均为纯文件 IO、
     // 可达秒级（千级文件扫描 / 整目录 zstd 拷贝），移出 UI 线程，完成后回主线程续跑。
     std::thread      m_thStartPrep;          // StartTask 预备线程（同时刻至多一个，guards 保证不重叠）
+    std::atomic_bool m_bStartPrepRunning = {false};  // 2026-10-30 预备在途（线程创建前置 true，
+                                               //   主线程回调首行复位；孤儿检测用——预备窗口内
+                                               //   任务已 Running 但 runner 未起，属合法无 runner 态）
     std::thread      m_thBackup;             // RunCurrentStage 改码备份线程（同上）
     std::atomic_bool m_bBackupRunning = {false};   // 2026.08.22 m_thBackup 运行标志（StopAll join / 回退守卫）
     std::thread      m_thAdhocBackup;        // 2026.08.26 助手轮 turn 快照线程（大工程全量扫描+哈希可达数十秒，

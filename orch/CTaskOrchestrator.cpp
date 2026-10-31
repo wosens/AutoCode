@@ -60,6 +60,7 @@ CTaskOrchestrator::~CTaskOrchestrator() {
     if (m_thStartPrep.joinable()) {
         m_thStartPrep.join();
     }
+    m_bStartPrepRunning = false;   // 2026-10-30 防御复位（析构后回调不再执行）
     if (m_thBackup.joinable()) {
         m_thBackup.join();
     }
@@ -245,10 +246,12 @@ void CTaskOrchestrator::StartTask(CTaskInfo* a_pTask) {
     if (m_thStartPrep.joinable()) {
         m_thStartPrep.join();   // guards 已保证无重叠，此处仅防御（立即返回）
     }
+    m_bStartPrepRunning = true;   // 2026-10-30 孤儿检测用：预备窗口（任务已 Running、runner 未起）
     m_thStartPrep = std::thread([this, pGuard, sTaskId, pPm]() {
         pPm->SyncGuideIncremental();   // 纯文件 IO，内部吞错，失败不阻断
         pPm->InitTaskDir(sTaskId);
         QMetaObject::invokeMethod(this, [this, pGuard]() {
+            m_bStartPrepRunning = false;   // 2026-10-30 回到主线程即脱离预备窗口（后续链同步推进）
             if (pGuard.isNull()) {
                 return;   // 预备期间任务被删除/归档回收
             }
@@ -422,6 +425,25 @@ bool CTaskOrchestrator::IsRunnerBusy() const {
         }
     }
     return false;
+}
+
+bool CTaskOrchestrator::IsTaskChainIdle() const {
+    // 2026-10-30 任务推进链静止判定（任务运行态孤儿看门狗用，详见头文件注释）。
+    //   各分量均为主线程写（备份原子标志除外），const 读无锁安全；助手会话有意
+    //   不计入——助手在跑而任务链静止仍属任务悬挂，不能因助手活跃而漏判。
+    if (IsRunnerBusy()) {
+        return false;
+    }
+    if (m_bBackupRunning.load()) {
+        return false;
+    }
+    if (m_bSdkReviewRunning) {
+        return false;   // SDK 静态预审（分钟级后台）期间任务 Running 但无 runner，合法
+    }
+    if (m_bStartPrepRunning.load()) {
+        return false;   // 启动预备（指纹同步/任务目录初始化）窗口，同上
+    }
+    return true;
 }
 
 void CTaskOrchestrator::SetReviewParallel(int a_iN) {
@@ -3062,6 +3084,20 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     //   在跑与本调用无关（各会话独立 runner/进程/会话链）。
     SAdhocSession* pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
     if (pS->pRunner != nullptr && pS->pRunner->IsRunning()) {
+        // 2026.10.28 压缩窗口期禁注入（ReadBook 实测「压缩期间提交 B，压缩后执行的是
+        //   上一个提示词 A」根修）：CompactSummarize/CompactReseed 轮是压缩两步的内部
+        //   阶段——注入的指令随被丢弃的 fork 会话（摘要轮）消失或污染重播种轮，压缩
+        //   完成后既不执行也不在队列。一律入 aPendingInjects，Reseed 完成后统一排空
+        //   执行（用户最新意图优先于自愈重发的陈旧原提问，见 CompactReseed 分支）。
+        if (pS->eMode == CompactSummarize || pS->eMode == CompactReseed) {
+            if (!a_sText.trimmed().isEmpty()) {
+                pS->aPendingInjects.append(a_sText);
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("queued"),
+                    QStringLiteral("已排队追加指令（压缩完成后自动发送）：%1")
+                        .arg(a_sText.left(120)));
+            }
+            return;
+        }
         // 轮中介入（方案 §2.3）：非只读文本注入前同口径拍 turn 快照（失败不阻断）。
         if (a_iPerm != PermReadOnly && !a_sText.trimmed().isEmpty() && m_pPm != nullptr
             && !m_pPm->ProjectDir().isEmpty()) {
@@ -3131,6 +3167,12 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     pS->iPerm = a_iPerm;
     pS->sLastTaskId = a_sTaskId;   // 自动续发排队指令时沿用同任务档（记忆注入）
     pS->iResume = 0;   // 新提问：max-turns 自动续跑计数清零
+    // 2026-10-29 整链耗时锚（用户需求：专家链完成时 done 耗时含实施轮）：SubmitAdhoc
+    //   =新提示词链唯一入口（用户直发/排队排空/压缩自愈重发/提炼稿回投）；链内轮
+    //   （规划/验证/修复/续跑/纠偏/压缩）不经此 → 面板链钟不被重锚，done 耗时自然
+    //   覆盖规划+实施+验证+回炉全部轮次。注入路径（轮中介入）不锚——它属于当前轮。
+    pS->iChainStartMs = QDateTime::currentMSecsSinceEpoch();
+    emit sigAdhocChainStart(a_sAsstId);
     // 2026.09.23 v3.0.219 工作量评估：按本条提示词难度自动上调轮次预算（MaxTurnsAuto
     //   可关）；预算随会话存续——续跑/纠偏/压缩重发沿用（同一条提问工作量不变）。
     {
@@ -3199,11 +3241,21 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             pS->sGuideHash = sHash;
             emit sigAdhocStateChanged(a_sAsstId);   // 哈希变化 → 存盘 assistant.json
             const bool bFirst = pS->sSid.isEmpty();
-            if (bFirst) {
+            // 2026-10-22 超限改自取：guide 全文投喂上限 20000 字符（中文约 1~1.3万 token）。
+            //   超限时即低首投也改为一句话自取（同变更重投口径），防历史膨胀存量
+            //   （如 HotNews 207KB）一次性吃掉 6万+ token；正常预算内首投仍全文。
+            constexpr int k_iGuideFeedMaxChars = 20000;
+            if (bFirst && sGuide.size() <= k_iGuideFeedMaxChars) {
                 // 首次新建会话：仍全文投喂（保证模型一定拿到工程认知，一次性成本）。
                 sPrompt = QStringLiteral(
                     "以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再处理用户请求："
                     "\\n---\\n%1\\n---\\n\\n%2").arg(sGuide, sPrompt);
+            } else if (bFirst) {
+                sPrompt = QStringLiteral(
+                    "这是与本助手的第一次对话。当前工程的指南 .autodev/guide.md 篇幅较长"
+                    "（约 %1KB，待后台压缩整理），请先用 Read 工具读取 .autodev/guide.md "
+                    "了解项目基本情况（内容较长可分段读），再处理用户请求。"
+                    "\\n\\n\\n%2").arg(QString::number(sGuide.size() / 1024), sPrompt);
             } else {
                 // 2026.08.27 变更重投瘦身（大工程助手每步极慢主因之一）：只投一句话让
                 //   agent 用 Read 自取——读多少缓存多少，与 Claude Code 按需探索同口径。
@@ -3301,6 +3353,10 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     //   验证步骤，直投纯对话行为；深链辅助轮（规划/验证）的 assistant 输出压缩上屏
     //   （CompressDeepAuxText）——结论一眼可见、验证长文不再夹在中间刷屏。
     {
+        // 2026-10-30 深链静默缓存复位：新提示词链起点——上一链的静默文本/实施报告
+        //   残留（理论上已在链尾清空，防御异常中断路径）不得带入新链。
+        pS->aDeepMuted.clear();
+        pS->sDeepExecReport.clear();
         const int iDeep = (g_iAdhocDeepOverride >= 0)
             ? g_iAdhocDeepOverride
             : ((a_iPerm != PermReadOnly && m_pPm != nullptr
@@ -3402,6 +3458,7 @@ void CTaskOrchestrator::StopAdhoc(const QString& a_sAsstId) {
     if (pS != nullptr && pS->pRunner != nullptr
         && (pS->pRunner->IsRunning() || pS->pRunner->IsGraceActive()
             || pS->pRunner->IsRetryPending())) {
+        FlushDeepMuted(*pS);   // 2026-10-30 用户停止=异常终局：静默文本先补发再留停止痕迹
         emit sigAdhocEvent(a_sAsstId, QStringLiteral("stopped"),
             QStringLiteral("⏹ 已停止"));
         pS->pRunner->Stop();
@@ -3616,22 +3673,43 @@ void CTaskOrchestrator::OnAdhocInfo(const QString& a_sAsstId, const QString& a_s
 }
 
 void CTaskOrchestrator::OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText) {
+    bool bDeepMuted = false;
     if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
-        // 2026.10.02 深链辅助轮（规划/验证）输出压缩上屏（用户需求：验证日志别刷屏、
-        //   结论一眼可见）：≤360 字原样，超长保首 300 字+折叠尾注（结论由事件判定行
-        //   呈现）；不记 sLastAsstText（纠偏判据只认执行轮终答）；不记 aTranscript
-        //   （fork 一次性分支文本入回灌历史会带偏下一轮，同 v2.1.124 连发只留末条
-        //   的口径——顺带修复旧版把规划/验证长文也追加进回灌历史的带偏隐患）。
-        if (pS->eMode == DeepPlan || pS->eMode == DeepVerify) {
+        // 2026.10.02 深链规划轮输出压缩上屏（用户需求：验证日志别刷屏、结论一眼
+        //   可见）：≤360 字原样，超长保首 300 字+折叠尾注；不记 sLastAsstText
+        //   （纠偏判据只认执行轮终答）；不记 aTranscript（fork 一次性分支文本入
+        //   回灌历史会带偏下一轮，同 v2.1.124 连发只留末条的口径）。
+        if (pS->eMode == DeepPlan) {
             const QString sCompressed = CompressDeepAuxText(a_sText);
             if (!sCompressed.isEmpty()) {
                 emit sigAdhocAssistantText(a_sAsstId, sCompressed);
             }
             return;
         }
-        pS->sLastAsstText = a_sText;   // 2026.09.09 v2.1.131 纠偏判据：终答=最后一条
+        // 2026-10-30 深链静默输出（用户需求：执行轮不再直接输出执行结果，改由验证轮
+        //   统一输出综合结果+验证结论，避免结论分散两处每次翻找）：深链执行/修复轮
+        //   （bDeepActive 且 Submitting）与验证轮的 assistant 文本全部静默——只入
+        //   aDeepMuted 缓存不上屏（工具调用/事件行仍实时反馈过程）；执行/修复轮仍
+        //   记 sLastAsstText（确认语纠偏判据只认执行轮终答）且照记回灌 transcript
+        //   （会话上下文）；验证轮 fork 文本不入回灌（同上口径）。链成功时由验证轮
+        //   终答统一外显并丢弃缓存；异常终局 FlushDeepMuted 兜底补发，信息不丢。
+        bDeepMuted = (pS->eMode == DeepVerify)
+                  || (pS->bDeepActive && pS->eMode == Submitting);
+        if (bDeepMuted) {
+            pS->aDeepMuted.append(a_sText);
+            if (pS->eMode == Submitting) {
+                pS->sLastAsstText = a_sText;   // 纠偏判据：执行/修复轮终答=最后一条
+            } else {
+                return;   // 验证轮：静默即止（不 emit、不入回灌）
+            }
+            // 执行/修复轮：静默但继续走下方回灌记录（emit 由 bDeepMuted 跳过）
+        } else {
+            pS->sLastAsstText = a_sText;   // 2026.09.09 v2.1.131 纠偏判据：终答=最后一条
+        }
     }
-    emit sigAdhocAssistantText(a_sAsstId, a_sText);
+    if (!bDeepMuted) {
+        emit sigAdhocAssistantText(a_sAsstId, a_sText);
+    }
     // 2026.09.02 回灌记录：轮内 assistant 输出记入缓存，供每轮独立会话的后端
     //   下一轮回灌（claude/pi 原生续接用不到）；下次外部提交时面板会整体重建
     //   权威记录，此处追加只为覆盖内部续发路径（排队指令/max-turns 续跑）。
@@ -3987,6 +4065,9 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         //   直接收尾。链基点先推进到执行轮 sid（验证/回炉/重启均从它 fork；压栈留待
         //   链尾统一做）。纯对话模式行为不变。
         if (pS->bDeepActive) {
+            // 2026-10-30 执行/修复轮终答捕获：result 文本=实施报告，注入验证轮
+            //   【执行Agent实施报告】供验证者整合进面向用户的综合结果。
+            pS->sDeepExecReport = a_sResult.trimmed();
             if (pS->bTurnSawTool && !a_sSid.isEmpty()) {
                 pS->sSid = a_sSid;
                 StartDeepVerify(*pS);
@@ -3995,6 +4076,9 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             if (!pS->bTurnSawTool) {
                 emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_skip_verify"),
                     QStringLiteral("ℹ 本轮未调用工具（未改动工程），跳过验证"));
+                // 2026-10-30 零工具=纯问答：无验证轮呈现结果 → 静默文本兑底补发
+                //   （答案必须可见，不能因静默机制丢失）。
+                FlushDeepMuted(*pS);
             }
             FinishAdhocSuccess(*pS, a_sSid);
             return;
@@ -4016,6 +4100,8 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
             pS->bAutoCompactActive = false;
             pS->eMode = Idle;
             emit sigAdhocFinished(a_sAsstId);
+            // 2026.10.28 压缩失败也排空压缩窗口期排队指令（用户意图不随压缩失败丢失）
+            DeferredDrainPendingInjects(*pS);
             return;
         }
         // 第二步：临时清空 sid → StartAdhocStage 走新建会话分支投递摘要；
@@ -4056,6 +4142,15 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         //   SubmitAdhoc 链：定界/规则全新构建）；压缩失败则交还用户手发。
         if (pS->bAutoCompactActive) {
             pS->bAutoCompactActive = false;
+            // 2026.10.28 压缩窗口期新提交优先（ReadBook 实测「压缩期间提交 B，压缩后
+            //   执行的是上一个提示词 A」根修）：压缩期间用户提交的指令已在 aPendingInjects
+            //   排队（压缩窗口期禁注入），其语义新于自愈重发的陈旧原提问 A——重发 A 会
+            //   顶掉用户新意图，B 反被当作 A 轮的中途注入。队列非空 → 跳过 A 重发，
+            //   直接排空队列（B 作为压缩后首轮执行）；队列空 → 维持原重发行为。
+            if (!pS->aPendingInjects.isEmpty()) {
+                DeferredDrainPendingInjects(*pS);
+                return;
+            }
             const QString sResend = pS->sPendingPrompt;
             const int iResendPerm = pS->iPerm;
             const QString sResendTask = pS->sLastTaskId;
@@ -4065,6 +4160,10 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 });
             }
         }
+        // 2026.10.28 手动压缩收尾排空：压缩窗口期提交的指令原先搁浅在队列（本分支
+        //   原先不排空，下一轮 FinishAdhocSuccess 才有机会）→ 压缩完成即排空执行；
+        //   自动路径队列空时此处为 no-op。
+        DeferredDrainPendingInjects(*pS);
         return;
     }
     case DeepPlan: {
@@ -4075,7 +4174,12 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 QStringLiteral("⚠ 规划轮失败（%1），跳过规划直接执行")
                     .arg(a_sResult.left(240)));
             pS->eMode = Submitting;
-            StartAdhocStage(*pS, pS->sDeepExecPrompt, /*a_bDropLastUser=*/true);
+            // 2026-10-30 与规划成功路径同口径：直投也带实施报告要求（后续验证轮仍会运行，
+            //   执行结果统一由验证轮汇总输出）。
+            StartAdhocStage(*pS, pS->sDeepExecPrompt + QStringLiteral(
+                "\n\n---\n【实施报告要求】完成后输出简明实施报告（清单式：改动文件与要点、"
+                "各项完成情况、遗留问题）——该报告交给独立验证Agent 核验并由其向用户统一"
+                "汇总，不要面向用户展开叙述。"), /*a_bDropLastUser=*/true);
             return;
         }
         pS->sDeepPlan = a_sResult.trimmed();
@@ -4085,9 +4189,19 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_plan_done"),
             QStringLiteral("✔ 规划完成（含验收标准），开始执行"));
         pS->eMode = Submitting;
+        // 2026-10-29 尾部收尾要求（用户需求：专家轮清理无用/临时文件）：实施轮完成后
+        //   删除本轮自己创建的临时探针/中间产物（构建常规中间目录不算）。
+        // 2026-10-30 实施报告口径（用户需求：执行结果不直接上屏，改由验证轮统一输出）：
+        //   实施轮终答写成简明报告交给验证Agent 整合，不面向用户展开叙述。
         StartAdhocStage(*pS, pS->sDeepExecPrompt + QStringLiteral(
             "\n\n---\n【专家模式·实施计划】以下计划由规划Agent基于你的请求生成，供执行参考；"
-            "执行中发现与实际不符时可合理调整，但最终须达成计划中的验收标准：\n%1")
+            "执行中发现与实际不符时可合理调整，但最终须达成计划中的验收标准：\n%1\n"
+            "---\n【实施报告要求】完成后输出简明实施报告（清单式：改动文件与要点、"
+            "各项完成情况、遗留问题）——该报告交给独立验证Agent 核验并由其向用户统一"
+            "汇总，不要面向用户展开叙述。\n"
+            "---\n【收尾要求】全部步骤完成并自验后，删除本次实施过程中你自己创建的"
+            "临时文件（探针脚本、中间产物、输出重定向文件等；构建系统的常规中间目录"
+            "不算，勿删），保持工程整洁。")
             .arg(pS->sDeepPlan), /*a_bDropLastUser=*/true);
         return;
     }
@@ -4097,6 +4211,19 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         QString sReasons;
         const int iVerdict = ParseDeepVerdict(a_sResult, &sReasons);
         if (iVerdict == 1) {
+            // 2026-10-30 专家轮统一输出口径（用户需求）：验证轮终答=面向用户的唯一
+            //   结果报告（按 StartDeepVerify 模板含【综合结果】+【验证结论】），作为
+            //   链尾结论文块外显；被静默的执行/修复/验证轮过程文本随之丢弃（内容已
+            //   由验证者整合进报告）。result 空文本兑底取末条静默文本。
+            QString sReport = a_sResult.trimmed();
+            if (sReport.isEmpty() && !pS->aDeepMuted.isEmpty()) {
+                sReport = pS->aDeepMuted.last();
+            }
+            if (!sReport.isEmpty()) {
+                emit sigAdhocAssistantText(a_sAsstId, sReport.left(8000));
+            }
+            pS->aDeepMuted.clear();
+            pS->sDeepExecReport.clear();
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_verify_pass"),
                 QStringLiteral("✔ 独立验证通过，专家模式闭环完成"));
             FinishAdhocSuccess(*pS, pS->sSid);
@@ -4117,7 +4244,10 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 "【专家模式·修复轮】独立验证者报告以下问题未通过验收：\n---\n%1\n---\n"
                 "请在现有改动基础上修复以上全部问题（会话已保留此前的改动与上下文，"
                 "不要重做已通过的部分），对照验收标准逐项处理后，"
-                "简要说明每个问题的修复方式。")
+                "把修复情况写成简明清单（该清单交给验证Agent 核验并向用户汇总，"
+                "不直接面向用户）；修复完成后删除本轮自己创建的"
+                "临时文件（探针脚本、中间产物、输出重定向文件等；构建系统的"
+                "常规中间目录不算，勿删）。")
                 .arg(sReasons.left(1500)));
             return;
         }
@@ -4178,22 +4308,35 @@ void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
 void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
     // 深度链第 3 步：验证轮（fork 一次性分支）。独立验证者只核验不修复（禁 Edit/Write），
     //   按 guide.md 构建说明实际编译/测试 + 逐项核对验收标准，末行输出 VERIFY:PASS/FAIL。
+    //   2026-10-30 统一输出口径（用户需求：执行结果不再直接上屏）：验证者整合
+    //   【执行Agent实施报告】与自证事实，产出面向用户的唯一报告（综合结果+验证结论）。
     a_S.eMode = DeepVerify;
     emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_verify"),
         QStringLiteral("🔍 专家模式：验证Agent 按验收标准实际编译/测试核验…"));
     const QString sCriteria = ExtractDeepCriteria(a_S.sDeepPlan);
+    const QString sExecReport = a_S.sDeepExecReport.trimmed().isEmpty()
+        ? QStringLiteral("（执行轮未产出文字报告——请以你自己核验到的工程实际状态为准）")
+        : a_S.sDeepExecReport.trimmed().left(3000);
     const QString sPrompt = QStringLiteral(
-        "【专家模式·验证轮】你是独立验证者。执行Agent 刚完成了用户请求的改动，"
-        "请客观验收（只验证、严禁修复、严禁修改任何工程文件）：\n"
+        "【专家模式·验证轮】你是独立验证者，也是本轮面向用户的唯一发言人（执行Agent "
+        "的结果不再直接展示，由你统一汇总）。执行Agent 刚完成了用户请求的改动，请核验"
+        "后输出一份完整的综合报告（只验证、严禁修复、严禁修改任何工程文件）：\n"
         "1) 逐项核对【验收标准】：需看代码的用 Read 核对，需看行为的实际运行验证；\n"
         "2) 编译/测试方法优先按 .autodev/guide.md 的构建说明执行；无说明时用工程惯例"
         "命令（如 cmake --build build、msbuild、pnpm test 等）；\n"
-        "3) 正文逐项给出证据（执行的命令与关键输出/检查的文件与关键行）；\n"
+        "3) 你的最终输出就是用户看到的唯一结果报告，结构必须为两段：\n"
+        "   【综合结果】面向用户完整说明本次改动：做了什么、涉及哪些文件、最终效果、"
+        "遗留事项——以【执行Agent实施报告】为底稿，用你自己核验到的事实校正与补充"
+        "（报告未提及但实际发生的重要改动也要覆盖）；\n"
+        "   【验证结论】逐项给出证据（执行的命令与关键输出/检查的文件与关键行）；\n"
         "4) 最后一行必须精确输出总结论（二选一）：\n"
         "   VERIFY:PASS\n"
         "   VERIFY:FAIL: <原因清单，逐条对应未通过的验收标准>\n"
-        "---\n【验收标准】\n%1\n---\n【用户原始请求】\n%2")
-        .arg(sCriteria, a_S.sPendingPrompt.left(800));
+        "5) 收尾清理（2026-10-29 用户需求）：验证结束前删除本轮验证过程中你自己创建的"
+        "临时文件（探针脚本、输出重定向文件、临时测试数据等；构建系统的常规中间目录"
+        "不算，勿删）；清理失败不影响验证结论。\n"
+        "---\n【执行Agent实施报告】\n%3\n---\n【验收标准】\n%1\n---\n【用户原始请求】\n%2")
+        .arg(sCriteria, a_S.sPendingPrompt.left(800), sExecReport);
     StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
                     k_iDeepAuxTurns, QStringLiteral("Edit,Write"));
 }
@@ -4217,6 +4360,10 @@ void CTaskOrchestrator::DeepChainRestart(SAdhocSession& a_S, const QString& a_sW
     if (a_S.iDeepRestart < iCap) {
         ++a_S.iDeepRestart;
         a_S.iDeepRetry = 0;
+        // 2026-10-30 静默缓存复位：上轮尝试的过程文本/实施报告不带入重启链（失败
+        //   教训已由 sDeepFailSummary 承载注入重规划，旧文本留在屏上只会干扰新轮）。
+        a_S.aDeepMuted.clear();
+        a_S.sDeepExecReport.clear();
         emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_restart"),
             QStringLiteral("♻ %1——专家模式自动重启深度链（第 %2/%3 次：重新规划→执行→验证）")
                 .arg(a_sWhy).arg(a_S.iDeepRestart).arg(iCap));
@@ -4241,11 +4388,14 @@ void CTaskOrchestrator::DeepChainRestart(SAdhocSession& a_S, const QString& a_sW
         QStringLiteral("✗ 专家模式未能达成验收（%1；已自动重启 %2 次）。"
                        "会话与改动已保留，可人工检查后发送修复指令")
             .arg(a_sWhy).arg(a_S.iDeepRestart));
+    FlushDeepMuted(a_S);   // 2026-10-30 最终失败：静默文本兑底补发（改动细节不丢）
     FinishAdhocFailure(a_S);
 }
 
 void CTaskOrchestrator::FinishAdhocSuccess(SAdhocSession& a_S, const QString& a_sFinalSid) {
     a_S.iHitLimitStreak = 0;   // 2026-10-09 本轮正常完成：触顶计数回落（下轮预算回基线）
+    a_S.aDeepMuted.clear();      // 2026-10-30 深链静默缓存（PASS 路径已提前清，防御异常残留）
+    a_S.sDeepExecReport.clear();
     // 原 Submitting 成功尾段提炼（2026.09.26）：压栈 (prompt, newSid) 并推进链基点
     //   （sid 空=异常不压栈、链不动）→ 模型/上下文上报 → guide 同步节流 → 排队指令
     //   续发（多条合并投送）。深度链 PASS 与纯对话成功统一走这里。
@@ -4287,8 +4437,24 @@ void CTaskOrchestrator::FinishAdhocFailure(SAdhocSession& a_S) {
     a_S.sPendingPrompt.clear();
     a_S.eMode = Idle;
     a_S.bDeepActive = false;   // 深度链终结（失败）
+    a_S.aDeepMuted.clear();      // 2026-10-30 深链静默缓存（deep_fail 路径已补发，防御残留）
+    a_S.sDeepExecReport.clear();
     emit sigAdhocContext(a_S.sId, -1);
     emit sigAdhocFinished(a_S.sId);
+}
+
+void CTaskOrchestrator::FlushDeepMuted(SAdhocSession& a_S) {
+    // 2026-10-30 深链静默文本兑底补发：链未走到验证 PASS（用户停止/最终失败/零工具
+    //   跳过验证）时，把被静默的执行/修复/验证轮 assistant 文本补发面板——过程与
+    //   结论信息不丢；链成功路径不调用（报告已由验证轮终答统一呈现，静默过程文本
+    //   按用户需求丢弃）。取副本清空后再发，防信号重入（面板同步重载）叠加。
+    const QStringList aBuf = a_S.aDeepMuted;
+    a_S.aDeepMuted.clear();
+    for (const QString& s : aBuf) {
+        if (!s.trimmed().isEmpty()) {
+            emit sigAdhocAssistantText(a_S.sId, s);
+        }
+    }
 }
 
 int CTaskOrchestrator::ParseDeepVerdict(const QString& a_sResult, QString* a_pReasons) {

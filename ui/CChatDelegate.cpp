@@ -38,6 +38,7 @@ const QColor kColBody(QStringLiteral("#374151"));
 const QColor kColErr(QStringLiteral("#dc2626"));
 const QColor kColSys(QStringLiteral("#9ca3af"));
 const QColor kColHighlight(QStringLiteral("#fffbeb"));
+const QColor kColSelected(QStringLiteral("#dbeafe"));   // 条目选中底色（蓝 100，浅于跳转高亮；2026-10-23 条目选择复制）
 const QColor kColMore(QStringLiteral("#9ca3af"));
 const QColor kColUserSep(QStringLiteral("#9ca3af"));   // 2026.09.19 用户提示词顶部分隔线
 const QColor kColMonoText(0, 0, 0);            // QPlainTextEdit 缺省黑字口径
@@ -293,7 +294,10 @@ int CChatDelegate::EstimateHeight(const SDisplayItem& a_it, int a_iWidth) const
     }
     case CMessageBlock::Event: {
         // 徽章 + 正文整体 QTextLayout（与 paintEventBadge 同源）；user 块顶部 3px
-        // 分隔线 + 头像缩进（宽 -18），非 user 全宽（绘制同口径）
+        // 分隔线 + 头像缩进（宽 -18），非 user 全宽（绘制同口径）。
+        // 2026-10-22 估高改为给 painted 高度严格相等（旧式 qMax(iFmH,16)+iWrapped-
+        // lineSpacing 在 lineSpacing>height（字体 leading>0）时每行欠 leading px，
+        // 后续条目叠画本行尾部）
         const SEventStyle stEv = EventStyle(a_it.sEventKind);
         const bool bUser = (a_it.sEventKind == QStringLiteral("user"));
         const int iTop = bUser ? 3 : 0;
@@ -304,8 +308,8 @@ int CChatDelegate::EstimateHeight(const SDisplayItem& a_it, int a_iWidth) const
         const int iTextW = qMax(16, iAvail - (bUser ? 18 : 0));
         const int iWrapped = wrappedHeight(stEv.sBullet + QLatin1Char(' ') + a_it.sText,
                                            fLay, iTextW);
-        return iTop + (iWrapped > 0 ? qMax(iFmH, 16) + iWrapped - fm.lineSpacing()
-                                    : qMax(iFmH, 16));
+        // paintEventBadge 实际占高 = iTop + 布局高（lay.draw 白上而下）
+        return iTop + qMax(iWrapped > 0 ? iWrapped : 0, qMax(iFmH, 16));
     }
     case CMessageBlock::System: {
         // 组头 ▸/▾ brief（共 N 行，点击展开）斜体 #9ca3af；展开=左缘 10 缩进逐行
@@ -415,6 +419,8 @@ void CChatDelegate::paint(QPainter* a_pPainter, const QStyleOptionViewItem& a_oO
     if (pIt == nullptr)
         return;
     a_pPainter->save();
+    if (a_oOption.state & QStyle::State_Selected)   // 条目选中底色（2026-10-23 条目选择复制，画在最底层不遮字）
+        a_pPainter->fillRect(a_oOption.rect, kColSelected);
     if (pIt->bHighlight)                       // 跳转高亮 #fffbeb
         a_pPainter->fillRect(a_oOption.rect, kColHighlight);
     switch (pIt->eKind) {
@@ -445,7 +451,11 @@ void CChatDelegate::paintAssistant(QPainter* a_pPainter, const QStyleOptionViewI
                Qt::AlignLeft | Qt::AlignVCenter,
                QStringLiteral("⏺ %1").arg(a_it.sBackend.isEmpty()
                                             ? QStringLiteral("Agent") : a_it.sBackend));
-    // 正文：池化 QTextDocument 同源 Markdown 直绘（透明底、无边框）
+    // 正文：池化 QTextDocument 同源 Markdown 直绘（透明底、无边框）。
+    // 2026-10-22 绘制裁剪到本行矩形：估高欠量帧（doc 实高 > 行高，实高校正在
+    // OnDocReady 链路补上前的同一帧）doc 不再溢出画到下一行上（下一行内容叠画
+    // 在本行尾部上——「已完成」覆盖回复尾部实害的放大面）；校正后行高容纳全 doc，
+    // 裁剪不再吃内容
     const int iDocW = qMax(16, rc.width() - 13);
     if (m_pPool == nullptr)
         return;
@@ -453,8 +463,11 @@ void CChatDelegate::paintAssistant(QPainter* a_pPainter, const QStyleOptionViewI
     if (pDoc == nullptr)
         return;
     p.setPen(a_oOption.palette.text().color());
+    p.save();
+    p.setClipRect(rc);
     p.translate(rc.left() + 13, rc.top() + iSpeakerH + 4);
     pDoc->drawContents(&p);
+    p.restore();
 }
 
 void CChatDelegate::paintToolUse(QPainter* a_pPainter, const QStyleOptionViewItem& a_oOption,
@@ -662,4 +675,55 @@ QString CChatDelegate::ToolTipAt(const QModelIndex& a_oIndex, const QPoint& a_oP
         aTips << ToolIcon(e.sTool) + QStringLiteral(" ")
               + CMessageBlock::ToolSummary(e.sTool, e.sInput, 200, 120);
     return aTips.join(QLatin1Char('\n'));
+}
+
+bool CChatDelegate::IsHeaderHit(const QModelIndex& a_oIndex, const QPoint& a_oPos) const
+{
+    const SDisplayItem* pIt = itemOf(a_oIndex);
+    if (pIt == nullptr
+            || (pIt->eKind != CMessageBlock::ToolUse && pIt->eKind != CMessageBlock::System))
+        return false;
+    return m_aHeaderRect.value(a_oIndex.row()).contains(a_oPos);
+}
+
+QString CChatDelegate::PlainTextAt(const QModelIndex& a_oIndex) const
+{
+    // 复制层非 Assistant 数据源（2026-10-22）：徽章/组头/图标等装饰不进文本——
+    // 复制产物直接可用；ToolUse 逐条目带工具名+入参/结果（monoInput/monoResult
+    // 同源，含 JSON 缩进与 Edit 红绿行的 ± 前缀，丢颜色保留行）
+    const SDisplayItem* pIt = itemOf(a_oIndex);
+    if (pIt == nullptr)
+        return QString();
+    switch (pIt->eKind) {
+    case CMessageBlock::Event:
+    case CMessageBlock::Error:
+        return pIt->sText;
+    case CMessageBlock::System:
+        return pIt->aSysLines.join(QLatin1Char('\n'));
+    case CMessageBlock::ToolUse: {
+        QStringList aOut;
+        const bool bMulti = pIt->aTools.size() > 1;
+        for (int i = 0; i < pIt->aTools.size(); ++i) {
+            const SToolEntry& e = pIt->aTools.at(i);
+            aOut << QStringLiteral("【%1】%2")
+                        .arg(e.sTool,
+                             CMessageBlock::ToolSummary(e.sTool, e.sInput));
+            aOut << (bMulti ? QStringLiteral("入参 #%1").arg(i + 1)
+                            : QStringLiteral("入参"));
+            for (const SMonoLine& m : monoInputLines(e))
+                aOut << m.sText;
+            aOut << (bMulti ? QStringLiteral("结果 #%1").arg(i + 1)
+                            : QStringLiteral("结果"));
+            for (const SMonoLine& m : monoResultLines(e))
+                aOut << m.sText;
+            aOut << QString();                 // 条目间空行
+        }
+        while (!aOut.isEmpty() && aOut.last().isEmpty())
+            aOut.removeLast();
+        return aOut.join(QLatin1Char('\n'));
+    }
+    case CMessageBlock::Assistant:
+    default:
+        return QString();                     // Assistant 走池 Markdown doc（保持源格式）
+    }
 }

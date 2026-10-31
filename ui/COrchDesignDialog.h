@@ -65,8 +65,12 @@ private:
     void OnAddStage();
     void OnEditStage();
     void OnDeleteStage();
-    void OnToggleStageDefault();     // 「设置为缺省」/右键切换（已缺省 → 取消）
     void OnStageSelectionChanged();
+
+    // 2026-10-23 阶段「缺省选择」勾开时的预设同步：把阶段 id 写入所有已配置预设
+    //   （非空）的档位——消除「不在任何档位预设 → 兑底强制勾选 → 档位显式移除
+    //   无效」的冲突，档位预设成为唯一事实源（新增阶段及编辑开缺省时调）。
+    void SyncStageToTierPresets(const QString& a_sStageId);
 
     // —— 阶段要求编辑器 ——
     void LoadStagePrompt(int a_iRow);           // 载入该行阶段提示词（脏检查）

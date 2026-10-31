@@ -62,8 +62,24 @@ public:
 //   HarnessAgent 被误幽灵化「窗口消失」）；② 新增 sandbox launch 命令
 //   （LaunchAut）：主进程亲自 CreateProcess + AddManualRootPid 登记根，进程链
 //   永不断（提示词铁律同步禁断链启动方式）。
+//   2026-10-26 出生登记（QuickTool 工程实测「%TEMP% 副本测试窗口裸弹」根因）：
+//   Agent 把被测 exe 拷到工程外（%TEMP%\dsh-verify51 等）再经中间 shell 启动——
+//   ①工程根兑底认不出（exe 不在根内），②中间 shell 退出断链后进程树判定也
+//   认不出，两道全破 → 窗口裸弹用户桌面（QuickTool 本身置顶磁吸，格外扰人）。
+//   对策 OnBirthScan（250ms）：趁链还活着（Agent 脚本 Start-Process 后多带
+//   Start-Sleep，链活数秒）就发现新出生进程，沿 ppid 爬链到本进程的登记进
+//   m_aAgentBorn（出生登记表）；链断后窗口弹出，ConsiderWindowImpl 按登记
+//   兜底收纳（IsAgentBornPid，与树内同零宽限直收）。直接子（父=本进程）不
+//   登记——那是用户经 UI ShellExecuteEx 启动的形态（与宽限期启发同口径）。
+//   exe 位置不再限定工程根：Agent 拷到哪里启动都能收住。
     void SetProjectRoot(const QString& a_sRoot);   // 打开/切换工程时刷新
     void ReadoptProjectWindows();                  // 扫描带标记窗口，工程内的续收纳
+
+    // 出生登记查询（诊断/测试用）：进程是否在链活期间被登记为 Agent 后代。
+    bool IsAgentBornPid(DWORD a_dwPid) const;
+    // 出生登记 janitor 兑底宽限（仅测试用）：默认 10 分钟（根 runner 退出后，
+    //   其遗留被测/拉起进程超时自动终结——QuickTool 实测记事本残留不清理）。
+    void SetBornJanitorGraceForTest(int a_iMs) { m_iBornJanitorGraceMs = a_iMs; }
 
     // 钩子线程句柄（Start 时创建；无 Q_OBJECT 的内部类经指针直调 StopHook）。
     class CSbxHookThread* m_pHookTh = nullptr;
@@ -116,6 +132,7 @@ signals:
 
 private slots:
     void OnSweep();          // 周期扫描：补收纳 + 条目健康检查
+    void OnBirthScan();      // 出生登记扫描（250ms）：链活期间发现 Agent 后代新进程
     void OnRecFinished();    // 录像线程收尾（deleteLater）
 
 public:
@@ -140,6 +157,7 @@ private:
     void RestoreEntriesOfPidLocked(DWORD a_dwPid);         // 持锁实现（tryLock 外壳内部用）
     void GhostAndTrack(HWND a_hWnd);
     bool TreePid(DWORD a_dwPid);           // 属本进程树（或手工根）
+    DWORD ParentOfPid(DWORD a_dwPid) const;   // 2026-10-26 pid 父查询（锁内读表）
     HWND ArgHwnd(const QJsonObject& a_oArgs, bool* a_pbOk) const;
     CSandboxRecorder* StartRecorder(HWND a_hWnd, DWORD a_dwPid, const QString& a_sExe,
                                     QString* a_psPathOut);
@@ -161,9 +179,16 @@ private:
     bool                       m_bStarted = false;
     bool                       m_bRecOn = true;        // 运行期录像开关（record_on/off）
     QTimer                     m_tSweep;
+    QTimer                     m_tBirth;              // 出生登记扫描器（2026-10-26）
+    QHash<DWORD, qint64>       m_aAgentBorn;          // pid→创建时刻（出生登记表）
+    QHash<DWORD, DWORD>        m_aBornRoot;           // pid→根 runner pid（出生归属，2026-10-26 janitor）
+    int                        m_iBornJanitorGraceMs = 10 * 60 * 1000;  // 根死后遗留兑底宽限（测试可缩短）
+    QSet<DWORD>                m_aSeenPids;           // 上轮全量 pid（差分找新增）
+    mutable QMutex             m_mtxBorn;             // m_aAgentBorn 跨线程（UI写/钩子读）
     QHash<DWORD, DWORD>        m_oParentMap;           // pid→ppid 快照（500ms 缓存）
     QHash<DWORD, qint64>        m_oParentCreated;       // 2026-10-14 pid→创建时刻（PID 复用防护，见 CSandboxCore.h）
     qint64                     m_iMapBuiltMs = 0;
+    mutable QMutex             m_mtxPidMap;            // 2026-10-26 并发写防护：钩子/UI/工作线程共写 pid 表（QHash 并发写会损坏结构死循环）
     QSet<DWORD>                m_aManualRoots;         // 测试/特殊场景手工根
 
     struct SEntry {

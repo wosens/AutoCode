@@ -5,6 +5,7 @@
 class QLabel;
 class QToolButton;
 class QMouseEvent;
+class QPixmap;
 
 // FR-3 自绘标题栏：一行高 widget，左侧软件标题 + 右侧最小化/最大化·还原/关闭三按钮。
 // 自身不处理拖拽/缩放——交由 CMainWindow::nativeEvent 拦 WM_NCHITTEST 统一判定
@@ -23,6 +24,11 @@ public:
     //   最大化按钮据此判翻转方向（图标是还原图标→还原窗口，反之最大化）。命名避开 IsMaximized
     //   （与 <windowsx.h> 的 IsMaximized(hwnd) 宏撞名致 C4003）。
     bool IsMaxState() const { return m_bMaximized; }
+
+    // 2026.10.27 运行态窗口图标动画：主窗口忙碌定时器每帧把整幅重绘的图标喂进来
+    //   （与任务栏 windowIcon 同帧：上 2/3 原图标中部截取放大 + 下 1/3 整带进度条
+    //   来回摇摆）；a_pm 为空恢复静态应用图标。
+    void SetBusyPixmap(const QPixmap& a_pm);
 
     // FR-3：给定屏幕坐标，判定落在标题栏的哪一区，供 CMainWindow::nativeEvent
     //        的 WM_NCHITTEST 做低成本命中（只做坐标比较，内部直接用成员指针，不遍历 widget 树）。

@@ -1175,8 +1175,22 @@ void CVersionDialog::StartProbe(int a_iBackend) {
             QStringList() << QStringLiteral("--version"),
             kiProbeTimeoutMs,
             [this, fnFailDetail](int a_iEc, const QString& a_sOut) {
-                OnProbeDone(5, a_iEc == 0, a_iEc == 0
-                    ? QStringLiteral("CLI 可启动") : fnFailDetail(a_iEc, a_sOut));
+                if (a_iEc == 0) {
+                    OnProbeDone(5, true, QStringLiteral("CLI 可启动"));
+                    return;
+                }
+                // 2026.10.22 实害：另一 hermes 进程（如 hermes 后端助手正在执行）持有
+                //   install 状态锁时，hermes 对并发访问优雅退出 exit=1 并报
+                //   "install state is not writable by this user"——属瞬时占用而非安装
+                //   损坏，提示语直说，避免误导用户去查权限。hermes 原文附后供对账。
+                if (a_sOut.contains(QStringLiteral("not writable by this user"))) {
+                    OnProbeDone(5, false, QStringLiteral(
+                        "Hermes install 状态被其它 Hermes 进程占用（例如 hermes 后端助手正在执行）——"
+                        "瞬时锁，等它结束重测即可。hermes 原文：")
+                        + a_sOut.simplified().left(200));
+                    return;
+                }
+                OnProbeDone(5, false, fnFailDetail(a_iEc, a_sOut));
             });
         break;
     }

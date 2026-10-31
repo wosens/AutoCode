@@ -6,6 +6,7 @@
 #include <QJsonParseError>
 #include <QFile>
 #include "core/CFrwDevice.h"
+#include "core/CTempPaths.h"   // 2026.10.28 临时文件统一根 exe同级~Temperary
 #include <QFileInfo>
 #include <QDir>
 #include <QCoreApplication>
@@ -527,8 +528,8 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
     bool bMcpReady = false;
     if (a_bEnableAskUser) {
         static int s_iSeq = 0;
-        const QString sPath = QDir::tempPath() + QStringLiteral("/autocode_mcp_%1_%2.json")
-            .arg(QCoreApplication::applicationPid()).arg(++s_iSeq);
+        const QString sPath = CTempPaths::FilePath(
+            QStringLiteral("autocode_mcp_"), QStringLiteral(".json"));
         QJsonObject oEnv;
         oEnv.insert(QStringLiteral("AUTOCODE_ASK_PIPE"),
             QStringLiteral("AutoCodeMcpAsk-%1").arg(QCoreApplication::applicationPid()));
@@ -684,9 +685,9 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
                     //   在 aArgs 组装时预取、而成员已被 Reset 清空导致永不携带的滞后）。
                     {
                         static int s_iSeq = 0;
-                        m_sModelSettingsPath = QDir::tempPath()
-                            + QStringLiteral("/autocode_claude_model_%1_%2.json")
-                                  .arg(QCoreApplication::applicationPid()).arg(++s_iSeq);
+                        m_sModelSettingsPath = CTempPaths::FilePath(
+                            QStringLiteral("autocode_claude_model_"),
+                            QStringLiteral(".json"));
                         QJsonObject oSetEnv;
                         oSetEnv.insert(QStringLiteral("ANTHROPIC_BASE_URL"), pUse->sBaseURL);
                         if (!pUse->sApiKey.isEmpty()) {
@@ -1559,7 +1560,7 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine, int a_iEpoch) {
                         //   HTTP。用 node.exe 发同款请求：QNAM 200 + node 401/reset = 铁证
                         //   进程级拦截；两者都 200 = 拦截不存在，问题在 claude 自身逻辑）。
                         {
-                            const QString sJs = QDir::tempPath()
+                            const QString sJs = CTempPaths::Dir()
                                 + QStringLiteral("/autocode_node_probe.js");
                             {
                                 QFile fJs(sJs);

@@ -21,6 +21,7 @@
 #include <tlhelp32.h>    // 2026-10-17 在席锁受保护进程 PID 复用用例（快照枚举 svchost）
 
 #include "project/CProjectManager.h"
+#include "core/CTempPaths.h"   // 2026.10.28 临时文件统一根用例
 #include "ui/CSettingsDialog.h"
 #include "agent/CDeepSeekRunner.h"   // 2026-10-21 沙箱遗留标签恢复用例
 
@@ -50,11 +51,142 @@ private slots:
         RemoveConfig();
     }
 
+    // 2026.10.28 临时文件统一根（用户指令：exe 同级 ~Temperary，30 天清扫）：
+    //   根路径/唯一文件名/超期清扫（根内旧删新留）+ 系统临时目录遗留 autocode_* 同清。
+    void testTempPathsRootAndSweep() {
+        // ① 根目录：exe 同级 ~Temperary，调用后存在
+        const QString sRoot = CTempPaths::Dir();
+        QVERIFY(sRoot.endsWith(QStringLiteral("~Temperary")));
+        QVERIFY(QDir(sRoot).exists());
+        // ② FilePath：落在根内、带 pid、两次不同、未写盘即给名
+        const QString sF1 = CTempPaths::FilePath(QStringLiteral("autocode_t_"),
+                                                 QStringLiteral(".json"));
+        const QString sF2 = CTempPaths::FilePath(QStringLiteral("autocode_t_"),
+                                                 QStringLiteral(".json"));
+        QVERIFY(sF1.startsWith(sRoot + QLatin1Char('/')));
+        QVERIFY(sF1.contains(QString::number(QCoreApplication::applicationPid())));
+        QVERIFY(sF1 != sF2);
+        QVERIFY(!QFileInfo::exists(sF1));
+        // ③ 30 天清扫：根内超期文件删、新文件留；系统临时目录超期遗留同清
+        const QString sOld = sRoot + QStringLiteral("/autocode_old_case.json");
+        const QString sKeep = CTempPaths::FilePath(QStringLiteral("autocode_keep_"),
+                                                   QStringLiteral(".tmp"));
+        const auto fnWrite = [](const QString& sPath) {
+            QFile f(sPath);
+            f.open(QIODevice::WriteOnly);
+            f.write("x");
+            f.close();
+        };
+        fnWrite(sOld);
+        fnWrite(sKeep);
+        QFile fOld(sOld);
+        QVERIFY(fOld.open(QIODevice::ReadWrite));   // setFileTime 需写句柄（SetFileTime 要 GENERIC_WRITE）
+        QVERIFY(fOld.setFileTime(QDateTime::currentDateTime().addDays(-40),
+                                 QFileDevice::FileModificationTime));
+        fOld.close();
+        const QString sLegacy = QDir::tempPath()
+                                + QStringLiteral("/autocode_legacy_sweep_case.json");
+        fnWrite(sLegacy);
+        QFile fLegacy(sLegacy);
+        QVERIFY(fLegacy.open(QIODevice::ReadWrite));
+        QVERIFY(fLegacy.setFileTime(QDateTime::currentDateTime().addDays(-40),
+                                    QFileDevice::FileModificationTime));
+        fLegacy.close();
+        CTempPaths::SweepExpired(30);
+        QVERIFY(!QFileInfo::exists(sOld));        // 根内超期文件已删
+        QVERIFY(QFileInfo::exists(sKeep));        // 新文件保留
+        QVERIFY(!QFileInfo::exists(sLegacy));     // 系统临时目录超期遗留已删
+        QFile::remove(sKeep);                     // 测试自清不污染
+    }
+
     // AC-2：首次运行（无 config.ini）历史为空，不崩溃。
     void testEmptyOnFirstRun() {
         CProjectManager stPm;
         stPm.LoadRecent();
         QVERIFY(stPm.RecentProjects().isEmpty());
+    }
+
+    // 2026-10-31 v5.2.456 [Recent] 编码自愈与自管读写（启动页「锟斤拷」根治）：
+    //   ①GBK 档中文路径往返无损；②UTF-8 化档（Beta UTF-8 开关期间被 Windows profile
+    //   API 整文件重写的形态）LoadRecent 自动转正回 GBK 且本次即读出正确中文；
+    //   ③SaveRecent 写回固定 GBK（字节层验证，不再依赖 ACP）；④[Recent] 节替换不
+    //   破坏其它节字节；⑤Count 丢失兑底序号探测仍有效（新解析器行为对齐旧版）。
+    void testRecentEncodingSelfHeal() {
+        const QString sCfg = ConfigPath();
+        const QString sZh = QStringLiteral("E:/工程/远程监控项目");   // 含 GBK 双字节
+
+        // ① GBK 档：手工写 GBK 字节 → Load 读出正确中文 → Save 写回仍 GBK。
+        {
+            const QString sBody = QStringLiteral(
+                "[Other]\r\nKey=Stay\r\n[Recent]\r\nCount=1\r\n1=%1\r\nC1=2\r\n").arg(sZh);
+            const std::wstring ws = sBody.toStdWString();
+            const int n = WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                                             nullptr, 0, nullptr, nullptr);
+            QByteArray aGbk(n, Qt::Uninitialized);
+            WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                                aGbk.data(), n, nullptr, nullptr);
+            QFile f(sCfg);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(aGbk);
+            f.close();
+
+            CProjectManager stPm;
+            stPm.LoadRecent();
+            QCOMPARE(stPm.RecentProjects().size(), 1);
+            QCOMPARE(stPm.RecentProjects().first(), sZh);
+            QCOMPARE(stPm.RecentOpenCounts().first(), 2);
+
+            stPm.AddRecent(QStringLiteral("C:/NewOne"));   // 触发 SaveRecent（MRU 置顶）
+            QFile fAfter(sCfg);
+            QVERIFY(fAfter.open(QIODevice::ReadOnly));
+            const QByteArray aAfter = fAfter.readAll();
+            fAfter.close();
+            QVERIFY(aAfter.contains("Key=Stay"));   // ④ 其它节字节保留
+            const int nUtf8Strict = MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS,
+                aAfter.constData(), int(aAfter.size()), nullptr, 0);
+            QVERIFY(nUtf8Strict == 0);   // ③ 写回后非严格 UTF-8（= GBK 口径；含非法前导字节）
+            QVERIFY(aAfter.contains("\xd4\xb6\xb3\xcc"));  // 「远程」GBK 字节
+            QCOMPARE(stPm.RecentProjects().first(), QStringLiteral("C:/NewOne"));
+        }
+
+        // ② UTF-8 化档：同内容以 UTF-8 写盘（含 BOM 不写，Windows API 产物无 BOM）
+        //    → LoadRecent 自动转正 + 中文可读；且文件已被重写为 GBK。
+        {
+            QFile f(sCfg);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QStringLiteral("[Recent]\r\nCount=1\r\n1=%1\r\nC1=1\r\n")
+                        .arg(sZh)
+                        .toUtf8());
+            f.close();
+
+            CProjectManager stPm;
+            stPm.LoadRecent();
+            QCOMPARE(stPm.RecentProjects().size(), 1);
+            QCOMPARE(stPm.RecentProjects().first(), sZh);   // 本次即已正确（非锟斤拷）
+
+            QFile fAfter2(sCfg);
+            QVERIFY(fAfter2.open(QIODevice::ReadOnly));
+            const QByteArray aAfter = fAfter2.readAll();
+            fAfter2.close();
+            const int nUtf8Strict2 = MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS,
+                aAfter.constData(), int(aAfter.size()), nullptr, 0);
+            QVERIFY(nUtf8Strict2 == 0);   // 转正后回 GBK
+            QVERIFY(aAfter.contains("\xd4\xb6\xb3\xcc"));
+        }
+
+        // ⑤ Count 丢失：只剩编号键 → 顺序探测重建。
+        {
+            QFile f(sCfg);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QStringLiteral("[Recent]\r\n1=%1\r\n2=C:/Plain\r\n").arg(sZh).toUtf8());
+            f.close();
+            CProjectManager stPm;
+            stPm.LoadRecent();
+            QCOMPARE(stPm.RecentProjects().size(), 2);
+            QCOMPARE(stPm.RecentProjects().at(1), QStringLiteral("C:/Plain"));
+        }
     }
 
     // AC-3：打开 A 后，历史最前为 A。
@@ -1242,6 +1374,8 @@ private slots:
     //   offscreen 无原生窗口漂移不发生，QSKIP（口径同 test_execpanel recentDialogGeometryNoDrift）。
     void settingsDialogGeometryNoDrift();
     void testDshRestoreNeutralSecurity();   // 2026-10-21 沙箱遗留标签中性恢复
+    void testGuideBodyTextAndBudget();      // 2026-10-22 guide 篇幅约束（纯逻辑）
+    void testGuideCompactHashRoundTrip();   // 2026-10-22 压缩哈希/水位线共存
 };
 
 void CTestProjectManager::settingsDialogGeometryNoDrift() {
@@ -1322,6 +1456,73 @@ void CTestProjectManager::testDshRestoreNeutralSecurity() {
     QCOMPARE(CDeepSeekRunner::RestoreNeutralSecurity(
                  sRoot + QStringLiteral("/no_such_dir")), 0);
 }
+
+    // —— 2026-10-22 guide.md 篇幅约束（防无限增长膨胀上下文，HotNews 实害 207KB）——
+    // 纯逻辑离线用例：正文剥离（指纹表段+机器变更日志段）/预算判定/压缩哈希往返。
+void CTestProjectManager::testGuideBodyTextAndBudget() {
+        CProjectManager stPm;
+        // ① 小正文 + 两个机器段 → 不超预算；剥离后不含机器段内容。
+        QString sGuide = QStringLiteral("# 指南\n概述三行\n模块A\n模块B\n");
+        sGuide += QStringLiteral("\n<!-- AUTOCODE_FINGERPRINTS_BEGIN -->\n"
+                                 "```autocode-fp\n"
+                                 "src/a.cpp | 100 | 1755043200000 | -\n"
+                                 "```\n<!-- AUTOCODE_FINGERPRINTS_END -->\n");
+        sGuide += QStringLiteral("\n## 变更日志（增量）\n- [2026-10-22T10:00:00] 新增：x\n"
+                                 "- [2026-10-22T11:00:00] 修改：y\n");
+        QCOMPARE(stPm.GuideOverBudget(sGuide), false);
+        const QString sBody = stPm.GuideBodyText(sGuide);
+        QVERIFY(!sBody.contains(QLatin1String("AUTOCODE_FINGERPRINTS")));
+        QVERIFY(!sBody.contains(QStringLiteral("变更日志")));
+        QVERIFY(!sBody.contains(QLatin1String("src/a.cpp")));
+        QVERIFY(sBody.contains(QStringLiteral("模块A")));   // 正文保留
+
+        // ② 超行数预算（>300 行）即使字符不多也超限。
+        QString sMany;
+        for (int i = 0; i < 320; ++i) {
+            sMany += QStringLiteral("行%1\n").arg(i);
+        }
+        QCOMPARE(stPm.GuideOverBudget(sMany), true);
+
+        // ③ 超字符预算（>10000 字符）即使行数不多也超限；机器段不计入。
+        QString sBig = QStringLiteral("x").repeated(11000);
+        QCOMPARE(stPm.GuideOverBudget(sBig), true);
+        QString sBigFp = QStringLiteral("# t\n")
+            + QStringLiteral("<!-- AUTOCODE_FINGERPRINTS_BEGIN -->\n")
+            + QStringLiteral("f").repeated(11000)
+            + QStringLiteral("\n<!-- AUTOCODE_FINGERPRINTS_END -->\n");
+        QCOMPARE(stPm.GuideOverBudget(sBigFp), false);   // 指纹段大不算正文膨胀
+
+        // ④ 只有 BEGIN 无 END：其后全部视为机器段（防御半截标记）。
+        QString sHalf = QStringLiteral("# t\n正文\n<!-- AUTOCODE_FINGERPRINTS_BEGIN -->\n残段");
+        QCOMPARE(stPm.GuideBodyText(sHalf), QStringLiteral("# t\n正文\n"));
+    }
+
+    // 压缩尝试哈希与水位线共存于 guide_sync.json（互不覆盖）。
+void CTestProjectManager::testGuideCompactHashRoundTrip() {
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        CProjectManager stPm;
+        stPm.Open(oTmp.path());
+        const QString sJson = oTmp.path() + QStringLiteral("/.autodev/guide_sync.json");
+        QVERIFY(!QFile::exists(sJson));
+
+        stPm.SaveGuideSyncLines(42);
+        stPm.SaveGuideCompactHash(QStringLiteral("abc123"));
+        // 两键共存：先写水位线再写哈希，水位线不被覆盖；反之亦然。
+        QFile f(sJson);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+        f.close();
+        QCOMPARE(o.value(QLatin1String("lastSyncLines")).toInt(), 42);
+        QCOMPARE(o.value(QLatin1String("lastCompactHash")).toString(), QStringLiteral("abc123"));
+        QCOMPARE(stPm.LoadGuideSyncLines(), 42);
+        QCOMPARE(stPm.LoadGuideCompactHash(), QStringLiteral("abc123"));
+
+        // 再写水位线，哈希保留。
+        stPm.SaveGuideSyncLines(43);
+        QCOMPARE(stPm.LoadGuideSyncLines(), 43);
+        QCOMPARE(stPm.LoadGuideCompactHash(), QStringLiteral("abc123"));
+    }
 
 QTEST_MAIN(CTestProjectManager)
 #include "test_projectmanager.moc"
