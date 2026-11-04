@@ -78,14 +78,18 @@ std::optional<EStage> CStageMachine::PrevStage(const QList<EStage>& a_aFlow, ESt
     return a_aFlow.at(iIdx - 1);
 }
 
-EStage CStageMachine::RejectTarget(EStage a_eReviewStage) {
+// 2026-11-02 修跨流路由：CodeReview/Test 的回炉目标按任务类型分流——feature 流回
+//   Develop；bugfix 流不含 Develop（硬编码 Develop 得到流外阶段，调用侧 PrevStage
+//   兑底反而跳回首阶段 Intake），改回 BugFix（bugfix 流内唯一生产阶段）。
+EStage CStageMachine::RejectTarget(EStage a_eReviewStage, ETaskType a_eType) {
     switch (a_eReviewStage) {
         case EStage::ReviewReq:        return EStage::ConfirmReq;   // 需求评审 → 回确认需求
         case EStage::ReviewDesign:     return EStage::Design;       // 设计评审 → 回设计
         case EStage::ReviewPlan:       return EStage::Plan;         // 计划评审 → 回计划
         case EStage::RootCauseVerify:  return EStage::RootCause;    // 根因核实 → 回根因分析
-        case EStage::CodeReview:       return EStage::Develop;      // 代码审查 → 回开发
-        case EStage::Test:             return EStage::Develop;      // 测试失败 → 回开发
+        case EStage::CodeReview:       // 代码审查 → 回生产阶段（按流分流）
+        case EStage::Test:             // 测试失败 → 回生产阶段（按流分流）
+            return (a_eType == ETaskType::Bugfix) ? EStage::BugFix : EStage::Develop;
         default:                       return a_eReviewStage;
     }
 }

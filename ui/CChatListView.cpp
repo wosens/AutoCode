@@ -186,9 +186,12 @@ bool CChatListView::JumpToItem(int a_iItemRow)
     m_bAtBottom = false;                     // 跳转后不再贴底粘滞（ScrollBlockToTop 口径）
     scrollTo(m_pModel->index(a_iItemRow, 0), QAbstractItemView::PositionAtTop);   // 滚到视口顶部
     m_pModel->setData(m_pModel->index(a_iItemRow, 0), true, CChatModel::HighlightRole);
-    QTimer::singleShot(1200, this, [this, a_iItemRow] {          // 高亮 1200ms 自清（不落盘）
-        if (m_pModel != nullptr && a_iItemRow < m_pModel->rowCount())
-            m_pModel->setData(m_pModel->index(a_iItemRow, 0), false, CChatModel::HighlightRole);
+    // 高亮自清锁定发起时的模型：触发时若已换绑另一任务模型（本工程常态流程），
+    //   读当下 m_pModel 会误清新模型同行高亮，而旧模型的高亮标记永久残留。
+    CChatModel* const pM = m_pModel;
+    QTimer::singleShot(1200, this, [this, pM, a_iItemRow] {          // 高亮 1200ms 自清（不落盘）
+        if (pM != nullptr && a_iItemRow < pM->rowCount())
+            pM->setData(pM->index(a_iItemRow, 0), false, CChatModel::HighlightRole);
     });
     return true;
 }
@@ -200,14 +203,23 @@ void CChatListView::updateBand()
     const QRect rcVis = viewport()->rect();
     if (rcVis.height() <= 0)
         return;
+    // 探测点落在 spacing 间隙/内容区外时沿 y 向内侧步进重试：固定 2px 内缩点逐像素
+    //   滚动下极易落空，旧版无条件回退首行/末行会把 OnBand 区间放大成 [0, N-1] 全量
+    //   （带材化被击穿、LRU 逐出失效、长会话整表材化内存膨胀）。
+    const int iStep = spacing() + 1;
     QModelIndex idxTop = indexAt(QPoint(2, 2));
-    if (!idxTop.isValid()) {
-        // 视口顶端落在 margins/空白：从首行兜底（首行必在或模型为空已排除）
-        idxTop = m_pModel->index(0, 0);
-    }
+    for (int y = 2 + iStep; !idxTop.isValid() && y < rcVis.height() / 2; y += iStep)
+        idxTop = indexAt(QPoint(2, y));
     QModelIndex idxBot = indexAt(QPoint(2, rcVis.height() - 2));
+    for (int y = rcVis.height() - 2 - iStep;
+         !idxBot.isValid() && y >= rcVis.height() / 2; y -= iStep)
+        idxBot = indexAt(QPoint(2, y));
+    if (!idxTop.isValid() && !idxBot.isValid())
+        return;   // 视口完全空白（两探测都落空）：本轮无可见带，不碰池
+    if (!idxTop.isValid())
+        idxTop = idxBot;   // 只剩单端命中：以命中端为带（不再无条件回退首/末行）
     if (!idxBot.isValid())
-        idxBot = m_pModel->index(m_pModel->rowCount() - 1, 0);
+        idxBot = idxTop;
     m_pPool->OnBand(idxTop.row(), idxBot.row(),
                     verticalScrollBar()->value(), rcVis.height());
 }
@@ -285,8 +297,9 @@ void CChatListView::openOverlay(const QModelIndex& a_idx)
     closeOverlay();
     // 打开复制浮层=用户交互意图：停贴底粘滞（closeOverlay 按当前位置还原）。
     // 否则开层后任何高度校正 → rangeChanged 自动滚底 → valueChanged 按「滚动即
-    // 收层」把刚打开的浮层秒关（借鉴 HarnessAgent v1.9.50 T9/T15 修复）
-    m_bAtBottom = false;
+    // 收层」把刚打开的浮层秒关（借鉴 HarnessAgent v1.9.50 T9/T15 修复）。
+    // 注意：置位点在全部早退校验之后——早退路径不碰 m_bAtBottom，防失败的双击
+    // 静默关掉贴底跟随（流式新消息不再自动滚底，直到用户手动滚动才恢复）。
     const QRect rc = visualRect(a_idx);
     if (!rc.isValid() || rc.width() < 60)
         return;
@@ -324,6 +337,7 @@ void CChatListView::openOverlay(const QModelIndex& a_idx)
     }
     if (pDoc == nullptr)
         return;
+    m_bAtBottom = false;   // 全部校验通过、确定开层：此刻才停贴底粘滞（见顶部注释）
     auto* pOv = new COverlayBrowser(viewport());
     m_pOverlay = pOv;
     m_iOverlayRow = a_idx.row();

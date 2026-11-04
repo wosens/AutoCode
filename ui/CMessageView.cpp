@@ -107,7 +107,26 @@ void CMessageView::PrependBlocks(const QList<CMessageBlock*>& a_aBlocks) {
     }
     m_bFollow = false;   // 补历史 = 用户在上方浏览，暂停尾部跟随
     for (int i = a_aBlocks.size() - 1; i >= 0; --i) {
+        if (a_aBlocks.at(i) == nullptr) {
+            continue;   // 2026-11-02 判空（与 AddBlock 口径一致：insertWidget(0,nullptr) 崩溃）
+        }
         m_pLayout->insertWidget(0, a_aBlocks.at(i));
+    }
+    // 2026-11-02 前插上限保护（与 AddBlock 对称）：反向分页前插旧路径完全绕过
+    //   k_iMaxBlocks，持续上翻长历史块数无界增长；从尾部摘除最新块保持上限。
+    while (m_pLayout->count() - 1 > k_iMaxBlocks) {
+        QLayoutItem* pItem = m_pLayout->takeAt(m_pLayout->count() - 2);   // 尾 stretch 前
+        if (pItem == nullptr) {
+            break;
+        }
+        QWidget* pW = pItem->widget();
+        delete pItem;
+        if (CMessageBlock* pBlock = qobject_cast<CMessageBlock*>(pW)) {
+            emit sigBlockDropped(pBlock);
+            pBlock->deleteLater();
+        } else if (pW != nullptr) {
+            pW->deleteLater();
+        }
     }
     if (pAnchor == nullptr) {
         return;   // 无锚（理论不达）：块已插入，滚动位置交给后续滚动/重建

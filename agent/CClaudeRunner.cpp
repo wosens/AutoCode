@@ -46,6 +46,16 @@ CClaudeRunner::CClaudeRunner(QObject* a_pParent)
 
 CClaudeRunner::~CClaudeRunner() {
     Stop();
+    // 临时文件（mcp-config / 模型 settings）随对象销毁一并清理：settings 含明文
+    //   ANTHROPIC_API_KEY/AUTH_TOKEN，进程退出后残留在 ~Temperary 属凭据泄露面。
+    if (!m_sMcpConfigPath.isEmpty()) {
+        QFile::remove(m_sMcpConfigPath);
+        m_sMcpConfigPath.clear();
+    }
+    if (!m_sModelSettingsPath.isEmpty()) {
+        QFile::remove(m_sModelSettingsPath);
+        m_sModelSettingsPath.clear();
+    }
 #ifdef Q_OS_WIN
     // 2026.09.22 KILL_ON_JOB_CLOSE 兑底：关闭 Job 句柄 → 树内仍存活的孤儿（cmd 已死
     //   而 node 未收尾的场景）一并终结，程序退出无残留。
@@ -527,7 +537,6 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
     //   临时文件而非 JSON 内联：cmd /c 会重解析引号，JSON 内大量双引号经 cmd 极易出错。
     bool bMcpReady = false;
     if (a_bEnableAskUser) {
-        static int s_iSeq = 0;
         const QString sPath = CTempPaths::FilePath(
             QStringLiteral("autocode_mcp_"), QStringLiteral(".json"));
         QJsonObject oEnv;
@@ -684,7 +693,6 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
                     //   写成后立即同步进本轮启动参数（fnSyncSettingsArg，修上一轮仅
                     //   在 aArgs 组装时预取、而成员已被 Reset 清空导致永不携带的滞后）。
                     {
-                        static int s_iSeq = 0;
                         m_sModelSettingsPath = CTempPaths::FilePath(
                             QStringLiteral("autocode_claude_model_"),
                             QStringLiteral(".json"));
@@ -1875,7 +1883,11 @@ void CClaudeRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStat
     }
     if (a_iExitCode == 0) {
         m_bFinished = true;
-        emit sigFinished(true, QString(), 0, 0, 0.0, QString());
+        // 带出本轮 sid（init 行已捕获 m_sLastSessionId 时上层可 --resume 续跑，旧实现
+        //   传空 sid 导致该轮无法续跑）；token 同 result 收尾口径防与实时上抛双计。
+        const qint64 iFinIn  = (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iStreamIn;
+        const qint64 iFinOut = (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iStreamOut;
+        emit sigFinished(true, QString(), iFinIn, iFinOut, 0.0, m_sLastSessionId);
         return;
     }
     // 2026.08.15 区分两种异常退出：
@@ -2078,7 +2090,7 @@ QString CClaudeRunner::MineTranscriptErrorTail() {
             // 结构抽不到（未知事件形态）：退回原始行内 "text"/"content" 字段片段。
             const QString sRaw = QString::fromUtf8(szLine);
             static const QRegularExpression re(
-                QStringLiteral("\"(?:text|content|message)\"\s*:\s*\"([^\"]{20,400})\""));
+                QStringLiteral("\"(?:text|content|message)\"\\s*:\\s*\"([^\"]{20,400})\""));
             const auto m = re.match(sRaw);
             sText = m.hasMatch() ? m.captured(1) : sRaw.left(300);
         }
@@ -2093,9 +2105,17 @@ QString CClaudeRunner::FindTranscriptPath() {
     // 按 sid 在 ~/.claude/projects/<工程>/*/<sid>.jsonl 定位会话 transcript。
     //   目录名是工程路径的字符替换（':'、'\\'、'+' 等非字母数字全变 '-'），不重造变换规则，
     //   直接遍历各工程子目录按文件名精确匹配（目录数有限，只在启动/崩溃判定时调用，开销可忽略）。
-    if (m_sLastSessionId.isEmpty() || !m_sTranscriptPath.isEmpty()) {
+    //   缓存必须绑 sid：result/fork 换新 sid 后旧缓存会挖到旧会话错误、宽限期轮旧
+    //   transcript 判不出收敛（误报失败而非自动续跑）。
+    if (m_sLastSessionId.isEmpty()) {
+        m_sTranscriptPath.clear();
+        m_sTranscriptForSid.clear();
+        return QString();
+    }
+    if (!m_sTranscriptPath.isEmpty() && m_sTranscriptForSid == m_sLastSessionId) {
         return m_sTranscriptPath;
     }
+    m_sTranscriptPath.clear();
     const QString sFileName = m_sLastSessionId + QStringLiteral(".jsonl");
     QDir dirProjects(QDir::homePath() + QStringLiteral("/.claude/projects"));
     const QFileInfoList aSubs = dirProjects.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
@@ -2103,6 +2123,7 @@ QString CClaudeRunner::FindTranscriptPath() {
         const QString sPath = stSub.absoluteFilePath() + QLatin1Char('/') + sFileName;
         if (QFile::exists(sPath)) {
             m_sTranscriptPath = sPath;
+            m_sTranscriptForSid = m_sLastSessionId;
             return m_sTranscriptPath;
         }
     }

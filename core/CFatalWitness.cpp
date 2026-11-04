@@ -5,7 +5,6 @@
 #include <QtGlobal>
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <windows.h>
 
 namespace {
@@ -27,7 +26,10 @@ void FatalMsgHandler(QtMsgType a_eType, const QMessageLogContext& a_stCtx, const
                 *pSlash = '\0';
                 char szPath[MAX_PATH];
                 std::snprintf(szPath, MAX_PATH, "%s\\dump\\_qfatal_witness.txt", szExe);
-                CreateDirectoryA((std::string(szExe) + "\\dump").c_str(), nullptr);
+                // 目录拼接用栈缓冲——fatal 路径禁堆分配（std::string 可能先崩）。
+                char szDir[MAX_PATH];
+                std::snprintf(szDir, MAX_PATH, "%s\\dump", szExe);
+                CreateDirectoryA(szDir, nullptr);
                 HANDLE h = CreateFileA(szPath, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (h != INVALID_HANDLE_VALUE) {
@@ -42,7 +44,12 @@ void FatalMsgHandler(QtMsgType a_eType, const QMessageLogContext& a_stCtx, const
                         aUtf8.constData(),
                         a_stCtx.file ? a_stCtx.file : "?", (unsigned)a_stCtx.line);
                     DWORD dwWr = 0;
-                    WriteFile(h, szLine, iN > 0 ? (DWORD)iN : 0, &dwWr, nullptr);
+                    // snprintf 返回值是"本应写入"长度，超长时可达 sizeof(szLine)+，
+                    // 必须夹取到缓冲区内，否则 WriteFile 越界读栈内存。
+                    const DWORD dwLen = (iN > 0)
+                        ? (DWORD)(iN < (int)sizeof(szLine) ? iN : (int)sizeof(szLine) - 1)
+                        : 0;
+                    WriteFile(h, szLine, dwLen, &dwWr, nullptr);
                     CloseHandle(h);
                 }
             }
@@ -61,6 +68,13 @@ void FatalMsgHandler(QtMsgType a_eType, const QMessageLogContext& a_stCtx, const
 namespace CFatalWitness {
 
 void Install() {
+    // 幂等防重入：二次 Install 时 qInstallMessageHandler 返回的是本 handler 自身，
+    // 存入默认 handler 后任意消息都会无限自递归直至栈溢出。
+    static bool s_bInstalled = false;
+    if (s_bInstalled) {
+        return;
+    }
+    s_bInstalled = true;
     s_pDefaultHandler = qInstallMessageHandler(FatalMsgHandler);
 }
 

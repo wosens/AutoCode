@@ -40,6 +40,7 @@
 #include <shobjidl_core.h>   // 2026-10-16 MakeShortcut：IShellLinkW 建 .lnk（windows.h 后置）
 
 #include "sandbox/CSandboxCore.h"
+#include "sandbox/SandboxCli.h"   // ParseCli/VkOfName（2026-11-01 自 Core 拆出）
 #include "sandbox/CSandboxManager.h"
 #include "sandbox/CSandboxRecorder.h"
 
@@ -145,6 +146,9 @@ bool DeploySelfHost(const QString& a_sDir) {
         QStringLiteral("Qt6Core.dll"), QStringLiteral("Qt6Gui.dll"),
         QStringLiteral("Qt6Widgets.dll"), QStringLiteral("Qt6Test.dll"),
         QStringLiteral("opengl32sw.dll"),
+        // 2026-11-01 沙箱动态库化：镜像副本启动即依赖 GhostSandbox.dll（import
+        // lib 链接）；CWD 兜底不可靠（ctest 的 CWD=build），部署必须自带。
+        QStringLiteral("GhostSandbox.dll"),
     };
     if (!QDir().mkpath(a_sDir + QStringLiteral("/platforms"))) {
         return false;
@@ -162,6 +166,14 @@ bool DeploySelfHost(const QString& a_sDir) {
     }
     QFile::copy(sDllSrc + QStringLiteral("/platforms/qwindows.dll"),
                 a_sDir + QStringLiteral("/platforms/qwindows.dll"));
+    // 2026-11-01 沙箱动态库化：GhostSandbox.dll 与本测试 exe 同目录（POST_BUILD
+    //   镜像），且必须拷贝成功——副本进程的 DLL 搜索链里 CWD（ctest 时=build）
+    //   不含它，静默跳过 = 副本起不来（0xC0000135）→ 后续断言全红。
+    if (!QFile::copy(QCoreApplication::applicationDirPath()
+                         + QStringLiteral("/GhostSandbox.dll"),
+                     a_sDir + QStringLiteral("/GhostSandbox.dll"))) {
+        return false;
+    }
     return true;
 }
 
@@ -1266,7 +1278,7 @@ private slots:
             QVERIFY(sbx::RestoreWindow(h, true));          // 退出还原：标记保留（时刻=now）
             QVERIFY(sbx::HasAdoptMark(h));
             // 伪造超龄标记（20 分钟前）——与 core 的 kPropAdopt 同名直写。
-            SetPropW(h, sbx::kPropAdopt, reinterpret_cast<HANDLE>(
+            SetPropW(h, sbx::PropAdoptName(), reinterpret_cast<HANDLE>(
                 static_cast<intptr_t>(static_cast<ULONG>(
                     GetTickCount() - 20UL * 60 * 1000))));
 
@@ -1312,7 +1324,7 @@ private slots:
                 }
             }
             QVERIFY2(dwExplorer != 0, "找不到 explorer 进程");
-            SetPropW(h, sbx::kPropGhost,
+            SetPropW(h, sbx::PropGhostName(),
                      reinterpret_cast<HANDLE>(static_cast<intptr_t>(dwExplorer)));
 
             CSandboxManager stMgr;
@@ -1327,7 +1339,7 @@ private slots:
             QVERIFY(sbx::IsGhosted(h));                     // 也不越权还原（保持原状）
             stMgr.Shutdown();
             // 清场：恢复 owner=本进程再正常还原（清标记）。
-            SetPropW(h, sbx::kPropGhost, reinterpret_cast<HANDLE>(
+            SetPropW(h, sbx::PropGhostName(), reinterpret_cast<HANDLE>(
                 static_cast<intptr_t>(GetCurrentProcessId())));
             QVERIFY(sbx::RestoreWindow(h));
         }

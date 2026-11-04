@@ -58,7 +58,7 @@ inline QString ToString(ETaskType a_eType) {
         case ETaskType::Feature: return "feature";
         case ETaskType::Bugfix:  return "bugfix";
     }
-    return "feature";
+    return {};   // 2026-11-02 越界枚举不再伪装成合法默认值（防损坏数据被静默规整回写）
 }
 
 inline QString ToString(ETier a_eTier) {
@@ -67,7 +67,7 @@ inline QString ToString(ETier a_eTier) {
         case ETier::Standard: return "standard";
         case ETier::Strict:   return "strict";
     }
-    return "standard";
+    return {};   // 2026-11-02 越界枚举不再伪装成合法默认值
 }
 
 inline QString ToString(ETaskStatus a_eStatus) {
@@ -79,5 +79,5 @@ inline QString ToString(ETaskStatus a_eStatus) {
         case ETaskStatus::Done:    return QStringLiteral("已完成");
         case ETaskStatus::Failed:  return QStringLiteral("失败");
     }
-    return {};
+    return {};   // 越界枚举 → 空串（三态口径一致）
 }

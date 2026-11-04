@@ -1044,6 +1044,13 @@ void CExecutionPanel::OnOutputsContextMenu(const QPoint& a_stPos) {
         if (sDst.isEmpty()) {
             return;   // 用户取消
         }
+        // 同源保护：用户在对话框里选回产物原路径时，先删后拷会把源文件删掉再拷贝
+        //   失败（源已不在），产物永久丢失——同路径直接视为已保存。
+        if (QFileInfo(aItems.first().first).absoluteFilePath().compare(
+                QFileInfo(sDst).absoluteFilePath(), Qt::CaseInsensitive) == 0) {
+            m_sLastArtifactSaveDir = QFileInfo(sDst).absolutePath();
+            return;
+        }
         QFile::remove(sDst);   // 确认覆盖后先删旧（QFile::copy 不覆盖）
         if (QFile::copy(aItems.first().first, sDst)) {
             m_sLastArtifactSaveDir = QFileInfo(sDst).absolutePath();   // 记住本次目录
@@ -1861,6 +1868,15 @@ void CExecutionPanel::OnAdhocFinished(const QString& a_sAsstId) {
                     sSend += QStringLiteral("\n\n【指令 %1】\n%2").arg(i + 1).arg(aTexts.at(i));
                 }
             }
+            // 2026-11-02 补发链先置运行态（QuickTool 实害：首条指令永远不执行）：
+            //   命名轮收尾到延迟补发（1.5s）之间存在空闲窗口——外档幽灵的收尾除名
+            //   （本函数尾部 singleShot(0) 判「!bRunning」）恰在此窗口触发 → 幽灵除名
+            //   +会话释放，随后延迟补发 AsstById 落空被静默丢弃（prompt 只上屏不执行、
+            //   sid 恒空）。此处立即置运行态：①幽灵除名跳过（补发轮真正收尾时按正常
+            //   链路落盘除名）；②补发窗口内切档时 TakeRunningForReload 以运行中幽灵
+            //   保留该助手（会话链/暂存不丢，补发照常抵达）；提炼分支同口径（refine
+            //   轮 StartAdhocStage→sigAdhocRunning 会再锚，此处覆盖其起轮前空档）。
+            SetAsstRunning(a_sAsstId, true);
             // 2026-10-08 提示词长度闸门（命名挂起收尾补发路径同口径）：多条合并后的
             //   补发文本超限同样转提炼（合并更易超限）；转正上屏已完成，直接上抛。
             int iFlushGate = 0;
@@ -4433,6 +4449,10 @@ void CExecutionPanel::OnAsstTabContextMenu(const QPoint& a_stPos) {
     if (pAsst == nullptr) {
         return;   // 非助手 Tab：无菜单
     }
+    // menu.exec 模态循环期间外档幽灵收尾/收尾链可重排或删除该助手：链前快照 id，
+    //   分支内按 id 重查（TriggerAsstAutoRename/DeleteAsst 内部均按 id 处理，
+    //   但取入参绝不能再解引用旧 pAsst）。
+    const QString sAsstId = pAsst->sId;
     QMenu menu(this);
     menu.setToolTipsVisible(true);   // 菜单项说明（Qt 默认不显示 action tooltip）
     QAction* pActRename = menu.addAction(
@@ -4452,16 +4472,21 @@ void CExecutionPanel::OnAsstTabContextMenu(const QPoint& a_stPos) {
     pActDel->setToolTip(QStringLiteral("从当前档永久移除该助手（对话/会话链/统计，不可恢复）"));
     QAction* pAct = menu.exec(pBar->mapToGlobal(a_stPos));
     if (pAct == pActRename) {
-        OnAsstTabRenamed(iIdx);   // 复用双击改名（输入框 + Tab 标题刷新 + 落盘）
+        // 复用双击改名（模态循环后按下标重查页，内部再按 id 加固）。
+        const int iIdxNow = m_pTabs->indexOf(AsstById(sAsstId) != nullptr
+            ? AsstById(sAsstId)->pPage : nullptr);
+        if (iIdxNow >= 0) {
+            OnAsstTabRenamed(iIdxNow);
+        }
     } else if (pAct == pActAuto) {
         // 2026-10-03 统一入口 TriggerAsstAutoRename（素材收集 + 运行中挂起/空闲立即
         //   发射，见函数头注）；仅无素材（没收到过提示词）时提示。
-        if (!TriggerAsstAutoRename(pAsst->sId)) {
+        if (!TriggerAsstAutoRename(sAsstId)) {
             QMessageBox::information(this, QStringLiteral("自动重命名"),
                 QStringLiteral("该助手还没有收到过任何提示词，没有素材可总结。"));
         }
     } else if (pAct == pActDel) {
-        DeleteAsst(pAsst->sId);
+        DeleteAsst(sAsstId);
     }
 }
 
@@ -4633,6 +4658,14 @@ void CExecutionPanel::OnAsstTabRenamed(int a_iIdx) {
     if (AsstIsForeign(*pAsst)) {
         return;   // 2026-10-02 外档幽灵：改名回归属任务下做（防跨档写脏名）
     }
+    // 模态循环（exec）期间定时器/排队信号照常派发（收尾链/幽灵除名/看门狗自愈可
+    //   增删/重排 m_aAssts）：链前快照 id，返回后按 id 重查，全程不依赖旧指针/旧下标。
+    //   2026-11-02 补快照归属档 key（QuickTool 实害：改名弹窗开着时任务终态自动选中/
+    //   切档 → 面板重建，目标助手不在新视图 → 改名被静默丢弃）：目标落空时改走
+    //   sigAsstRenameInArchive 直接改归属档案文件（工程全局档/任务私有档）。
+    const QString sId = pAsst->sId;
+    const QString sOwnerKey = pAsst->sOwnerKey;
+    const QString sOldName = pAsst->sName;
     bool bOk = false;
     QString sName;
     {
@@ -4643,7 +4676,7 @@ void CExecutionPanel::OnAsstTabRenamed(int a_iIdx) {
         QInputDialog stDlg(this);
         stDlg.setWindowTitle(QStringLiteral("重命名助手"));
         stDlg.setLabelText(QStringLiteral("助手名："));
-        stDlg.setTextValue(pAsst->sName);
+        stDlg.setTextValue(sOldName);
         stDlg.setInputMode(QInputDialog::TextInput);   // 同旧 QLineEdit::Normal 回显
         if (!m_stRenameDlgGeo.isEmpty()) {
             stDlg.restoreGeometry(m_stRenameDlgGeo);
@@ -4663,14 +4696,22 @@ void CExecutionPanel::OnAsstTabRenamed(int a_iIdx) {
         m_stRenameDlgGeo = stDlg.saveGeometry();   // 确认/取消均回填（位置记忆不应因取消丢失）
         sName = stDlg.textValue().trimmed();
     }
-    if (!bOk || sName.isEmpty() || sName == pAsst->sName) {
+    SAsst* pAfter = AsstById(sId);   // 模态循环后重查（可能已被删除/改名）
+    if (!bOk || sName.isEmpty()) {
         return;
     }
-    pAsst->sName = sName;
-    m_pTabs->setTabText(a_iIdx, AsstTabText(*pAsst));   // 2026.08.27 ●/⏳ 统一 AsstTabText
-    if (m_pAsstBar != nullptr) {
-        m_pAsstBar->NotifyTabsChanged();   // 改名变宽/窄 → 多行重排
+    if (pAfter == nullptr) {
+        // 2026-11-02 目标已不在当前视图（弹窗期间切档：任务终态自动选中/用户点选任务
+        //   → LoadAssistantState 重建面板，非运行助手不在新视图）：不再静默丢弃，
+        //   直接改归属档案（宿主 OnAsstRenameInArchive 读写该档文件），切回来即见。
+        emit sigAsstRenameInArchive(sId, sOwnerKey, sName);
+        return;
     }
+    if (sName == pAfter->sName) {
+        return;
+    }
+    pAfter->sName = sName;
+    RefreshAsstTabTexts();   // 按 id 刷新标题/tooltip（多行重排/●⏳统一在此内处理）
     emit sigAsstLayoutChanged();   // 名字入档 → 落盘
 }
 

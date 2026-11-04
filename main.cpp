@@ -12,7 +12,7 @@
 #include "agent/CMcpAskServer.h"
 #include "core/CCrashDump.h"
 #include "core/CFatalWitness.h"   // 2026.10.28 qFatal 见证：fastfail 零痕迹死亡的唯一遗言（静默退出排查与加固方案）
-#include "sandbox/CSandboxCore.h"   // 2026-09-26 --sandbox 命令解析（sbx::ParseCli）
+#include "sandbox/SandboxCli.h"      // 2026-11-01 沙箱动态库化：CLI 解析拆出（exe 子进程模式不加载沙箱 dll）
 #include <windows.h>   // v2.2.146 诊断模式 ExitProcess 直退（析构拆序段错误兑底）
 #include "ui/CSettingsDialog.h"
 #include "ui/CRecentProjectsDialog.h"   // 2026.10.09 启动界面（launcher 模式）
@@ -24,6 +24,7 @@
 #include <QLabel>
 #include <QFile>
 #include <QHeaderView>   // 2026.09.11 --diag-settings 转储列宽/resize mode
+#include <QProcess>      // 2026-11-03 Low 完整性自检自动重启自愈
 #include <QTextStream>
 #include <QLocalSocket>   // 2026-09-12 --ask 弹窗确认（手工审批全后端通道）
 #include <QJsonDocument>
@@ -387,6 +388,65 @@ int main(int argc, char* argv[]) {
         "QMenuBar::item { background-color: transparent; padding: 5px 10px; border-radius: 3px; }"
         "QMenuBar::item:selected { background-color: #dbeafe; color: #1e40af; }"));
 
+    // 2026-10-31 部署标签竞态自检（提测资料实害）；2026-11-03 升级自动自愈：副本
+    //   目录刻意 Low（沙箱可写面，OI 继承）——新落 exe 生即 Low，守卫 5 分钟拍点
+    //   前启动的实例整进程 Low，子进程受 No-Write-Up 限制无法写任何 Medium 工程
+    //   （选工程对话框里新建文件夹都被拒，2026-11-03 用户实害）。旧版仅弹告警
+    //   引导手工重启；现检测到 Low 即自动重启自愈（exe 标签此刻已被守卫修复，
+    //   重启即 Medium）——本块置于启动页之前，用户仅感知窗口重开一次。带
+    //   --il-relaunch 防循环：重启后仍 Low（守卫拍点未到）则告警说明并按旧口径
+    //   继续运行（Low 态仍可看日志/只读操作，不二次重启）。
+    {
+        HANDLE hTok = nullptr;
+        bool bLowIl = false;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+            DWORD dwNeed = 0;
+            GetTokenInformation(hTok, TokenIntegrityLevel, nullptr, 0, &dwNeed);
+            if (dwNeed > 0) {
+                std::vector<char> aBuf(dwNeed);
+                if (GetTokenInformation(hTok, TokenIntegrityLevel, aBuf.data(),
+                                        dwNeed, &dwNeed)) {
+                    const auto* pLabel =
+                        reinterpret_cast<TOKEN_MANDATORY_LABEL*>(aBuf.data());
+                    const DWORD dwSub = *GetSidSubAuthorityCount(pLabel->Label.Sid);
+                    bLowIl = *GetSidSubAuthority(pLabel->Label.Sid, int(dwSub) - 1)
+                             < SECURITY_MANDATORY_MEDIUM_RID;
+                }
+            }
+            CloseHandle(hTok);
+        }
+        if (bLowIl) {
+            bool bRelaunched = app.arguments().contains(
+                QStringLiteral("--il-relaunch"));   // GetCommandLineW 解码，中文安全
+            if (bRelaunched) {
+                QMessageBox stWarn;
+                stWarn.setIcon(QMessageBox::Warning);
+                QFont fWarn = stWarn.font();
+                fWarn.setPointSize(11);   // 全局 UI 11 号
+                stWarn.setFont(fWarn);
+                stWarn.setWindowTitle(QStringLiteral("程序完整性异常"));
+                stWarn.setText(QStringLiteral(
+                    "AutoCode 仍以 Low 完整性运行（exe 标签竞态：自动重启后未恢复，"
+                    "守卫任务可能尚未修复 exe 标签）。本次会话将无法写入任何工程"
+                    "文件（新建文件夹/创建文件会被拒绝）。\n\n"
+                    "请等待几分钟（守卫 5 分钟拍点）后关闭并重新启动 AutoCode。"));
+                stWarn.exec();   // 告警后继续运行（只读操作可用，不二次重启）
+            } else {
+                qDebug() << "[IL] Low integrity on start -> relaunch self as Medium";
+                // 原样透传启动参数（--no-launcher 等不能丢）+ 追加防循环标记；
+                //   arguments() 经 GetCommandLineW 解码，中文参数安全。
+                QStringList aRelaunch = app.arguments();
+                if (!aRelaunch.isEmpty()) {
+                    aRelaunch.removeFirst();   // argv[0]=自身路径，startDetached 已单独传
+                }
+                aRelaunch << QStringLiteral("--il-relaunch");
+                QProcess::startDetached(
+                    QCoreApplication::applicationFilePath(), aRelaunch);
+                return 0;   // 立即退出，新进程接手走启动页
+            }
+        }
+    }
+
     // 2026.10.09 启动界面：主窗口构造/显示前先弹「最近打开」启动页（launcher 模式）——
     //   双击/「打开」= 启动后直接进入选中工程；「跳过」= 改开 exe 同级 AutoCode 工作
     //   目录（2026.10.14 起不再进空主界面：免选工程即可建任务/对话助手，不算工程、
@@ -435,44 +495,6 @@ int main(int argc, char* argv[]) {
     //   默认编排）并注册自定义阶段（EStage≥100）进运行期定义表——后续任何
     //   FindStage/新建任务对话框/执行引擎均即刻可见；设计窗口保存后再增量重注册。
     COrchConfig::Instance()->ApplyToRuntime();
-
-    // 2026-10-31 部署标签竞态自检（提测资料实害）：副本目录刻意 Low（沙箱可写面，
-    //   OI 继承）——新落 exe 生即 Low，在守卫 5 分钟拍点前启动的实例整进程 Low，
-    //   其 agent 子进程受 No-Write-Up 限制无法写任何 Medium 工程（"连文件都无法创建"）。
-    //   检测到即告警引导重启（exe 标签此刻已被守卫修复，重启即恢复 Medium）。
-    {
-        HANDLE hTok = nullptr;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
-            DWORD dwNeed = 0;
-            GetTokenInformation(hTok, TokenIntegrityLevel, nullptr, 0, &dwNeed);
-            if (dwNeed > 0) {
-                std::vector<char> aBuf(dwNeed);
-                if (GetTokenInformation(hTok, TokenIntegrityLevel, aBuf.data(),
-                                        dwNeed, &dwNeed)) {
-                    const auto* pLabel =
-                        reinterpret_cast<TOKEN_MANDATORY_LABEL*>(aBuf.data());
-                    const DWORD dwSub = *GetSidSubAuthorityCount(pLabel->Label.Sid);
-                    const DWORD dwIl = *GetSidSubAuthority(pLabel->Label.Sid,
-                                                           int(dwSub) - 1);
-                    if (dwIl < SECURITY_MANDATORY_MEDIUM_RID) {
-                        QMessageBox stWarn;
-                        stWarn.setIcon(QMessageBox::Warning);
-                        QFont fWarn = stWarn.font();
-                        fWarn.setPointSize(11);   // 全局 UI 11 号
-                        stWarn.setFont(fWarn);
-                        stWarn.setWindowTitle(QStringLiteral("程序完整性异常"));
-                        stWarn.setText(QStringLiteral(
-                            "AutoCode 当前以 Low 完整性运行（exe 部署标签竞态），"
-                            "助手将无法写入任何工程文件（创建文件会被直接拒绝）。\n"
-                            "exe 标签已由守卫任务自动修复——请关闭本窗口后"
-                            "重新启动 AutoCode 即可恢复。"));
-                        stWarn.exec();
-                    }
-                }
-            }
-            CloseHandle(hTok);
-        }
-    }
 
     CMainWindow window;
     window.show();

@@ -21,6 +21,18 @@
 //   管理器析构期间钩子线程可读到旧指针对销毁中的对象 invokeMethod（use-after-free 窗口）。
 static std::atomic<CSandboxManager*> g_pSbxMgrForHook { nullptr };
 
+// 2026-11-02 物理输入拦截生效位（钩子回调读，管理器写）：Agent 运行期启
+//   （agent_active 命令置位 × cfg.bBlockSynth）。独立于 g_pSbxMgrForHook：回调
+//   里只查本原子（relaxed），不经管理器对象（避免析构窗口悬垂）。
+static std::atomic<bool>  g_bEatSynth   { false };
+static std::atomic<qint64> g_iLastEatLog { 0 };   // 拦截日志节流（10s 一条）
+static std::atomic<quint64> g_uEatCount  { 0 };   // 累计吞掉数（验证/诊断硬指标）
+
+// 2026-11-02 Agent 运行态原子镜像（工作线程 agent_active 写、UI 线程收纳判定读）：
+//   m_bAgentActive 普通成员跨线程读写是数据竞争，收纳兑底（IsTempArtifactPid）
+//   需要无锁可读的真值，镜像一份（与 m_bAgentActive 同步维护；Shutdown 清零）。
+static std::atomic<bool>  g_bSbxAgentActive { false };
+
 // —— 2026-10-28 janitor/退出兑底击杀审计日志：exe 同级 sandbox\janitor_kills.log ——
 // 每次真实击杀（或 AutoCode 自家镜像拦截）一行：时刻+杀手+目标+镜像+根+原因。
 // 背景：v5.1.425 出生登记自登记漏洞导致主进程被自身 janitor 零痕迹击杀（多机实害），
@@ -31,9 +43,11 @@ static void JanitorKillLog(DWORD a_dwTargetPid, const QString& a_sImg, DWORD a_d
     const QString sDir = QCoreApplication::applicationDirPath() + QStringLiteral("/sandbox");
     QDir().mkpath(sDir);
     QFile fLog(sDir + QStringLiteral("/janitor_kills.log"));
-    if (!fLog.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+    if (!fLog.open(QIODevice::WriteOnly | QIODevice::Append)) {
         return;
     }
+    // 行尾已带 \r\n：禁再开 Text 模式（会把 \n 二次翻译成 \r\n → 实路 \r\r\n
+    //   每行多出空行回车，审计日志逐行夹空行）。
     const QString sLine = QStringLiteral("[%1] killer_pid=%2 target_pid=%3 img=%4 root=%5 why=%6\r\n")
         .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
         .arg(QCoreApplication::applicationPid())
@@ -66,15 +80,81 @@ protected:
         HWINEVENTHOOK hHook = SetWinEventHook(
             EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, &CSbxHookThread::HookProc,
             0, 0, WINEVENT_OUTOFCONTEXT);
+        // 2026-11-02 物理输入拦截：低级钩子与 WinEvent 同线程（均要求消息循环）。
+        //   钩子常驻、回调只查原子标志（relaxed 读，极快）——生效/失效由
+        //   管理器切 g_bEatSynth（避免动态装/卸钩子的窗口期与线程归属坑）。
+        //   hMod 必须是「包含回调函数的模块」——本 dll（且回调是其静态成员）；
+        //   传 nullptr 会取宿主 exe 模块，回调地址却在 dll 内 → 系统回调不到
+        //   （实测静默失效，拦截不生效）。
+        HMODULE hModSbx = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&CSbxHookThread::MouseLLProc),
+                           &hModSbx);
+        HHOOK hMouseLL = SetWindowsHookExW(WH_MOUSE_LL, &CSbxHookThread::MouseLLProc,
+                                           hModSbx, 0);
+        HHOOK hKbdLL = SetWindowsHookExW(WH_KEYBOARD_LL, &CSbxHookThread::KbdLLProc,
+                                         hModSbx, 0);
         MSG stMsg;
         while (GetMessageW(&stMsg, nullptr, 0, 0) > 0) {
             TranslateMessage(&stMsg);
             DispatchMessageW(&stMsg);
         }
+        if (hMouseLL != nullptr) {
+            UnhookWindowsHookEx(hMouseLL);
+        }
+        if (hKbdLL != nullptr) {
+            UnhookWindowsHookEx(hKbdLL);
+        }
         if (hHook != nullptr) {
             UnhookWinEvent(hHook);
         }
+        g_bEatSynth.store(false, std::memory_order_relaxed);   // 线程退出即失效
         m_dwTid = 0;
+    }
+
+    // —— 2026-11-02 合成输入拦截回调（Agent 运行期，带 INJECTED 标志即吞） ——
+    // 仅查标志位（微秒级，不卡输入流）；日志节流 10s 防频繁吞时刷盘。
+    static LRESULT CALLBACK MouseLLProc(int a_nCode, WPARAM a_wP, LPARAM a_lP) {
+        if (a_nCode == HC_ACTION
+                && g_bEatSynth.load(std::memory_order_relaxed)
+                && (reinterpret_cast<const MSLLHOOKSTRUCT*>(a_lP)->flags
+                    & LLMHF_INJECTED) != 0) {
+            g_uEatCount.fetch_add(1, std::memory_order_relaxed);
+            EatLog(u8"mouse");
+            return 1;   // 吞掉：Agent 的物理鼠标模拟无效化
+        }
+        return CallNextHookEx(nullptr, a_nCode, a_wP, a_lP);
+    }
+
+    static LRESULT CALLBACK KbdLLProc(int a_nCode, WPARAM a_wP, LPARAM a_lP) {
+        if (a_nCode == HC_ACTION
+                && g_bEatSynth.load(std::memory_order_relaxed)
+                && (reinterpret_cast<const KBDLLHOOKSTRUCT*>(a_lP)->flags
+                    & LLKHF_INJECTED) != 0) {
+            g_uEatCount.fetch_add(1, std::memory_order_relaxed);
+            EatLog(u8"keyboard");
+            return 1;   // 吞掉：Agent 的物理键盘模拟无效化
+        }
+        return CallNextHookEx(nullptr, a_nCode, a_wP, a_lP);
+    }
+
+    static void EatLog(const char* a_sKind) {
+        const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
+        qint64 iLast = g_iLastEatLog.load();
+        if (iNow - iLast < 10000
+                || !g_iLastEatLog.compare_exchange_strong(iLast, iNow)) {
+            return;   // 节流：10 秒内只记一条（compare_exchange 失败=并发已记）
+        }
+        QFile f(QCoreApplication::applicationDirPath()
+                + QStringLiteral("/debug.log"));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Append)) {
+            f.write(QStringLiteral("[%1] [sandbox] 已拦截 Agent 物理输入模拟（%2，后续同类不重记）——请用 sandbox_* 工具消息级驱动\r\n")
+                        .arg(QDateTime::currentDateTime().toString(
+                                 QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                             QString::fromUtf8(a_sKind))
+                        .toUtf8());
+        }
     }
 
     static void CALLBACK HookProc(HWINEVENTHOOK, DWORD, HWND a_hWnd,
@@ -217,9 +297,15 @@ CSandboxManager::~CSandboxManager() {
 }
 
 void CSandboxManager::SetConfig(const SSbxCfg& a_stCfg) {
+    // 持锁写：工作线程 Execute/ExecuteLocked 持 m_mtxState 读同一结构（status/
+    //   capture 分支），非原子结构无锁并发写=撕裂读风险。
+    QMutexLocker oL(&m_mtxState);
     m_stCfg = a_stCfg;
     m_stCfg.iFps = qBound(1, m_stCfg.iFps, 15);
     m_stCfg.iRetainDays = qBound(1, m_stCfg.iRetainDays, 365);
+    // 2026-11-02 配置热更同步拦截生效位（开关即时生效）。
+    g_bEatSynth.store(m_stCfg.bBlockSynth && m_bAgentActive && m_stCfg.bEnable,
+                      std::memory_order_relaxed);
 }
 
 QString CSandboxManager::RecordDir() const {
@@ -231,6 +317,10 @@ QString CSandboxManager::ShotDir() const {
 }
 
 void CSandboxManager::SetProjectRoot(const QString& a_sRoot) {
+    // 持锁写：钩子线程经 ConsiderWindow→IsProjectTestPid/AddWindow 在 m_mtxState
+    //   下读 m_sProjRoot（QString 隐式共享，无锁并发读写可致 d 指针撕裂/引用
+    //   计数竞争——切工程瞬间恰有测试窗口弹出时可能崩溃）。
+    QMutexLocker oL(&m_mtxState);
     m_sProjRoot = a_sRoot;
 }
 
@@ -278,6 +368,10 @@ void CSandboxManager::ReadoptProjectWindows() {
         sRoot += QLatin1Char('/');
     }
     const ULONG dwNow = GetTickCount();
+    // 收纳/还原循环持状态锁：GhostAndTrack/RebuildCacheLocked 的契约是「调用方
+    //   持 m_mtxState」，而本函数在 Start 与每次切工程时跑——工作线程
+    //   ExecuteLocked 正持同锁改 m_aEntries，无锁并发写同一 QList 可容器损坏。
+    QMutexLocker oL(&m_mtxState);
     for (const auto& pr : std::as_const(stCtx.aMarked)) {
         const HWND h = pr.first;
         // 实例互斥：幽灵中且收纳者是活着的其他实例（本窗口归它管）→ 不越权
@@ -338,9 +432,12 @@ void CSandboxManager::Start() {
         }
     }
     // ③ 钩子 + 周期扫描（总开关开才收纳；关时仅保留命令通道与孤儿还原）。
+    //   2026-11-02：钩子线程的启动条件扩为 AutoGhost ∥ BlockSynth——物理输入
+    //   拦截（LL 钩子）与窗口收纳（WinEvent）共用该线程；用户关自动收纳但开
+    //   拦截时也要起线程（ConsiderWindow 内部因 AutoGhost=false 不收纳，无副作用）。
     if (m_stCfg.bEnable) {
         g_pSbxMgrForHook.store(this, std::memory_order_release);
-        if (m_stCfg.bAutoGhost) {
+        if (m_stCfg.bAutoGhost || m_stCfg.bBlockSynth) {
             auto* pHook = new CSbxHookThread(this);
             pHook->setObjectName(QStringLiteral("sbxHook"));
             m_pHookTh = pHook;
@@ -403,6 +500,7 @@ void CSandboxManager::Shutdown() {
         }
     }
     g_pSbxMgrForHook.store(nullptr, std::memory_order_release);
+    g_bSbxAgentActive.store(false, std::memory_order_relaxed);   // 退出即非 Agent 运行态
     m_aPendingGhosts.clear();   // 宽限期待定作废（定时器 lambda 有窗口有效性复判）
     // 停钩子线程（SetWinEventHook 要求安装线程自己 Unhook）。
     // 2026.09.28 有限等待线程退出：不等得重雪旧实现（QThread 父子托管）
@@ -411,7 +509,11 @@ void CSandboxManager::Shutdown() {
         auto* pHook = static_cast<CSbxHookThread*>(m_pHookTh);
         pHook->StopHook();
         if (!pHook->wait(2000)) {
-            qWarning("[CSandboxManager] 钩子线程未在 2s 内退出（可能卡在 UnhookWinEvent）");
+            // 卡在 UnhookWinEvent：摘离父子托管并放弃回收——线程对象以 this 为父，
+            //   若仍在运行就被 ~QObject 连带 delete 会触发 qFatal「Destroyed while
+            //   thread is still running」直接终止进程（泄漏优于终止；进程即将退出）。
+            qWarning("[CSandboxManager] 钩子线程未在 2s 内退出（可能卡在 UnhookWinEvent），放弃回收");
+            pHook->setParent(nullptr);
         }
         m_pHookTh = nullptr;   // finished→deleteLater 已挂，对象由事件循环回收
     }
@@ -449,6 +551,21 @@ void CSandboxManager::ReloadConfig() {
         }
         if (!m_tBirth.isActive()) {
             m_tBirth.start();
+        }
+        // 2026-11-02：热更补起钩子线程（启动时 AutoGhost/BlockSynth 均关、运行中
+        //   开任一）——条件与 Start③一致；WinEvent/LL 钩子随线程常驻。
+        if (m_pHookTh == nullptr && (m_stCfg.bAutoGhost || m_stCfg.bBlockSynth)) {
+            auto* pHook = new CSbxHookThread(this);
+            pHook->setObjectName(QStringLiteral("sbxHook"));
+            m_pHookTh = pHook;
+            QPointer<CSandboxManager> pSelf(this);
+            connect(pHook, &QThread::finished, pHook, [pSelf, pHook]() {
+                if (!pSelf.isNull() && pSelf->m_pHookTh == pHook) {
+                    pSelf->m_pHookTh = nullptr;
+                }
+                pHook->deleteLater();
+            });
+            pHook->start();
         }
     } else {
         m_tSweep.stop();
@@ -688,6 +805,48 @@ bool CSandboxManager::IsProjectTestPid(DWORD a_dwPid) {
     return iAgeMs >= 0 && iAgeMs < 10LL * 60 * 1000;
 }
 
+// 2026-11-02 %TEMP% 产物兑底（实现见头文件注释；QuickTool 实害链收口）。
+bool CSandboxManager::IsTempArtifactPid(DWORD a_dwPid) {
+    if (!g_bSbxAgentActive.load(std::memory_order_relaxed) || a_dwPid == 0) {
+        return false;   // Agent 空闲期永不兑底（用户自己跑临时程序不收）
+    }
+    const QString sExe = QDir::fromNativeSeparators(sbx::ExePathOfPid(a_dwPid)).toLower();
+    if (sExe.isEmpty()) {
+        return false;
+    }
+    bool bTemp = false;
+    const QString sTmp = QDir::fromNativeSeparators(QDir::tempPath()).toLower();
+    if (!sTmp.isEmpty() && sExe.startsWith(sTmp)) {
+        bTemp = true;
+    } else {
+        // exe 同级 ~Temperary（v5.1.428 程序临时根）——部分链路副本落这里。
+        const QString sAppTmp = QDir::fromNativeSeparators(
+            QCoreApplication::applicationDirPath() + QStringLiteral("/~Temperary")).toLower();
+        if (sExe.startsWith(sAppTmp)) {
+            bTemp = true;
+        }
+    }
+    if (!bTemp) {
+        return false;
+    }
+    // 父死 + 新建 <10 分钟（与 IsProjectTestPid 同守卫：父表防陈旧 + 锁序）。
+    QMutexLocker oMap(&m_mtxPidMap);
+    const qint64 iNow = QDateTime::currentMSecsSinceEpoch();
+    if (m_oParentMap.isEmpty() || iNow - m_iMapBuiltMs > 500) {
+        sbx::BuildParentMap(m_oParentMap, m_oParentCreated);
+        m_iMapBuiltMs = iNow;
+    }
+    if (sbx::IsParentAlive(a_dwPid, m_oParentMap)) {
+        return false;   // 父活着：用户主动打开（任意启动器），不兑底
+    }
+    const qint64 iCreated = m_oParentCreated.value(a_dwPid, 0);
+    if (iCreated <= 0) {
+        return false;   // 创建时刻不可得：保守不兑底
+    }
+    const qint64 iAgeMs = QDateTime::currentMSecsSinceEpoch() - iCreated;
+    return iAgeMs >= 0 && iAgeMs < 10LL * 60 * 1000;
+}
+
 bool CSandboxManager::LaunchAut(const QJsonObject& a_oArgs, QString& a_sOut) {
     // sandbox launch <exe> [args...]：主进程亲自启动被测程序并登记手工根——
     //   窗口弹出即收纳（TreePid 命中手工根 + 零宽限直收），不受 Agent shell
@@ -777,7 +936,12 @@ bool CSandboxManager::ConsiderWindowImpl(HWND a_hWnd, bool a_bFinal) {
             //   （OnBirthScan）则收纳（与树内同零宽限直收：链在出生时验证过，
             //   用户豁免登记不涉及 Agent 后代）。
             if (!IsAgentBornPid(dwPid)) {
-                return false;
+                // 2026-11-02 %TEMP% 产物兑底（四道闸收口）：出生登记漏逮
+                //   （中间人秒退 <250ms）且 exe 在临时目录——Agent 拷 exe 到
+                //   %TEMP%/~Temperary 启动的最后盲区（QuickTool 实害链终点）。
+                if (!IsTempArtifactPid(dwPid)) {
+                    return false;
+                }
             }
         }
     }
@@ -1087,6 +1251,19 @@ bool CSandboxManager::ExecuteLocked(const QString& a_sCmd, const QJsonObject& a_
     auto fnLeaf = [this](auto a_fn) { m_mtxState.unlock(); const auto r = a_fn(); m_mtxState.lock(); return r; };
     const QString sCmd = a_sCmd.toLower();
     a_sOut.clear();
+    // 2026-11-02 Agent 运行态联动（宿主起停助手/任务时通知）：置位/清位
+    //   物理输入拦截生效位（与 cfg.bBlockSynth 相与）。
+    if (sCmd == QStringLiteral("agent_active")) {
+        m_bAgentActive = a_oArgs.value(QStringLiteral("on")).toBool(true);
+        g_bSbxAgentActive.store(m_bAgentActive, std::memory_order_relaxed);
+        g_bEatSynth.store(m_stCfg.bBlockSynth && m_bAgentActive && m_stCfg.bEnable,
+                          std::memory_order_relaxed);
+        a_sOut = QStringLiteral("物理输入拦截：%1（Agent %2，累计吞 %3）")
+                     .arg(g_bEatSynth.load() ? QStringLiteral("生效") : QStringLiteral("停用"),
+                          m_bAgentActive ? QStringLiteral("运行中") : QStringLiteral("空闲"))
+                     .arg(g_uEatCount.load());
+        return true;
+    }
     if (sCmd == QStringLiteral("status")) {
         a_sOut = QStringLiteral("沙箱：%1｜自动收纳：%2｜录像：%3（帧率 %4）｜在册窗口 %5 个\n录像目录：%6")
             .arg(m_stCfg.bEnable ? QStringLiteral("启用") : QStringLiteral("停用"))
@@ -1171,6 +1348,53 @@ bool CSandboxManager::ExecuteLocked(const QString& a_sCmd, const QJsonObject& a_
                          .arg(bDbl ? QStringLiteral(" 双击") : QString())
                          .arg(bRight ? QStringLiteral(" 右键") : QString())
                    : QStringLiteral("点击失败（窗口无效）");
+        if (bOk) {
+            for (const SEntry& st : std::as_const(m_aEntries)) {
+                if (st.h == h && st.pRec != nullptr) {
+                    st.pRec->SetClickMarker(iX, iY);
+                }
+            }
+        }
+        return bOk;
+    }
+    if (sCmd == QStringLiteral("hclick")) {
+        // 2026-11-02 宿主代发硬件级点击（只认硬件输入的程序专用：QuickTool 任务栏
+        //   实测消息级点击假阳性）。Agent 自己发 SendInput 会被物理拦截吞掉；
+        //   本命令在「临时关拦截窗口」内代发——关拦→移光标→mouse_event→事件流过
+        //   钩子→恢复原拦截态。窗口总时长约 250ms（点击 100ms + 过钩子 150ms），
+        //   Agent 恰在窗口期自发输入的概率极低且仅单次，可接受。
+        const int iX = a_oArgs.value(QStringLiteral("x")).toInt();
+        const int iY = a_oArgs.value(QStringLiteral("y")).toInt();
+        const bool bDbl = a_oArgs.value(QStringLiteral("dbl")).toBool();
+        const bool bRight = a_oArgs.value(QStringLiteral("right")).toBool();
+        // 客户区坐标 → 屏幕坐标（与 click 同口径）
+        POINT stPt = { iX, iY };
+        const bool bOk = fnLeaf([&]() {
+            if (!ClientToScreen(h, &stPt)) {
+                return false;
+            }
+            const bool bPrev = g_bEatSynth.exchange(false);   // 关拦截窗口
+            SetCursorPos(stPt.x, stPt.y);
+            Sleep(60);
+            const DWORD dwDown = bRight ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
+            const DWORD dwUp   = bRight ? MOUSEEVENTF_RIGHTUP   : MOUSEEVENTF_LEFTUP;
+            mouse_event(dwDown, 0, 0, 0, 0);
+            Sleep(40);
+            mouse_event(dwUp, 0, 0, 0, 0);
+            if (bDbl) {   // 双击 = 同位置再来一轮（间隔小于系统双击阈值）
+                Sleep(40);
+                mouse_event(dwDown, 0, 0, 0, 0);
+                Sleep(40);
+                mouse_event(dwUp, 0, 0, 0, 0);
+            }
+            Sleep(150);   // 等事件流过低级钩子再恢复拦截（免吞掉自己）
+            g_bEatSynth.store(bPrev);
+            return true;
+        });
+        a_sOut = bOk ? QStringLiteral("已硬件点击 (%1,%2)%3%4（宿主代发）").arg(iX).arg(iY)
+                         .arg(bDbl ? QStringLiteral(" 双击") : QString())
+                         .arg(bRight ? QStringLiteral(" 右键") : QString())
+                   : QStringLiteral("硬件点击失败（窗口无效）");
         if (bOk) {
             for (const SEntry& st : std::as_const(m_aEntries)) {
                 if (st.h == h && st.pRec != nullptr) {

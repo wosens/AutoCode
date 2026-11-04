@@ -111,6 +111,7 @@ private:
         QByteArray reqHead;    // 已解析的请求头（含末尾空行）
         bool bHeadDone = false;
         bool bForwarded = false;   // 请求已发上游（其后上游→客户端纯管道）
+        bool bRespSent = false;    // 已向客户端回写过响应字节（FailConn 判据：不再补 502）
         // —— 2026-10-31 响应侧状态（workdir 消毒）——
         int  eResp = 0;             // 0=头未收全 1=盲转发 2=chunked+SSE 重写
         QByteArray aRespHead;       // 头阶段积累（收全后判定模式并清空）
@@ -118,6 +119,8 @@ private:
         qint64 llChunkRemain = -1;  // chunked：当前帧剩余（-1=待尺寸行，-3=待帧尾 CRLF）
         QByteArray aSseLine;        // SSE 半行残余（跨帧拼接）
         QList<SHeldArgs> aHeld;     // 扣留的 arguments（finish/[DONE]/终止帧冲刷）
+        QByteArray aUpTail;         // 响应流滚动尾巴（usage JSON 跨块拼接；按连接隔离）
+        int iUpTailScan = 0;        // 已扫描偏移（防已上报 usage 重复 emit）
     };
 
     void CleanupConn(SConn* a_pConn);
@@ -137,7 +140,6 @@ private:
     int   m_iMaxTokens = 32768;
     QString m_sWorkDir;      // 2026-10-31 会话工作目录（相对 workdir 校验基准）
     quint16 m_uPort = 0;
-    QByteArray m_aUpTail;   // 上游→客户端流的滚动尾巴（usage JSON 跨块拼接用）
 
-    void ScanUsage(const QByteArray& a_pChunk);
+    void ScanUsage(SConn* a_pConn, const QByteArray& a_pChunk);
 };

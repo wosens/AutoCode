@@ -9,11 +9,11 @@
 
 // 单个阶段的元数据：驱动 prompt 加载、工具集、IO 文件
 struct SStageDef {
-    EStage      eStage;
+    EStage      eStage{};    // 2026-11-02 类内初始化：缺省构造漏赋字段不再读未初始化值（NSDMI 仍为聚合）
     QString     sId;          // 英文 id：intake / design ...
     QString     sNameZh;      // 中文名：需求收集 / 设计 ...
-    bool        bFeature;     // 是否属于 Feature 流程
-    bool        bBugfix;      // 是否属于 Bugfix 流程
+    bool        bFeature = false;   // 是否属于 Feature 流程
+    bool        bBugfix = false;    // 是否属于 Bugfix 流程
     QString     sTools;       // 该阶段禁用的工具集（deny 黑名单 → --disallowedTools；bypass 模式下仍生效）
     QString     sPromptFile;  // prompts 目录下的模板文件名
     QStringList aInputs;      // 输入文件（相对任务私有目录 .autodev/tasks/<id>/）
@@ -37,7 +37,7 @@ QList<EStage> ResolveFlow(ETaskType a_eType, const QList<EStage>& a_aCustom);
 //   （产物 → 产出阶段反查 StageDef.sOutput；guide.md 等非阶段产物恒保留）。
 //   过滤后为空 → 兜底 requirements.md（若 ConfirmReq 在流内）否则 intake.md，
 //   保证任何勾选组合下阶段至少有一份有效输入、EnsureStageInputs 不弹回。
-//   返回的 a_bDropped 回带被滤掉的输入名（供编排器注入「流水线说明」）。
+//   出参 a_pDropped（非空时）回带被滤掉的输入名（供编排器注入「流水线说明」）。
 QStringList FilterInputs(const SStageDef& a_stDef, const QList<EStage>& a_aFlow,
                          QStringList* a_pDropped = nullptr);
 

@@ -597,7 +597,17 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
     const bool bBinExt = s_aBinExt.contains(sSuffix);
     int iZero = 0;
     for (char c : aBytes) { if (c == '\0') ++iZero; }
-    bool bBinary = bBinExt || (!aBytes.isEmpty() && iZero * 10 > aBytes.size());
+    // 2026-10-31 v5.2.460 文本 BOM 优先于 NUL 启发式（实害：VS 资源编辑器生成的
+    //   resource.h 默认 UTF-16 LE（NUL ≈50%），旧逻辑误判二进制走十六进制视图；
+    //   BOM 是显式编码标记，空字节比例启发式向它让位——与 config 编码治理同原则：
+    //   显式标记防误判。已知二进制后缀仍优先（不带 BOM 但确属二进制）。
+    const bool bHasTextBom = (aBytes.size() >= 2
+            && ((uchar(aBytes[0]) == 0xFF && uchar(aBytes[1]) == 0xFE)
+             || (uchar(aBytes[0]) == 0xFE && uchar(aBytes[1]) == 0xFF)))
+        || (aBytes.size() >= 3 && uchar(aBytes[0]) == 0xEF
+            && uchar(aBytes[1]) == 0xBB && uchar(aBytes[2]) == 0xBF);
+    bool bBinary = bBinExt
+        || (!aBytes.isEmpty() && !bHasTextBom && iZero * 10 > aBytes.size());
 
     QString sEnc, sText;
     if (!bBinary) {

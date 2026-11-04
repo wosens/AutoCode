@@ -144,16 +144,14 @@ qt_add_executable(AutoCode WIN32
     db/CTaskHistoryDB.cpp
     sqlite3.h
     sqlite3.c
-    # 内置测试沙箱（2026-09-26）：Agent 后代窗口自动幽灵化收纳 + 消息级操控 +
-    # MP4 录像（MF H264）+ 管理对话框；MCP 工具/CLI 统一入口见 CSandboxManager
-    sandbox/CSandboxCore.h
-    sandbox/CSandboxCore.cpp
-    sandbox/CSandboxManager.h
-    sandbox/CSandboxManager.cpp
-    sandbox/CSandboxRecorder.h
-    sandbox/CSandboxRecorder.cpp
-    sandbox/CSandboxDialog.h
-    sandbox/CSandboxDialog.cpp
+    # 测试沙箱（2026-11-01 动态库化）：实现整体退到 GhostSandbox.dll（TestSandbox\），
+    # exe 只留宿主门面（加载/转发）+ CLI 解析（子进程模式不加载沙箱 dll）；
+    # ABI 边界见 sandbox/SandboxAbi.h，接入文档 doc/测试沙箱接入开发指南.md。
+    sandbox/SandboxAbi.h
+    sandbox/CSandboxHost.h
+    sandbox/CSandboxHost.cpp
+    sandbox/SandboxCli.h
+    sandbox/SandboxCli.cpp
     # 2026-09-30 代码审查接入（ReviewSdk.dll 动态加载 + 异步审查服务 + 右键审查对话框）
     review/CReviewSdkClient.h
     review/CReviewSdkClient.cpp
@@ -232,6 +230,115 @@ add_custom_command(TARGET AutoCode PRE_BUILD
 set_target_properties(AutoCode PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY         ${CMAKE_CURRENT_SOURCE_DIR}/Execute
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# ============================================================================
+# GhostSandbox.dll —— 首个测试沙箱动态库（2026-11-01 沙箱动态库化）。
+#   即原「内置幽灵沙箱」整体（Core/Manager/Recorder/Dialog + ABI 适配层）；
+#   输出到 Execute/TestSandbox/（主程序 QLibrary 按全路径加载，[Sandbox] Type 路由）；
+#   私有依赖/配置目录 Execute/TestSandbox/GhostSandbox\（资产正本 sandbox/assets/）。
+# WINDOWS_EXPORT_ALL_SYMBOLS：C++ 类/sbx:: 函数导出给单测直调；跨模块数据导入
+#   不可靠（Core 的 prop 名已函数化）；C ABI 导出在 SandboxAbi.h 里显式 dllexport。
+# ============================================================================
+add_library(GhostSandbox SHARED
+    sandbox/SandboxAbi.h
+    sandbox/CGhostSandboxEntry.cpp
+    sandbox/CSandboxCore.h
+    sandbox/CSandboxCore.cpp
+    sandbox/CSandboxManager.h
+    sandbox/CSandboxManager.cpp
+    sandbox/CSandboxRecorder.h
+    sandbox/CSandboxRecorder.cpp
+    sandbox/CSandboxDialog.h
+    sandbox/CSandboxDialog.cpp
+    sandbox/SandboxCli.h
+    sandbox/SandboxCli.cpp
+)
+target_include_directories(GhostSandbox PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
+)
+target_link_libraries(GhostSandbox PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Widgets dwmapi Shell32 user32
+    mfplat mfreadwrite mfuuid ole32 oleaut32
+)
+set_target_properties(GhostSandbox PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+    RUNTIME_OUTPUT_DIRECTORY         ${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox
+    LIBRARY_OUTPUT_DIRECTORY         ${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox
+    LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox
+)
+# 沙箱私有目录（同名文件夹）：依赖与自有配置正本随建随更（不删用户自加文件）。
+add_custom_command(TARGET GhostSandbox POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:GhostSandbox>/GhostSandbox"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/sandbox/assets/GhostSandbox"
+        "$<TARGET_FILE_DIR:GhostSandbox>/GhostSandbox"
+    COMMENT "Sync TestSandbox/GhostSandbox private dir"
+)
+
+# ============================================================================
+# MsbSandbox —— 第二个测试沙箱（2026-11-01：Rust SDK→cdylib 接入 microsandbox）。
+#   源码 msbsandbox/（Cargo 工程，C ABI 见 SandboxAbi.h）；可选 target：需要
+#   Rust 工具链（cargo）且首次构建联网拉 crates（已配 rsproxy 镜像），故不入
+#   ALL/默认构建——手动 cmake --build . --target MsbSandbox。
+#   产物归置同 GhostSandbox 口径（2026-11-01 用户指令）：一切构建产物只落
+#   Execute/TestSandbox/——cargo 中间产物走 CARGO_TARGET_DIR（源码树零残留；
+#   固定盘根短路径 E:\msb-target：长路径下 cc-rs 调 MSVC lib.exe 报 1104
+#   ——AutoCode\build\msbsandbox-target 实测复现，盘根短路径实测通过），
+#   dll+pdb 部署到 TestSandbox；runtime（msb.exe+libkrunfw.dll，
+#   ≈70MB，首次 cargo 构建时 SDK 自动装到 ~/.microsandbox）构建后自动同步到
+#   TestSandbox/MsbSandbox/runtime/（已存在则 copy_if_different 增量）。资产
+#   正本 sandbox/assets/MsbSandbox/（README；runtime 二进制不入仓库）。
+# ============================================================================
+file(TO_NATIVE_PATH "E:/msb-target" MSB_CARGO_TARGET)
+# runtime 同步命令（~/.microsandbox 存在时才追加；首次构建后重跑 cmake 补齐）
+set(MSB_RUNTIME_CMDS "")
+if(EXISTS "$ENV{USERPROFILE}/.microsandbox/bin/msb.exe")
+    list(APPEND MSB_RUNTIME_CMDS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$ENV{USERPROFILE}/.microsandbox/bin/msb.exe"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox/runtime/bin/msb.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$ENV{USERPROFILE}/.microsandbox/lib/libkrunfw.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox/runtime/lib/libkrunfw.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$ENV{USERPROFILE}/.microsandbox/lib/libkrunfw.dll"
+            "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox/runtime/bin/libkrunfw.dll")
+endif()
+add_custom_target(MsbSandbox
+    # ① 资产正本 → 私有目录
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/sandbox/assets/MsbSandbox"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox"
+    # ② cargo 构建（中间产物钉进 build/msbsandbox-target，源码树不留 target/）
+    COMMAND ${CMAKE_COMMAND} -E env
+        "CARGO_TARGET_DIR=${MSB_CARGO_TARGET}"
+        cargo build --release
+    # ③ 部署 dll + pdb（与 GhostSandbox 同目录口径）
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "E:/msb-target/release/MsbSandbox.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "E:/msb-target/release/MsbSandbox.pdb"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox.pdb"
+    # ④ runtime 同步：~/.microsandbox（SDK download-binaries 安装位）→ 私有目录
+    #    （源缺失时静默跳过——首次构建已装，重建不重复下载）
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox/runtime/bin"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Execute/TestSandbox/MsbSandbox/runtime/lib"
+    # ④ runtime 同步（configure 期探测 ~/.microsandbox，存在才生成拷贝命令；
+    #    cmd 内嵌 if exist 的引号在 VERBATIM 下损坏，故用 configure 期分支）。
+    #    msb.exe 静态导入 libkrunfw.dll：bin 旁须有副本（否则 spawn 即 0xC0000135；
+    #    注意 msb.exe 还静态导入 winhvplatform.dll——WHP 未启用的机器上 msb.exe
+    #    本就无法启动，属预期，启用后自愈）。
+    ${MSB_RUNTIME_CMDS}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/msbsandbox"
+    COMMENT "Build & deploy MsbSandbox.dll (Rust cdylib, needs cargo + network)"
+    VERBATIM
 )
 
 # 环境安装脚本随 exe 输出到 Execute 目录（功能菜单 → 环境安装 调用）
@@ -329,6 +436,8 @@ qt_add_executable(test_projectmanager
     core/CTaskInfo.cpp
     ui/CSettingsDialog.h
     ui/CSettingsDialog.cpp
+    sandbox/CSandboxHost.h
+    sandbox/CSandboxHost.cpp      # 2026-11-01 沙箱类型枚举（TestSandbox\*.dll）
     ui/CVersionDialog.h
     ui/CVersionDialog.cpp
 )
@@ -446,12 +555,8 @@ qt_add_executable(test_tasklistpanel
     ui/CTaskListPanel.cpp
     ui/CProjectExplorerPanel.h
     ui/CProjectExplorerPanel.cpp
-    sandbox/CSandboxCore.h
-    sandbox/CSandboxCore.cpp
-    sandbox/CSandboxManager.h
-    sandbox/CSandboxManager.cpp
-    sandbox/CSandboxRecorder.h
-    sandbox/CSandboxRecorder.cpp
+    sandbox/CSandboxHost.h
+    sandbox/CSandboxHost.cpp      # 2026-11-01 豁免登记经宿主单例（沙箱实现在 GhostSandbox.dll）
     core/StageDef.h
     core/StageDef.cpp
     core/TaskTypes.h
@@ -464,7 +569,14 @@ target_include_directories(test_tasklistpanel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ui
     ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
 )
-target_link_libraries(test_tasklistpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test Shell32 dwmapi mfplat mfreadwrite mfuuid ole32 frwdevice)
+target_link_libraries(test_tasklistpanel PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test Shell32 frwdevice GhostSandbox)
+# 2026-11-01 沙箱动态库化：import-lib 链 GhostSandbox.dll；Windows 加载器按 exe 目录
+# 搜 DLL，而 dll 落 TestSandbox\ —— 拷一份到测试输出目录（同配置目录，Debug/Release 均可）。
+add_custom_command(TARGET test_tasklistpanel POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:GhostSandbox>" "$<TARGET_FILE_DIR:test_tasklistpanel>/GhostSandbox.dll"
+    COMMENT "Mirror GhostSandbox.dll for test_tasklistpanel"
+)
 set_target_properties(test_tasklistpanel PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -657,6 +769,8 @@ set_target_properties(test_rollback PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_rollback COMMAND test_rollback)
+
+
 
 
 
@@ -992,18 +1106,19 @@ add_test(NAME test_reviewsdk COMMAND test_reviewsdk)
 #      刻意不进 offscreen 清单；无窗口环境（无桌面会话）自动 QSKIP ----
 qt_add_executable(test_sandbox
     tests/test_sandbox.cpp
-    sandbox/CSandboxCore.h
-    sandbox/CSandboxCore.cpp
-    sandbox/CSandboxManager.h
-    sandbox/CSandboxManager.cpp
-    sandbox/CSandboxRecorder.h
-    sandbox/CSandboxRecorder.cpp
 )
+# 2026-11-01 沙箱动态库化：直调符号（sbx::*/CSandboxManager）经 import lib 来自
+# GhostSandbox.dll（WINDOWS_EXPORT_ALL_SYMBOLS 全导出）。
 target_include_directories(test_sandbox PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/sandbox
 )
-target_link_libraries(test_sandbox PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test dwmapi Shell32 mfplat mfreadwrite mfuuid ole32)
+target_link_libraries(test_sandbox PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test GhostSandbox)
+add_custom_command(TARGET test_sandbox POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:GhostSandbox>" "$<TARGET_FILE_DIR:test_sandbox>/GhostSandbox.dll"
+    COMMENT "Mirror GhostSandbox.dll for test_sandbox"
+)
 set_target_properties(test_sandbox PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
@@ -1067,6 +1182,34 @@ target_include_directories(probe_sorec PRIVATE
 )
 target_link_libraries(probe_sorec PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets frwdevice)
 set_target_properties(probe_sorec PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# ==== 复制浮层不透明底像素探针（2026-11-03：双击选择态被选文字背景不得透明，透明则与
+#     底下 delegate 原条目文字叠加成重影）——手动运行：Execute\probe_ovbg.exe，
+#     退出码 0=不透明通过 / 3=透明失败，产出 ovbg_*.png 供人眼复核。====
+qt_add_executable(probe_ovbg
+    tests/probe_ovbg.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+)
+target_include_directories(probe_ovbg PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(probe_ovbg PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test frwdevice)
+set_target_properties(probe_ovbg PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 

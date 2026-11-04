@@ -1,4 +1,5 @@
-#include "CSettingsDialog.h"
+﻿#include "CSettingsDialog.h"
+#include "sandbox/CSandboxHost.h"   // 2026-11-01 沙箱类型枚举（TestSandbox\*.dll）
 
 #include <QAbstractItemModel>
 #include <QAbstractItemView>   // NoEditTriggers（模型列表双击改开编辑对话框）
@@ -1004,14 +1005,41 @@ void CSettingsDialog::SetupUi() {
     pLayDirsCol->addLayout(pRowDirs2);
     fnAddPair(pRowDirs2, QStringLiteral("备份恢复排除："), m_pEditBackupDirs, 1);
 
-    // —— 内置测试沙箱（2026-09-26）——：Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 +
-    //    点击穿透 + 无任务栏，用户无感），Agent 经 sandbox_* MCP 工具/--sandbox 命令
-    //    操控/截图，全程自动 MP4 录像。 ——
     // —— 内置测试沙箱（2026-09-26；2026.09.27 开关两项/录像参数各合并一行）——：
     //    Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 + 点击穿透 + 无任务栏，用户无感），
     //    Agent 经 sandbox_* MCP 工具/--sandbox 命令操控/截图，全程自动 MP4 录像。 ——
     auto* pGroupSbx = new QGroupBox(QStringLiteral("测试沙箱"), this);
     auto* pLaySbxCol = new QVBoxLayout(pGroupSbx);
+    // 2026-11-02 双沙箱并行路由（替代旧单选 Type 下拉）：窗口槽与 VM 槽同时
+    //   可用、宿主按命令自动路由（vm_*→microVM，窗口类→幽灵沙箱）——Windows
+    //   GUI 程序只能在窗口沙箱测（microVM guest 是 Linux），两类需求互补。
+    auto* pRowSbxType = new QHBoxLayout();
+    pLaySbxCol->addLayout(pRowSbxType);
+    m_pChkSbxWindow = new QCheckBox(QStringLiteral("窗口沙箱：GhostSandbox"), pGroupSbx);
+    m_pChkSbxWindow->setToolTip(QStringLiteral(
+        "Windows GUI 程序测试（Agent 启动的窗口自动幽灵化收纳/截图/消息级点击）。\n"
+        "microVM 里跑不了 Windows 程序（guest 是 Linux），GUI 测试主力（需勾选）"));
+    pRowSbxType->addWidget(m_pChkSbxWindow);
+    pRowSbxType->addSpacing(12);
+    m_pChkSbxVm = new QCheckBox(QStringLiteral("Linux microVM：MsbSandbox"), pGroupSbx);
+    m_pChkSbxVm->setToolTip(QStringLiteral(
+        "Linux 命令硬隔离沙箱（vm_exec 独立内核跑 alpine，文件系统/网络隔离）——\n"
+        "不可信命令/跨平台验证用。需 Windows「虚拟机监控程序平台」(WHP)；\n"
+        "未启用时保存会引导提权开启，运行期该槽自动降级不影响窗口沙箱"));
+    pRowSbxType->addWidget(m_pChkSbxVm);
+    {
+        QString sEnumErr;
+        const auto aProv = CSandboxHost::EnumSandboxes(&sEnumErr);
+        if (!sEnumErr.isEmpty()) {
+            m_pChkSbxWindow->setToolTip(m_pChkSbxWindow->toolTip()
+                + QStringLiteral("\n枚举提示：%1").arg(sEnumErr));
+        }
+    }
+    m_pChkSbxWindow->setChecked(
+        (m_pPm != nullptr) ? m_pPm->LoadSandboxWindowEnable() : true);
+    m_pChkSbxVm->setChecked(
+        (m_pPm != nullptr) ? m_pPm->LoadSandboxVmEnable() : false);
+    pRowSbxType->addStretch(1);
     auto* pRowSbxChk = new QHBoxLayout();
     pLaySbxCol->addLayout(pRowSbxChk);
     m_pChkSbxEnable = new QCheckBox(QStringLiteral("启用内置测试沙箱"), pGroupSbx);
@@ -1032,25 +1060,42 @@ void CSettingsDialog::SetupUi() {
     m_pChkSbxRecord->setToolTip(QStringLiteral(
         "每个收纳窗口自动录像（PrintWindow 离屏截帧 + H264 编码），存"
         " exe\\sandbox\\rec\\；窗口还原/关闭时自动封盘（[Sandbox] Record，默认开）"));
+    // 2026-11-02 物理输入拦截：Agent 运行期吞掉合成鼠标/键盘（SendInput/pyautogui
+    //   等物理模拟带 INJECTED 标志）——机制性根治 Agent 抢占用户鼠标键盘；用户
+    //   真实硬件输入不受影响（Agent 空闲时不拦截）。
+    m_pChkSbxBlockSynth = new QCheckBox(
+        QStringLiteral("拦截 Agent 物理输入模拟（鼠标键盘不被抢占）"), pGroupSbx);
+    m_pChkSbxBlockSynth->setChecked(
+        (m_pPm != nullptr) ? m_pPm->LoadSandboxBlockSynth() : true);
+    m_pChkSbxBlockSynth->setToolTip(QStringLiteral(
+        "助手/任务运行期间，自动拦截 Agent 发出的物理鼠标/键盘模拟"
+        "（SendInput/pyautogui 等合成输入）并丢弃——模型不守规矩时也无法抢占你的"
+        "键鼠；界面测试请让它用 sandbox_* 工具（消息级，天然无扰）。\n"
+        "你自己的真实键鼠不受影响；Agent 空闲时不拦截（[Sandbox] BlockSynth，默认开）"));
     auto* pRowSbxRec = new QHBoxLayout();
     pLaySbxCol->addLayout(pRowSbxRec);
+    // 2026-11-02 物理输入拦截单独一行（含义重要，不与录像参数混排）。
+    pRowSbxRec->addWidget(m_pChkSbxBlockSynth);
+    pRowSbxRec->addStretch(1);
+    auto* pRowSbxRec2 = new QHBoxLayout();
+    pLaySbxCol->addLayout(pRowSbxRec2);
     // 2026-10-08 录制开关并入录像参数行（复选框+帧率+保留均短，合一行压缩纵向占用）。
-    pRowSbxRec->addWidget(m_pChkSbxRecord);
-    pRowSbxRec->addSpacing(12);
+    pRowSbxRec2->addWidget(m_pChkSbxRecord);
+    pRowSbxRec2->addSpacing(12);
     m_pSpinSbxFps = new QSpinBox(pGroupSbx);
     m_pSpinSbxFps->setRange(1, 15);
     m_pSpinSbxFps->setSuffix(QStringLiteral(" fps"));
     m_pSpinSbxFps->setToolTip(QStringLiteral(
         "录像帧率；界面验证场景 5fps 足够（文件小、过程可回放）（[Sandbox] Fps，默认 5）"));
-    fnAddPair(pRowSbxRec, QStringLiteral("录像帧率："), m_pSpinSbxFps);
-    pRowSbxRec->addSpacing(12);
+    fnAddPair(pRowSbxRec2, QStringLiteral("录像帧率："), m_pSpinSbxFps);
+    pRowSbxRec2->addSpacing(12);
     m_pSpinSbxRetain = new QSpinBox(pGroupSbx);
     m_pSpinSbxRetain->setRange(1, 365);
     m_pSpinSbxRetain->setSuffix(QStringLiteral(" 天"));
     m_pSpinSbxRetain->setToolTip(QStringLiteral(
         "录像保留天数：启动时清理超期 MP4（[Sandbox] RetainDays，默认 7 天）"));
-    fnAddPair(pRowSbxRec, QStringLiteral("录像保留："), m_pSpinSbxRetain);
-    pRowSbxRec->addStretch(1);
+    fnAddPair(pRowSbxRec2, QStringLiteral("录像保留："), m_pSpinSbxRetain);
+    pRowSbxRec2->addStretch(1);
 
     // —— 按钮 ——
     auto* pBtns = new QDialogButtonBox(
@@ -2388,6 +2433,18 @@ int CSettingsDialog::SandboxRetainDays() const {
     return (m_pSpinSbxRetain != nullptr) ? qBound(1, m_pSpinSbxRetain->value(), 365) : 7;
 }
 
+bool CSettingsDialog::SandboxWindowEnable() const {
+    return (m_pChkSbxWindow != nullptr) ? m_pChkSbxWindow->isChecked() : true;
+}
+
+bool CSettingsDialog::SandboxVmEnable() const {
+    return (m_pChkSbxVm != nullptr) ? m_pChkSbxVm->isChecked() : false;
+}
+
+bool CSettingsDialog::SandboxBlockSynth() const {
+    return (m_pChkSbxBlockSynth != nullptr) ? m_pChkSbxBlockSynth->isChecked() : true;
+}
+
 // —— CodexHarness 第四后端（2026 第四后端接入；口径同 Pi 同名方法）——
 QString CSettingsDialog::CodexNodePath() const {
     return m_pEditCodexNode != nullptr ? m_pEditCodexNode->text().trimmed() : QString();
@@ -2615,7 +2672,8 @@ void CSettingsDialog::OnInstallCodexLocal() {
     if (iRc >= 8) {
         QMessageBox::warning(this, QStringLiteral("CodexHarness"),
             QStringLiteral("robocopy 复制失败（退出码 %1）：\n%2")
-                .arg(QString::number(iRc), QString::fromUtf8(stProc.readAllStandardError())));
+                .arg(QString::number(iRc), QString::fromUtf8(stProc.readAllStandardError()
+                     + stProc.readAllStandardOutput())));   // 2026-11-02 robocopy 日志全走 stdout，只读 stderr 恒为空
         return;
     }
     DetectCodexInstalled(false);   // 自动重检 + 结果提示（命中自动回填根目录）
@@ -2762,7 +2820,8 @@ void CSettingsDialog::OnInstallHermesLocal() {
     if (iRc >= 8) {
         QMessageBox::warning(this, QStringLiteral("Hermes"),
             QStringLiteral("robocopy 复制失败（退出码 %1）：\n%2")
-                .arg(QString::number(iRc), QString::fromUtf8(stProc.readAllStandardError())));
+                .arg(QString::number(iRc), QString::fromUtf8(stProc.readAllStandardError()
+                     + stProc.readAllStandardOutput())));   // 2026-11-02 robocopy 日志全走 stdout，只读 stderr 恒为空
         return;
     }
     DetectHermesInstalled(false);   // 自动重检 + 结果提示

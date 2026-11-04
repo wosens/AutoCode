@@ -1,4 +1,4 @@
-#include "CProjectExplorerPanel.h"
+﻿#include "CProjectExplorerPanel.h"
 #include "ui/CMenuIcon.h"
 
 #include <QTreeView>
@@ -10,6 +10,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include "core/CFrwDevice.h"
@@ -60,7 +61,8 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>   // ShellExecuteExW（本翻译单元 windows.h 未带入，显式包含）
-#include "sandbox/CSandboxManager.h"   // 2026.09.26 用户启动豁免登记（点开的程序不进沙箱不录像）
+#include "sandbox/CSandboxHost.h"   // 2026.09.26 用户启动豁免登记（点开的程序不进沙箱不录像；
+                                    // 2026-11-01 动态库化：经宿主单例转发 dll）
 // 2026.09.17 打开方式菜单 shell 同源枚举：SHAssocEnumHandlers/IEnumAssocHandlers/
 //   IAssocHandler（GetUIName 本地化名 + Invoke 交 shell 处理 %1 展开/DDE 动词如
 //   devenv /dde）；ILCreateFromPath/SHCreateDataObject 用于构造 Invoke 入参。
@@ -736,7 +738,7 @@ void CProjectExplorerPanel::RunBatViaCmd(const QString& a_sAbsPath) {
         if (stSei.hProcess != nullptr) {
             const DWORD dwPid = GetProcessId(stSei.hProcess);
             if (dwPid != 0) {
-                CSandboxManager::RegisterUserRoot(dwPid, stSei.hProcess);   // 句柄移交
+                CSandboxHost::RegisterUserRoot(dwPid, stSei.hProcess);   // 句柄移交
                 return;
             }
             CloseHandle(stSei.hProcess);
@@ -799,7 +801,7 @@ void CProjectExplorerPanel::InvokeAssocHandler(int a_iIndex, const QString& a_sF
             if (stSei.hProcess != nullptr) {
                 const DWORD dwPid = GetProcessId(stSei.hProcess);
                 if (dwPid != 0) {
-                    CSandboxManager::RegisterUserRoot(dwPid, stSei.hProcess);
+                    CSandboxHost::RegisterUserRoot(dwPid, stSei.hProcess);
                 } else {
                     CloseHandle(stSei.hProcess);
                 }
@@ -1242,6 +1244,17 @@ void CProjectExplorerPanel::OnSingleClicked(const QModelIndex& a_stIdx) {
 }
 
 void CProjectExplorerPanel::OpenWithShell(const QString& a_sAbsPath) {
+    // 2026.11 双击去重：双击会先发两次 clicked 再叠 doubleClicked（非文本文件
+    //   一次双击共 3 次 ShellExecute，exe 会被拉起 3 个进程）——500ms 内同路径
+    //   重复启动请求直接忽略。
+    static QString s_sLastPath;
+    static qint64 s_llLastMs = 0;
+    const qint64 llNow = QDateTime::currentMSecsSinceEpoch();
+    if (a_sAbsPath == s_sLastPath && llNow - s_llLastMs < 500) {
+        return;
+    }
+    s_sLastPath = a_sAbsPath;
+    s_llLastMs = llNow;
     // 2026.08.28 对齐 Windows 资源管理器双击口径：ShellExecuteW 显式传
     //   lpDirectory=文件所在目录。此前走 QDesktopServices::openUrl，其内部
     //   ShellExecute 的目录参数为 NULL → 子进程继承 AutoCode 的当前工作目录
@@ -1267,7 +1280,7 @@ void CProjectExplorerPanel::OpenWithShell(const QString& a_sAbsPath) {
         if (stSei.hProcess != nullptr) {
             const DWORD dwPid = GetProcessId(stSei.hProcess);
             if (dwPid != 0) {
-                CSandboxManager::RegisterUserRoot(dwPid, stSei.hProcess);   // 句柄移交
+                CSandboxHost::RegisterUserRoot(dwPid, stSei.hProcess);   // 句柄移交
                 return;
             }
             CloseHandle(stSei.hProcess);
@@ -1876,9 +1889,15 @@ void CProjectExplorerPanel::DoDelete() {
         return;
     }
     if (QFileInfo(sPath).isDir()) {
-        QDir(sPath).removeRecursively();
-    } else {
-        QFile::remove(sPath);
+        if (!QDir(sPath).removeRecursively()) {
+            QMessageBox::warning(this, QStringLiteral("删除"),
+                QStringLiteral("删除失败（目录非空且合有占用/只读文件？）：\n%1")
+                    .arg(QDir::toNativeSeparators(sPath)));
+        }
+    } else if (!QFile::remove(sPath)) {
+        QMessageBox::warning(this, QStringLiteral("删除"),
+            QStringLiteral("删除失败（文件被占用/只读？）：\n%1")
+                .arg(QDir::toNativeSeparators(sPath)));
     }
 }
 
@@ -2126,7 +2145,11 @@ void CProjectExplorerPanel::DoRename() {
             QStringLiteral("目标已存在：%1").arg(sNew.trimmed()));
         return;
     }
-    QFile::rename(sPath, sDst);
+    if (!QFile::rename(sPath, sDst)) {
+        QMessageBox::warning(this, QStringLiteral("改名"),
+            QStringLiteral("改名失败（目标被占用/权限不足？）：\n%1 → %2")
+                .arg(QDir::toNativeSeparators(sPath), QDir::toNativeSeparators(sDst)));
+    }
 }
 
 void CProjectExplorerPanel::CopyPath() {

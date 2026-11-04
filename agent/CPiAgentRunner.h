@@ -191,6 +191,7 @@ private:
 
     QProcess*   m_pProc = nullptr;
     QByteArray  m_buf;                    // stdout 跨 readyRead 行缓冲
+    QByteArray  m_bufErr;                 // stderr 跨 readyRead 行缓冲（跨块残行/UTF-8 多字节不断链）
     bool        m_bFinished = false;      // 本轮已发 sigFinished（防重复）
     bool        m_bAgentEnded = false;    // 已收 agent_end（进程退出即按成功收尾）
     bool        m_bSawSession = false;    // 本轮已确认会话 id（一次性=session 头；RPC=get_state 回读）

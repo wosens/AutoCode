@@ -113,8 +113,14 @@ void CAsstTabBar::SetClosableChecker(const std::function<bool(int a_iIndex)>& a_
 
 void CAsstTabBar::SetPageRunning(QWidget* a_pPage, bool a_bRunning)
 {
+    // 2026-11-02 判空提前：旧序 contains 在前，SetPageRunning(nullptr,true) 时
+    //   bWas=false≠true 穿透守卫把 nullptr 插入 m_runPages——闪点定时器从此常驻
+    //   （500ms 全量重绘）且该条目永无法清除。
+    if (a_pPage == nullptr) {
+        return;
+    }
     const bool bWas = m_runPages.contains(a_pPage);
-    if (bWas == a_bRunning || a_pPage == nullptr) {
+    if (bWas == a_bRunning) {
         return;                        // 状态未变不折腾（面板刷新路径高频到达）
     }
     if (a_bRunning)

@@ -224,13 +224,23 @@ static bool DshApplyDirAce(const QString& a_sDir, const QString& a_sSid, bool a_
         return true;   // 目录不在场：无可授（后续会话也不需要；不算失败）
     }
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"AutoCode_DshAclGrant_Mutex");
+    bool bMutexHeld = false;
     if (hMutex != nullptr) {
-        WaitForSingleObject(hMutex, 8000);   // 已被创建并持有→等；二次持有也无妨
+        // 初拥（创建即持）或等构前任释放（最多 8s）；超时未持得互斥时不得继续
+        //   DACL 读-合-写（串行化被静默打破=跨实例竞态），按失败返回让调用方计入
+        //   失败目录（幂等可重试）。
+        const DWORD dwW = WaitForSingleObject(hMutex, 8000);
+        bMutexHeld = (dwW == WAIT_OBJECT_0 || dwW == WAIT_ABANDONED);
+        if (!bMutexHeld) {
+            CloseHandle(hMutex);
+            return false;
+        }
     }
     struct CMutexGuard {
         HANDLE h;
-        ~CMutexGuard() { if (h != nullptr) { ReleaseMutex(h); CloseHandle(h); } }
-    } stGuard{ hMutex };
+        bool bHeld;
+        ~CMutexGuard() { if (h != nullptr) { if (bHeld) { ReleaseMutex(h); } CloseHandle(h); } }
+    } stGuard{ hMutex, bMutexHeld };
 
     PSID pSid = nullptr;
     if (!ConvertStringSidToSidW(
@@ -564,30 +574,8 @@ static bool DshEnsureProfileWritable(QString* a_psErr)
 int CDeepSeekRunner::ApplyExtraWriteDirs(const QString& a_sWorkDir,
                                          const QStringList& a_aGrant,
                                          const QStringList& a_aRevoke) {
-    // 工程根规范化 → 工作区写 SID（与 harness 派生一致）→ 逐目录授/撤。
-    if ((a_aGrant.isEmpty() && a_aRevoke.isEmpty()) || a_sWorkDir.trimmed().isEmpty()) {
-        return 0;
-    }
-    const QString sCanonicalRoot = DshCanonicalWinPath(a_sWorkDir);
-    if (sCanonicalRoot.isEmpty()) {
-        return a_aGrant.size();   // 工程根拿不到规范名：全部按失败计（不阻断，日志可见）
-    }
-    const QString sSid = DshWorkspaceWriteSidOf(sCanonicalRoot);
-    if (sSid.isEmpty()) {
-        return a_aGrant.size();
-    }
-    int iFailed = 0;
-    for (const QString& sDir : a_aRevoke) {
-        if (!a_aGrant.contains(sDir) && !DshApplyDirAce(sDir, sSid, false)) {
-            ++iFailed;
-        }
-    }
-    for (const QString& sDir : a_aGrant) {
-        if (!DshApplyDirAce(sDir, sSid, true)) {
-            ++iFailed;
-        }
-    }
-    return iFailed;
+    // 委托四参重载（授/撤逻辑单源维护，防两份近似拷贝漂移）。
+    return ApplyExtraWriteDirs(a_sWorkDir, a_aGrant, a_aRevoke, nullptr);
 }
 
 // —— 2026-10-19 缺写权限 ACE 的提权修复支撑（声明注释见 CDeepSeekRunner.h）——
@@ -2134,12 +2122,24 @@ bool CDeepSeekRunner::EnsureProcess(const QString& a_sWorkDir) {
 }
 
 QString CDeepSeekRunner::EffectiveProvider() const {
-    // 自定义模型启用 → 固定发组合 yml 的 env 槽位名；否则走 [Agent] DshProvider。
-    return CustomActiveValid() ? QStringLiteral("autocode-active") : DshProvider();
+    // 会话级覆盖优先（与 EnsureProcess 烘焙 env 的 iUseM 同源）：自定义模型启用（覆盖
+    //   或全局激活）→ 固定发组合 yml 的 env 槽位名；否则走 [Agent] DshProvider。
+    //   旧实现只看全局 s_iCustomActive——覆盖有效而全局未激活时 initialize 发 fixed/
+    //   DshModel，与 env 烘焙的 autocode-active 槽位不一致（provider/model 协议参数
+    //   与实际路由错位）。
+    const int iOvM = ModelOvIdxIn(s_aCustomModels.size());
+    const int iUseM = (iOvM >= 0) ? iOvM : s_iCustomActive;
+    const bool bUseCustom = (iUseM >= 0 && iUseM < s_aCustomModels.size());
+    return bUseCustom ? QStringLiteral("autocode-active") : DshProvider();
 }
 
 QString CDeepSeekRunner::EffectiveModel() const {
-    return CustomActiveValid() ? s_aCustomModels.at(s_iCustomActive).sModelId : DshModel();
+    const int iOvM = ModelOvIdxIn(s_aCustomModels.size());
+    const int iUseM = (iOvM >= 0) ? iOvM : s_iCustomActive;
+    if (iUseM >= 0 && iUseM < s_aCustomModels.size()) {
+        return s_aCustomModels.at(iUseM).sModelId;
+    }
+    return DshModel();
 }
 
 void CDeepSeekRunner::SyncCordisFromMaster() {
@@ -2248,6 +2248,10 @@ void CDeepSeekRunner::Stop() {
     m_bRetryPending = false;
     m_eRunState = RunIdle;
     if (m_bSelfHealing) {
+        // 先摘自愈态再 kill：kill 触发的 OnHealFinished 是同步到达，若 m_bSelfHealing
+        //   仍为 true 会走 FinishHeal(false) 完整收口，与随后的「已被用户停止」消息
+        //   矛盾（先置 false 使其走迟到信号早退路径，只留一条停止消息）。
+        m_bSelfHealing = false;
         if (m_pHealTimer != nullptr) {
             m_pHealTimer->stop();
         }
@@ -2263,7 +2267,6 @@ void CDeepSeekRunner::Stop() {
         if (!m_sHealLockPath.isEmpty()) {
             QFile::remove(m_sHealLockPath);
         }
-        m_bSelfHealing = false;
         m_iHealStep = 0;
         emit sigInfo(QStringLiteral("🔧 DSH 自动修复已被用户停止（锁已释放，"
                                     "下次启动阶段会重新检测）"));
@@ -2694,6 +2697,13 @@ void CDeepSeekRunner::CheckStall() {
 
 void CDeepSeekRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eStatus) {
     Q_UNUSED(a_eStatus);
+    // 自愈期间主进程生命周期由 Heal 流程独占管理：上一轮残留的 ProcReady 空闲 node
+    //   自行退出（崩溃/被杀）不该走 Prompting 失败路径重复报错——自愈完成后会重入
+    //   StartStage 自动继续原阶段。
+    if (m_bSelfHealing) {
+        MarkProcDead();
+        return;
+    }
     const EProcState ePrev = m_eProcState;
     MarkProcDead();
     if (m_bTurnReported) {

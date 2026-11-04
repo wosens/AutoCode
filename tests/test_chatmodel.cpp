@@ -4,6 +4,8 @@
 #include <QClipboard>
 #include <QFontMetrics>
 #include <QGuiApplication>
+#include <QHash>
+#include <QImage>
 #include <QTextDocument>
 #include <QTextLayout>
 
@@ -71,6 +73,7 @@ private slots:
     void firstPaintCorrectsAssistantHeight();
     void plainTextForOverlay();
     void overlayOpenAndHeaderGuard();
+    void overlayOpaqueBackgroundPixel();   // 2026-11-03 双击选择态浮层底不透明像素锁
 
     // —— 7. 2026-10-23 栈溢出防回归（切助手三连崩 0xC00000FD）——
     void widthReformatNoRecurse();          // 临界震荡：重排链中滚动条翻转不递归
@@ -118,6 +121,31 @@ SBlockData TestChatModel::mkSystem(const QString& a_sText)
     st.eKind = CMessageBlock::System;
     st.sText = a_sText;
     return st;
+}
+
+// 区间众数色 ≈ 期望色（±2/通道）：浮层覆盖区背景像素必远多于字形像素，众数即底色
+//（2026-11-03 浮层不透明底像素锁用，见 overlayOpaqueBackgroundPixel）
+static bool ModeColorIs(const QImage& a_img, const QRect& a_rc, const QColor& a_want)
+{
+    QHash<QRgb, int> hist;
+    for (int y = a_rc.top(); y <= a_rc.bottom(); y += 2) {
+        for (int x = a_rc.left(); x <= a_rc.right(); x += 2) {
+            ++hist[a_img.pixel(qBound(0, x, a_img.width() - 1),
+                               qBound(0, y, a_img.height() - 1))];
+        }
+    }
+    QRgb uBest = 0;
+    int iBest = -1;
+    for (auto it = hist.constBegin(); it != hist.constEnd(); ++it) {
+        if (it.value() > iBest) {
+            iBest = it.value();
+            uBest = it.key();
+        }
+    }
+    const QColor c(uBest);
+    return qAbs(c.red() - a_want.red()) <= 2
+        && qAbs(c.green() - a_want.green()) <= 2
+        && qAbs(c.blue() - a_want.blue()) <= 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +643,66 @@ void TestChatModel::overlayOpenAndHeaderGuard()
     QVERIFY(v.OverlayText().contains(QStringLiteral("入参")));
     QVERIFY(v.OverlayText().contains(QStringLiteral("file_path")));   // 入参 JSON 文本可复制
     QVERIFY(v.OverlayText().contains(QStringLiteral("结果")));
+}
+
+// ---------------------------------------------------------------------------
+// 5b. 2026-11-03 复制浮层不透明底像素回归：双击日志进入选择态后，被选择文字
+//     背景不得透明——透明则 delegate 已绘制的原条目文字从浮层底下透出、同位
+//     叠加成重影，看不清当前要选的文本。字符串锁（overlayOpenAndHeaderGuard）
+//     之外再上像素锁：viewport()->grab() 离屏合成（delegate 底稿先画、浮层
+//     子控件后画，与真实屏幕 z 序一致），浮层覆盖区众数色必须 = #fffbeb；
+//     若透明，众数会落到视口白底 #ffffff（浮层取焦后行选中已被 focusOut 清掉）。
+// ---------------------------------------------------------------------------
+void TestChatModel::overlayOpaqueBackgroundPixel()
+{
+    CChatModel m;
+    m.AppendBlock(mkAssistant(QStringLiteral(
+        "回复正文：垫底原文字 ABCDEFG 0123456789，浮层透明则透出成重影。\n\n第二段。\n")));
+    SBlockData stEv;
+    stEv.eKind = CMessageBlock::Event;
+    stEv.sEventKind = QStringLiteral("done");
+    stEv.sText = QStringLiteral("已完成（16:47:43，耗时 1分23秒）");
+    m.AppendBlock(stEv);
+
+    CChatListView v;
+    v.resize(600, 500);
+    v.SetModel(&m);
+    v.show();
+    qApp->processEvents();
+
+    const QColor colWant(0xff, 0xfb, 0xeb);    // #fffbeb 浮层米黄底（不透明）
+
+    // ① 事件行（纯文本自建 doc 路径）
+    v.scrollTo(m.index(1, 0), QAbstractItemView::PositionAtTop);
+    qApp->processEvents();
+    const QRect rcEv = v.visualRect(m.index(1, 0));
+    QVERIFY(rcEv.isValid());
+    QTest::mouseDClick(v.viewport(), Qt::LeftButton, Qt::NoModifier, rcEv.center());
+    qApp->processEvents();
+    QVERIFY(v.OverlayVisible());
+    const QImage imgEv = v.viewport()->grab().toImage();
+    QVERIFY(ModeColorIs(imgEv, rcEv.adjusted(3, 3, -10, -3), colWant));
+    QTest::mouseDClick(v.viewport(), Qt::LeftButton, Qt::NoModifier, rcEv.center());
+    qApp->processEvents();
+    QVERIFY(!v.OverlayVisible());
+
+    // ② 助手行（池 Markdown doc 路径）：浮层只盖 doc 区（speaker 行之下），取样带同口径
+    QFont fSp = v.font();
+    fSp.setWeight(QFont::DemiBold);
+    const int iSpeakerH = QFontMetrics(fSp).height();
+    v.scrollTo(m.index(0, 0), QAbstractItemView::PositionAtTop);
+    qApp->processEvents();
+    const QRect rcAs = v.visualRect(m.index(0, 0));
+    QVERIFY(rcAs.isValid());
+    QTest::mouseDClick(v.viewport(), Qt::LeftButton, Qt::NoModifier,
+                       rcAs.topLeft() + QPoint(rcAs.width() / 2, iSpeakerH + 30));
+    qApp->processEvents();
+    QVERIFY(v.OverlayVisible());
+    const QImage imgAs = v.viewport()->grab().toImage();
+    const QRect rcBand(rcAs.left() + 20, rcAs.top() + iSpeakerH + 8,
+                       qMax(40, rcAs.width() - 40),
+                       qMax(20, qMin(60, rcAs.height() - iSpeakerH - 14)));
+    QVERIFY(ModeColorIs(imgAs, rcBand, colWant));
 }
 
 // ---------------------------------------------------------------------------

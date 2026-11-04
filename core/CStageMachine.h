@@ -19,16 +19,16 @@ public:
     static std::optional<EStage> NextStage(const QList<EStage>& a_aFlow, EStage a_eCur);
 
     // 阶段 a_eCur 在 a_aFlow 中的前一个阶段；a_eCur 是首阶段或不在流内 → nullopt。
-    //   评审驳回回退时用：回炉目标被用户取消勾选时，退到生阶段的前一个流内阶段。
+    //   评审驳回回退时用：回炉目标被用户取消勾选时，退到该生产阶段的前一个流内阶段。
     static std::optional<EStage> PrevStage(const QList<EStage>& a_aFlow, EStage a_eCur);
 
     // 评审驳回时回到的上游生产阶段
-    static EStage RejectTarget(EStage a_eReviewStage);
+    static EStage RejectTarget(EStage a_eReviewStage, ETaskType a_eType);
 
     // 判断某阶段是否属于指定任务类型的流程
     static bool StageInFlow(ETaskType a_eType, EStage a_eStage);
 
-    // 该阶段的起始阶段（按任务类型）
+    // 返回指定任务类型流程的首阶段
     static EStage FirstStage(ETaskType a_eType);
 
     // 返回该任务类型的完整阶段序列（按流程顺序）

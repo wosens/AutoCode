@@ -88,13 +88,29 @@ public:
                                       const QString& a_sLocation, const QString& a_sDetail,
                                       const QString& a_sHarnessMdPath);
 
+    // 2026-11-03 cmd 启动注入防御纯谓词（抽静态供单测，LaunchCmdWindow 分层调用）。
+    //   误伤教训：整体级禁双引号会废掉全部 bat 调用（含空格路径必须加引号），
+    //   故分层：CmdTitleTainted 标题最严（"/%/&）；CmdLineTainted 命令行
+    //   （%/控制字符/双引号不成对，允许成对引号）；CmdPathTainted 工作目录
+    //   （"/%）；CmdValueTainted 外部值（路径/URL 拼入命令前："/%/&/|/^/<>/控制
+    //   字符——元字符只能在值级拦，骨架命令自身合法使用 && / ||）。
+    static bool CmdTitleTainted(const QString& a_s);
+    static bool CmdLineTainted(const QString& a_s);
+    static bool CmdPathTainted(const QString& a_s);
+    static bool CmdValueTainted(const QString& a_s);
+
     // 2026.10.21 可用性探测态（公开枚举：外部经 ProbeStateOf 读行态）。
     enum EProbeState { EProbeIdle = 0, EProbeRunning, EProbeOk, EProbeFail };
 
     // 2026.10.21 探测详情访问器（ui-sandbox/单测钩子）：a_iBackend 行的验证态与
     //   不可用原因全文（不可变；不触碰 UI）。
-    EProbeState ProbeStateOf(int a_iBackend) const { return m_aeProbe[a_iBackend]; }
-    QString     ProbeDetailOf(int a_iBackend) const { return m_asProbeDetail[a_iBackend]; }
+    // 2026-11-02 入口自防越界（公开钩子供 ui-sandbox/单测，勿信调用方下标契约）
+    EProbeState ProbeStateOf(int a_iBackend) const {
+        return (a_iBackend >= 1 && a_iBackend <= 5) ? m_aeProbe[a_iBackend] : EProbeIdle;
+    }
+    QString     ProbeDetailOf(int a_iBackend) const {
+        return (a_iBackend >= 1 && a_iBackend <= 5) ? m_asProbeDetail[a_iBackend] : QString();
+    }
 
 signals:
     // 2026.10.21 自动修复分派：a_iFaultBackend=故障后端号（1..5），a_iFixBackend=

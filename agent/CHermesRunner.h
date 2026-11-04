@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QDateTime>   // 2026-11-02 自包含：m_tLastWalMod 成员直接依赖
 #include <QJsonObject>
 #include <QProcess>
 #include <QStringList>
@@ -44,6 +45,11 @@
 //   - claude 专属参数降级：a_iMaxTurns/a_iAutocompactK/a_bEnableAskUser/a_bFork/
 //     a_sResumeSid/a_sDisallowedTools 忽略（非默认值时 sigInfo 提示一次）。
 //     InjectUserTurn 安全 no-op 返回 false（一次性进程）。
+// 2026-11-02 钳位常量落名（原注释引用 kHermesMaxTokCap/kHermesCtxCap 但常量不存在，
+//   131072/200000 在 .h/.cpp 三处硬编码）：真正单点收口，只改这里。
+constexpr int   kHermesMaxTokCap = 131072;   // 网关 2^17 max_tokens 上限（pi 先例）
+constexpr qint64 kHermesCtxCap = 200000;     // 当前工程实证安全 contextWindow
+
 class CHermesRunner : public CAgentRunnerBase {
     Q_OBJECT
 
@@ -159,7 +165,7 @@ private:
     static QString s_sHermesEffort;   // 2026-10-08 思考强度（agent.reasoning_effort；空=不托管）
     void Reset();
     void HandleLine(const QByteArray& a_sLine);   // NDJSON 事件分发
-    void ApplyUsage(const QJsonObject& oUsage, bool a_bFromResult = false);
+    void ApplyUsage(const QJsonObject& a_oUsage, bool a_bFromResult = false);
     void FinishTurnOnResult();                     // 2026.10.29 result 后驻留观察期满终态收尾（见 CheckStall）
     double ComputeTurnCost() const;
     void EmitFailed(const QString& a_sMsg);

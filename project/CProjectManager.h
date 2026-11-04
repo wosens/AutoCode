@@ -556,6 +556,8 @@ public:
     // Enable 总开关（默认开）：Agent 后代 GUI 窗口自动幽灵化收纳 + sandbox_* 命令通道；
     // AutoGhost 自动收纳（默认开）；Record 自动录像（2026.10.02 起默认关，勾选后 MP4 存 exe\sandbox\rec）；
     // Fps 录制帧率 1..15（默认 5）；RetainDays 录像保留天数 1..365（默认 7，启动清理）。
+    // Type 沙箱类型（2026-11-01 动态库化）：exe 同级 TestSandbox\<Type>.dll 的主干名，
+    //   默认 GhostSandbox（内置幽灵沙箱）。
     bool SaveSandboxEnable(bool a_bOn);
     bool LoadSandboxEnable() const;
     bool SaveSandboxAutoGhost(bool a_bOn);
@@ -566,6 +568,19 @@ public:
     int  LoadSandboxFps() const;
     bool SaveSandboxRetainDays(int a_iDays);
     int  LoadSandboxRetainDays() const;
+    bool SaveSandboxType(const QString& a_sType);
+    QString LoadSandboxType() const;
+    // 2026-11-02 双沙箱并行路由（[Sandbox] WindowEnable/VmEnable）：窗口槽
+    //   (GhostSandbox) 与 VM 槽 (MsbSandbox) 同时可用、按命令自动路由——
+    //   Windows GUI 测试走窗口沙箱，Linux 命令/不可信代码走 VM 沙箱。
+    bool SaveSandboxWindowEnable(bool a_bOn);
+    bool LoadSandboxWindowEnable() const;
+    bool SaveSandboxVmEnable(bool a_bOn);
+    bool LoadSandboxVmEnable() const;
+    // 2026-11-02 物理输入拦截（[Sandbox] BlockSynth，默认开）：Agent 运行期吞掉
+    //   合成鼠标/键盘事件——机制性根治 Agent 抢占用户鼠标键盘。
+    bool SaveSandboxBlockSynth(bool a_bOn);
+    bool LoadSandboxBlockSynth() const;
 
     // ---- 专家助手开关持久化（config.ini 的 [Adhoc] ExpertAssistant）----
     // 2026.08.26 闭环改造：启用后助手提交改码提示词时自动做编译/测试验证并回注重试；
@@ -712,7 +727,8 @@ private:
     QString       m_sProjectDir;
     CAgentRunnerBase* m_pGuideRunner = nullptr;       // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
     CAgentRunnerBase* m_pGuideSyncRunner = nullptr;    // 需求4 guide.md 增量同步专用 runner
-    std::atomic<bool> m_bFpSyncRunning = false;        // 2026.08.26 指纹同步后台线程占用标志（防重入/并发写 guide）
+    // （2026.08.26 指纹同步后台线程占用标志已升为 SyncGuideIncremental 内进程级
+    //   静态——detach 线程在对象析构后写成员=悬垂写，勿改回成员）
 
     QStringList   m_aRecentProjects;   // MRU，最前为最近
     QList<int>    m_aiRecentOpens;     // 2026.09.20 打开次数（与上表同序：AddRecent 命中累加/新条目=1）

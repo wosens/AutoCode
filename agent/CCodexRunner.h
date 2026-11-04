@@ -132,6 +132,6 @@ private:
     QStringList m_aStderrTail;            // stderr 尾部（失败消息附带）
     QElapsedTimer m_actClock;             // 距上次收到输出（stall 巡检）
     QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
-    CCodexProxy* m_pProxy = nullptr;      // 2026.08.21 输出上限代理（http+chat 生效）
+    CCodexProxy* m_pProxy = nullptr;      // 2026.08.21 输出上限代理（http+chat 生效）  // 2026-11-02 所有权：StartStage 在 http 代理模式下 new，Stop/Reset/delete 三路径配对释放置 nullptr
     bool m_bUsageLive = false;            // 2026.08.21 代理已上抛真实计量（收尾报 0 防双计）
 };

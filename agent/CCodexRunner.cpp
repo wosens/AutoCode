@@ -139,7 +139,8 @@ static QString CodexEffProvider() {
 }
 static QString CodexEffModel() {
     return CodexEffModelFor(CodexActiveEntry());
-}static QString CodexEffBaseUrl() {
+}
+static QString CodexEffBaseUrl() {
     return CodexEffBaseUrlFor(CodexActiveEntry());
 }
 static QString CodexEffWireApi() {
@@ -554,12 +555,14 @@ static bool WriteCodexAuthJson(const QString& a_sHome, QString* a_pErr) {
     //   JSON（无法解析出既有键）时同样不动它，避免整体重写毁掉无法解析的凭据。
     // 2026.08.21 生效 key：自定义模型激活时取条目 key（条目 key 空回退固定键）。
     const QString sApiKey = CodexEffApiKey();
-    if (sApiKey.isEmpty() && !bParsedOk) {
+    if (sApiKey.isEmpty() || !bParsedOk) {
+        // 空 key = 沿用 ~/.codex 既有登录态，一律不动 auth.json（旧条件写反：
+        //   空 key 且文件不存在时会落盘写出空 {} 新文件，与注释矛盾）；
+        //   既有文件非法 JSON（无法解析出既有键）时同样不动，避免整体重写毁掉
+        //   无法解析的凭据。
         return true;
     }
-    if (!sApiKey.isEmpty()) {
-        oRoot.insert(QStringLiteral("OPENAI_API_KEY"), sApiKey);
-    }
+    oRoot.insert(QStringLiteral("OPENAI_API_KEY"), sApiKey);
     QSaveFile stOut(sPath);
     if (!stOut.open(QIODevice::WriteOnly)) {
         if (a_pErr != nullptr) {

@@ -18,3 +18,8 @@ qd3err.txt
 txt
 file
 CodeStyle/
+
+# 2026-11-01 MsbSandbox（Rust cdylib）：构建产物与 runtime 二进制不入库
+msbsandbox/target/
+Execute/TestSandbox/MsbSandbox/runtime/
+.review

@@ -47,12 +47,18 @@ static QString TrimNamePunct(const QString& a_s);
 
     QString Name() const { return m_sName; }
     // 名称变更发 sigChanged（自动命名回填时触发 task.json 回写与 UI 刷新）。
-    void SetName(const QString& a_sName) { m_sName = a_sName; emit sigChanged(); }
+    // 2026-11-02 补「值不变不发」守卫（与同类 setter 统一）：值未变也 emit 会
+    //   触发冗余 task.json 回写与 UI 刷新；SetAutoNamed 变化处自行发信号兜底。
+    void SetName(const QString& a_sName) {
+        if (m_sName != a_sName) { m_sName = a_sName; emit sigChanged(); }
+    }
 
     // 自动命名标记（2026.08.20）：新建任务未填名称时置 true（临时名占位），
     // Intake 阶段产出 requirements.md 后由编排器据其推断正式名称并清标记。
     bool AutoNamed() const { return m_bAutoNamed; }
-    void SetAutoNamed(bool a_b) { m_bAutoNamed = a_b; }
+    void SetAutoNamed(bool a_b) {
+        if (m_bAutoNamed != a_b) { m_bAutoNamed = a_b; emit sigChanged(); }
+    }
 
     // 归档标记（2026.08.22）：右键「移除」把任务移到历史时置 true 并随 task.json 落盘；
     // 启动加载据此把该任务归历史表，不回当前表（否则 Stopped 状态与普通停止无法区分，
@@ -136,7 +142,9 @@ static QString TrimNamePunct(const QString& a_s);
 
     // —— 错误 / 控制标志 ——
     QString LastError() const { return m_sErr; }
-    void SetLastError(const QString& a_s) { m_sErr = a_s; emit sigChanged(); }
+    void SetLastError(const QString& a_s) {
+        if (m_sErr != a_s) { m_sErr = a_s; emit sigChanged(); }   // 2026-11-02 补值不变守卫
+    }
 
     bool PauseRequested() const { return m_bPauseReq; }
     void SetPauseRequested(bool a_b) {

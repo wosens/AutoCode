@@ -10,7 +10,7 @@
 //
 // 背景：编排器/项目管理器共 5 处持有 runner（任务/评审 fan-out/ad-hoc 助手/guide 生成/
 // guide 同步），此前全部硬编码 CClaudeRunner。为支持设置里切换 Agent 后端，把对上层
-// 有意义的面（6 信号 + 生命周期接口 + Last* 元信息）上移到本基类，5 处持有点改持
+// 有意义的面（信号 + 生命周期接口 + Last* 元信息；2026-11-02 修正：原「6 信号」计数已随 sigUsageDelta 等追加过时，删具体数字防再过时）上移到本基类，5 处持有点改持
 // 基类指针，创建统一走 CAgentRunnerFactory。
 //
 // 信号签名与语义逐字继承自原 CClaudeRunner.h（claude 后端零回归是硬门禁）：
@@ -78,7 +78,9 @@ public:
         m_iModelOvIdx = a_iIdx;
         m_stModelOv = a_stE;
     }
-    void ClearStageModelOverride() { m_iModelOvIdx = -1; }
+    // 2026-11-02 清除时同步复位快照：防消费方先判 HasStageModelOverride=false 之外
+    //   的路径误用已撤销的旧条目（旧实现残留 m_stModelOv 旧值）。
+    void ClearStageModelOverride() { m_iModelOvIdx = -1; m_stModelOv = SDshModelEntry{}; }
     bool HasStageModelOverride() const { return m_iModelOvIdx >= 0; }
 
     // 向当前运行中的进程追加一条用户轮次；未运行或失败时安全 no-op 返回 false。
@@ -143,6 +145,12 @@ public:
     //   即刻命中新装命令，无需重启 AutoCode（同 install_env.bat :RefreshPath 口径）。
     //   30 秒 TTL 缓存注册表读取；注册表读取失败时安全回退纯 systemEnvironment()。
     static QProcessEnvironment MergedPathEnvironment();
+
+    // Git Bash 安装根探测（2026-11-03 bash WSL 存根根治，配套 MergedPathEnvironment
+    //   的 PATH 前置；说明见 .cpp 实现）。返回形如 "C:/Program Files/Git" 的安装
+    //   根（其 usr/bin 或 bin 下有 bash.exe）；找不到返回空串。命中永久缓存，
+    //   空结果 30 秒 TTL 重试（装完 Git 不重启 AutoCode 即生效）。
+    static QString GitBashRootDir();
 
 signals:
     void sigInfo(const QString& a_sLine);                              // 系统/原始信息

@@ -26,6 +26,10 @@ CReviewSdkClient* CReviewSdkClient::Get() {
 
 bool CReviewSdkClient::EnsureLoaded(QString* a_pErr) {
 #ifdef Q_OS_WIN
+    // 静态互斥串行化首载（并行评审 worker 首次并发调用时对 m_bTried/m_sLoadErr/
+    //   m_pfn* 的检查-置位-写入构成数据竞争；函数级静态保证进程内单例同锁）。
+    static QMutex s_mtxLoad;
+    QMutexLocker stLock(&s_mtxLoad);
     if (m_bTried) {
         if (a_pErr != nullptr) {
             *a_pErr = m_sLoadErr;

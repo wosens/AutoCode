@@ -77,6 +77,14 @@ QString fnReadPkgVersion(const QString& a_sPkgPath) {
     return oDoc.object().value(QStringLiteral("version")).toString();
 }
 
+// 2026-11-03 外部值级注入防御（LaunchCmdWindow 整体校验的值级补充，静态成员
+//   CVersionDialog::CmdValueTainted 的文件内便捷别名）：配置的 Pi/Hermes/DSH
+//   根目录、用户当场输入的仓库地址等拼入 cmd 命令行前先过本闸——Windows 路径
+//   与常规 git 地址（https://…/git@…）不含这些字符，出现即视为异常/恶意输入。
+bool fnCmdSafeValue(const QString& a_s) {
+    return !CVersionDialog::CmdValueTainted(a_s);
+}
+
 } // namespace
 
 CVersionDialog::CVersionDialog(FBusyCheck a_fnBusy, QWidget* a_pParent)
@@ -569,6 +577,12 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
                     .arg(QDir::toNativeSeparators(sPiRoot)));
             return;
         }
+        if (!fnCmdSafeValue(sPiRoot)) {   // 2026-11-03 值级注入防御（见 LaunchCmdWindow）
+            QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
+                QStringLiteral("PIAgent 根路径含引号/百分号/& 等特殊字符，已拒绝执行：\n%1")
+                    .arg(QDir::toNativeSeparators(sPiRoot)));
+            return;
+        }
         if (!QFile::exists(sBat)) {
             QMessageBox::warning(this, QStringLiteral("更新 PIAgent"),
                 QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。").arg(sBatNative));
@@ -641,6 +655,12 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
                         .arg(QDir::toNativeSeparators(sHermesRoot)));
                 return;
             }
+            if (!fnCmdSafeValue(sHermesRoot)) {   // 2026-11-03 值级注入防御
+                QMessageBox::warning(this, QStringLiteral("更新 Hermes"),
+                    QStringLiteral("Hermes 根路径含引号/百分号/& 等特殊字符，已拒绝执行：\n%1")
+                        .arg(QDir::toNativeSeparators(sHermesRoot)));
+                return;
+            }
             if (!QFile::exists(sBat)) {
                 QMessageBox::warning(this, QStringLiteral("更新 Hermes"),
                     QStringLiteral("找不到安装脚本：\n%1\n\n请确认程序目录完整。")
@@ -685,6 +705,12 @@ void CVersionDialog::OnUpdateBackend(int a_iBackend) {
             QMessageBox::information(this, QStringLiteral("Hermes"),
                 QStringLiteral("仓库地址不能为空（缺省源 https://github.com/"
                                "nousresearch/hermes-agent，或本机 Hermes 仓库路径）。"));
+            return;
+        }
+        if (!fnCmdSafeValue(sRepo)) {   // 2026-11-03 值级注入防御（用户当场输入）
+            QMessageBox::warning(this, QStringLiteral("Hermes"),
+                QStringLiteral("仓库地址含引号/百分号/& 等特殊字符，已拒绝执行：\n%1")
+                    .arg(sRepo));
             return;
         }
         if (!bRemote) {
@@ -775,6 +801,12 @@ void CVersionDialog::ResolveDshTagThenUpdate() {
                         .arg(sTag, CDeepSeekRunner::SupportedDshTag()));
                 return;
             }
+            if (!fnCmdSafeValue(sDshRootNative)) {   // 2026-11-03 值级注入防御
+                QMessageBox::warning(this, QStringLiteral("更新 DeepSeekHarness"),
+                    QStringLiteral("DeepSeekHarness 根路径含引号/百分号/& 等特殊字符，"
+                                   "已拒绝执行：\n%1").arg(sDshRootNative));
+                return;
+            }
             const QString sCmdUpdate = sDshRootNative.isEmpty()
                 ? QStringLiteral("\"%1\" /update-dsh %2").arg(sBatNative, sTag)
                 : QStringLiteral("\"%1\" /update-dsh %2 \"%3\"")
@@ -841,10 +873,63 @@ void CVersionDialog::UpdateUpdateButtons() {
                          "仓库地址点击后输入（git URL 或本机仓库路径）"));
 }
 
+// 2026-11-03 cmd 启动注入防御纯谓词（分层规则详见头文件声明处与 LaunchCmdWindow
+//   注释；抽静态的动机：可离线单测，防再次出现"整体禁引号废掉全部 bat 调用"
+//   式回归）。
+bool CVersionDialog::CmdTitleTainted(const QString& a_s) {
+    return a_s.contains(QLatin1Char('"')) || a_s.contains(QLatin1Char('%'))
+        || a_s.contains(QLatin1Char('&'));
+}
+
+bool CVersionDialog::CmdLineTainted(const QString& a_s) {
+    if (a_s.contains(QLatin1Char('%'))
+        || a_s.count(QLatin1Char('"')) % 2 != 0) {
+        return true;
+    }
+    static const QRegularExpression reCtl(QStringLiteral("[\\r\\n\\t]"));
+    return a_s.contains(reCtl);
+}
+
+bool CVersionDialog::CmdPathTainted(const QString& a_s) {
+    return a_s.contains(QLatin1Char('"')) || a_s.contains(QLatin1Char('%'));
+}
+
+bool CVersionDialog::CmdValueTainted(const QString& a_s) {
+    static const QRegularExpression reBad(QStringLiteral("[\"%&|^<>\\r\\n\\t]"));
+    return a_s.contains(reBad);
+}
+
 bool CVersionDialog::LaunchCmdWindow(bool a_bRunAs, const QString& a_sTitle,
                                      const QString& a_sCmdLine, const QString& a_sWorkDir) {
     // cmd /k title <标题> && <命令>：可见窗口保持打开（输出可查），标题便于
     //   辨认多窗口（同既有安装按钮 runas 口径；a_bRunAs=false 走 open）。
+    // 2026-11-02 注入防御、2026-11-03 修正误伤：整体级禁双引号废掉了全部 bat
+    //   调用——含空格路径必须加引号（..\Execute - 副本\install_env.bat /update-pi
+    //   "根"），更新 Pi/Hermes/DSH/Node 全被拒。改为分层设防：标题（本函数
+    //   调用方全是硬编码文案）最严——引号/%/& 一律拒（title 段拼在 && 之前，
+    //   & 可折断出第二段命令）；命令行——% 拒（cmd 变量展开无合法用途）、
+    //   控制字符拒、双引号须成对（奇数=引用边界破损）；工作目录——引号/% 拒。
+    //   外部值（路径/URL）由调用方过 fnCmdSafeValue() 在值级拦元字符。
+    const auto fnTitleBad = [](const QString& a_s) {
+        return CVersionDialog::CmdTitleTainted(a_s);
+    };
+    const auto fnDirBad = [](const QString& a_s) {
+        return CVersionDialog::CmdPathTainted(a_s);
+    };
+    QString sWhy;
+    if (fnTitleBad(a_sTitle)) {
+        sWhy = QStringLiteral("标题含引号/百分号/& 等特殊字符");
+    } else if (CVersionDialog::CmdLineTainted(a_sCmdLine)) {
+        sWhy = QStringLiteral("命令含百分号/控制字符，或双引号不成对");
+    } else if (fnDirBad(a_sWorkDir)) {
+        sWhy = QStringLiteral("工作目录含引号/百分号等特殊字符");
+    }
+    if (!sWhy.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("更新"),
+                             QStringLiteral("%1，已拒绝执行：%2")
+                                 .arg(sWhy, a_sCmdLine.left(120)));
+        return false;
+    }
     const QString sParams = QStringLiteral("/k title %1 && %2").arg(a_sTitle, a_sCmdLine);
     HINSTANCE hInst = ShellExecuteW(nullptr,
         a_bRunAs ? L"runas" : L"open", L"cmd.exe",
@@ -1491,9 +1576,13 @@ QString CVersionDialog::BuildAutoFixPrompt(int a_iBackend, const QString& a_sNam
                                   " 的 autocode-* 槽位。");
         break;
     case 4:
-        sPrompt += QStringLiteral("\n\n注意：CodexHarness 为 npm 本地工程（锁定版 0.87.0），"
-                                  "修复即 npm install @openai/codex@0.87.0 --save-exact；"
-                                  "模型路由在 ~/.codex/config.toml + auth.json。");
+        // 2026-11-02 消除硬编码漂移：锁定版一律取 ExpectedCodexVersion()（与更新
+        //   命令/Verdict 同源）——旧文本写死 0.87.0，版本升级后自愈提示词会指示
+        //   修复代理装回旧版导致 CodexHarness 修复失败。
+        sPrompt += QStringLiteral("\n\n注意：CodexHarness 为 npm 本地工程（锁定版 %1），"
+                                  "修复即 npm install @openai/codex@%1 --save-exact；"
+                                  "模型路由在 ~/.codex/config.toml + auth.json。")
+                      .arg(CCodexRunner::ExpectedCodexVersion());
         break;
     case 5:
         sPrompt += QStringLiteral("\n\n注意：Hermes 为 git 部署（hermes.exe / dist\\cli.js），"
@@ -1646,7 +1735,7 @@ QString CVersionDialog::PickLatestHermesTag(const QStringList& a_aLines, QString
         }
         const QString sVer = m.captured(2).mid(1);   // 去前导 v
         const QVersionNumber vCur = QVersionNumber::fromString(sVer);
-        const bool bPeeled = m.captured(3).isEmpty();
+        const bool bLightweight = m.captured(3).isEmpty();   // 2026-11-02 改名：旧名 bPeeled 语义反置（真值=未剥离的轻量 tag），与覆盖分支条件组合极易反向误改
         if (vCur.isNull()) {
             continue;
         }
@@ -1654,7 +1743,7 @@ QString CVersionDialog::PickLatestHermesTag(const QStringList& a_aLines, QString
             vBest = vCur;
             sBestVer = sVer;
             sBestSha = m.captured(1);
-        } else if (vCur == vBest && !bPeeled) {
+        } else if (vCur == vBest && !bLightweight) {
             // 同版本附注 tag：轻量行 sha=tag 对象，^{} 行 sha=commit 实体 → 覆盖。
             sBestSha = m.captured(1);
         }

@@ -1,5 +1,6 @@
 ﻿// 内置测试沙箱核心能力层实现（说明见同名 .h）。
 #include "CSandboxCore.h"
+#include "SandboxCli.h"   // VkOfName（SendKeys 键名解析；2026-11-01 自本文件迁出）
 
 #include <QJsonObject>
 #include <QRect>
@@ -27,15 +28,15 @@
 // 幽灵化标记（SetProp；崩溃后新实例可据此还原）。2026-10-09 移入 sbx 并解除
 //   文件内限定：单元测试需直接访问 prop 名伪造跨实例场景（越权保护/标记超龄）。
 namespace sbx {
-const wchar_t* kPropGhost   = L"AutoCodeSbxGhost.1";   // 值 = 收纳者 PID
-const wchar_t* kPropOrigEx  = L"AutoCodeSbxOrigEx.1";  // 值 = 原 GWL_EXSTYLE
+const wchar_t* PropGhostName() { static const wchar_t* k = L"AutoCodeSbxGhost.1"; return k; }  // 值 = 收纳者 PID
+const wchar_t* kPropOrigEx  = L"AutoCodeSbxOrigEx.1";  // 值 = 原 GWL_EXSTYLE（仅本 dll 内使用）
 // 2026-10-08 「曾收纳」标记：AutoCode 退出还原在册窗口时保留（区别于用户主动
 //   还原——那会连此标记一并清）。新实例启动/切工程时扫到它：窗口进程 exe 在
 //   当前工程目录内 → 续收纳重新隐形（否则窗口裸奔在用户桌面，Compositer 实测）。
 // 2026-10-09 值改存打标/还原时刻 GetTickCount()（原恒为 1 无时效）：续收纳只认
 //   「最近还原」的窗口——超龄说明 Agent 早不再测它，用户可能正在用，不得再收
 //   （用户实测：工程内软件窗口反复自动消失/出现，就是无时效标记被反复续收）。
-const wchar_t* kPropAdopt   = L"AutoCodeSbxAdopt.1";
+const wchar_t* PropAdoptName() { static const wchar_t* k = L"AutoCodeSbxAdopt.1"; return k; }
 } // namespace sbx
 
 namespace {
@@ -204,20 +205,23 @@ bool GhostWindow(HWND a_hWnd) {
         return false;
     }
     const LONG_PTR lEx = GetWindowLongPtrW(a_hWnd, GWL_EXSTYLE);
-    if (!SetPropW(a_hWnd, kPropGhost,
+    if (!SetPropW(a_hWnd, PropGhostName(),
                   reinterpret_cast<HANDLE>(static_cast<intptr_t>(GetCurrentProcessId())))) {
         return false;
     }
     SetPropW(a_hWnd, kPropOrigEx, reinterpret_cast<HANDLE>(static_cast<intptr_t>(lEx)));
-    SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(
+    SetPropW(a_hWnd, PropAdoptName(), reinterpret_cast<HANDLE>(
         static_cast<intptr_t>(static_cast<ULONG>(GetTickCount()))));   // 曾收纳（时刻；退出还原时刷新）
     const LONG_PTR lNew = lEx | WS_EX_LAYERED | WS_EX_TRANSPARENT
                         | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
     SetLastError(0);   // SetWindowLongPtr 成功可合法返回 0（原值即 0），先清防残留误判
     SetWindowLongPtrW(a_hWnd, GWL_EXSTYLE, lNew);
     if (GetLastError() != 0) {
-        RemovePropW(a_hWnd, kPropGhost);
+        RemovePropW(a_hWnd, PropGhostName());
         RemovePropW(a_hWnd, kPropOrigEx);
+        RemovePropW(a_hWnd, PropAdoptName());   // 回滚同样摘除刚打的「曾收纳」标记：
+        //   幽灵化未成而带新鲜标记，后续实例会误走续收纳路径（且每次重试都刷新
+        //   时间戳永不超龄，窗口被反复误收）。
         return false;   // 提权/跨会话等改不动：安全侧不收纳
     }
     SetLayeredWindowAttributes(a_hWnd, 0, 1, LWA_ALPHA);   // alpha=1：视觉不可见仍重绘
@@ -235,7 +239,7 @@ bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark) {
     if (!IsWindow(a_hWnd)) {
         return false;
     }
-    const HANDLE hVal = GetPropW(a_hWnd, kPropGhost);
+    const HANDLE hVal = GetPropW(a_hWnd, PropGhostName());
     if (hVal == nullptr) {
         return false;   // 非本产品收纳的窗口
     }
@@ -248,16 +252,16 @@ bool RestoreWindow(HWND a_hWnd, bool a_bKeepAdoptMark) {
         // 原本就是分层窗口：恢复不透明（否则 alpha=1 残留，还原后仍看不见）。
         SetLayeredWindowAttributes(a_hWnd, 0, 255, LWA_ALPHA);
     }
-    RemovePropW(a_hWnd, kPropGhost);
+    RemovePropW(a_hWnd, PropGhostName());
     RemovePropW(a_hWnd, kPropOrigEx);
     // 2026-10-08 用户主动还原（默认）连「曾收纳」标记一并清——之后新实例不会再
     //   自动续收它；AutoCode 退出路径传 true 保留，供继任实例识别续收。
     if (!a_bKeepAdoptMark) {
-        RemovePropW(a_hWnd, kPropAdopt);
+        RemovePropW(a_hWnd, PropAdoptName());
     } else {
         // 退出还原：刷新「曾收纳」时刻——继任实例的时效窗从还原起算（收纳后
         //   AutoCode 连续跑数小时再退出，旧时刻已超龄会被误判成「用户在用」）。
-        SetPropW(a_hWnd, kPropAdopt, reinterpret_cast<HANDLE>(
+        SetPropW(a_hWnd, PropAdoptName(), reinterpret_cast<HANDLE>(
             static_cast<intptr_t>(static_cast<ULONG>(GetTickCount()))));
     }
     if (ITaskbarList* pList = nullptr;
@@ -276,7 +280,7 @@ struct SRestoreCtx {
 
 BOOL CALLBACK RestoreMarkedProc(HWND a_hWnd, LPARAM a_lParam) {
     auto* pCtx = reinterpret_cast<SRestoreCtx*>(a_lParam);
-    if (GetPropW(a_hWnd, kPropGhost) != nullptr) {
+    if (GetPropW(a_hWnd, PropGhostName()) != nullptr) {
         RestoreWindow(a_hWnd, pCtx->bKeepAdopt);
         ++pCtx->iCount;
     }
@@ -291,7 +295,7 @@ int RestoreAllMarked(bool a_bKeepAdoptMark) {
 }
 
 bool HasAdoptMark(HWND a_hWnd) {
-    return IsWindow(a_hWnd) && GetPropW(a_hWnd, kPropAdopt) != nullptr;
+    return IsWindow(a_hWnd) && GetPropW(a_hWnd, PropAdoptName()) != nullptr;
 }
 
 // 2026-10-09 「曾收纳」时刻（GetTickCount 快照；无标记返回 0）。年龄判定用无符号
@@ -300,30 +304,30 @@ ULONG AdoptMarkTick(HWND a_hWnd) {
     if (!IsWindow(a_hWnd)) {
         return 0;
     }
-    const HANDLE hVal = GetPropW(a_hWnd, kPropAdopt);
+    const HANDLE hVal = GetPropW(a_hWnd, PropAdoptName());
     return hVal != nullptr ? static_cast<ULONG>(
         static_cast<ULONG_PTR>(reinterpret_cast<intptr_t>(hVal))) : 0;
 }
 
-// 2026-10-09 幽灵中窗口的收纳者 PID（kPropGhost 值；非幽灵返回 0）——多实例
+// 2026-10-09 幽灵中窗口的收纳者 PID（PropGhostName() 值；非幽灵返回 0）——多实例
 //   互斥用：别的活实例正在管理的窗口，本实例不得越权还原/续收。
 DWORD GhostOwnerPid(HWND a_hWnd) {
     if (!IsWindow(a_hWnd)) {
         return 0;
     }
-    const HANDLE hVal = GetPropW(a_hWnd, kPropGhost);
+    const HANDLE hVal = GetPropW(a_hWnd, PropGhostName());
     return hVal != nullptr ? static_cast<DWORD>(
         static_cast<ULONG_PTR>(reinterpret_cast<intptr_t>(hVal))) : 0;
 }
 
 void ClearAdoptMark(HWND a_hWnd) {
     if (IsWindow(a_hWnd)) {
-        RemovePropW(a_hWnd, kPropAdopt);
+        RemovePropW(a_hWnd, PropAdoptName());
     }
 }
 
 bool IsGhosted(HWND a_hWnd) {
-    return IsWindow(a_hWnd) && GetPropW(a_hWnd, kPropGhost) != nullptr;
+    return IsWindow(a_hWnd) && GetPropW(a_hWnd, PropGhostName()) != nullptr;
 }
 
 bool IsGhostableShape(HWND a_hWnd) {
@@ -534,48 +538,6 @@ bool TypeText(HWND a_hWnd, const QString& a_sText) {
     return true;
 }
 
-quint32 VkOfName(const QString& a_sName) {
-    const QString s = a_sName.trimmed().toLower();
-    if (s.isEmpty()) {
-        return 0;
-    }
-    static const QHash<QString, quint32> sMap = {
-        { QStringLiteral("ctrl"),   VK_CONTROL }, { QStringLiteral("control"), VK_CONTROL },
-        { QStringLiteral("shift"),  VK_SHIFT },   { QStringLiteral("alt"),     VK_MENU },
-        { QStringLiteral("win"),    VK_LWIN },    { QStringLiteral("meta"),    VK_LWIN },
-        { QStringLiteral("enter"),  VK_RETURN },  { QStringLiteral("return"),  VK_RETURN },
-        { QStringLiteral("tab"),    VK_TAB },     { QStringLiteral("esc"),     VK_ESCAPE },
-        { QStringLiteral("escape"), VK_ESCAPE },  { QStringLiteral("space"),   VK_SPACE },
-        { QStringLiteral("left"),   VK_LEFT },    { QStringLiteral("right"),   VK_RIGHT },
-        { QStringLiteral("up"),     VK_UP },      { QStringLiteral("down"),    VK_DOWN },
-        { QStringLiteral("del"),    VK_DELETE },  { QStringLiteral("delete"),  VK_DELETE },
-        { QStringLiteral("back"),   VK_BACK },    { QStringLiteral("backspace"), VK_BACK },
-        { QStringLiteral("home"),   VK_HOME },    { QStringLiteral("end"),     VK_END },
-        { QStringLiteral("pgup"),   VK_PRIOR },   { QStringLiteral("pageup"),  VK_PRIOR },
-        { QStringLiteral("pgdn"),   VK_NEXT },    { QStringLiteral("pagedown"), VK_NEXT },
-        { QStringLiteral("insert"), VK_INSERT },  { QStringLiteral("ins"),     VK_INSERT },
-        { QStringLiteral("apps"),   VK_APPS },
-        { QStringLiteral("f1"), VK_F1 },  { QStringLiteral("f2"), VK_F2 },
-        { QStringLiteral("f3"), VK_F3 },  { QStringLiteral("f4"), VK_F4 },
-        { QStringLiteral("f5"), VK_F5 },  { QStringLiteral("f6"), VK_F6 },
-        { QStringLiteral("f7"), VK_F7 },  { QStringLiteral("f8"), VK_F8 },
-        { QStringLiteral("f9"), VK_F9 },  { QStringLiteral("f10"), VK_F10 },
-        { QStringLiteral("f11"), VK_F11 }, { QStringLiteral("f12"), VK_F12 },
-        { QStringLiteral("capslock"), VK_CAPITAL }, { QStringLiteral("numlock"), VK_NUMLOCK },
-        { QStringLiteral(","), VK_OEM_COMMA }, { QStringLiteral("."), VK_OEM_PERIOD },
-    };
-    if (sMap.contains(s)) {
-        return sMap.value(s);
-    }
-    if (s.size() == 1) {
-        const SHORT sVk = VkKeyScanW(s.at(0).unicode());
-        if (sVk != -1) {
-            return static_cast<quint32>(LOBYTE(sVk));
-        }
-    }
-    return 0;
-}
-
 bool SendKeys(HWND a_hWnd, const QString& a_sCombo) {
     if (!IsWindow(a_hWnd)) {
         return false;
@@ -772,88 +734,4 @@ bool ParseHwnd(const QString& a_sText, HWND* a_phOut) {
     *a_phOut = reinterpret_cast<HWND>(static_cast<uintptr_t>(u));
     return true;
 }
-
-bool ParseCli(const QStringList& a_aArgs, QString* a_psCmd, QJsonObject* a_pOut) {
-    if (a_psCmd == nullptr || a_pOut == nullptr || a_aArgs.size() < 3) {
-        return false;
-    }
-    const QString sCmd = a_aArgs.at(2).toLower();
-    const int iN = a_aArgs.size();
-    auto fnArg = [&a_aArgs](int a_i, const QString& a_sDef = QString()) -> QString {
-        return (a_i < a_aArgs.size()) ? a_aArgs.at(a_i) : a_sDef;
-    };
-    auto fnH = [&fnArg](int a_i) { return fnArg(a_i); };   // hwnd 文本原样传
-    QJsonObject o;
-    if (sCmd == QStringLiteral("windows") || sCmd == QStringLiteral("status")
-            || sCmd == QStringLiteral("record_on") || sCmd == QStringLiteral("record_off")
-            || sCmd == QStringLiteral("restore-all") || sCmd == QStringLiteral("restore_all")) {
-        *a_psCmd = (sCmd == QLatin1String("restore-all")) ? QStringLiteral("restore_all") : sCmd;
-        *a_pOut = o;
-        return true;
-    }
-    if (sCmd == QStringLiteral("capture")) {
-        if (iN < 4) return false;
-        o.insert(QStringLiteral("hwnd"), fnArg(3));
-        if (iN >= 5) o.insert(QStringLiteral("path"), fnArg(4));
-    } else if (sCmd == QStringLiteral("click")) {
-        if (iN < 6) return false;
-        o.insert(QStringLiteral("hwnd"), fnH(3));
-        o.insert(QStringLiteral("x"), fnArg(4).toInt());
-        o.insert(QStringLiteral("y"), fnArg(5).toInt());
-        const QString sMode = (iN >= 7) ? fnArg(6).toLower() : QString();
-        o.insert(QStringLiteral("dbl"), sMode == QLatin1String("dbl")
-                                     || sMode == QLatin1String("double"));
-        o.insert(QStringLiteral("right"), sMode == QLatin1String("right"));
-    } else if (sCmd == QStringLiteral("drag")) {
-        if (iN < 8) return false;
-        o.insert(QStringLiteral("hwnd"), fnH(3));
-        o.insert(QStringLiteral("x1"), fnArg(4).toInt());
-        o.insert(QStringLiteral("y1"), fnArg(5).toInt());
-        o.insert(QStringLiteral("x2"), fnArg(6).toInt());
-        o.insert(QStringLiteral("y2"), fnArg(7).toInt());
-        if (iN >= 9) o.insert(QStringLiteral("ms"), fnArg(8).toInt());
-    } else if (sCmd == QStringLiteral("type")) {
-        if (iN < 5) return false;
-        o.insert(QStringLiteral("hwnd"), fnH(3));
-        o.insert(QStringLiteral("text"), QStringList(a_aArgs.mid(4)).join(QLatin1Char(' ')));
-    } else if (sCmd == QStringLiteral("launch")) {
-        // --sandbox launch <exe> [参数...]：主进程代启动被测程序（2026-10-14
-        //   断链漏收治理：Start-Process/cmd start 中间人秒退会切断进程树）。
-        if (iN < 4) return false;
-        o.insert(QStringLiteral("exe"), fnArg(3));
-        if (iN >= 5) {
-            // 余参重建成命令行串：含空格/制表的元素补引号（Qt 拆参已剥一层）。
-            QStringList aRest;
-            for (int k = 4; k < iN; ++k) {
-                const QString s = a_aArgs.at(k);
-                aRest.append(s.contains(QLatin1Char(' '))
-                                 || s.contains(QLatin1Char('\t'))
-                                 || s.isEmpty()
-                             ? QStringLiteral("\"%1\"").arg(s) : s);
-            }
-            o.insert(QStringLiteral("args"), aRest.join(QLatin1Char(' ')));
-        }
-    } else if (sCmd == QStringLiteral("keys")) {
-        if (iN < 5) return false;
-        o.insert(QStringLiteral("hwnd"), fnH(3));
-        o.insert(QStringLiteral("keys"), fnArg(4));
-    } else if (sCmd == QStringLiteral("command")) {
-        if (iN < 5) return false;
-        o.insert(QStringLiteral("hwnd"), fnH(3));
-        o.insert(QStringLiteral("cmd"), fnArg(4).toInt());
-    } else if (sCmd == QStringLiteral("button")) {
-        if (iN < 4) return false;
-        o.insert(QStringLiteral("hwnd"), fnArg(3));
-    } else if (sCmd == QStringLiteral("tree") || sCmd == QStringLiteral("add")
-            || sCmd == QStringLiteral("restore") || sCmd == QStringLiteral("close")) {
-        if (iN < 4) return false;
-        o.insert(QStringLiteral("hwnd"), fnArg(3));
-    } else {
-        return false;   // 未知命令
-    }
-    *a_psCmd = sCmd;
-    *a_pOut = o;
-    return true;
-}
-
 } // namespace sbx

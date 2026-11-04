@@ -41,7 +41,7 @@ static double s_dHermesPriceCacheReadPerM = 0.3;
 static double s_dHermesPriceCacheWritePerM = 3.75;
 static double s_dHermesPriceOutPerM       = 15.0;
 // 激活模型条目回填的窗口/输出上限（写 ~/.hermes 前钳位）。
-static qint64 s_iHermesCtx = 200000;
+static qint64 s_iHermesCtx = kHermesCtxCap;
 static int    s_iHermesMaxTok = 32768;
 
 void CHermesRunner::SetHermesRoot(const QString& a_sRoot) { s_sHermesRoot = a_sRoot.trimmed(); }
@@ -99,7 +99,7 @@ void CHermesRunner::SetHermesPriceCacheWritePerM(double a_d) { s_dHermesPriceCac
 void CHermesRunner::SetHermesPriceOutPerM(double a_d) { s_dHermesPriceOutPerM = qMax(0.0, a_d); }
 
 void CHermesRunner::SetHermesRuntimeLimits(qint64 a_iCtx, int a_iMaxTok) {
-    s_iHermesCtx = ClampCtx(a_iCtx > 0 ? a_iCtx : 200000);
+    s_iHermesCtx = ClampCtx(a_iCtx > 0 ? a_iCtx : kHermesCtxCap);
     s_iHermesMaxTok = ClampMaxTok(a_iMaxTok > 0 ? a_iMaxTok : 32768);
 }
 
@@ -222,6 +222,40 @@ bool IsTopLevelKeyLine(const QString& a_sLine) {
     return re.match(a_sLine).hasMatch();
 }
 
+// 2026-11-02 精确键名重载：段定位旧口径 startsWith("model") 会误认同前缀顶级键
+//   （models:/agents:/model_list: 等），读值取错段、写键插错段——键名整词匹配。
+bool IsTopLevelKeyLine(const QString& a_sLine, const QString& a_sKey) {
+    if (!IsTopLevelKeyLine(a_sLine)) {
+        return false;
+    }
+    const int iColon = a_sLine.indexOf(QLatin1Char(':'));
+    return a_sLine.left(iColon).trimmed() == a_sKey;
+}
+
+// 2026-11-02 YAML 双引号标量完整转义与对称解码：旧写入只转义 \" 不转义反斜杠/
+//   换行，值含 \ 时产出非法 YAML；读回不解码 \"，幂等短路永不相等 → 每次启动
+//   都重写 config.yaml。写-读往返对称后幂等比较才成立。
+QString YamlQuote(const QString& a_sVal) {
+    QString sOut;
+    sOut.reserve(a_sVal.size());
+    for (const QChar& ch : a_sVal) {
+        if (ch == QLatin1Char('\\')) {
+            sOut += QStringLiteral("\\\\");
+        } else if (ch == QLatin1Char('"')) {
+            sOut += QStringLiteral("\\\"");
+        } else if (ch == QLatin1Char('\n')) {
+            sOut += QStringLiteral("\\n");
+        } else if (ch == QLatin1Char('\r')) {
+            sOut += QStringLiteral("\\r");
+        } else if (ch == QLatin1Char('\t')) {
+            sOut += QStringLiteral("\\t");
+        } else {
+            sOut += ch;
+        }
+    }
+    return sOut;
+}
+
 // 缩进键行匹配（注释行 # 开头不命中——正则要求空白后紧跟键名）。
 QRegularExpressionMatch MatchModelKey(const QString& a_sLine) {
     static const QRegularExpression re(
@@ -307,8 +341,7 @@ bool HasStrayHermesEffortLines(const QStringList& a_aLines) {
 QString BuildHermesAgentEffortText(const QStringList& a_aLines, const QString& a_sEffort) {
     int iAgent = -1;
     for (int i = 0; i < a_aLines.size(); ++i) {
-        if (a_aLines.at(i).startsWith(QStringLiteral("agent"))
-            && IsTopLevelKeyLine(a_aLines.at(i))) {
+        if (IsTopLevelKeyLine(a_aLines.at(i), QStringLiteral("agent"))) {
             iAgent = i;
             break;
         }
@@ -387,7 +420,9 @@ QMap<QString, QString> ReadHermesModelKeys(const QStringList& a_aLines) {
     bool bInModel = false;
     for (const QString& sLine : a_aLines) {
         if (IsTopLevelKeyLine(sLine)) {
-            bInModel = sLine.startsWith(QStringLiteral("model"));
+            // 2026-11-02 前缀匹配改精确键名：同前缀顶级键（models:/agents:/model_list:）
+            //   会被误认目标段（读值取错段/写键插错段）
+            bInModel = IsTopLevelKeyLine(sLine, QStringLiteral("model"));
             continue;
         }
         if (!bInModel) {
@@ -407,8 +442,7 @@ QString BuildHermesYamlText(const QStringList& a_aLines,
                             const QMap<QString, QString>& a_oTargets) {
     int iModel = -1;
     for (int i = 0; i < a_aLines.size(); ++i) {
-        if (a_aLines.at(i).startsWith(QStringLiteral("model"))
-            && IsTopLevelKeyLine(a_aLines.at(i))) {
+        if (IsTopLevelKeyLine(a_aLines.at(i), QStringLiteral("model"))) {
             iModel = i;
             break;
         }
@@ -446,9 +480,7 @@ QString BuildHermesYamlText(const QStringList& a_aLines,
             for (const char* sK : kHermesModelKeys) {
                 const QString sKey = QString::fromLatin1(sK);
                 aOut << sIndent + sKey + QStringLiteral(": \"")
-                        + a_oTargets.value(sKey).replace(QLatin1Char('"'),
-                                                         QStringLiteral("\\\""))
-                        + QLatin1Char('"');
+                        + YamlQuote(a_oTargets.value(sKey)) + QLatin1Char('"');
             }
         }
     }
@@ -463,9 +495,7 @@ QString BuildHermesYamlText(const QStringList& a_aLines,
         for (const char* sK : kHermesModelKeys) {
             const QString sKey = QString::fromLatin1(sK);
             aOut << sIndent + sKey + QStringLiteral(": \"")
-                    + a_oTargets.value(sKey).replace(QLatin1Char('"'),
-                                                     QStringLiteral("\\\""))
-                    + QLatin1Char('"');
+                    + YamlQuote(a_oTargets.value(sKey)) + QLatin1Char('"');
         }
         aOut << QString();   // 末尾换行
     }
@@ -1297,17 +1327,20 @@ void CHermesRunner::HandleLine(const QByteArray& a_sLine) {
         m_iResultSeenMs = QDateTime::currentMSecsSinceEpoch();   // 2026.10.29 记 result 时刻：
         //   进入驻留观察（CheckStall 5min 零 stdout 事件才收尾）——多阶段轮的
    //   中途 result 不再立即终结轮次（v5.1.436 立即收尾误伤实测）
+        return;   // 2026-11-02 补 return：旧实现落入下方未知事件兜底，整条 result
+        //   JSON（含完整回复文本）被当系统信息行原样 emit，与 sigAssistantText/
+        //   sigFinished 内容重复刷屏。
     }
     // 未知事件：原始透传 sigInfo（前向兼容，真实格式落定后在此扩展分支）。
     emit sigInfo(QString::fromUtf8(a_sLine));
 }
 
-void CHermesRunner::ApplyUsage(const QJsonObject& oUsage, bool a_bFromResult) {
+void CHermesRunner::ApplyUsage(const QJsonObject& a_oUsage, bool a_bFromResult) {
     // usage 分量（累计口径同 pi）：input/cacheRead/cacheWrite/output；缺字段容错为 0。
-    const qint64 iIn   = static_cast<qint64>(oUsage.value(QStringLiteral("input")).toDouble());
-    const qint64 iCRd  = static_cast<qint64>(oUsage.value(QStringLiteral("cacheRead")).toDouble());
-    const qint64 iCWr  = static_cast<qint64>(oUsage.value(QStringLiteral("cacheWrite")).toDouble());
-    const qint64 iOut  = static_cast<qint64>(oUsage.value(QStringLiteral("output")).toDouble());
+    const qint64 iIn   = static_cast<qint64>(a_oUsage.value(QStringLiteral("input")).toDouble());
+    const qint64 iCRd  = static_cast<qint64>(a_oUsage.value(QStringLiteral("cacheRead")).toDouble());
+    const qint64 iCWr  = static_cast<qint64>(a_oUsage.value(QStringLiteral("cacheWrite")).toDouble());
+    const qint64 iOut  = static_cast<qint64>(a_oUsage.value(QStringLiteral("output")).toDouble());
     // Hermes 按「本轮增量」上报（每条 assistant 一份该请求 usage）→ 累加进总额。
     m_iSumPlainInTok   += iIn;
     m_iSumCacheReadTok += iCRd;

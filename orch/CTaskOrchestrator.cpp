@@ -730,7 +730,7 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
     if (a_eDec == EReviewDecision::Reject) {
         // 2026.08.15 (流程档位) 回炉目标被用户取消勾选时，退到评审阶段在流内的前一阶段
         //   （防跳到未勾选阶段跑一轮不属于本流水线的工作）。
-        EStage eBack = CStageMachine::RejectTarget(eCur);
+        EStage eBack = CStageMachine::RejectTarget(eCur, a_pTask->Type());
         const QList<EStage> aFlow = TaskFlow(a_pTask);
         if (!aFlow.contains(eBack)) {
             eBack = CStageMachine::PrevStage(aFlow, eCur).value_or(EStage::Intake);
@@ -759,7 +759,10 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
                 .arg(StageNameZh(eBack)).arg(a_pTask->StageIter())
                 .arg(sDigest.isEmpty() ? QString()
                      : QStringLiteral("｜阻塞摘要：%1").arg(sDigest)));
-        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        const QPointer<CTaskInfo> pGuard(a_pTask);
+        QTimer::singleShot(0, this, [this, pGuard]() {
+            if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+        });
         return;
     }
 
@@ -774,7 +777,10 @@ void CTaskOrchestrator::FinishReviewStage(CTaskInfo* a_pTask, EReviewDecision a_
     }
     a_pTask->SetCurrentStage(*oNext);
     emit sigTaskChanged(a_pTask);
-    QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+    const QPointer<CTaskInfo> pGuard(a_pTask);
+    QTimer::singleShot(0, this, [this, pGuard]() {
+        if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+    });
 }
 
 void CTaskOrchestrator::ResolveReviewEscalation(CTaskInfo* a_pTask, int a_iChoice) {
@@ -807,7 +813,10 @@ void CTaskOrchestrator::ResolveReviewEscalation(CTaskInfo* a_pTask, int a_iChoic
         }
         a_pTask->SetCurrentStage(*oNext);
         emit sigTaskChanged(a_pTask);
-        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        const QPointer<CTaskInfo> pGuard(a_pTask);
+        QTimer::singleShot(0, this, [this, pGuard]() {
+            if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+        });
         return;
     }
     if (a_iChoice == 1) {
@@ -817,7 +826,10 @@ void CTaskOrchestrator::ResolveReviewEscalation(CTaskInfo* a_pTask, int a_iChoic
         StageEvent(a_pTask, QStringLiteral("manual_rerun"),
             QStringLiteral("↻ 人工介入：重置迭代计数，重跑当前阶段"));
         emit sigTaskChanged(a_pTask);
-        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        const QPointer<CTaskInfo> pGuard(a_pTask);
+        QTimer::singleShot(0, this, [this, pGuard]() {
+            if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+        });
         return;
     }
     // 2 = 保持暂停：任务维持 Paused（升级语义不变，用户可稍后点「继续」重跑）。
@@ -1611,7 +1623,7 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
         const EReviewDecision eDec = ParseReviewDecision(a_pTask, eCur, a_sResult);
         if (eDec == EReviewDecision::Reject) {
             // 2026.08.15 (流程档位) 回炉目标不在生效流内 → 退到评审阶段的前一个流内阶段
-            EStage eBack = CStageMachine::RejectTarget(eCur);
+            EStage eBack = CStageMachine::RejectTarget(eCur, a_pTask->Type());
             const QList<EStage> aFlow = TaskFlow(a_pTask);
             if (!aFlow.contains(eBack)) {
                 eBack = CStageMachine::PrevStage(aFlow, eCur).value_or(EStage::Intake);
@@ -1645,7 +1657,10 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
                         .arg(sDigest.isEmpty() ? QString() :
                              QStringLiteral("｜阻塞摘要：%1").arg(sDigest)));
             }
-            QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+            const QPointer<CTaskInfo> pGuard(a_pTask);
+            QTimer::singleShot(0, this, [this, pGuard]() {
+                if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+            });
             return;
         }
         // Pass
@@ -1663,7 +1678,10 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
 
     a_pTask->SetCurrentStage(*oNext);
     emit sigTaskChanged(a_pTask);
-    QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+    const QPointer<CTaskInfo> pGuard(a_pTask);
+    QTimer::singleShot(0, this, [this, pGuard]() {
+        if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+    });
 }
 
 void CTaskOrchestrator::ReRunResume(CTaskInfo* a_pTask, const QString& a_sCont) {
@@ -2693,7 +2711,10 @@ bool CTaskOrchestrator::EnsureStageInputs(CTaskInfo* a_pTask, const SStageDef& a
         StageEvent(a_pTask, QStringLiteral("need_input"),
             QStringLiteral("⚠ 缺少 %1，回退到「%2」重新生成")
                 .arg(sInput, pProdDef ? pProdDef->sNameZh : QString()));
-        QTimer::singleShot(0, this, [this, a_pTask]() { RunCurrentStage(a_pTask); });
+        const QPointer<CTaskInfo> pGuard(a_pTask);
+        QTimer::singleShot(0, this, [this, pGuard]() {
+            if (!pGuard.isNull()) { RunCurrentStage(pGuard); }   // 悬垂守卫：定时器触发前任务被删/归档即跳过
+        });
         return false;   // 已安排重跑，调用方应立即返回
     }
     return true;   // 所有声明输入就绪
@@ -2877,7 +2898,7 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     QString sFinalPrompt = a_sPrompt;
     const QString sHistory = BuildAdhocHistoryBlock(a_S, a_bDropLastUser);
     if (!sHistory.isEmpty()) {
-        sFinalPrompt = sHistory + QStringLiteral("\\n\\n") + a_sPrompt;
+        sFinalPrompt = sHistory + QStringLiteral("\n\n") + a_sPrompt;
     }
     // 2026.09.23 v3.0.219 轮次预算：SubmitAdhoc 按提示词难度评估（iTurnsBudget），
     //   内部链路（命名/续跑等未评估路径）回退全局基值。
@@ -3249,20 +3270,20 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
                 // 首次新建会话：仍全文投喂（保证模型一定拿到工程认知，一次性成本）。
                 sPrompt = QStringLiteral(
                     "以下是当前工程的项目指南（guide.md）。请先阅读以了解项目基本情况，再处理用户请求："
-                    "\\n---\\n%1\\n---\\n\\n%2").arg(sGuide, sPrompt);
+                    "\n---\n%1\n---\n\n%2").arg(sGuide, sPrompt);
             } else if (bFirst) {
                 sPrompt = QStringLiteral(
                     "这是与本助手的第一次对话。当前工程的指南 .autodev/guide.md 篇幅较长"
                     "（约 %1KB，待后台压缩整理），请先用 Read 工具读取 .autodev/guide.md "
                     "了解项目基本情况（内容较长可分段读），再处理用户请求。"
-                    "\\n\\n\\n%2").arg(QString::number(sGuide.size() / 1024), sPrompt);
+                    "\n\n\n%2").arg(QString::number(sGuide.size() / 1024), sPrompt);
             } else {
                 // 2026.08.27 变更重投瘦身（大工程助手每步极慢主因之一）：只投一句话让
                 //   agent 用 Read 自取——读多少缓存多少，与 Claude Code 按需探索同口径。
                 sPrompt = QStringLiteral(
                     "【项目指南已更新】.autodev/guide.md 自上次阅读后有变化，"
                     "请先用 Read 工具读取 .autodev/guide.md 同步项目认知，"
-                    "再处理用户请求。\\n\\n\\n%1").arg(sPrompt);
+                    "再处理用户请求。\n\n\n%1").arg(sPrompt);
             }
         }
     }
@@ -3273,8 +3294,8 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
     //   明示本规则是条件性约束不是任务。
     if (a_iPerm != PermReadOnly) {
         sPrompt.append(QStringLiteral(
-            "\\n\\n---\\n【以下为附加工程约定（背景约束、不是任务——仅在满足各自条件时遵守，"
-            "不要主动执行，更不要以确认语代替处理上面的用户请求）】\\n【强制记录规则】如果你在本次回答中实际修改了工程源码文件，结束前必须向 "
+            "\n\n---\n【以下为附加工程约定（背景约束、不是任务——仅在满足各自条件时遵守，"
+            "不要主动执行，更不要以确认语代替处理上面的用户请求）】\n【强制记录规则】如果你在本次回答中实际修改了工程源码文件，结束前必须向 "
             "`.autodev/record.md` **追加**恰好一行，格式："
             "`[yyyy-MM-dd HH:mm] 助手 | <简述改了哪些文件/做了什么>`（时间用 `date` 命令取当前时刻）。"
             "必须用 Edit 工具在文件末尾追加（先 Read 再 Edit 末尾行），**严禁用 Write 覆盖整个 record.md**。"
@@ -3339,7 +3360,7 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             && sNoticeOwner == sOwner) {
             sPrompt.prepend(QStringLiteral(
                 "【系统回退通知】工作目录已回退到版本 #%1：此前对话中描述的文件修改已不存在于磁盘。"
-                "请以当前磁盘内容为准，不要基于已被回退的修改继续工作。\\n---\\n").arg(iNoticeTarget));
+                "请以当前磁盘内容为准，不要基于已被回退的修改继续工作。\n---\n").arg(iNoticeTarget));
             m_pPm->ClearPendingNotice();
         }
         AsyncAdhocBackup(a_sAsstId, sOwner, a_sText);
@@ -4212,9 +4233,10 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         const int iVerdict = ParseDeepVerdict(a_sResult, &sReasons);
         if (iVerdict == 1) {
             // 2026-10-30 专家轮统一输出口径（用户需求）：验证轮终答=面向用户的唯一
-            //   结果报告（按 StartDeepVerify 模板含【综合结果】+【验证结论】），作为
-            //   链尾结论文块外显；被静默的执行/修复/验证轮过程文本随之丢弃（内容已
-            //   由验证者整合进报告）。result 空文本兑底取末条静默文本。
+            //   结果报告（按 StartDeepVerify 模板含【需求对照】+【改动摘要】+
+            //   【验证结论】三段，需求逐条对照用户请求），作为链尾结论文块外显；
+            //   被静默的执行/修复/验证轮过程文本随之丢弃（内容已由验证者整合进报告）。
+            //   result 空文本兑底取末条静默文本。
             QString sReport = a_sResult.trimmed();
             if (sReport.isEmpty() && !pS->aDeepMuted.isEmpty()) {
                 sReport = pS->aDeepMuted.last();
@@ -4241,9 +4263,9 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                     .arg(pS->iDeepRetry).arg(MaxIter()).arg(sReasons.left(160)));
             pS->eMode = Submitting;
             StartAdhocStage(*pS, QStringLiteral(
-                "【专家模式·修复轮】独立验证者报告以下问题未通过验收：\n---\n%1\n---\n"
+                "【专家模式·修复轮】独立验证者报告以下需求/验收项未通过：\n---\n%1\n---\n"
                 "请在现有改动基础上修复以上全部问题（会话已保留此前的改动与上下文，"
-                "不要重做已通过的部分），对照验收标准逐项处理后，"
+                "不要重做已通过的部分），对照需求清单与验收标准逐项处理后，"
                 "把修复情况写成简明清单（该清单交给验证Agent 核验并向用户汇总，"
                 "不直接面向用户）；修复完成后删除本轮自己创建的"
                 "临时文件（探针脚本、中间产物、输出重定向文件等；构建系统的"
@@ -4296,9 +4318,12 @@ void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
         "禁止修改任何文件（可用 Read/Grep/Glob 等只读工具探索工程）。\n"
         "计划格式（Markdown，全文 ≤60 行）：\n"
         "## 目标\n（一两句话）\n"
+        "## 需求清单\n（把用户请求逐条拆成编号需求：一条话可拆多条、不得遗漏，"
+        "尽量保留用户原话关键词，不改写成熱语；此清单供验证轮逐条对照用户请求，"
+        "是最终报告的第一段）\n1. …\n"
         "## 实施步骤\n1. …（每步写明要动的文件/位置，尽量具体可执行）\n"
-        "## 验收标准\n1. …（每条必须客观可验证：可编译、可运行、测试通过、"
-        "文件内容/行为符合预期；禁止「优化」「完善」等主观措辞）\n"
+        "## 验收标准\n1. …（编号尽量对应需求清单；每条必须客观可验证：可编译、"
+        "可运行、测试通过、文件内容/行为符合预期；禁止「优化」「完善」等主观措辞）\n"
         "---\n【用户请求】\n%1%2")
         .arg(a_S.sPendingPrompt.left(2000), sLessons);
     StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
@@ -4307,36 +4332,63 @@ void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
 
 void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
     // 深度链第 3 步：验证轮（fork 一次性分支）。独立验证者只核验不修复（禁 Edit/Write），
-    //   按 guide.md 构建说明实际编译/测试 + 逐项核对验收标准，末行输出 VERIFY:PASS/FAIL。
+    //   按 guide.md 构建说明实际编译/测试 + 逐条对照需求清单，末行输出 VERIFY:PASS/FAIL。
     //   2026-10-30 统一输出口径（用户需求：执行结果不再直接上屏）：验证者整合
-    //   【执行Agent实施报告】与自证事实，产出面向用户的唯一报告（综合结果+验证结论）。
+    //   【执行Agent实施报告】与自证事实，产出面向用户的唯一报告。
+    //   2026-11-02 报告改需求对照式（用户需求：总结/验证结论太复杂抓不住重点）：首段
+    //   【需求对照】逐条对照用户请求（规划需求清单缺失时验证者自行拆解原始请求），
+    //   每条一行状态+一句话依据；PASS 仅当全部 ✅，未完成/部分/未验证必须给原因。
     a_S.eMode = DeepVerify;
     emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_verify"),
-        QStringLiteral("🔍 专家模式：验证Agent 按验收标准实际编译/测试核验…"));
+        QStringLiteral("🔍 专家模式：验证Agent 逐条对照需求并实际编译/测试核验…"));
     const QString sCriteria = ExtractDeepCriteria(a_S.sDeepPlan);
+    // 规划·需求清单（新链由规划轮产出；旧链/规划失败缺失 → 验证者自行拆解用户原始请求）
+    QString sReqs = ExtractDeepSection(a_S.sDeepPlan, QStringLiteral("需求清单"));
+    sReqs = sReqs.isEmpty()
+        ? QStringLiteral("（规划未产出需求清单——请把【用户原始请求】逐条拆成编号需求"
+                          "再逐条对照，一条话可拆多条、不得遗漏）")
+        : sReqs.left(1200);
     const QString sExecReport = a_S.sDeepExecReport.trimmed().isEmpty()
         ? QStringLiteral("（执行轮未产出文字报告——请以你自己核验到的工程实际状态为准）")
         : a_S.sDeepExecReport.trimmed().left(3000);
     const QString sPrompt = QStringLiteral(
         "【专家模式·验证轮】你是独立验证者，也是本轮面向用户的唯一发言人（执行Agent "
         "的结果不再直接展示，由你统一汇总）。执行Agent 刚完成了用户请求的改动，请核验"
-        "后输出一份完整的综合报告（只验证、严禁修复、严禁修改任何工程文件）：\n"
-        "1) 逐项核对【验收标准】：需看代码的用 Read 核对，需看行为的实际运行验证；\n"
+        "后输出简洁、抓重点的报告（只验证、严禁修复、严禁修改任何工程文件）：\n"
+        "1) 先确定【需求清单】（缺失时自行从【用户原始请求】逐条拆解，一条话可拆"
+        "多条、不得遗漏），再逐条核对每条需求：看代码的用 Read 核对，看行为的"
+        "实际运行验证；\n"
         "2) 编译/测试方法优先按 .autodev/guide.md 的构建说明执行；无说明时用工程惯例"
         "命令（如 cmake --build build、msbuild、pnpm test 等）；\n"
-        "3) 你的最终输出就是用户看到的唯一结果报告，结构必须为两段：\n"
-        "   【综合结果】面向用户完整说明本次改动：做了什么、涉及哪些文件、最终效果、"
-        "遗留事项——以【执行Agent实施报告】为底稿，用你自己核验到的事实校正与补充"
-        "（报告未提及但实际发生的重要改动也要覆盖）；\n"
-        "   【验证结论】逐项给出证据（执行的命令与关键输出/检查的文件与关键行）；\n"
+        "3) 你的最终输出就是用户看到的唯一结果报告，结构必须为三段（顺序固定，全文"
+        "尽量 ≤40 行、一行一条，不铺陈过程）：\n"
+        "   【需求对照】逐条一行：N. <需求一句话> → 状态 + 一句话依据，状态四选一：\n"
+        "     ✅已完成：<结果/关键证据>｜⚠️部分完成：<还缺什么>｜❌未完成：<原因>｜"
+        "⭕未验证：<无法验证的原因>（未完成/部分/未验证必须写原因，不得留空）；\n"
+        "   【改动摘要】≤6 行：做了什么、涉及哪些文件、遗留事项（无则写「无」）；\n"
+        "   【验证结论】只列决定判定的关键证据（执行的命令与关键输出/检查的文件与"
+        "关键行），逐条对应验收标准，过程细节一律省略；\n"
         "4) 最后一行必须精确输出总结论（二选一）：\n"
         "   VERIFY:PASS\n"
-        "   VERIFY:FAIL: <原因清单，逐条对应未通过的验收标准>\n"
+        "   （仅当【需求对照】全部条目为 ✅已完成；任一 ⚠️/❌/⭕ 都必须判 FAIL）\n"
+        "   VERIFY:FAIL: <原因清单，逐条对应未完成/部分完成/未验证的需求>\n"
         "5) 收尾清理（2026-10-29 用户需求）：验证结束前删除本轮验证过程中你自己创建的"
         "临时文件（探针脚本、输出重定向文件、临时测试数据等；构建系统的常规中间目录"
         "不算，勿删）；清理失败不影响验证结论。\n"
-        "---\n【执行Agent实施报告】\n%3\n---\n【验收标准】\n%1\n---\n【用户原始请求】\n%2")
-        .arg(sCriteria, a_S.sPendingPrompt.left(800), sExecReport);
+        "6) 验证纪律（2026-11-02 硬约束，TuKan 实害：简单窗口持久化改动验证轮跑了"
+        "17 分钟未收敛——5 轮 GUI 沙箱实测+10 次图像分析+范围发散到指令外疑点）：\n"
+        "   a) 手段分级：配置/持久化/UI 文本类改动优先 Read/Grep 读源码与配置文件"
+        "静态确认；仅当行为无法静态确认时才运行程序，全程最多启停 1 轮（启动→核对→"
+        "关闭）；禁止用截图/图像分析确认窗口矩形或控件状态——用窗口 API 读值或"
+        "配置文件比对代替；\n"
+        "   b) 范围锁定：只验证【需求清单】/【验收标准】所列事项；过程中发现的范围外"
+        "疑点一律写入【改动摘要】末尾「观察项」，禁止展开排查（更禁止顺手修复）；\n"
+        "   c) 预算上限：工具调用累计约 30 次仍未核验完时，停止进一步验证，基于已"
+        "核验事实直接输出结论，未核验的需求如实标 ⭕未验证并写原因——宁可结论保守，"
+        "不可验证无界。\n"
+        "---\n【执行Agent实施报告】\n%4\n---\n【需求清单】\n%1\n---\n"
+        "【验收标准】\n%2\n---\n【用户原始请求】\n%3")
+        .arg(sReqs, sCriteria, a_S.sPendingPrompt.left(2000), sExecReport);
     StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
                     k_iDeepAuxTurns, QStringLiteral("Edit,Write"));
 }
@@ -4480,23 +4532,35 @@ int CTaskOrchestrator::ParseDeepVerdict(const QString& a_sResult, QString* a_pRe
     return rePass.match(a_sResult).hasMatch() ? 1 : -1;
 }
 
-QString CTaskOrchestrator::ExtractDeepCriteria(const QString& a_sPlan) {
-    // 纯函数：从规划产物提取「## 验收标准」段（到下一个 ## 标题或文末）；段缺失/
-    //   段体为空 → 回退整份计划（验证轮仍拿到可用输入）；恒截 2000 字。
-    if (a_sPlan.trimmed().isEmpty()) {
-        return QStringLiteral("（规划产物缺失——请按用户原始请求的合理结果验收）");
+QString CTaskOrchestrator::ExtractDeepSection(const QString& a_sPlan,
+                                              const QString& a_sName) {
+    // 纯函数（2026-11-02 需求对照）：从规划产物提取「## <段名>」段体（到下一个
+    //   ## 标题或文末；标题容忍 0..3 个 # 前缀）。段缺失/段体空 → 空串，回退策略
+    //   由调用方决定（验收标准回退整计划，需求清单回退“验证者自行拆解”）。
+    if (a_sPlan.trimmed().isEmpty() || a_sName.trimmed().isEmpty()) {
+        return QString();
     }
-    static const QRegularExpression reSection(
-        QStringLiteral("(?m)^#{0,3}\\s*验收标准\\s*$"));
+    const QRegularExpression reSection(
+        QStringLiteral("(?m)^#{0,3}\\s*%1\\s*$").arg(
+            QRegularExpression::escape(a_sName.trimmed())));
     const auto m = reSection.match(a_sPlan);
     if (!m.hasMatch()) {
-        return a_sPlan.trimmed().left(2000);
+        return QString();
     }
     const QString sRest = a_sPlan.mid(m.capturedEnd());
     static const QRegularExpression reNext(QStringLiteral("(?m)^#{1,3}\\s+\\S"));
     const auto mNext = reNext.match(sRest);
     QString sBody = mNext.hasMatch() ? sRest.left(mNext.capturedStart()) : sRest;
-    sBody = sBody.trimmed();
+    return sBody.trimmed();
+}
+
+QString CTaskOrchestrator::ExtractDeepCriteria(const QString& a_sPlan) {
+    // 纯函数：从规划产物提取「## 验收标准」段；段缺失/段体为空 → 回退整份计划
+    //   （验证轮仍拿到可用输入）；恒截 2000 字。段体提取已下沉到 ExtractDeepSection。
+    if (a_sPlan.trimmed().isEmpty()) {
+        return QStringLiteral("（规划产物缺失——请按用户原始请求的合理结果验收）");
+    }
+    QString sBody = ExtractDeepSection(a_sPlan, QStringLiteral("验收标准"));
     if (sBody.isEmpty()) {
         return a_sPlan.trimmed().left(2000);
     }

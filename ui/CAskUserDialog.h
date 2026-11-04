@@ -34,4 +34,5 @@ private:
     QPlainTextEdit*   m_pEditOther   = nullptr;   // 选项模式下“其他”项的输入框
     QDialogButtonBox* m_pBtns        = nullptr;
     QString           m_sAnswer;
+    int               m_iHBeforeOther = 0;   // 显示「其他」输入框前的窗口高（隐藏时恢复，防钳位欠减）
 };

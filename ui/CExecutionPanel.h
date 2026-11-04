@@ -281,6 +281,10 @@ signals:
     void sigAdhocStop(const QString& a_sAsstId);
     // 2026-10-02 跨档幽灵：外档运行中助手被点击（切回归属任务/工程档）与结束（落盘后除幽灵）。
     void sigAsstForeignActivated(const QString& a_sOwnerKey);
+    // 2026-11-02 改名目标在弹窗期间被切档踢出当前视图：按归属档 key 直接改档案文件
+    //   （宿主 OnAsstRenameInArchive：读工程全局档/任务私有档 → 按 id 改名 → 回写）。
+    void sigAsstRenameInArchive(const QString& a_sId, const QString& a_sOwnerKey,
+                                const QString& a_sName);
     void sigAsstForeignFinished(const QString& a_sAsstId);
     void sigAdhocBlocksChanged();                         // 助手流变化（#1 存盘）
     // 2026-10-31 在途轮标记变化（SetAsstRunning 真实跳变沿）：主窗口据此落盘

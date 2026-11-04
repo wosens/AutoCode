@@ -199,6 +199,10 @@ private slots:
     //   挂起不提交；命名期间追加只暂存；命名收尾统一转正补发（多条合并）；
     //   停止撤销挂起退回输入框。
     void asstAutoNameRenameFirstOnSend();
+    // 2026-11-02 幽灵除名 vs 补发竞态（QuickTool 实害：首条指令只上屏永不执行）。
+    void asstAutoNameFlushKeepsGhostPendingSubmit();
+    // 2026-11-02 改名弹窗期间切档：目标落空改发档案改名信号，不再静默丢弃。
+    void asstRenameFallsBackToArchive();
     // 2026-10-31 上次未执行完续跑回归：档残留 pend 标记 → PendAsstIds 检出
     //   （已关闭排除）；SetAsstRunning 置/清 ↔ JSON pend 键写/不写；
     //   ResumePendAsst 以「继续执行上次中断的指令」走正常发送链；ClearAsstPend 清空。
@@ -739,6 +743,37 @@ void TestExecPanel::filePreviewCodeSyntax() {
         QVERIFY(pView != nullptr);
         QVERIFY(pView->toPlainText().contains(QStringLiteral("std::printf")));
         QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, false));
+    }
+
+    // 2026-10-31 v5.2.460 UTF-16 LE 文本防误判（VS resource.h 实害）：NUL ≈50% 的
+    //   带 BOM 文本不得走十六进制视图——文本 BOM 优先于空字节比例启发式。
+    {
+        const QString sRh = sTmpRoot + QStringLiteral("/resource.h");
+        QFile fRh(sRh);
+        QVERIFY(fRh.open(QIODevice::WriteOnly));
+        const QString sBody = QStringLiteral(
+            "// {{NO_DEPENDENCIES}}\n#define IDR_MAINFRAME 128\n"
+            "#define IDD_ABOUTBOX 129\n");
+        QByteArray aWithBom;
+        aWithBom.append(char(0xFF));
+        aWithBom.append(char(0xFE));
+        // QString→UTF-16LE 字节（Qt6 无 toUtf16 成员，经 QStringEncoder）。
+        QStringEncoder enc16(QStringConverter::Utf16LE,
+                             QStringConverter::Flag::Stateless);
+        aWithBom += enc16.encode(sBody);
+        QVERIFY(aWithBom.size() > 4 && aWithBom.count(char(0)) * 10 > aWithBom.size());
+        fRh.write(aWithBom);
+        fRh.close();
+        w.ShowFile(sRh);
+        // 内容可读（经 UTF-16LE 解码；十六进制页无 QTextBrowser 可见）
+        QTextBrowser* pRh = nullptr;
+        const auto aViewsRh = w.findChildren<QTextBrowser*>();
+        for (QTextBrowser* p : aViewsRh) {
+            if (p->isVisible()) { pRh = p; break; }
+        }
+        if (pRh == nullptr && !w.IsCodeViewActive()) {
+            QFAIL("UTF-16 文本被误判为二进制（走了十六进制视图）");
+        }
     }
 
     // 换非源码文件（.txt）：恒纯文本页，不受语法页影响。
@@ -3674,6 +3709,107 @@ void TestExecPanel::asstAutoNameRenameFirstOnSend() {
     QCOMPARE(spySubmit2.count(), 0);
     panel.hide();
     panel2.hide();
+}
+
+void TestExecPanel::asstAutoNameFlushKeepsGhostPendingSubmit() {
+    // 2026-11-02 幽灵除名 vs 补发竞态回归（QuickTool 实害：首条指令只上屏永不执行）：
+    //   首条「先改名后执行」链中切档（命名轮运行中 → 助手以幽灵保留）→ 命名收尾
+    //   OnAdhocFinished：旧版收尾尾部的幽灵除名判定（singleShot(0)「!bRunning」）恰在
+    //   补发延迟窗口（1.5s）内触发 → 面板除名+会话释放 → 延迟补发 AsstById 落空被
+    //   静默丢弃（sid 恒空、助手看似从未运行）。修复=补发链先置运行态：①幽灵除名
+    //   跳过（不发射 sigAsstForeignFinished）；②延迟补发照常发射 sigAdhocSubmit。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("助手1"), 0));   // 默认名：走先改名链
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    panel.SetAdhocEnabled(true);
+    // 模拟主窗口 OnAsstForeignFinished 的面板除名（真实验害链：除名+会话释放）。
+    QObject::connect(&panel, &CExecutionPanel::sigAsstForeignFinished,
+                     &panel, [&panel](const QString& sIdG) {
+        panel.RemoveAsstEntry(sIdG);
+    });
+    QSignalSpy spyForeign(&panel, &CExecutionPanel::sigAsstForeignFinished);
+    QSignalSpy spySubmit(&panel, &CExecutionPanel::sigAdhocSubmit);
+    // 模拟编排器命名链：auto_naming 事件 + StartAdhocStage 的 sigAdhocRunning。
+    QObject::connect(&panel, &CExecutionPanel::sigAsstAutoRename,
+                     &panel, [&panel](const QString& sIdN, const QString&) {
+        panel.SetAsstRunning(sIdN, true);
+    });
+    QPlainTextEdit* pIn = nullptr;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->tabText(i).startsWith(QStringLiteral("助手1"))) {
+            pTabs->setCurrentIndex(i);
+            pIn = pTabs->widget(i)->findChild<QPlainTextEdit*>();
+            break;
+        }
+    }
+    QVERIFY(pIn != nullptr);
+    const QString sId = panel.ActiveAsstId();
+    pIn->setPlainText(QStringLiteral("帮我修复语言菜单"));
+    panel.DoAdhocSend(sId);
+    QCOMPARE(spySubmit.count(), 0);          // 命名挂起：未提交
+    QCOMPARE(panel.StagedCount(sId), 1);
+    QVERIFY(panel.AsstRunning(sId));         // 命名轮运行中
+    // 模拟切档：视图 key 切任务档（助手 sOwnerKey 仍 "" → 变外档幽灵）。
+    panel.SetViewKey(QStringLiteral("taskA"));
+    // 命名轮收尾：暂存转正 + 延迟补发。修复后：收尾先持运行态 → 幽灵除名跳过。
+    panel.OnAdhocFinished(sId);
+    QVERIFY(panel.AsstRunning(sId));         // 补发窗口先持运行态（除名判定跳过）
+    QTRY_COMPARE(spySubmit.count(), 1);     // 修复前：幽灵在 1.5s 前被除名，永不发射
+    QVERIFY(spySubmit.at(0).at(1).toString().contains(QStringLiteral("修复语言菜单")));
+    QCOMPARE(spyForeign.count(), 0);        // 补发窗口内不得除名（轮次真正收尾才除）
+    QCOMPARE(panel.StagedCount(sId), 0);
+    panel.hide();
+}
+
+void TestExecPanel::asstRenameFallsBackToArchive() {
+    // 2026-11-02 改名弹窗期间切档：目标不在新视图 → 发射 sigAsstRenameInArchive
+    //   （id+归属档 key+新名）由宿主改档案文件，不再静默丢弃。
+    //   驱动方式：定时器在 QInputDialog::exec 内填新名，填完先模拟切档剔掉目标
+    //   （RemoveAsstEntry）再 accept——返回后 AsstById 落空 → 走档案改名信号。
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QJsonArray aAssts;
+    aAssts.append(MakeAsst(QStringLiteral("待改名助手"), 0));
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    QTest::qWait(100);
+    QSignalSpy spyRename(&panel, &CExecutionPanel::sigAsstRenameInArchive);
+    const QString sId = panel.ActiveAsstId();
+    int iTab = -1;
+    for (int i = 0; i < pTabs->count(); ++i) {
+        if (pTabs->widget(i)->findChild<QPlainTextEdit*>() != nullptr
+                && pTabs->tabText(i).startsWith(QStringLiteral("待改名助手"))) {
+            iTab = i;
+            break;
+        }
+    }
+    QVERIFY(iTab >= 0);
+    QTimer::singleShot(0, [&panel, sId]() {
+        QWidget* pM = QApplication::activeModalWidget();
+        if (pM == nullptr) { return; }
+        QLineEdit* pEd = pM->findChild<QLineEdit*>();
+        if (pEd != nullptr) {
+            pEd->setText(QStringLiteral("新名字123"));
+        }
+        panel.RemoveAsstEntry(sId);   // 模拟弹窗期间切档：目标被剔出视图
+        static_cast<QDialog*>(pM)->accept();
+    });
+    // OnAsstTabRenamed 为私有槽：经 QTabBar::tabBarDoubleClicked 信号真链路触发。
+    QVERIFY(QMetaObject::invokeMethod(pTabs->tabBar(), "tabBarDoubleClicked",
+                                      Q_ARG(int, iTab)));
+    QTRY_COMPARE(spyRename.count(), 1);   // 目标落空：不改静默丢弃，发档案改名
+    QCOMPARE(spyRename.at(0).at(0).toString(), sId);
+    QCOMPARE(spyRename.at(0).at(1).toString(), QString());   // 归属工程全局档
+    QCOMPARE(spyRename.at(0).at(2).toString(), QStringLiteral("新名字123"));
+    panel.hide();
 }
 
 void TestExecPanel::promptGateRefineFlow() {

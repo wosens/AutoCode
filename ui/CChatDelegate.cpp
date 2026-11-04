@@ -653,7 +653,13 @@ bool CChatDelegate::editorEvent(QEvent* a_pEvent, QAbstractItemModel* a_pModel,
                 - QPoint(13, QFontMetrics(fSp).height() + 4);
             const QString sUrl = pDoc->documentLayout()->anchorAt(ptDoc);
             if (!sUrl.isEmpty()) {
-                QDesktopServices::openUrl(QUrl(sUrl));
+                // 2026-11-02 scheme 白名单：助手正文含工具输出回显，可携带 file:/
+                //   ms-msdt: 等任意协议，单击即触发系统处理器——仅放行 http/https/mailto。
+                const QString sScheme = QUrl(sUrl).scheme().toLower();
+                if (sScheme == QLatin1String("http") || sScheme == QLatin1String("https")
+                    || sScheme == QLatin1String("mailto")) {
+                    QDesktopServices::openUrl(QUrl(sUrl));
+                }
                 return true;
             }
         }

@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
+#include <QSaveFile>   // 2026-11-02 原子替换
 #include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QTextStream>
@@ -228,7 +229,9 @@ SGuideChangeSet CGuideFingerprintScanner::Diff(const QList<SFileFingerprint>& a_
     // prev 按路径建索引（保序：相同路径取首个）。
     QHash<QString, const SFileFingerprint*> mapPrev;
     for (const SFileFingerprint& rFp : a_aPrev) {
-        mapPrev.insert(rFp.sRelPath, &rFp);
+        if (!mapPrev.contains(rFp.sRelPath)) {
+            mapPrev.insert(rFp.sRelPath, &rFp);   // 2026-11-02 QHash::insert 是覆盖语义（留最后），与「取首个」注释相反——改 contains 守卫真正取首个
+        }
     }
     // cur 按路径建索引。
     QHash<QString, const SFileFingerprint*> mapCur;
@@ -444,25 +447,20 @@ bool CGuideFingerprintScanner::WriteIncremental(const QString& a_sGuidePath,
         }
     }
 
-    // 6) 临时文件 + rename 原子替换（R2）。UTF-8 with BOM，与 guide.md 编码一致。
-    const QString sTmp = a_sGuidePath + QStringLiteral(".tmp");
-    QFile stTmp(sTmp);
-    if (!stTmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    // 6) 原子替换（2026-11-02 改 QSaveFile）。旧实现 remove+rename 两步间崩溃/
+    //   rename 失败会把 guide.md 丢失（仅剩 .tmp），且 write 未校验（磁盘满时截断
+    //   tmp 也被换上）。QSaveFile：写临时文件 + commit 单步原子替换，失败自动
+    //   保留原文件。UTF-8 with BOM，与 guide.md 编码一致。（行尾口径：读取经
+    //   QIODevice::Text 归一 LF，写回为 LF——与既有全量写入路径同口径。）
+    QSaveFile stTmp(a_sGuidePath);
+    if (!stTmp.open(QIODevice::WriteOnly)) {
         return false;
     }
-    stTmp.write("\xEF\xBB\xBF");   // UTF-8 BOM
-    stTmp.write(sNewGuide.toUtf8());
-    stTmp.close();
-
-    // Windows 上 rename 覆盖目标：QFile::rename 目标存在时失败，故先删原文件再改名。
-    if (QFile::exists(a_sGuidePath)) {
-        if (!QFile::remove(a_sGuidePath)) {
-            QFile::remove(sTmp);
-            return false;
-        }
+    stTmp.write("\xEF\xBB\xBF");   // UTF-8 BOM（正文由上方重组路径生成，不带 BOM）
+    const QByteArray aBody = sNewGuide.toUtf8();
+    if (stTmp.write(aBody) != aBody.size()) {
+        stTmp.cancelWriting();
+        return false;   // 短写：放弃替换，原文件保留
     }
-    if (!QFile::rename(sTmp, a_sGuidePath)) {
-        return false;   // 改名失败：临时文件残留，调用方可手动清理
-    }
-    return true;
+    return stTmp.commit();
 }

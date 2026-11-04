@@ -37,7 +37,12 @@ QString CTaskListPanel::FormatTokens(qint64 a_iTokens) {
         return QString::number(a_iTokens);
     }
     if (a_iTokens < 1000000) {
-        return QStringLiteral("%1K").arg(QString::number(a_iTokens / dK, 'f', 1));
+        // 2026-11-02 边界进档：999950~999999 先除后舍入会显示「1000.0K」（单位与
+        //   数值矛盾），舍入结果 ≥1000 时升 M 档（下同）。
+        const double dKv = QString::number(a_iTokens / dK, 'f', 1).toDouble();
+        return dKv >= 1000.0
+            ? QStringLiteral("1.0M")
+            : QStringLiteral("%1K").arg(QString::number(dKv, 'f', 1));
     }
     if (a_iTokens < 1000000000LL) {
         return QStringLiteral("%1M").arg(QString::number(a_iTokens / (dK * dK), 'f', 1));
@@ -372,8 +377,7 @@ void CTaskListPanel::RestoreSelection(CTaskInfo* a_pTarget) {
     }
 }
 
-void CTaskListPanel::DeselectAll()
-{
+void CTaskListPanel::DeselectAll() {   // 2026-11-02 K&R 归一（原 Allman 与全文件不一致）
     // 2026-10-02 程序化取消选中（外档幽灵点击回工程档用）：置 m_bAllowDeselect 后清
     // 两表选中，走正常选中变更链（emit sigTaskSelected(nullptr) → OnTaskSelected 切档）。
     m_bAllowDeselect = true;
@@ -738,6 +742,7 @@ void CTaskListPanel::OnCurrentContextMenu(const QPoint& a_pos) {
     QAction* pActRemove = menu.addAction(MenuIcon(QStringLiteral("ow-remove")), QStringLiteral("移除"));
     QAction* pActDelete = menu.addAction(MenuIcon(QStringLiteral("ow-delete")), QStringLiteral("删除"));   // 2026.10.20 补图标（与全应用菜单图标化对齐）
     QAction* pSel = menu.exec(m_pListCur->viewport()->mapToGlobal(a_pos));
+    if (!m_aTasks.contains(pTask) && !m_aHis.contains(pTask)) { return; }   // 2026-11-02 同历史菜单：exec 后存活校验
     if (pSel == pActView) {
         emit sigViewTask(pTask);
     } else if (pSel == pActRename) {

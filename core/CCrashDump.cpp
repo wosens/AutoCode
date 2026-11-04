@@ -78,6 +78,11 @@ void PruneOldDumps(const char* a_pszDir) {
         char szFull[MAX_PATH];
         std::snprintf(szFull, MAX_PATH, "%s\\%s", a_pszDir, aszNames[i]);
         DeleteFileA(szFull);
+        // 同名 .txt sidecar（WriteDumpForPid 的异常码记录）一并删，
+        // 否则 .dmp 清后 sidecar 永久残留、dump 目录文件数无上限增长。
+        char szTxt[MAX_PATH];
+        std::snprintf(szTxt, MAX_PATH, "%s.txt", szFull);
+        DeleteFileA(szTxt);
     }
 }
 

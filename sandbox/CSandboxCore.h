@@ -59,9 +59,12 @@ bool HasAdoptMark(HWND a_hWnd);
 void ClearAdoptMark(HWND a_hWnd);
 ULONG AdoptMarkTick(HWND a_hWnd);            // 打标时刻（GetTickCount 快照）
 DWORD GhostOwnerPid(HWND a_hWnd);            // 幽灵中窗口的收纳者 PID（互斥用）
-// prop 名导出（单元测试伪造跨实例场景直接 SetProp 用）。
-extern const wchar_t* kPropGhost;
-extern const wchar_t* kPropAdopt;
+// prop 名导出（单元测试伪造跨实例场景直接 SetProp 用）。2026-11-01 沙箱
+// 动态库化：原 extern const wchar_t* 数据符号改为函数——MSVC 跨模块数据导入
+// 必须 __declspec(dllimport) 配套（CMake WINDOWS_EXPORT_ALL_SYMBOLS 对数据符号
+// 不可靠），函数化后单测经 import lib 正常解析。
+const wchar_t* PropGhostName();   // 幽灵标记（值 = 收纳者 PID）
+const wchar_t* PropAdoptName();   // 「曾收纳」标记（值 = 打标/还原时刻 tick）
 // 全屏扫描还原所有带本产品标记的窗口（启动兜底：上次崩溃残留的隐形窗口）。
 int  RestoreAllMarked(bool a_bKeepAdoptMark = false);
 
@@ -96,14 +99,8 @@ QString DumpUiTree(HWND a_hWnd, int a_iMaxDepth = 24);
 
 // —— 杂项 ——
 bool ParseHwnd(const QString& a_sText, HWND* a_phOut);       // 十进制/0x 前缀十六进制
-quint32 VkOfName(const QString& a_sName);                    // 键名(ctrl/enter/f1/a)→VK，未知 0
 
-// —— CLI 参数解析（--sandbox 模式，main.cpp 与测试共用）——
-// a_aArgs：完整命令行（含 argv[0] 与 "--sandbox"）。成功拆出 cmd + 参数 JSON。
-// 支持：windows/status/record_on/record_off/restore-all（无参）；
-//   capture [hwnd] [outfile]；click hwnd x y [dbl|right]；drag hwnd x1 y1 x2 y2 [ms]；
-//   type hwnd text...；keys hwnd combo；command hwnd id；button ctrl；
-//   tree hwnd；add hwnd；restore hwnd；close hwnd。
-bool ParseCli(const QStringList& a_aArgs, QString* a_psCmd, QJsonObject* a_pOut);
+// —— CLI 参数解析（--sandbox 模式）见 SandboxCli.h（2026-11-01 拆出独立编译
+//    单元：exe 子进程模式与单元测试在「不加载沙箱 dll」时也要能解析）——
 
 } // namespace sbx

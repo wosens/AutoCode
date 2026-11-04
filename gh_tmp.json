@@ -1,0 +1,82 @@
+{
+  "url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996",
+  "repository_url": "https://api.github.com/repos/superradcompany/microsandbox",
+  "labels_url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996/labels{/name}",
+  "comments_url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996/comments",
+  "events_url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996/events",
+  "html_url": "https://github.com/superradcompany/microsandbox/issues/1996",
+  "id": 6154961426,
+  "node_id": "I_kwDOM7BPMc8AAAABbt1CEg",
+  "number": 1996,
+  "title": "Windows 10: msb.exe fails to start since v0.7.0 - missing `WHvGetVirtualProcessorState`",
+  "user": {
+    "login": "rafalkk",
+    "id": 54404141,
+    "node_id": "MDQ6VXNlcjU0NDA0MTQx",
+    "avatar_url": "https://avatars.githubusercontent.com/u/54404141?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/rafalkk",
+    "html_url": "https://github.com/rafalkk",
+    "followers_url": "https://api.github.com/users/rafalkk/followers",
+    "following_url": "https://api.github.com/users/rafalkk/following{/other_user}",
+    "gists_url": "https://api.github.com/users/rafalkk/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/rafalkk/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/rafalkk/subscriptions",
+    "organizations_url": "https://api.github.com/users/rafalkk/orgs",
+    "repos_url": "https://api.github.com/users/rafalkk/repos",
+    "events_url": "https://api.github.com/users/rafalkk/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/rafalkk/received_events",
+    "type": "User",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "labels": [
+
+  ],
+  "state": "open",
+  "locked": false,
+  "assignees": [
+
+  ],
+  "milestone": null,
+  "comments": 0,
+  "created_at": "2026-11-02T02:17:43Z",
+  "updated_at": "2026-11-02T02:17:43Z",
+  "closed_at": null,
+  "assignee": null,
+  "author_association": "NONE",
+  "issue_field_values": [
+
+  ],
+  "type": null,
+  "active_lock_reason": null,
+  "sub_issues_summary": {
+    "total": 0,
+    "completed": 0,
+    "percent_completed": 0
+  },
+  "issue_dependencies_summary": {
+    "blocked_by": 0,
+    "total_blocked_by": 0,
+    "blocking": 0,
+    "total_blocking": 0
+  },
+  "body": "Hi, i checked that last working version on windows 10 is v0.6.18.\n\nsince v0.7.0 it throws error:\n\"The procedure entry point WHvGetVirtualProcessorState could not be located in the dynamic link library WinHvPlatform.dll\"\n\nThanks for your work! It would be great if you could maintain Windows 10 compatibility. \n\n----------------------------------------------------------------------\nBelow is what ai suggested:\n\nThe libkrun Windows backend should not statically require these newer WHP functions.\n\nInstead, it should:\n- Load WHvGetVirtualProcessorState dynamically using GetProcAddress.\n- Load WHvSetVirtualProcessorState dynamically.\n- Check whether the functions exist.\n- Use older compatible WHP APIs where possible.\n- Disable snapshot functionality when the required APIs aren't available.\nThis would allow ordinary VM execution to continue on Windows 10 without sacrificing the newer snapshot functionality on Windows 11.\n\nWhat upstream libkrun shows: is adding its own Windows backend. It’s still unreleased: it’s in main as the krun-whp crate, no release tag includes it yet, and the README calls Windows “(upcoming)”. That backend uses only the basic hypervisor calls (create, map memory, run, registers, interrupts) that every Windows 10 since 1809 has, with no snapshot functions. So the problem is specific to microsandbox’s fork, which is a useful point to make in the issue.\n",
+  "closed_by": null,
+  "reactions": {
+    "url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "timeline_url": "https://api.github.com/repos/superradcompany/microsandbox/issues/1996/timeline",
+  "performed_via_github_app": null,
+  "state_reason": null,
+  "pinned_comment": null
+}

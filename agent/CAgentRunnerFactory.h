@@ -41,8 +41,8 @@ public:
         return NameOf(s_eBackend);
     }
     // 2026.09.20 助手粘性后端：任意后端枚举→名（与 BackendName 同源防漂移）。
-    static QString NameOf(EBackend e) {
-        switch (e) {
+    static QString NameOf(EBackend a_eBackend) {   // 2026-11-02 参数名补 a_ 前缀（同文件口径）
+        switch (a_eBackend) {
             case BackendDsh:   return QStringLiteral("dsh");
             case BackendPi:    return QStringLiteral("pi");
             case BackendCodex: return QStringLiteral("codex");
@@ -59,15 +59,9 @@ public:
         return QStringLiteral("Claude");
     }
     // 后端显示名（UI 展示用：助手对话块说话人标签等，随当前选择的后端走）。
-    static QString BackendDisplayName() {
-        switch (s_eBackend) {
-            case BackendDsh:   return QStringLiteral("DSH");
-            case BackendPi:    return QStringLiteral("PIAgent");
-            case BackendCodex: return QStringLiteral("CodexHarness");
-            case BackendHermes: return QStringLiteral("Hermes");
-            default:           return QStringLiteral("Claude");
-        }
-    }
+    // 2026-11-02 改委托实现：与 DisplayNameOf 同源防漂移（旧代码两份映射重复维护，
+    //   新增/更名后端需同步两处，违背本文件「同源防漂移」自定纪律）。
+    static QString BackendDisplayName() { return DisplayNameOf(BackendName()); }
 
     static CAgentRunnerBase* Create(QObject* a_pParent = nullptr) {
         // 按全局单选后端分派。DSH/Pi 路径未配置时不在此拦截——StartStage 的前置校验

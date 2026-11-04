@@ -89,6 +89,8 @@ public:
 
 private:
     CReviewSdkClient() = default;
+    CReviewSdkClient(const CReviewSdkClient&) = delete;            // 单例禁止拷贝
+    CReviewSdkClient& operator=(const CReviewSdkClient&) = delete;
 
     // 导出表（9 个 LCR_* 函数；任一解析失败视为不可用）
     const char* (*m_pfnVersion)(void)                                   = nullptr;

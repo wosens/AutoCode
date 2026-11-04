@@ -126,7 +126,6 @@ bool CCodexProxy::Start(const QUrl& a_sTargetBase, int a_iMaxTokens,
     m_urlTarget = a_sTargetBase;
     m_iMaxTokens = a_iMaxTokens;
     m_sWorkDir = a_sWorkDir;
-    m_aUpTail.clear();
     if (!m_pServer->listen(QHostAddress::LocalHost, 0)) {
         return false;
     }
@@ -223,8 +222,11 @@ void CCodexProxy::TryForward(SConn* a_pConn) {
     if (!bHasBody || iBodyWant <= 0) {
         bChatCall = false;   // 无请求体（GET /models 等）：盲转发
     }
-    if (bChatCall && a_pConn->buf.size() < iBodyWant) {
-        return;   // 等请求体收全（Content-Length 口径；codex 不用 chunked 请求）
+    // 等请求体收全（Content-Length 口径；codex 不用 chunked 请求）——对所有带体请求
+    //   生效（旧版仅限 chat：其它 POST 在 body 未收全时即转发，connected 里 buf.clear()
+    //   后到达的剩余请求体被 TryForward 早退丢弃，分段传输的大请求体被截断）。
+    if (bHasBody && iBodyWant > 0 && a_pConn->buf.size() < iBodyWant) {
+        return;
     }
     // —— 建上游连接 + 转发 ——
     QTcpSocket* pUp = new QTcpSocket(this);
@@ -280,7 +282,29 @@ void CCodexProxy::TryForward(SConn* a_pConn) {
             //   上下文显示/闸门，费用统计仍只认真实 usage（sigUsage），不双计。
             emit sigPromptEstimate(EstimatePromptTokens(sBody));
         } else {
-            sOut = a_pConn->reqHead + a_pConn->buf;
+            // 盲转发：Host 同样重写为上游目标（原值指向 127.0.0.1:代理端口，
+            //   按 Host 做虚拟主机路由的网关会误路由/404），其余头逐行透传。
+            const QList<QByteArray> aHeadLines = a_pConn->reqHead.split('\n');
+            QByteArray sNewHead;
+            for (const QByteArray& sRaw : aHeadLines) {
+                const QByteArray sTrim = sRaw.trimmed();
+                if (sTrim.isEmpty()) {
+                    continue;
+                }
+                const int iColon = sTrim.indexOf(':');
+                const bool bHost = iColon > 0
+                    && sTrim.left(iColon).compare("Host", Qt::CaseInsensitive) == 0;
+                if (bHost) {
+                    const QByteArray sHostHdr = m_urlTarget.port(80) == 80
+                        ? m_urlTarget.host().toUtf8()
+                        : m_urlTarget.host().toUtf8() + ':' + QByteArray::number(m_urlTarget.port(80));
+                    sNewHead += "Host: " + sHostHdr + "\r\n";
+                } else {
+                    sNewHead += sTrim + "\r\n";
+                }
+            }
+            sNewHead += "\r\n";   // 头/体分隔空行
+            sOut = sNewHead + a_pConn->buf;
             a_pConn->buf.clear();
         }
         pUp->write(sOut);
@@ -293,7 +317,11 @@ void CCodexProxy::TryForward(SConn* a_pConn) {
         // 2026-10-31 chunked+SSE 响应进入消毒重写路径（workdir 幻觉拦截），
         //   其余（头未收全/非 chunked/非 SSE）盲转发字节级透传。
         const QByteArray aChunk = pUp->readAll();
-        a_pConn->pClient->write(ProcessUpstream(a_pConn, aChunk));
+        const QByteArray aOut = ProcessUpstream(a_pConn, aChunk);
+        if (!aOut.isEmpty()) {
+            a_pConn->bRespSent = true;   // 已回写过响应字节：FailConn 不再补 502
+            a_pConn->pClient->write(aOut);
+        }
     });
     connect(pUp, &QTcpSocket::disconnected, this, [this, a_pConn]() {
         if (!m_aConns.contains(a_pConn)) {
@@ -332,9 +360,14 @@ void CCodexProxy::FailConn(SConn* a_pConn, const QString& a_sWhy) {
     // 2026.08.21 实测崩溃根因）。
     m_aConns.removeOne(a_pConn);
     if (a_pConn->pClient != nullptr) {
-        a_pConn->pClient->write(
-            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        a_pConn->pClient->flush();
+        // 已回写过部分响应（上游中途 ConnectionResetError 等）时直接断链：
+        //   此时再拼一段完整 502 到半截响应尾部会污染 codex 的 HTTP 流
+        //   （同 RemoteHostClosedError 已修场景的姊妹形态）。
+        if (!a_pConn->bRespSent) {
+            a_pConn->pClient->write(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            a_pConn->pClient->flush();
+        }
     }
     CleanupConn(a_pConn);
     Q_UNUSED(a_sWhy);
@@ -462,7 +495,7 @@ QByteArray CCodexProxy::ProcessSseLine(SConn* a_pConn, const QByteArray& a_sLine
 
 QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChunk) {
     if (a_pConn->eResp == 1) {
-        ScanUsage(a_pChunk);
+        ScanUsage(a_pConn, a_pChunk);
         return a_pChunk;   // 盲转发（非 chunked / 非 SSE / 帧异常降级）
     }
     QByteArray aOut;
@@ -484,7 +517,7 @@ QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChu
         aOut += sHead;
         a_pConn->eResp = (bChunked && bSse) ? 2 : 1;
         if (a_pConn->eResp == 1) {
-            ScanUsage(a_pConn->aUpIn);
+            ScanUsage(a_pConn, a_pConn->aUpIn);
             aOut += a_pConn->aUpIn;
             a_pConn->aUpIn.clear();
             return aOut;
@@ -507,7 +540,7 @@ QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChu
             if (!bOk) {
                 // 帧损坏（不应发生）：先补发已积累 body 再降级盲转发保连通
                 a_pConn->eResp = 1;
-                ScanUsage(a_pConn->aUpIn);
+                ScanUsage(a_pConn, a_pConn->aUpIn);
                 aOut += WrapChunked(aBody) + a_pConn->aUpIn;
                 a_pConn->aUpIn.clear();
                 return aOut;
@@ -542,7 +575,7 @@ QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChu
         if (a_pConn->llChunkRemain == 0) {
             a_pConn->llChunkRemain = -3;   // 待帧尾 CRLF
         }
-        ScanUsage(aData);   // 解码后的 SSE 字节喂 usage 扫描（不受分帧影响）
+        ScanUsage(a_pConn, aData);   // 解码后的 SSE 字节喂 usage 扫描（不受分帧影响）
         a_pConn->aSseLine += aData;
         int iNl = 0;
         while ((iNl = a_pConn->aSseLine.indexOf('\n')) >= 0) {
@@ -555,47 +588,50 @@ QByteArray CCodexProxy::ProcessUpstream(SConn* a_pConn, const QByteArray& a_pChu
     return aOut;
 }
 
-void CCodexProxy::ScanUsage(const QByteArray& a_pChunk) {
+void CCodexProxy::ScanUsage(SConn* a_pConn, const QByteArray& a_pChunk) {
     // 拼滚动尾巴（usage JSON 可能被 TCP 分块切开），在尾部窗口内找 "usage" 对象：
     //   {"prompt_tokens":N,...,"completion_tokens":M,...}（SSE 末块 / 非流式 JSON 通用）。
     // 每找到一处 = 一次 chat/completions 的真实计量 → sigUsage 上抛（runner 累计）。
-    m_aUpTail.append(a_pChunk);
-    if (m_aUpTail.size() > 8192) {
-        m_aUpTail = m_aUpTail.right(8192);
-    }
-    int iPos = 0;
+    // 尾巴/偏移均挂连接（旧版类级共享：并发连接的上游字节互相污染，交错/残留
+    //   会错检或重复计）；持久偏移 iUpTailScan 防已上报 usage 被后续数据块重复
+    //   扫描重复 emit（旧版每轮从 0 重扫、仅消费超 512 字节才截断——首个 usage
+    //   在 512 字节内时每个后续块都重报一次，用量/费用系统性虚高）。
+    QByteArray& aTail = a_pConn->aUpTail;
+    aTail.append(a_pChunk);
     while (true) {
-        const int iUsage = m_aUpTail.indexOf("\"usage\"", iPos);
+        const int iUsage = aTail.indexOf("\"usage\"", a_pConn->iUpTailScan);
         if (iUsage < 0) {
+            // 无未闭合对象：推进偏移，只保留 "usage" 词长-1 的跨界余量（词被 TCP
+            //   分块切开时下一块仍能命中）。
+            a_pConn->iUpTailScan = qMax(a_pConn->iUpTailScan, aTail.size() - 7);
             break;
         }
-        const int iObjEnd = m_aUpTail.indexOf('}', iUsage);
+        const int iObjEnd = aTail.indexOf('}', iUsage);
         if (iObjEnd < 0) {
-            break;   // 对象未收全，留在尾巴等下一块
+            a_pConn->iUpTailScan = iUsage;   // 对象未收全：钉在起始处等下一块
+            break;
         }
-        const QByteArray sObj = m_aUpTail.mid(iUsage, iObjEnd - iUsage);
-        bool bIn = false, bOut = false;
+        const QByteArray sObj = aTail.mid(iUsage, iObjEnd - iUsage);
         qint64 iIn = 0, iOut = 0;
         const QRegularExpression reIn(QStringLiteral("\"prompt_tokens\"\\s*:\\s*(\\d+)"));
         const QRegularExpression reOut(QStringLiteral("\"completion_tokens\"\\s*:\\s*(\\d+)"));
         const auto mIn = reIn.match(QString::fromLatin1(sObj));
         const auto mOut = reOut.match(QString::fromLatin1(sObj));
-        if (mIn.hasMatch()) {
+        if (mIn.hasMatch() && mOut.hasMatch()) {
             iIn = mIn.captured(1).toLongLong();
-            bIn = true;
-        }
-        if (mOut.hasMatch()) {
             iOut = mOut.captured(1).toLongLong();
-            bOut = true;
-        }
-        if (bIn && bOut) {
             emit sigUsage(iIn, iOut);
         }
-        iPos = iObjEnd + 1;
+        a_pConn->iUpTailScan = iObjEnd + 1;
     }
-    // 已消费部分出尾巴（保留最后 512 字节防跨块截断重复/漏配）。
-    if (iPos > 512) {
-        m_aUpTail = m_aUpTail.right(512);
+    // 修剪前缀（偏移之前均已消费/无需重扫），防尾巴无限增长。
+    if (a_pConn->iUpTailScan > 4096) {
+        aTail = aTail.mid(a_pConn->iUpTailScan);
+        a_pConn->iUpTailScan = 0;
+    }
+    if (aTail.size() > 16384) {   // 极端不收敛兑底（乱流无 '}'）
+        aTail = aTail.right(8192);
+        a_pConn->iUpTailScan = qBound(0, a_pConn->iUpTailScan, aTail.size());
     }
 }
 

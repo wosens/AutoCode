@@ -37,6 +37,10 @@ public:
         bool bRecord    = true;    // [Sandbox] Record     自动录像
         int  iFps       = 5;       // [Sandbox] Fps        录制帧率 1..15
         int  iRetainDays = 7;      // [Sandbox] RetainDays 录像保留天数 1..365
+        // 2026-11-02 物理输入拦截：Agent 运行期间吞掉合成鼠标/键盘事件
+        //   （SendInput/pyautogui 等带 INJECTED 标志）——提示词铁律只能约束
+        //   自觉的模型，机制性拦截才能根治“Agent 抢占用户鼠标键盘”。
+        bool bBlockSynth = true;   // [Sandbox] BlockSynth 配置开关（默认开）
     };
 
     explicit CSandboxManager(QObject* a_pParent = nullptr);
@@ -151,6 +155,14 @@ private:
     //   主动打开，不兑底）→ 视为 Agent 启动的被测工程产物。须在 TreePid 之后调
     //   （复用其刚刷新的 pid→创建时刻表；自带 500ms 防陈旧重建守卫）。
     bool IsProjectTestPid(DWORD a_dwPid);
+    // 2026-11-02 %TEMP% 产物兑底（QuickTool 实害链收口）：Agent 把被测 exe 拷到
+    //   系统临时目录/exe 同级 ~Temperary 再经中间 shell 启动——IsProjectTestPid
+    //   （exe 须在工程根内）与出生登记（中间人秒退 <250ms 漏逮）双双落空，窗口
+    //   裸弹用户桌面。四重限定压误伤：① Agent 活跃（agent_active 置位，空闲期
+    //   用户自己跑临时程序不收）；② exe 在 %TEMP% 或 ~Temperary 下（正常软件
+    //   绝不装这里）；③ 父进程已死（explorer 双击等用户启动父活着）；④ 进程
+    //   新建 <10 分钟（陈旧残留视为用户手动运行）。
+    bool IsTempArtifactPid(DWORD a_dwPid);
     // 2026-10-14 sandbox launch：主进程 CreateProcess 启动被测程序并登记手工根。
     bool LaunchAut(const QJsonObject& a_oArgs, QString& a_sOut);
     void RestoreEntriesOfPid(DWORD a_dwPid);               // 登记豁免时回扫还原（兑底网）
@@ -178,6 +190,9 @@ private:
     SSbxCfg                    m_stCfg;
     bool                       m_bStarted = false;
     bool                       m_bRecOn = true;        // 运行期录像开关（record_on/off）
+    // 2026-11-02 物理输入拦截：宿主 agent_active 命令置位（助手/任务任一在跑），
+    //   与 cfg.bBlockSynth 相与后写全局原子（钩子线程读，回调内只查标志）。
+    bool                       m_bAgentActive = false; // 宿主告知的 Agent 运行态
     QTimer                     m_tSweep;
     QTimer                     m_tBirth;              // 出生登记扫描器（2026-10-26）
     QHash<DWORD, qint64>       m_aAgentBorn;          // pid→创建时刻（出生登记表）

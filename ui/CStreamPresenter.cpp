@@ -434,6 +434,13 @@ void CStreamPresenter::EnsureCoverage(int a_iTargetIdx, std::function<void(CMess
         if (a_iTargetIdx < 0 || a_iTargetIdx >= m_aBlocks.size()) {
             return;   // 目标越界：不回调（与 Legacy 越界口径一致）
         }
+        // 2026-11-02 补 m_bProjected 守卫（与 Append/BackfillResult 口径一致）：Bind 后
+        //   未 Rebuild 的跨档幽灵页模型为空，ItemAtDataIdx 返回 -1，JumpToItem 对 -1
+        //   静默 return false——跳转失效；未投影时先惰性投影再跳。
+        if (!m_bProjected) {
+            m_pModel->RebuildFrom(m_aBlocks);
+            m_bProjected = true;
+        }
         if (m_pView2 != nullptr) {
             m_pView2->JumpToItem(m_pModel->ItemAtDataIdx(a_iTargetIdx));
         }

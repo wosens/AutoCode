@@ -215,6 +215,7 @@ private:
     int        m_iGraceTicks = 0;         // 宽限期已轮询次数
     qint64     m_iTranscriptSeen = 0;     // transcript 已读到的字节偏移（基线 = StartStage 时文件大小）
     QString    m_sTranscriptPath;         // 会话 transcript 路径缓存（首次命中后固定）
+    QString    m_sTranscriptForSid;       // 缓存对应的 sid（result/fork 换新 sid 时缓存失效重查）
     // 2026.08.27 空结果失败真因挖掘：读 transcript 尾部找错误条目（isApiErrorMessage /
     //   error 级 system 行），返回拼接的错误文本（无则空串）——stderr 为空时（异机
     //   headless 失败常见）唯一可靠的信息源。

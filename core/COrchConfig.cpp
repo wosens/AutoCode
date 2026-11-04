@@ -1,5 +1,6 @@
 ﻿#include "COrchConfig.h"
 
+#include <QDebug>   // 2026-11-02 兜底路径 qWarning 留痕
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -286,16 +287,27 @@ bool COrchConfig::Load() {
     if (!f.exists() || !f.open(QIODevice::ReadOnly | QIODevice::Text)) {
         SeedDefaults();
         ApplyToRuntime();
-        Save();
+        if (!Save()) {
+            qWarning("[COrchConfig] 种子配置落盘失败：%s（内存默认仍生效）",
+                     qPrintable(ConfigPath()));   // 2026-11-02 兜底写失败不再无感
+        }
         return true;
     }
     QJsonParseError stErr;
     const QJsonDocument oDoc = QJsonDocument::fromJson(f.readAll(), &stErr);
     f.close();
     if (stErr.error != QJsonParseError::NoError || !oDoc.isObject()) {
-        SeedDefaults();   // 损坏 → 回默认（旧文件不覆盖，保存时才覆盖）
+        // 损坏 → 回默认并立即回写（2026-11-02 修正注释与实现矛盾；原注释称
+        //   「旧文件不覆盖」但下一行就是 Save 覆盖）。覆盖前先把损坏档改名为
+        //   .bak 留底——用户手改 JSON 出语法错误即被静默重置且无备份，自定义
+        //   编排将永久丢失；.bak 保留最后一次损坏现场供人工捞回。
+        QFile::rename(ConfigPath(), ConfigPath() + QStringLiteral(".bak"));
+        SeedDefaults();
         ApplyToRuntime();
-        Save();
+        if (!Save()) {
+            qWarning("[COrchConfig] 损坏档重置后回写失败：%s",
+                     qPrintable(ConfigPath()));   // 只读目录等场景：内存默认仍生效
+        }
         return true;
     }
     const QJsonObject oRoot = oDoc.object();

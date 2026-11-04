@@ -102,10 +102,16 @@ bool CTaskHistoryDB::VerifyOrReset(sqlite3* a_pDb, const QString& a_sPath) {
         sqlite3_finalize(pStmt);
         bCorrupt = true;
     } else {
-        if (sqlite3_step(pStmt) == SQLITE_ROW) {
+        const int iStepRc = sqlite3_step(pStmt);
+        if (iStepRc == SQLITE_ROW) {
             sVerdict = QString::fromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(pStmt, 0)));
         }
         sqlite3_finalize(pStmt);
+        if (iStepRc != SQLITE_ROW || sVerdict.isEmpty()) {
+            // BUSY/IO 错误时 step 不出 SQLITE_ROW、verdict 为空：这是"本次校验失败"，
+            // 不是"库损坏"——误判损坏会把健康库收档重建丢历史，中止打开待下次自愈。
+            return false;
+        }
         if (sVerdict.compare(QStringLiteral("ok"), Qt::CaseInsensitive) != 0) {
             bCorrupt = true;   // verdict 为错误描述清单
         }
@@ -118,9 +124,18 @@ bool CTaskHistoryDB::VerifyOrReset(sqlite3* a_pDb, const QString& a_sPath) {
     Release();
     const QString sBak = a_sPath + QStringLiteral(".corrupt-")
                          + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"));
-    QFile::rename(a_sPath, sBak);   // 收档失败（占用）则走覆盖重建，不中断打开流程
-    QFile::remove(a_sPath + QStringLiteral("-wal"));
-    QFile::remove(a_sPath + QStringLiteral("-shm"));
+    if (!QFile::rename(a_sPath, sBak)) {
+        // 收档失败（他实例占用）：尝试直接删除后重建；删不掉则中止打开（下次自愈），
+        //   严禁把坏库原样重开当健康库继续用（旧实现仅重开原路径，损坏仍在）。
+        QFile::remove(a_sPath + QStringLiteral("-wal"));
+        QFile::remove(a_sPath + QStringLiteral("-shm"));
+        if (!QFile::remove(a_sPath)) {
+            return false;
+        }
+    } else {
+        QFile::remove(a_sPath + QStringLiteral("-wal"));
+        QFile::remove(a_sPath + QStringLiteral("-shm"));
+    }
     const QByteArray aPath = a_sPath.toUtf8();
     sqlite3* pNew = nullptr;
     if (sqlite3_open(aPath.constData(), &pNew) != SQLITE_OK) {
@@ -209,8 +224,13 @@ void CTaskHistoryDB::Close() {
 }
 
 bool CTaskHistoryDB::Upsert(const CTaskInfo* a_pTask) {
+    // 参数先判后 Acquire：空指针/空 Id 提前返回不能把已打开句柄滞留在 m_pDb
+    // （短连接设计：任何返回路径都不得跳过 Release）。
+    if (a_pTask == nullptr || a_pTask->Id().isEmpty()) {
+        return false;
+    }
     sqlite3* pDb = Acquire();
-    if (pDb == nullptr || a_pTask == nullptr || a_pTask->Id().isEmpty()) {
+    if (pDb == nullptr) {
         return false;
     }
 
@@ -306,8 +326,11 @@ QList<CTaskInfo*> CTaskHistoryDB::LoadAll() const {
 }
 
 bool CTaskHistoryDB::Delete(const QString& a_sId) {
+    if (a_sId.isEmpty()) {
+        return false;   // 同 Upsert：先判后 Acquire，防句柄滞留
+    }
     sqlite3* pDb = Acquire();
-    if (pDb == nullptr || a_sId.isEmpty()) {
+    if (pDb == nullptr) {
         return false;
     }
 
@@ -359,6 +382,7 @@ int CTaskHistoryDB::MigrateLegacyToProjects(QString* a_pReport) {
     int iFailed = 0;   // 迁移失败行数（目标 Open 失败或 Upsert 失败）：非零则保留旧库供下次重试
     QStringList aProjects;
     for (auto it = mapGroups.constBegin(); it != mapGroups.constEnd(); ++it) {
+        const int iFailedBefore = iFailed;   // 组前快照：早前组失败不连坐木组成功计数
         CTaskHistoryDB stTarget;
         if (!stTarget.Open(ProjectDbPath(it.key()))) {
             iFailed += it.value().size();   // 整组失败：全组行待重试
@@ -372,7 +396,7 @@ int CTaskHistoryDB::MigrateLegacyToProjects(QString* a_pReport) {
             }
         }
         stTarget.Close();
-        if (iFailed == 0) {
+        if (iFailed == iFailedBefore) {
             aProjects << it.key();
         }
     }

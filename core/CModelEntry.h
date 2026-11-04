@@ -4,6 +4,7 @@
 #include <QList>
 #include <QChar>
 #include <QLatin1String>
+#include <limits>
 
 // 2026-10-08 提示词 token 本地估算（发送闸门用，零依赖零网络）：CJK 字符 ≈1 token、
 //   其余 ≈1/3 token（保守偏大取整），仅作阈值判定，与模型实际计量存在小偏差。
@@ -105,11 +106,12 @@ inline bool ApplyModelCellEdit(SDshModelEntry* a_pE, int a_iCol, const QString& 
             }
             break;
         }
-        case 5: {   // 最大输出：正整数
+        case 5: {   // 最大输出：正整数且≤ INT_MAX（qint64→int 隐式截断会得到错误值甚至负数
+                    //   并静默落存，违背「非正整数回退旧值」的校验本意）
             bool bOk = false;
             const qint64 iV = a_sText.toLongLong(&bOk);
-            if (bOk && iV > 0) {
-                a_pE->iMaxTok = iV;
+            if (bOk && iV > 0 && iV <= std::numeric_limits<int>::max()) {
+                a_pE->iMaxTok = static_cast<int>(iV);
             }
             break;
         }

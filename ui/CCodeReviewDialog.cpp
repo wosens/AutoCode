@@ -290,7 +290,10 @@ CCodeReviewDialog::CCodeReviewDialog(const QString& a_sTarget, QWidget* a_pParen
 CCodeReviewDialog::~CCodeReviewDialog() {
     if (m_pSvc != nullptr) {
         m_pSvc->Stop();
-        m_pSvc->deleteLater();
+        // 析构期间挂起的 DeferredDelete 不会再派发（无事件循环轮回），直接
+        //   delete（QObject 删除时自动从父列表摘除，安全）。
+        delete m_pSvc;
+        m_pSvc = nullptr;
     }
 }
 
@@ -852,13 +855,13 @@ void CCodeReviewDialog::RefreshCountLabel() {
 // ----------------------------------------------------------------------------
 // —— 右键菜单 ——
 void CCodeReviewDialog::OnFilesContextMenu(const QPoint& a_pt) {
-    auto* pMenu = new QMenu(this);
-    QAction* pActSel = pMenu->addAction(QStringLiteral("选择"));
-    QAction* pActUnsel = pMenu->addAction(QStringLiteral("取消选择"));
-    pMenu->addSeparator();
-    QAction* pActRun = pMenu->addAction(QStringLiteral("开始审查"));
+    QMenu oMenu(this);   // 栈对象：旧版 new QMenu(this) 每次右键累积子对象不释放
+    QAction* pActSel = oMenu.addAction(QStringLiteral("选择"));
+    QAction* pActUnsel = oMenu.addAction(QStringLiteral("取消选择"));
+    oMenu.addSeparator();
+    QAction* pActRun = oMenu.addAction(QStringLiteral("开始审查"));
     const QPoint ptGlobal = m_pTreeFiles->viewport()->mapToGlobal(a_pt);
-    QAction* pAct = pMenu->exec(ptGlobal);
+    QAction* pAct = oMenu.exec(ptGlobal);
     if (pAct == nullptr) {
         return;
     }
@@ -883,11 +886,11 @@ void CCodeReviewDialog::OnFilesContextMenu(const QPoint& a_pt) {
 }
 
 void CCodeReviewDialog::OnFindingsContextMenu(const QPoint& a_pt) {
-    auto* pMenu = new QMenu(this);
-    QAction* pActAll = pMenu->addAction(QStringLiteral("全选"));
-    QAction* pActNone = pMenu->addAction(QStringLiteral("取消全选"));
+    QMenu oMenu(this);   // 栈对象（同上，防长会话菜单累积）
+    QAction* pActAll = oMenu.addAction(QStringLiteral("全选"));
+    QAction* pActNone = oMenu.addAction(QStringLiteral("取消全选"));
     const QPoint ptGlobal = m_pTree->viewport()->mapToGlobal(a_pt);
-    QAction* pAct = pMenu->exec(ptGlobal);
+    QAction* pAct = oMenu.exec(ptGlobal);
     if (pAct == nullptr) {
         return;
     }
@@ -1182,7 +1185,13 @@ void CCodeReviewDialog::OnSaveReport() {
                              QStringLiteral("无法写入 %1").arg(sPath));
         return;
     }
-    stFile.write(m_sReportMd.toUtf8());
+    const QByteArray aBytes = m_sReportMd.toUtf8();
+    if (stFile.write(aBytes) != aBytes.size()) {   // 磁盘满/路径异常时防静默截断
+        stFile.close();
+        QMessageBox::warning(this, QStringLiteral("保存失败"),
+            QStringLiteral("写入不完整（磁盘满？）：%1").arg(sPath));
+        return;
+    }
     stFile.close();
 }
 

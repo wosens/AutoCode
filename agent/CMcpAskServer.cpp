@@ -5,6 +5,7 @@
 #include <QLocalSocket>
 #include <QElapsedTimer>
 #include <QCoreApplication>
+#include <QEventLoop>   // 2026-11-02 processEvents 轮询等待
 
 #include <iostream>
 #include <string>
@@ -240,6 +241,14 @@ void CMcpAskServer::HandleMessage(const QJsonObject& a_oMsg) {
                   QStringLiteral("y:int"), QStringLiteral("double:bool"),
                   QStringLiteral("right:bool") },
                 { QStringLiteral("x"), QStringLiteral("y") }));
+            aSbxTools.append(fnMake("sandbox_hclick",
+                "宿主代发硬件级点击（仅当目标只认硬件输入：消息级 click 无效/假阳性"
+                "时的兑底，如任务栏/托盘/shell 窗口）。会短暂移动光标（约 0.3 秒）；"
+                "禁止自己发 SendInput/pyautogui（会被宿主拦截丢弃）。",
+                { QStringLiteral("hwnd"), QStringLiteral("x:int"),
+                  QStringLiteral("y:int"), QStringLiteral("double:bool"),
+                  QStringLiteral("right:bool") },
+                { QStringLiteral("x"), QStringLiteral("y") }));
             aSbxTools.append(fnMake("sandbox_drag",
                 "向沙箱窗口投递鼠标拖拽（客户区坐标，起止点）。",
                 { QStringLiteral("hwnd"), QStringLiteral("x1:int"),
@@ -408,6 +417,11 @@ void CMcpAskServer::HandleAskUser(const QJsonValue& a_vId, const QJsonObject& a_
         if (bGot) {
             break;
         }
+        // 2026-11-02 主线程等待间隙处理排队事件：旧实现同步阻塞期间 Qt 事件循环
+        //   停摆——sigEof（claude 提前退出）与后续 stdin 消息（含 MCP 取消通知）
+        //   均无法处理，进程最长滞留至超时才退出。ExcludeUserInputEvents 防
+        //   重入用户输入；EOF 后 sigEof 已触发 app.quit，本循环经短轮询自然退出。
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
         sock.waitForReadyRead(500);   // 阻塞最多 500ms 或到数据
     }
 
@@ -489,6 +503,7 @@ void CMcpAskServer::HandleSandboxCall(const QJsonValue& a_vId, const QString& a_
         if (bGot) {
             break;
         }
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);   // 2026-11-02 同 HandleAskUser：等待间隙处理排队事件
         sock.waitForReadyRead(200);
     }
     sock.disconnectFromServer();

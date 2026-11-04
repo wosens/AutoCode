@@ -216,6 +216,8 @@ void CSandboxRecorder::run() {
             iCapW = iW;
             iCapH = iH;
             if (m_p->pWriter != nullptr) {
+                m_p->CloseSeg();   // 2026-11-02 显式关旧段：登记该段 Finalize 结果
+                m_bAllSegOk = m_bAllSegOk && m_p->bSegOk;
                 ++m_p->iSeg;   // 尺寸变化：另起新段文件
             }
             m_p->sSegPath = m_sPath;
@@ -313,11 +315,12 @@ void CSandboxRecorder::run() {
                         break;
                     }
                     pSample->Release();
+                    ++iFrames;            // 2026-11-02 移入成功分支：旧位置在
+                    m_p->iLastPts = iPts; // Lock/MFCreateSample 失败丢帧时也计数，
+                                          // 「已保存 N 帧」虚高且丢帧无提示
                 }
             }
             pBuf->Release();
-            ++iFrames;
-            m_p->iLastPts = iPts;
         }
     }
 
@@ -330,7 +333,10 @@ void CSandboxRecorder::run() {
     DeleteDC(hMem);
     ReleaseDC(nullptr, hScreen);
     m_p->CloseSeg();
-    const bool bSegOk = m_p->bSegOk;
+    // 2026-11-02 跨段累计：旧实现只取最后一段的 bSegOk，前段 Finalize 失败被后段
+    //   成功掩盖误报「保存成功」；窗口中途改尺寸产生多段（_p2.mp4...）时任一段
+    //   失败都按整体失败提示。
+    const bool bSegOk = m_p->bSegOk && m_bAllSegOk;
     if (bMf) {
         MFShutdown();
     }

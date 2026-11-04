@@ -189,6 +189,41 @@ private slots:
         }
     }
 
+    // 2026-11-01 v5.3.462 FFFD 形态终极自愈：外部程序（宿主启动器等）以 UTF-8 读写
+    //   GBK 档产生 U+FFFD 形态后，启动自动从 .bak-encoding-* 好备份恢复；无好备份
+    //   保持可读形态（不降级 '?'，v5.2.459 闸）。
+    void testRecentFffdAutoRestore() {
+        const QString sCfg = ConfigPath();
+        const QString sZh = QStringLiteral("E:/工程/中文项目");
+        // 好备份（GBK）：[Recent] 一条中文
+        {
+            const std::wstring ws = QStringLiteral("[Recent]\r\nCount=1\r\n1=%1\r\n")
+                                        .arg(sZh).toStdWString();
+            const int n = WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                                             nullptr, 0, nullptr, nullptr);
+            QByteArray aGbk(n, Qt::Uninitialized);
+            WideCharToMultiByte(936, 0, ws.c_str(), int(ws.size()),
+                                aGbk.data(), n, nullptr, nullptr);
+            QFile f(sCfg + QStringLiteral(".bak-encoding-20261101-good"));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(aGbk);
+            f.close();
+        }
+        // 坏档（FFFD 形态=合法 UTF-8 且含 ef bf bd）
+        {
+            QFile f(sCfg);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const QString sBad = QStringLiteral("Count=1\r\n1=E:/x\ufffd\ufffd\r\n");
+            f.write(QStringLiteral("[Recent]\r\n").toUtf8() + sBad.toUtf8());
+            f.close();
+        }
+        CProjectManager stPm;
+        stPm.LoadRecent();   // Sanitize → 检出 FFFD → 自动恢复好备份
+        QCOMPARE(stPm.RecentProjects().size(), 1);
+        QCOMPARE(stPm.RecentProjects().first(), sZh);   // 恢复的是好备份内容
+        QFile::remove(sCfg + QStringLiteral(".bak-encoding-20261101-good"));
+    }
+
     // AC-3：打开 A 后，历史最前为 A。
     void testSingleRecordedOnTop() {
         CProjectManager stPm;

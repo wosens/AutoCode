@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QProcess>
 #include <QPointer>
+#include <QStringList>   // 2026-11-02 自包含：多处声明直接使用
 #include <QList>
 #include <QPair>
 #include <QSet>
@@ -87,9 +88,12 @@ public:
     // 2026.09.26 专家助手深度模式纯函数（公开静态供回归测试）：
     //   ParseDeepVerdict 解析验证轮结论：1=PASS / 0=FAIL（a_pReasons 出失败原因，
     //   仅当行） / -1=无判定行（FAIL 优先判定，防原因文本里出现 pass 字样误判）。
-    //   ExtractDeepCriteria 从规划产物提取「## 验收标准」段（到下一 ## 标题或文末；
-    //   段缺失回退整份计划；恒截 2000 字）。
+    //   ExtractDeepSection 从规划产物提取「## <段名>」段体（到下一 ## 标题或文末；
+    //   段缺失/段体空 → 空串，回退策略由调用方决定）——2026-11-02 需求对照用
+    //   （验证轮注入规划「需求清单」段，与用户原始请求逐条对照）。
+    //   ExtractDeepCriteria 为「验收标准」段的兼容包装（缺失回退整份计划；恒截 2000）。
     static int  ParseDeepVerdict(const QString& a_sResult, QString* a_pReasons = nullptr);
+    static QString ExtractDeepSection(const QString& a_sPlan, const QString& a_sName);
     static QString ExtractDeepCriteria(const QString& a_sPlan);
     // 2026.10.02 查询意图启发式：查询/咨询类请求（无改码动词且有问句/查询信号）
     //   跳过专家模式深度链——规划/验证是改码场景的质量保障，对查询纯属干扰。
@@ -536,7 +540,7 @@ private:
     // 助手轮失败收尾（深度链最终失败）：保留断点（压栈保会话）+ 上下文 -1 + 交还输入栏。
     void FinishAdhocFailure(SAdhocSession& a_S);
 
-    CProjectManager* m_pPm;
+    CProjectManager* m_pPm = nullptr;   // 2026-11-02 补默认初始化（与其余指针成员一致，防构造遗漏参与判空）
     CAgentRunnerBase* m_pRunner = nullptr;   // 2026.08.18 基类指针：后端经 CAgentRunnerFactory 全局单选
     CTaskInfo*       m_pCurTask = nullptr;
     QString          m_sLastAssistantText;  // 缓存最新助手文本，用作摘要来源

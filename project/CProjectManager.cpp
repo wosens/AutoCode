@@ -119,6 +119,86 @@ bool IsValidStrictUtf8(const QByteArray& a_aBytes) {
 #endif
 }
 
+// ———— 2026-10-31 v5.2.458 config.ini 字节级节操作（模型表自管配套；与 [Recent]
+//   同模式，读写不经 Windows profile API——其整文件重写按当轮 ACP 转码，是历次
+//   编码事故（UTF-8 化/丢节/U+FFFD→'?'）的共同根源）————
+
+// 节体提取：返回 [节头行之后, 下一节头前) 原始字节（含尾部换行前的全部行）；
+//   不存在/文件空返回 false。支持 \r\n/\n 混合行尾。
+bool ExtractSectionBody(const QByteArray& a_aAll, const char* a_pszSect,
+                        QByteArray& a_aOut, qsizetype* a_pSectHeadEnd = nullptr) {
+    const QByteArray aHead = QByteArrayLiteral("[") + a_pszSect + "]";
+    qsizetype iSect = a_aAll.indexOf('\n' + aHead);
+    qsizetype iOff = 0;
+    if (iSect >= 0) {
+        iOff = iSect + 1 + aHead.size();
+    } else if (a_aAll.startsWith(aHead)) {
+        iOff = aHead.size();
+    } else {
+        return false;
+    }
+    // 对齐到节头行之后首个内容字节（跳过行尾；粘连档安全前造）。
+    const qsizetype iNl = a_aAll.indexOf('\n', iOff);
+    iOff = (iNl < 0) ? a_aAll.size() : iNl + 1;
+    qsizetype iNext = a_aAll.indexOf("\n[", iOff);
+    if (iNext < 0) {
+        iNext = a_aAll.size();
+    }
+    if (a_pSectHeadEnd != nullptr) {
+        *a_pSectHeadEnd = iOff;
+    }
+    a_aOut = a_aAll.mid(iOff, iNext - iOff);
+    return true;
+}
+
+// 节整替换（GBK 字节体）：读文件 → 定位/追加节 → QSaveFile 原子写回；其它节
+//   字节原样保留（不受 ACP 影响）。文件不存在 → 新建仅含本节。失败不抛。
+bool ReplaceSectionBytes(const QString& a_sPath, const char* a_pszSect,
+                         const QByteArray& a_aBody) {
+    const QByteArray aHead = QByteArrayLiteral("[") + a_pszSect + "]";
+    QFile fCfg(a_sPath);
+    QByteArray aAll;
+    if (fCfg.exists()) {
+        if (!fCfg.open(QIODevice::ReadOnly)) {
+            return false;
+        }
+        aAll = fCfg.readAll();
+        fCfg.close();
+    }
+    QByteArray aBodyEnd = a_aBody;
+    if (!aBodyEnd.endsWith('\n')) {
+        aBodyEnd += '\r';
+        aBodyEnd += '\n';
+    }
+    QByteArray aOut;
+    QByteArray aOldBody;
+    qsizetype iHeadEnd = 0;
+    if (ExtractSectionBody(aAll, a_pszSect, aOldBody, &iHeadEnd)) {
+        // 有节：[节头行起点, 下一节头) 整段替换（首个同名节；旧代码整节替换同口径）。
+        const qsizetype iSect = aAll.lastIndexOf('\n' + aHead, iHeadEnd);
+        const qsizetype iStart = (iSect >= 0) ? iSect + 1 : 0;
+        qsizetype iNext = aAll.indexOf("\n[", iHeadEnd);
+        if (iNext < 0) {
+            iNext = aAll.size();
+        }
+        aOut = aAll.left(iStart) + aHead + '\r' + '\n' + aBodyEnd + aAll.mid(iNext + 1);
+    } else {
+        // 无节：追加到文件尾（空文件=新建首节，勿漏节头）。
+        aOut = aAll;
+        if (!aOut.isEmpty() && !aOut.endsWith('\n')) {
+            aOut += '\r';
+            aOut += '\n';
+        }
+        aOut += aHead + '\r' + '\n' + aBodyEnd;
+    }
+    QSaveFile fOut(a_sPath);
+    if (!fOut.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    fOut.write(aOut);
+    return fOut.commit();
+}
+
 } // namespace
 
 CProjectManager::CProjectManager(QObject* a_pParent)
@@ -810,20 +890,23 @@ void CProjectManager::SyncGuideIncremental() {
     if (m_pGuideSyncRunner != nullptr && m_pGuideSyncRunner->IsRunning()) {
         return;
     }
-    // 上轮后台同步未完 → 跳过（不排队，避免堆积）。
+    // 上轮后台同步未完 → 跳过（不排队，避免堆积）。标志用进程级静态而非成员：
+    //   detach 线程在对象析构（程序退出）后仍可能运行，RAII 免职时写成员=悬垂写
+    //   已释放内存；静态存续期覆盖线程全生命，安全（单 PM 实例，语义等价）。
+    static std::atomic<bool> s_bFpSyncRunning{false};
     bool bExpected = false;
-    if (!m_bFpSyncRunning.compare_exchange_strong(bExpected, true)) {
+    if (!s_bFpSyncRunning.compare_exchange_strong(bExpected, true)) {
         return;
     }
     // 按值捕获所需路径，避免后台线程访问 this 成员的并发风险（析构竞态由程序生命周期保证）。
     const QString sProjectDir = m_sProjectDir;
     const QString sGuidePath  = AutoDevDir() + QStringLiteral("/guide.md");
-    std::thread([this, sProjectDir, sGuidePath]() {
+    std::thread([sProjectDir, sGuidePath]() {
         // RAII 占用释放：任何 return/异常路径都复位标志（否则上轮提前返回后同步永久失效）。
         struct SFlagGuard {
             std::atomic<bool>& m_rFlag;
             ~SFlagGuard() { m_rFlag = false; }
-        } stGuard{m_bFpSyncRunning};
+        } stGuard{s_bFpSyncRunning};
         try {
             const QList<SFileFingerprint> aCur =
                 CGuideFingerprintScanner::ScanProject(sProjectDir);
@@ -1347,6 +1430,9 @@ QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
                                                       const wchar_t* a_pSect,
                                                       int* a_pActive) const {
     // 2026.09.09 v2.1.144 从 LoadPiModels 泛化（四张模型表同构，仅节名不同）。
+    // 2026-10-31 v5.2.458 改字节级自读（不再经 GetPrivateProfileStringW：其对
+    //   ANSI 文件按当轮 ACP 解码，UTF-8 化/BOM 档直接读出乱码；字节级行级双口径
+    //   解码（QStringFromConfigBytes）+ BOM 预判，任意历史形态档均可正确读出）。
     QList<SDshModelEntry> aModels;
     if (a_pActive) {
         *a_pActive = -1;
@@ -1354,31 +1440,60 @@ QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
     if (a_sPath.isEmpty()) {
         return aModels;
     }
-    const std::wstring wsPath = a_sPath.toStdWString();
-    const int iCount = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Count", 0, wsPath.c_str()));
+    QFile fCfg(a_sPath);
+    if (!fCfg.open(QIODevice::ReadOnly)) {
+        return aModels;
+    }
+    QByteArray aAll = fCfg.readAll();
+    fCfg.close();
+    // BOM 预判归一（UTF-8 BOM 剥离；UTF-16 → UTF-8 字节——仅读路径，写侧恒 GBK）。
+    if (aAll.startsWith("\xef\xbb\xbf")) {
+        aAll = aAll.mid(3);
+    } else if (aAll.startsWith("\xff\xfe")) {
+        QStringDecoder d16(QStringConverter::Utf16LE, QStringConverter::Flag::Stateless);
+        const QString s16 = d16.decode(aAll.mid(2));
+        aAll = s16.toUtf8();
+    } else if (aAll.startsWith("\xfe\xff")) {
+        QStringDecoder d16be(QStringConverter::Utf16BE, QStringConverter::Flag::Stateless);
+        const QString s16be = d16be.decode(aAll.mid(2));
+        aAll = s16be.toUtf8();
+    }
+    const QString sSect = QString::fromWCharArray(a_pSect);
+    QByteArray aBody;
+    if (!ExtractSectionBody(aAll, sSect.toUtf8().constData(), aBody)) {
+        return aModels;
+    }
+    // 行级键值收集（键 ASCII，值双口径解码）。
+    QHash<QString, QString> mapKV;
+    for (const QByteArray& aLine : aBody.split('\n')) {
+        const QByteArray aTrim = aLine.trimmed();
+        const qsizetype iEq = aTrim.indexOf('=');
+        if (iEq <= 0 || aTrim.startsWith(';')) {
+            continue;
+        }
+        mapKV.insert(QString::fromLatin1(aTrim.left(iEq).trimmed()),
+                     QStringFromConfigBytes(aTrim.mid(iEq + 1).trimmed()));
+    }
+    const int iCount = mapKV.value(QStringLiteral("Count")).toInt();
     if (iCount <= 0) {
         return aModels;
     }
-    wchar_t szBuf[1024] = { 0 };
     for (int i = 0; i < iCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnReadStr = [&](const wchar_t* a_lpszSuffix) -> QString {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            const DWORD dwCopied = GetPrivateProfileStringW(a_pSect, wsKey.c_str(), L"",
-                                                            szBuf, 1024, wsPath.c_str());
-            return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+        const QString sP = QStringLiteral("M%1").arg(i);
+        auto fnReadStr = [&mapKV, &sP](const char* a_pszSuffix) -> QString {
+            return mapKV.value(sP + QLatin1String(a_pszSuffix)).trimmed();
         };
         SDshModelEntry stE;
-        stE.sDisp    = fnReadStr(L"Disp");
-        stE.sBaseURL = fnReadStr(L"URL");
-        stE.sApiKey  = fnReadStr(L"Key");
-        stE.sApi     = fnReadStr(L"Api");
-        stE.sModelId = fnReadStr(L"Model");
-        stE.iCtx     = fnReadStr(L"Ctx").toLongLong();
+        stE.sDisp    = fnReadStr("Disp");
+        stE.sBaseURL = fnReadStr("URL");
+        stE.sApiKey  = fnReadStr("Key");
+        stE.sApi     = fnReadStr("Api");
+        stE.sModelId = fnReadStr("Model");
+        stE.iCtx     = fnReadStr("Ctx").toLongLong();
         if (stE.iCtx <= 0) {
             stE.iCtx = 200000;
         }
-        stE.iMaxTok = fnReadStr(L"Max").toInt();
+        stE.iMaxTok = fnReadStr("Max").toInt();
         if (stE.iMaxTok <= 0) {
             stE.iMaxTok = 32768;
         }
@@ -1394,7 +1509,7 @@ QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
         aModels.append(stE);
     }
     if (a_pActive) {
-        const int iActive = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Active", -1, wsPath.c_str()));
+        const int iActive = mapKV.value(QStringLiteral("Active")).toInt();
         *a_pActive = (iActive >= 0 && iActive < aModels.size()) ? iActive : -1;
         if (*a_pActive < 0 && aModels.size() == 1) {   // 仅一条 → 自动设为缺省
             *a_pActive = 0;
@@ -1406,41 +1521,39 @@ QList<SDshModelEntry> CProjectManager::LoadModelsFrom(const QString& a_sPath,
 bool CProjectManager::SaveModelsTo(const QString& a_sPath, const wchar_t* a_pSect,
                                    const QList<SDshModelEntry>& a_aModels, int a_iActive) {
     // 2026.09.09 v2.1.144 从 SavePiModels 泛化（含缩短后的高位键清理）。
+    // 2026-10-31 v5.2.458 改字节级自写（ReplaceSectionBytes 整节替换，固定 GBK、
+    //   高位残留键随整节替换自动清；不再经 WritePrivateProfileStringW——其整文件
+    //   重写按当轮 ACP 转码且对膨胀/垃圾档历史性丢节）。
     if (a_sPath.isEmpty()) {
         return false;
     }
-    const std::wstring wsPath = a_sPath.toStdWString();
-    const int iOldCount = static_cast<int>(GetPrivateProfileIntW(a_pSect, L"Count", 0, wsPath.c_str()));
-    const int iNewCount = a_aModels.size();
-    WritePrivateProfileStringW(a_pSect, L"Count",
-                               std::to_wstring(iNewCount).c_str(), wsPath.c_str());
-    for (int i = 0; i < iNewCount; ++i) {
-        const SDshModelEntry& stE = a_aModels.at(i);
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        auto fnWrite = [&](const wchar_t* a_lpszSuffix, const QString& a_sValue) {
-            const std::wstring wsKey = wsPrefix + a_lpszSuffix;
-            WritePrivateProfileStringW(a_pSect, wsKey.c_str(),
-                                       a_sValue.trimmed().toStdWString().c_str(), wsPath.c_str());
-        };
-        fnWrite(L"Disp",  stE.sDisp);
-        fnWrite(L"URL",   stE.sBaseURL);
-        fnWrite(L"Key",   stE.sApiKey);
-        fnWrite(L"Api",   stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages") : stE.sApi);
-        fnWrite(L"Model", stE.sModelId);
-        fnWrite(L"Ctx",   QString::number(stE.iCtx));
-        fnWrite(L"Max",   QString::number(stE.iMaxTok));
-    }
-    for (int i = iNewCount; i < iOldCount && i < 64; ++i) {
-        const std::wstring wsPrefix = L"M" + std::to_wstring(i);
-        for (const wchar_t* lpszSuffix : {L"Disp", L"URL", L"Key", L"Api", L"Model", L"Ctx", L"Max"}) {
-            const std::wstring wsKey = wsPrefix + lpszSuffix;
-            WritePrivateProfileStringW(a_pSect, wsKey.c_str(), nullptr, wsPath.c_str());
+    // 2026-10-31 v5.2.459 防丢信息闸：条目含 U+FFFD 时拒绝落盘（同 SaveRecent）。
+    for (const SDshModelEntry& stE : a_aModels) {
+        if (stE.sDisp.contains(QChar(0xFFFD)) || stE.sBaseURL.contains(QChar(0xFFFD))
+                || stE.sModelId.contains(QChar(0xFFFD))) {
+            return false;
         }
     }
+    const QString sSect = QString::fromWCharArray(a_pSect);
+    const int iNewCount = a_aModels.size();
+    QString sBody = QStringLiteral("Count=%1\r\n").arg(iNewCount);
+    for (int i = 0; i < iNewCount; ++i) {
+        const SDshModelEntry& stE = a_aModels.at(i);
+        const QString sP = QStringLiteral("M%1").arg(i);
+        sBody += sP + QStringLiteral("Disp=%1\r\n").arg(stE.sDisp.trimmed());
+        sBody += sP + QStringLiteral("URL=%1\r\n").arg(stE.sBaseURL.trimmed());
+        sBody += sP + QStringLiteral("Key=%1\r\n").arg(stE.sApiKey.trimmed());
+        sBody += sP + QStringLiteral("Api=%1\r\n")
+                     .arg(stE.sApi.isEmpty() ? QStringLiteral("anthropic-messages")
+                                             : stE.sApi);
+        sBody += sP + QStringLiteral("Model=%1\r\n").arg(stE.sModelId.trimmed());
+        sBody += sP + QStringLiteral("Ctx=%1\r\n").arg(stE.iCtx);
+        sBody += sP + QStringLiteral("Max=%1\r\n").arg(stE.iMaxTok);
+    }
     const int iActive = (a_iActive >= 0 && a_iActive < iNewCount) ? a_iActive : -1;
-    WritePrivateProfileStringW(a_pSect, L"Active",
-                               std::to_wstring(iActive).c_str(), wsPath.c_str());
-    return true;
+    sBody += QStringLiteral("Active=%1\r\n").arg(iActive);
+    return ReplaceSectionBytes(a_sPath, sSect.toUtf8().constData(),
+                               GbkFromQString(sBody));
 }
 
 void CProjectManager::SyncModelTableToGlobal(const wchar_t* a_pSect,
@@ -1503,8 +1616,37 @@ void CProjectManager::SanitizeConfigEncoding() {
     }
     const QByteArray aAll = fCfg.readAll();
     fCfg.close();
-    // ① UTF-16 BOM：Windows profile API 的 Unicode 档，读写自洽，不碰。
-    if (aAll.startsWith("\xff\xfe") || aAll.startsWith("\xfe\xff")) {
+    const auto fnRewriteGbk = [&](const QString& a_sText) {
+        // 2026-10-31 v5.2.459 防丢信息闸：文本含 U+FFFD（历次编码事故的不可逆替换符）
+        //   时禁止转正——U+FFFD 形态档本就可读（字节级双口径），转正只会把替换符
+        //   兑底成 '?' 再丢一层；保持原样等待人工/备份修复。
+        if (a_sText.contains(QChar(0xFFFD))) {
+            return;
+        }
+        const QString sBak = sPath + QStringLiteral(".bak-encoding-")
+            + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+        QFile::copy(sPath, sBak);   // 转正前备份（失败不阻断：转正本身可逆）
+        QSaveFile fOut(sPath);
+        if (fOut.open(QIODevice::WriteOnly)) {
+            fOut.write(GbkFromQString(a_sText));
+            fOut.commit();
+        }
+    };
+    // ① BOM 档（用户手工/外部工具存出的 UTF-8 BOM / UTF-16）：字节级自管读写虽兼容，
+    //   但其余键仍走 Windows profile API（其对 BOM 档中文读写不可用）——统一转正
+    //   回 GBK（无 BOM，Windows API 唯一可写口径）。
+    if (aAll.startsWith("\xef\xbb\xbf")) {
+        fnRewriteGbk(QStringFromConfigBytes(aAll.mid(3)));
+        return;
+    }
+    if (aAll.startsWith("\xff\xfe")) {
+        QStringDecoder d16(QStringConverter::Utf16LE, QStringConverter::Flag::Stateless);
+        fnRewriteGbk(d16.decode(aAll.mid(2)));
+        return;
+    }
+    if (aAll.startsWith("\xfe\xff")) {
+        QStringDecoder d16be(QStringConverter::Utf16BE, QStringConverter::Flag::Stateless);
+        fnRewriteGbk(d16be.decode(aAll.mid(2)));
         return;
     }
     // ② 全 ASCII：无编码敏感内容。
@@ -1518,18 +1660,41 @@ void CProjectManager::SanitizeConfigEncoding() {
     if (bAsciiOnly) {
         return;
     }
-    // ③ UTF-8 严格全文件合法（IsValidStrictUtf8）→ UTF-8 化档（GBK 中文档几乎
-    //   不可能整段合法 UTF-8）。
+    // ③ UTF-8 严格全文件合法（IsValidStrictUtf8）→ UTF-8 化档。
     if (IsValidStrictUtf8(aAll)) {
-        const QString sAll = QStringFromConfigBytes(aAll);
-        const QString sBak = sPath + QStringLiteral(".bak-encoding-")
-            + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
-        QFile::copy(sPath, sBak);   // 转正前备份（失败不阻断：转正本身可逆）
-        QSaveFile fOut(sPath);
-        if (fOut.open(QIODevice::WriteOnly)) {
-            fOut.write(GbkFromQString(sAll));
-            fOut.commit();
+        // 2026-11-01 v5.3.462 FFFD 形态终极自愈（外部程序毁档实害：宿主启动器等以
+        //   UTF-8 读写 GBK 档，误读字节→U+FFFD 不可逆丢失后再 UTF-8 写回；
+        //   v5.2.459 起拒绝转正防 '?' 降级，但乱码形态仍会让用户反复看到）——
+        //   自动从 .bak-encoding-* 备份链找最新的「无 FFFD 且非 UTF-16」好档恢复；
+        //   坏档转存 config.ini.bak-ffbd-<时间戳> 留证；无可用备份则保持可读形态等人工。
+        if (aAll.contains("\xef\xbf\xbd")) {
+            QDir stDir(QFileInfo(sPath).absolutePath());
+            const QStringList aBaks = stDir.entryList(
+                QStringList() << QStringLiteral("config.ini.bak-encoding-*"),
+                QDir::Files, QDir::Time);   // mtime 降序（最新在前）
+            for (const QString& sBak : aBaks) {
+                QFile fBak(stDir.absoluteFilePath(sBak));
+                if (!fBak.open(QIODevice::ReadOnly)) {
+                    continue;
+                }
+                const QByteArray aBak = fBak.readAll();
+                fBak.close();
+                if (aBak.contains("\xef\xbf\xbd") || aBak.isEmpty()
+                        || aBak.startsWith("\xff\xfe") || aBak.startsWith("\xfe\xff")) {
+                    continue;   // 坏备份/Unicode 档不采用
+                }
+                if (IsValidStrictUtf8(aBak) && aBak != aAll) {
+                    continue;   // UTF-8 化备份（无 FFFD 但非 GBK）不采用
+                }
+                // 命中好备份：坏档转存 + 恢复。
+                QFile::rename(sPath, sPath + QStringLiteral(".bak-ffbd-")
+                    + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+                QFile::copy(stDir.absoluteFilePath(sBak), sPath);
+                return;
+            }
+            return;   // 无可用备份：保持可读形态（不再转正降级 '?'，v5.2.459 闸）
         }
+        fnRewriteGbk(QStringFromConfigBytes(aAll));
         return;
     }
     // ④ 其余：GBK 态（常态）或混合损坏体（历史遗留，不动防误伤）。
@@ -1547,6 +1712,13 @@ void CProjectManager::SaveRecent() {
     const QString sPath = ConfigFilePath();
     if (sPath.isEmpty()) {
         return;
+    }
+    // 2026-10-31 v5.2.459 防丢信息闸：列表含 U+FFFD（热重载读到坏档/历史污染）时
+    //   拒绝落盘——写入只会把替换符兑底成 '?'，保住盘上待修复的好数据。
+    for (const QString& s : m_aRecentProjects) {
+        if (s.contains(QChar(0xFFFD))) {
+            return;
+        }
     }
     // 新节文本：Count + N=路径 + CN=计数（计数与路径表长度对齐，缺省 1）。
     QString sSect = QStringLiteral("Count=%1").arg(m_aRecentProjects.size());
@@ -4528,12 +4700,17 @@ bool IsCodeRelatedFile(const QString& a_sRel) {
 }
 
 void CProjectManager::RequestBackupAbort() {
+    // 持锁访问：m_pBackupStore 在 m_MutexStore 下创建/删除（BackupStore()/Open()），
+    //   无锁读裸指针与备份线程并用同指针构成数据竞争；Open() 删除 store 时也可能
+    //   刚好悬垂（use-after-free）。
+    QMutexLocker stLock(&m_MutexStore);
     if (m_pBackupStore != nullptr) {
         m_pBackupStore->RequestAbort();
     }
 }
 
 void CProjectManager::ResetBackupAbort() {
+    QMutexLocker stLock(&m_MutexStore);
     if (m_pBackupStore != nullptr) {
         m_pBackupStore->ResetAbort();
     }
@@ -4778,4 +4955,110 @@ int CProjectManager::LoadSandboxRetainDays() const {
     const int iDays = GetPrivateProfileIntW(L"Sandbox", L"RetainDays", 7,
                                             sPath.toStdWString().c_str());
     return (iDays >= 1 && iDays <= 365) ? iDays : 7;
+}
+
+bool CProjectManager::SaveSandboxType(const QString& a_sType) {
+    // 2026-11-01 沙箱动态库化：Type = TestSandbox\<Type>.dll 主干名；空值回落
+    //   默认 GhostSandbox（防配置手改坏后启动失败）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const QString sVal = a_sType.isEmpty() ? QStringLiteral("GhostSandbox") : a_sType;
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Sandbox", L"Type", sVal.toStdWString().c_str(),
+                               wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadSandboxType() const {
+    // 缺键/空 → 默认 GhostSandbox（内置幽灵沙箱，历史行为不变）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return QStringLiteral("GhostSandbox");
+    }
+    WCHAR wsz[64] = {};
+    const DWORD n = GetPrivateProfileStringW(L"Sandbox", L"Type", L"GhostSandbox",
+                                             wsz, 64, sPath.toStdWString().c_str());
+    QString s = QString::fromWCharArray(wsz, static_cast<int>(n)).trimmed();
+    return s.isEmpty() ? QStringLiteral("GhostSandbox") : s;
+}
+
+// —— 2026-11-02 双沙箱并行开关（[Sandbox] WindowEnable/VmEnable）——
+// 旧单选 Type 键废弃但兼容：无新键时按旧 Type 推导（MsbSandbox→双开；
+//   GhostSandbox→窗口开/VM 关），老部署升级后行为与预期一致。
+bool CProjectManager::SaveSandboxWindowEnable(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    WritePrivateProfileStringW(L"Sandbox", L"WindowEnable", a_bOn ? L"1" : L"0",
+                               sPath.toStdWString().c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxWindowEnable() const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    WCHAR wsz[8] = {};
+    const DWORD n = GetPrivateProfileStringW(L"Sandbox", L"WindowEnable", L"",
+                                             wsz, 8, sPath.toStdWString().c_str());
+    const QString s = QString::fromWCharArray(wsz, static_cast<int>(n)).trimmed();
+    if (s.isEmpty()) {
+        // 无新键：按旧 Type 推导（新默认等效——GUI 测试主力默认开）。
+        return LoadSandboxType().compare(QStringLiteral("MsbSandbox"), Qt::CaseInsensitive) == 0
+                   ? true : true;   // 两值都开窗口槽（历史单选必含其一）
+    }
+    return (s == QLatin1String("1"));
+}
+
+bool CProjectManager::SaveSandboxVmEnable(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    WritePrivateProfileStringW(L"Sandbox", L"VmEnable", a_bOn ? L"1" : L"0",
+                               sPath.toStdWString().c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxVmEnable() const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    WCHAR wsz[8] = {};
+    const DWORD n = GetPrivateProfileStringW(L"Sandbox", L"VmEnable", L"",
+                                             wsz, 8, sPath.toStdWString().c_str());
+    const QString s = QString::fromWCharArray(wsz, static_cast<int>(n)).trimmed();
+    if (s.isEmpty()) {
+        // 无新键：按旧 Type 推导——旧选 MsbSandbox 的部署升级后 VM 槽默认开；
+        //   旧选 GhostSandbox 的保持仅窗口（行为不变，零意外）。
+        return LoadSandboxType().compare(QStringLiteral("MsbSandbox"),
+                                         Qt::CaseInsensitive) == 0;
+    }
+    return (s == QLatin1String("1"));
+}
+
+// —— 2026-11-02 物理输入拦截开关（[Sandbox] BlockSynth，默认开）——
+bool CProjectManager::SaveSandboxBlockSynth(bool a_bOn) {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    WritePrivateProfileStringW(L"Sandbox", L"BlockSynth", a_bOn ? L"1" : L"0",
+                               sPath.toStdWString().c_str());
+    return true;
+}
+
+bool CProjectManager::LoadSandboxBlockSynth() const {
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return true;
+    }
+    const int iVal = GetPrivateProfileIntW(L"Sandbox", L"BlockSynth", 1,
+                                           sPath.toStdWString().c_str());
+    return (iVal != 0);
 }

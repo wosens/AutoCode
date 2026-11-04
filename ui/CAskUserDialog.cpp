@@ -70,9 +70,20 @@ CAskUserDialog::CAskUserDialog(const QString& a_sQuestion,
             const bool bShowing = bOther && m_pEditOther->isHidden();
             const bool bHiding  = !bOther && !m_pEditOther->isHidden();
             if (bShowing || bHiding) {
-                const QRect rcAvail = QGuiApplication::primaryScreen()->availableGeometry();
-                const int iNewH = height() + (bShowing ? k_iOtherEditH : -k_iOtherEditH);
-                resize(width(), qBound(240, iNewH, rcAvail.height() - 40));
+                // 高度增减对称化：显示被屏幕钳位压顶（实际未增高）时，隐藏无条件回减
+                //   会让窗口比选择「其他」前永久矮一截——记录显示前高度，隐藏时恢复。
+                const QRect rcScr = window()->screen() != nullptr
+                    ? window()->screen()->availableGeometry()
+                    : QRect(0, 0, 1920, 1040);   // 屏幕拿不到（拓扑变化/RDP 断开）时兑底
+                if (bShowing) {
+                    m_iHBeforeOther = height();   // 记录基准（隐藏时恢复）
+                    resize(width(), qBound(240, height() + k_iOtherEditH,
+                                           rcScr.height() - 40));
+                } else {
+                    const int iTarget = m_iHBeforeOther > 0
+                        ? m_iHBeforeOther : height() - k_iOtherEditH;
+                    resize(width(), qBound(240, iTarget, rcScr.height() - 40));
+                }
             }
             m_pEditOther->setVisible(bOther);
             if (bOther) {
@@ -140,7 +151,9 @@ CAskUserDialog::CAskUserDialog(const QString& a_sQuestion,
                        + 34                                  // 按钮行
                        + pV->spacing() * 2 + stMg.top() + stMg.bottom();
     int iH = iNeedH + iRestMin;
-    const QRect rcAvail = QGuiApplication::primaryScreen()->availableGeometry();
+    const QRect rcAvail = window()->screen() != nullptr
+        ? window()->screen()->availableGeometry()
+        : QRect(0, 0, 1920, 1040);   // primaryScreen 可为 null（显示器拓扑变化/RDP 断开瞬间）
     const int iMaxH = qMax(320, rcAvail.height() * 3 / 4);
     if (iH > iMaxH) {
         // 放不下：钳高度 + 富文本 Tooltip（自动换行）展示完整问题。问题标签高度

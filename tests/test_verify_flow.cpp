@@ -302,11 +302,11 @@ private slots:
                 "require('fs').appendFileSync(%1,'===\\n'+s+'\\n');"
                 "setTimeout(()=>{"
                 "if(s.includes('规划轮')){"
-                "console.log(JSON.stringify({type:'assistant',text:'## 目标\\n实现X\\n## 实施步骤\\n1. 改 a.cpp\\n## 验收标准\\n1. 工程可编译',model:'stub-model',usage:{input:10,output:5}}));"
-                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'planned'}));"
+                "console.log(JSON.stringify({type:'assistant',text:'规划中：先读工程相关文件…',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'## 目标\\n实现X\\n## 需求清单\\n1. 实现登录功能\\n## 实施步骤\\n1. 改 a.cpp\\n## 验收标准\\n1. 工程可编译'}));"
                 "}else if(s.includes('验证轮')){"
                 "console.log(JSON.stringify({type:'assistant',text:'（过程稿）逐项核对中：已编译、已读 a.cpp。\\nVERIFY:PASS',model:'stub-model',usage:{input:10,output:5}}));"
-                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'【综合结果】完成播放防抖：a.cpp 新增拦截、新增测试。\\n【验证结论】已编译并逐项核对验收标准。\\nVERIFY:PASS'}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-sid-1',text:'【需求对照】\\n1. 实现登录功能 → ✅已完成：a.cpp 新增播放防抖拦截\\n【改动摘要】a.cpp 新增拦截；无遗留。\\n【验证结论】已编译并逐项核对验收标准。\\nVERIFY:PASS'}));"
                 "}else{"
                 "console.log(JSON.stringify({type:'tool',tool:'Edit',input:{file_path:'a.cpp'}}));"
                 "console.log(JSON.stringify({type:'assistant',text:'已按计划完成实现：a.cpp 新增播放防抖拦截',model:'stub-model',usage:{input:20,output:8}}));"
@@ -381,20 +381,30 @@ private slots:
         QVERIFY2(sVerifyCall.contains(QStringLiteral("VERIFY:PASS")),
                  "验证轮按验收标准判定");
         // 2026-10-30 深链静默输出 + 专家轮统一输出口径：验证轮 prompt 注入执行轮
-        //   实施报告并要求两段式综合报告；执行/验证轮流式文本不上屏，链尾由验证轮
-        //   终答（综合结果+验证结论）统一外显。
+        //   实施报告并要求综合报告；执行/验证轮流式文本不上屏，链尾由验证轮
+        //   终答统一外显。2026-11-02 报告改需求对照式（用户需求：总结太复杂抓不住
+        //   重点）：【需求对照】首段逐条对照需求清单（规划产出，含用户请求拆解）+
+        //   【改动摘要】+【验证结论】三段，PASS 仅当全部 ✅。
         QVERIFY2(sVerifyCall.contains(QStringLiteral("【执行Agent实施报告】"))
                      && sVerifyCall.contains(QStringLiteral("实施报告：1) a.cpp")),
                  "验证轮 prompt 应注入执行轮 result 终答（实施报告）");
-        QVERIFY2(sVerifyCall.contains(QStringLiteral("【综合结果】"))
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("【需求清单】"))
+                     && sVerifyCall.contains(QStringLiteral("1. 实现登录功能")),
+                 "验证轮 prompt 应注入规划产出的需求清单（2026-11-02 需求对照；"
+                 "编号行仅来自规划段提取，用户原始请求无编号）");
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("【需求对照】"))
+                     && sVerifyCall.contains(QStringLiteral("【改动摘要】"))
                      && sVerifyCall.contains(QStringLiteral("【验证结论】")),
-                 "验证轮 prompt 应要求两段式综合报告结构");
+                 "验证轮 prompt 应要求需求对照式三段报告结构");
+        QVERIFY2(sVerifyCall.contains(QStringLiteral("✅已完成"))
+                     && sVerifyCall.contains(QStringLiteral("未完成")),
+                 "验证轮应定义逐条状态标记（已完成/未完成/部分/未验证）");
         const QString sAllTexts = aTexts.join(QLatin1Char('\n'));
         QVERIFY2(!sAllTexts.contains(QStringLiteral("已按计划完成实现")),
                  "执行轮流式文本应被静默（不上屏）");
         QVERIFY2(!sAllTexts.contains(QStringLiteral("（过程稿）")),
                  "验证轮流式文本应被静默（不上屏）");
-        QCOMPARE(sAllTexts.count(QStringLiteral("【综合结果】")), 1);   // 仅 PASS 报告一次
+        QCOMPARE(sAllTexts.count(QStringLiteral("【需求对照】")), 1);   // 仅 PASS 报告一次
 
         CTaskOrchestrator::SetAdhocDeepOverride(-1);
         CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
@@ -594,6 +604,34 @@ private slots:
         const QString sLong = QStringLiteral("## 验收标准\n1. ")
             + QString(QStringLiteral("x")).repeated(5000);
         QVERIFY(CTaskOrchestrator::ExtractDeepCriteria(sLong).size() <= 2000);
+    }
+
+    void testDeepSectionExtract() {
+        // 2026-11-02 需求对照：ExtractDeepSection 通用段体提取（需求清单/验收标准
+        //   共用；段缺失/空体 → 空串由调用方回退，ExtractDeepCriteria 兼容包装不变）。
+        const QString sPlan = QStringLiteral(
+            "## 目标\n实现登录。\n\n## 需求清单\n1. 登录窗口\n2. 密码校验\n\n"
+            "## 实施步骤\n1. 改 a.cpp\n\n## 验收标准\n1. 编译零错误");
+        const QString sReqs = CTaskOrchestrator::ExtractDeepSection(
+            sPlan, QStringLiteral("需求清单"));
+        QVERIFY(sReqs.contains(QStringLiteral("登录窗口")));
+        QVERIFY(sReqs.contains(QStringLiteral("密码校验")));
+        QVERIFY(!sReqs.contains(QStringLiteral("实施步骤")));   // 到下一 ## 截断
+        QVERIFY(!sReqs.contains(QStringLiteral("编译零错误")));
+        // 段缺失 → 空串（调用方回退，不越俎代庖）。
+        QVERIFY(CTaskOrchestrator::ExtractDeepSection(
+            sPlan, QStringLiteral("风险")).isEmpty());
+        QVERIFY(CTaskOrchestrator::ExtractDeepSection(QString(),
+                     QStringLiteral("需求清单")).isEmpty());
+        QVERIFY(CTaskOrchestrator::ExtractDeepSection(sPlan, QString()).isEmpty());
+        // 段体空（仅标题） → 空串。
+        QVERIFY(CTaskOrchestrator::ExtractDeepSection(
+            QStringLiteral("## 需求清单\n\n## 目标\nx"),
+            QStringLiteral("需求清单")).isEmpty());
+        // 标题 # 前缀容忍（0..3 个）与两侧空白。
+        QVERIFY(CTaskOrchestrator::ExtractDeepSection(
+            QStringLiteral("### 需求清单 \n- 条目A\n\n## 后续"),
+            QStringLiteral("需求清单")).contains(QStringLiteral("条目A")));
     }
 
     // ============ 2026.10.02 专家模式查询跳过 + 辅助轮输出压缩 ============
@@ -1127,12 +1165,16 @@ private slots:
     }
 
     // AC-N1：Verify 不在 RejectTarget 路由表内 → 走 default 返回自身（不被当成评审驳回源）。
+    // 2026-11-02 RejectTarget 增任务类型参数（bugfix 流 CodeReview/Test 回 BugFix）。
     void testVerifyNotInRejectTarget() {
-        QCOMPARE(CStageMachine::RejectTarget(EStage::Verify), EStage::Verify);
-        // 既有驳回路由不变。
-        QCOMPARE(CStageMachine::RejectTarget(EStage::CodeReview), EStage::Develop);
-        QCOMPARE(CStageMachine::RejectTarget(EStage::ReviewReq), EStage::ConfirmReq);
-        QCOMPARE(CStageMachine::RejectTarget(EStage::Test), EStage::Develop);
+        QCOMPARE(CStageMachine::RejectTarget(EStage::Verify, ETaskType::Feature), EStage::Verify);
+        // 既有驳回路由不变（feature 流）。
+        QCOMPARE(CStageMachine::RejectTarget(EStage::CodeReview, ETaskType::Feature), EStage::Develop);
+        QCOMPARE(CStageMachine::RejectTarget(EStage::ReviewReq, ETaskType::Feature), EStage::ConfirmReq);
+        QCOMPARE(CStageMachine::RejectTarget(EStage::Test, ETaskType::Feature), EStage::Develop);
+        // 新增：bugfix 流 CodeReview/Test 回 BugFix（原硬编码 Develop 得流外阶段）。
+        QCOMPARE(CStageMachine::RejectTarget(EStage::CodeReview, ETaskType::Bugfix), EStage::BugFix);
+        QCOMPARE(CStageMachine::RejectTarget(EStage::Test, ETaskType::Bugfix), EStage::BugFix);
     }
 
     // Feature 流首阶段仍为 Intake（既有行为不变）。

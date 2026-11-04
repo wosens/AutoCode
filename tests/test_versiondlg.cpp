@@ -322,6 +322,56 @@ int main(int argc, char* argv[]) {
               QStringLiteral("Claude 行不应混入 DSH 专属提示"));
     }
 
+    // —— 7. cmd 启动注入防御纯谓词（2026-11-03 分层校验，防"整体禁引号废掉
+    //      全部 bat 调用"回归：用户实测 ..\Execute - 副本\install_env.bat /update-pi
+    //      被旧整体级检查拒绝）——
+    {
+        // 7.1 标题最严：硬编码文案过，引号/%/& 拒（title 段拼在 && 之前）。
+        Check(!CVersionDialog::CmdTitleTainted(QStringLiteral("AutoCode - 更新 PIAgent")),
+              QStringLiteral("纯中文标题应放行"));
+        Check(CVersionDialog::CmdTitleTainted(QStringLiteral("A&B")),
+              QStringLiteral("标题含 & 应拒"));
+        Check(CVersionDialog::CmdTitleTainted(QStringLiteral("A\"B")),
+              QStringLiteral("标题含引号应拒"));
+        Check(CVersionDialog::CmdTitleTainted(QStringLiteral("A%B")),
+              QStringLiteral("标题含 % 应拒"));
+        // 7.2 命令行：核心回归——含空格路径的成对引号命令必须放行；%/奇数引号/
+        //     控制字符拒；骨架自身的 && / || 合法。
+        const QString sBatCmd = QStringLiteral(
+            "\"E:\\wosens\\Execute - 副本\\install_env.bat\" /update-pi "
+            "\"E:\\wosens\\PIAgent\"");
+        Check(!CVersionDialog::CmdLineTainted(sBatCmd),
+              QStringLiteral("含空格路径的成对引号 bat 命令应放行（本次回归现场）"));
+        Check(!CVersionDialog::CmdLineTainted(
+                  QStringLiteral("npm i -g x && echo [OK] || echo [错误]")),
+              QStringLiteral("骨架命令的 && / || 应放行"));
+        Check(CVersionDialog::CmdLineTainted(QStringLiteral("cmd /k %PATH%")),
+              QStringLiteral("命令含 % 应拒（变量展开）"));
+        Check(CVersionDialog::CmdLineTainted(QStringLiteral("\"a\" \"b \\ calc")),
+              QStringLiteral("奇数引号应拒（边界破损）"));
+        Check(CVersionDialog::CmdLineTainted(QStringLiteral("a\r\nb")),
+              QStringLiteral("命令含控制字符应拒"));
+        // 7.3 工作目录：常规路径过，引号/% 拒。
+        Check(!CVersionDialog::CmdPathTainted(QStringLiteral("E:\\root dir\\x")),
+              QStringLiteral("含空格常规路径应放行"));
+        Check(CVersionDialog::CmdPathTainted(QStringLiteral("E:\\a%b")),
+              QStringLiteral("工作目录含 % 应拒"));
+        // 7.4 外部值：配置根/仓库地址拼入前拦元字符（值级设防，Windows 路径与
+        //     git 地址不含这些字符）。
+        Check(!CVersionDialog::CmdValueTainted(
+                  QStringLiteral("https://github.com/nousresearch/hermes-agent")),
+              QStringLiteral("常规 git URL 应放行"));
+        Check(!CVersionDialog::CmdValueTainted(QStringLiteral("E:\\wosens\\QT\\PIAgent")),
+              QStringLiteral("常规根路径应放行"));
+        Check(CVersionDialog::CmdValueTainted(
+                  QStringLiteral("E:\\x\" & calc")),
+              QStringLiteral("值含引号+& 应拒（注入尝试）"));
+        Check(CVersionDialog::CmdValueTainted(QStringLiteral("a|b")),
+              QStringLiteral("值含 | 应拒"));
+        Check(CVersionDialog::CmdValueTainted(QStringLiteral("a^b")),
+              QStringLiteral("值含 ^ 应拒"));
+    }
+
     if (g_iFail == 0) {
         g_out << "test_versiondlg: ALL PASSED" << Qt::endl;
         return 0;

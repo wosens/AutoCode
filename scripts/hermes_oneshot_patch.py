@@ -347,7 +347,8 @@ def main() -> int:
               f"(tried: {'; '.join(a_cand)})")
         return 1
     try:
-        src = open(p, encoding="utf-8", newline="").read()
+        with open(p, encoding="utf-8", newline="") as f:
+            src = f.read()
     except OSError as exc:
         print(f"cannot read {p}: {exc}")
         return 1
@@ -366,10 +367,20 @@ def main() -> int:
         out, s_verb = with_v6(with_v5(upgrade_v1(src))), "upgraded v1 -> v6"
     else:
         out, s_verb = install_fresh(src), "patched OK (v6)"
-    s_tmp = p + ".ac-tmp"
-    with open(s_tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(out)
-    os.replace(s_tmp, p)
+    # 临时文件名附 pid：多实例同时敷设时共写同一 tmp 会交错/截断，损坏内容被
+    #   os.replace 装入 oneshot.py；进程独占 tmp 后 replace 原子覆盖，最后写入者无害。
+    s_tmp = f"{p}.ac-tmp{os.getpid()}"
+    try:
+        with open(s_tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(out)
+        os.replace(s_tmp, p)
+    except OSError as exc:
+        print(f"cannot write {p}: {exc}")
+        try:
+            os.remove(s_tmp)
+        except OSError:
+            pass
+        return 1
     print(s_verb)
     return 0
 

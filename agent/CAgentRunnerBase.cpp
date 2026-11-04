@@ -7,6 +7,8 @@
 #include <QFileInfo>
 #include <QDateTime>
 #include <QProcess>
+#include <QSettings>
+#include <QStandardPaths>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -114,10 +116,108 @@ QProcessEnvironment CAgentRunnerBase::MergedPathEnvironment() {
     if (!s_sMergedPathCache.isEmpty()) {
         oEnv.insert(QStringLiteral("PATH"), s_sMergedPathCache);
     }
+    // 2026-11-03 Git Bash 前置（bash WSL 存根根治；探测见 GitBashRootDir）：
+    //   C:\Windows\System32\bash.exe 是 WSL 存根——未装发行版的机器每条命令必败
+    //   （「适用于 Linux 的 Windows 子系统没有已安装的分发版」）。Machine PATH 中
+    //   System32 恒在最前，Git Bash 目录排后段时 bash/sed/grep/awk 全套命中存根或
+    //   落空——Agent 全后端的 shell 工具链整体瘫痪（2026-10-17/10-30/11-03 三次
+    //   跨会话实害：DataRepeater 等工程 Agent 误报「沙箱持续故障」、构建/回归
+    //   多日无法执行的根因；机器环境不可控，便携应用必须在注入点自免疫）。
+    //   把 Git Bash 的 usr/bin（真 bash + unix 工具链 sed/grep/awk/timeout）与
+    //   bin（bash 壳 + git.exe）前置到 PATH 最前即根治；找不到 Git Bash 时不动
+    //   PATH（与旧行为一致，无 Git 的机器本来也跑不了 agent shell）。
+    const QString sGitRoot = GitBashRootDir();
+    if (!sGitRoot.isEmpty()) {
+        QString sPre;
+        const QString sUsr = sGitRoot + QStringLiteral("/usr/bin");
+        const QString sBin = sGitRoot + QStringLiteral("/bin");
+        if (QFileInfo(sUsr + QStringLiteral("/bash.exe")).isFile()) {
+            sPre += QDir::toNativeSeparators(sUsr) + QLatin1Char(';');
+        }
+        if (QFileInfo(sBin + QStringLiteral("/bash.exe")).isFile()) {
+            sPre += QDir::toNativeSeparators(sBin) + QLatin1Char(';');
+        }
+        if (!sPre.isEmpty()) {
+            oEnv.insert(QStringLiteral("PATH"),
+                        sPre + oEnv.value(QStringLiteral("PATH")));
+        }
+    }
 #else
     // 非 Windows：无注册表 PATH 语义，直接继承（保持行为一致）。
 #endif
     return oEnv;
+}
+
+// —— Git Bash 安装根探测（2026-11-03 bash WSL 存根根治，说明见头文件声明）——
+QString CAgentRunnerBase::GitBashRootDir() {
+    static QString s_sRoot;
+    static qint64 s_iEmptyStampMs = 0;   // 空结果 TTL（30 秒，装完 Git 不重启即生效）
+    if (!s_sRoot.isEmpty()) {
+        return s_sRoot;   // 命中永久缓存（安装根不会无故消失）
+    }
+    const qint64 kiNowMs = QDateTime::currentMSecsSinceEpoch();
+    if (s_iEmptyStampMs != 0 && kiNowMs - s_iEmptyStampMs < 30000) {
+        return QString();   // 刚探过为空：不重复击注册表/文件系统
+    }
+    // <root> 有效性：usr/bin/bash.exe（Git for Windows 完整 MSYS2 工具链 + 真 bash）
+    //   或 bin/bash.exe（精简壳）任一存在即认；拒绝 Windows 目录（防病理注册表值）。
+    QString sFound;
+    auto fnTryRoot = [&sFound](const QString& a_sRoot) {
+        const QString sRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(a_sRoot.trimmed()));
+        if (sRoot.isEmpty()
+            || sRoot.startsWith(QStringLiteral("C:/Windows"), Qt::CaseInsensitive)) {
+            return false;
+        }
+        if (QFileInfo(sRoot + QStringLiteral("/usr/bin/bash.exe")).isFile()
+            || QFileInfo(sRoot + QStringLiteral("/bin/bash.exe")).isFile()) {
+            sFound = sRoot;
+            return true;
+        }
+        return false;
+    };
+    // ① 注册表 GitForWindows（官方安装器权威锚点；只读——便携铁律允许）。
+    {
+        QSettings oReg(QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows"),
+                       QSettings::NativeFormat);
+        if (!fnTryRoot(oReg.value(QStringLiteral("InstallPath")).toString())) {
+            QSettings oReg2(QStringLiteral("HKEY_CURRENT_USER\\SOFTWARE\\GitForWindows"),
+                            QSettings::NativeFormat);
+            fnTryRoot(oReg2.value(QStringLiteral("InstallPath")).toString());
+        }
+    }
+    // ② PATH 里 git.exe 反推安装根（便携版/自定义盘符安装；git.exe 不受 WSL 存根
+    //    影响，findExecutable 走本进程继承 PATH）。
+    if (sFound.isEmpty()) {
+        const QString sGit = QStandardPaths::findExecutable(QStringLiteral("git.exe"));
+        if (!sGit.isEmpty()) {
+            QDir oDir(QFileInfo(sGit).absolutePath());   // <root>/cmd|bin|usr/bin
+            for (int i = 0; i < 2 && sFound.isEmpty(); ++i) {
+                if (oDir.cdUp()) {
+                    fnTryRoot(oDir.absolutePath());
+                }
+            }
+        }
+    }
+    // ③ 常见安装路径兑底（绿色版无注册表且不在 PATH）。
+    if (sFound.isEmpty()) {
+        const QStringList aCands = {
+            QStringLiteral("C:/Program Files/Git"),
+            QStringLiteral("C:/Program Files (x86)/Git"),
+            QDir::fromNativeSeparators(qEnvironmentVariable("LOCALAPPDATA"))
+                + QStringLiteral("/Programs/Git"),
+        };
+        for (const QString& sC : aCands) {
+            if (fnTryRoot(sC)) {
+                break;
+            }
+        }
+    }
+    if (sFound.isEmpty()) {
+        s_iEmptyStampMs = kiNowMs;
+    }
+    s_sRoot = sFound;
+    return s_sRoot;
 }
 
 QString CAgentRunnerBase::SharedSkillsCatalog() {
@@ -210,6 +310,13 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "内置测试沙箱（已内置，无需安装）：\n"
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
+            "- 物理模拟无效：Agent 运行期间宿主自动拦截并丢弃一切合成鼠标/键盘"
+            "（SendInput/pyautogui/keybd_event 等物理操控一律无效），不要尝试——"
+            "界面驱动只认 sandbox_* 工具（消息级，天然无扰）。\n"
+            "- 例外（硬件级点击）：目标只认硬件输入（消息级无效/假阳性，如任务栏/托盘/"
+            "shell 窗口）时，用 sandbox_hclick（宿主代发硬件点击，--sandbox hclick "
+            "<hwnd> <x> <y>）——仍禁止自发 SendInput/pyautogui（必被拦截无效）。\n"
+
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
             "（launch/windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"
@@ -287,6 +394,13 @@ QString CAgentRunnerBase::SharedSkillsCatalogFromDirs(const QStringList& aDirs) 
             "内置测试沙箱（已内置，无需安装，优先于任何技能）：\n"
             "- 由你启动的 GUI 程序窗口会被自动隐藏收纳（不抢焦点、点击穿透，用户无感）；"
             "窗口对用户不可见，必须以截图驱动验证。\n"
+            "- 物理模拟无效：Agent 运行期间宿主自动拦截并丢弃一切合成鼠标/键盘"
+            "（SendInput/pyautogui/keybd_event 等物理操控一律无效），不要尝试——"
+            "界面驱动只认 sandbox_* 工具（消息级，天然无扰）。\n"
+            "- 例外（硬件级点击）：目标只认硬件输入（消息级无效/假阳性，如任务栏/托盘/"
+            "shell 窗口）时，用 sandbox_hclick（宿主代发硬件点击，--sandbox hclick "
+            "<hwnd> <x> <y>）——仍禁止自发 SendInput/pyautogui（必被拦截无效）。\n"
+
             "- claude 后端优先用 MCP 工具 mcp__autocode__sandbox_*"
             "（launch/windows/capture/click/type/keys/tree/restore/add…）。\n"
             "- 其余后端用命令行：\"%1\" --sandbox windows ｜ --sandbox capture <hwnd> ｜"

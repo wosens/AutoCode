@@ -82,6 +82,7 @@ public:
     static QStringList DshExtraWriteDirs();
     // 授/撤 ACE（幂等：已有精确 ACE 跳过；命名互斥防多实例竞态）：a_aRevoke 里不在
     //   a_aGrant 的目录被撤销。返回失败目录数（0=全部成功；失败不阻断，日志可见）。
+    [[nodiscard]]   // 2026-11-02 返回成败/错误信息的函数，忽略返回值应显式 (void)
     static int ApplyExtraWriteDirs(const QString& a_sWorkDir,
                                   const QStringList& a_aGrant,
                                   const QStringList& a_aRevoke = QStringList());
@@ -92,6 +93,7 @@ public:
     //    修复「用户无 WRITE_DAC/WRITE_OWNER」根因，随后非提权重跑既有自愈补精确条目；
     //    人工等价：icacls "<目录>" /grant "*<本机用户SID>:(OI)(CI)(F)"）——
     // 查询+尝试静默自愈（内部即 DshEnsureLabelWritable）：0=已具备 1=本轮补上 -1=失败（需提权）。
+    [[nodiscard]]   // 2026-11-02 返回成败/错误信息的函数，忽略返回值应显式 (void)
     static int EnsureDirWriteAce(const QString& a_sDir);
     // —— 2026-10-21 沙箱关闭（danger-full-access 缺省）时的标签中性恢复：把
     //    workspace-write 时代遗留的低完整性强制标签（Low/Untrusted，NW 挡一切
@@ -99,6 +101,7 @@ public:
     //    自动跟随）。工程拷到新机器/老版本升级后无人清理，是「发布后没权限」
     //    的根子。返回 0=已中性（无标签或 Medium+，幂等）1=本轮已恢复 -1=失败
     //    （a_pOutCmd 非空时收 icacls 提权命令全文，静默写 SACL 过滤令牌常态失败）。
+    [[nodiscard]]   // 2026-11-02 返回成败/错误信息的函数，忽略返回值应显式 (void)
     static int RestoreNeutralSecurity(const QString& a_sDir,
                                       QString* a_pOutCmd = nullptr);
     // 当前进程令牌用户 SID 字符串（S-1-5-…；失败返回空串）。
@@ -109,6 +112,7 @@ public:
     // runas 提权执行 cmd.exe /c <a_sCmd> 并有界等待：false=未启动（UAC 被拒）、
     //   超时或退出码非 0；a_pdwExit 非空时收退出码（用 unsigned long 而非 DWORD，
     //   避免头文件引 windows.h）。
+    [[nodiscard]]   // 2026-11-02 返回成败/错误信息的函数，忽略返回值应显式 (void)
     static bool RunElevatedCmdBlocking(const QString& a_sCmd, int a_iTimeoutMs,
                                        unsigned long* a_pdwExit = nullptr);
     // EnsureProcess 静默自愈失败时的提权回调（仅 GUI 线程被调用；参数=目录+命令全文；
@@ -144,6 +148,7 @@ public:
     static bool LooksLikeDshRoot(const QString& a_sRoot);
     // 2026.08.18 可用性统一校验（启动警告/设置保存兜底/StartStage 前置三处同一口径）：
     //   返回空串 = 可用；非空 = 第一处问题的完整处理指引（含一键安装路径）。
+    [[nodiscard]]   // 2026-11-02 返回成败/错误信息的函数，忽略返回值应显式 (void)
     static QString DshConfigError();
     // 探测 exe 同级/上级的 DSH 仓库根（exeDir{, /.., /../..} × {/DeepSeekHarness/
     //   deepseek-harness, /deepseek-harness}；install_env.bat 的固定安装布局：exe

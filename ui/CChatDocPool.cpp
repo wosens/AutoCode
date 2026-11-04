@@ -11,6 +11,12 @@ CChatDocPool::CChatDocPool(QObject* a_pParent)
 
 CChatDocPool::~CChatDocPool()
 {
+    // 析构路径不回调：池是视图子对象，运行于 ~QObject 子对象删除序列，回调
+    //（fnDocAboutToDelete 捕获视图 this → closeOverlay 访问 verticalScrollBar/
+    //浮层）可能碰到已删兄弟控件——关停前由属主显式 Clear 摘引用，此处只释放内存。
+    fnDocAboutToDelete = nullptr;
+    fnDocReady = nullptr;
+    fnFetchText = nullptr;
     Clear();
 }
 
@@ -66,12 +72,13 @@ void CChatDocPool::evictLru(int a_iSkipItem)
             if (iNext < 0)
                 break;
             const int iVictim = iNext;
-            const SEntry& e = m_aDocs[iVictim];     // 统一「先取值后 remove」纪律：
-            const int iPrev = e.iPrev, iNextV = e.iNext;   // remove 后 e 失效，只许用局部
-            m_iEstTotal -= e.iEst;
+            QTextDocument* const pDoc = m_aDocs[iVictim].pDoc;   // 快照：回调可重入池
+            const int iPrev = m_aDocs[iVictim].iPrev;
+            const int iNextV = m_aDocs[iVictim].iNext;
+            m_iEstTotal -= m_aDocs[iVictim].iEst;
             if (fnDocAboutToDelete)          // 删除前通知（2026-10-23：浮层摘引用防 UAF）
                 fnDocAboutToDelete(iVictim);
-            delete e.pDoc;                          // 逐出即 delete
+            delete pDoc;                             // 逐出即 delete（只用局部快照）
             m_aDocs.remove(iVictim);
             m_aDocs[iPrev].iNext = iNextV;          // iPrev ≥ 0（victim 前方必有保护对象）
             if (iNextV >= 0)
@@ -80,13 +87,13 @@ void CChatDocPool::evictLru(int a_iSkipItem)
                 m_iKeyMru = iPrev;
             continue;
         }
-        SEntry& e = m_aDocs[iKey];
-        const int iNextKey = e.iNext;
-        m_iEstTotal -= e.iEst;
+        QTextDocument* const pDocLru = m_aDocs[iKey].pDoc;   // 快照：回调可重入池（rehash
+        const int iNextKey = m_aDocs[iKey].iNext;            // 后条目引用悬垂，禁跨回调用）
+        m_iEstTotal -= m_aDocs[iKey].iEst;
         if (fnDocAboutToDelete)              // 删除前通知（2026-10-23：浮层摘引用防 UAF）
             fnDocAboutToDelete(iKey);
-        delete e.pDoc;
-        m_aDocs.remove(iKey);               // remove 后 e 失效，先取 iNextKey
+        delete pDocLru;
+        m_aDocs.remove(iKey);
         m_iKeyLru = iNextKey;
         if (iNextKey < 0)
             m_iKeyMru = -1;                 // 池空
@@ -180,10 +187,15 @@ void CChatDocPool::OnBand(int a_iFirstRow, int a_iLastRow, int a_iViewportY, int
             aDrop.append(it.key());
     }
     for (int k : aDrop) {
-        SEntry& e = m_aDocs[k];
-        const int iPrev = e.iPrev, iNext = e.iNext;
-        m_iEstTotal -= e.iEst;
-        delete e.pDoc;
+        // 快照后回调再删（同 evictLru 纪律）：OnBand 删除路径同样遵守
+        //   fnDocAboutToDelete 契约（旧版漏调——浮层裸持被删 doc 即 UAF，正是
+        //   v5.0.412 要防的形态）；回调可重入池，禁持条目引用跨回调。
+        QTextDocument* const pDoc = m_aDocs[k].pDoc;
+        const int iPrev = m_aDocs[k].iPrev, iNext = m_aDocs[k].iNext;
+        m_iEstTotal -= m_aDocs[k].iEst;
+        if (fnDocAboutToDelete)
+            fnDocAboutToDelete(k);
+        delete pDoc;
         m_aDocs.remove(k);
         if (iPrev >= 0)
             m_aDocs[iPrev].iNext = iNext;
@@ -232,11 +244,18 @@ void CChatDocPool::OnWidthChanged(int a_iNewWidth)
 void CChatDocPool::Clear()
 {
     // 2026-10-23 删除前通知（fnDocAboutToDelete）：浮层等引用者在 delete 前摘引用
-    //（防 v5.0.412 类 UAF：绘制/析构访问已删 doc）
+    //（防 v5.0.412 类 UAF：绘制/析构访问已删 doc）。先快照 (key, doc) 列表再逐条
+    //「回调→delete」：回调链重入池（插入/逐出/清洗）会使哈希迭代器失效，禁止跨
+    //回调持有迭代器/条目引用。
+    QList<QPair<int, QTextDocument*>> aAll;
+    aAll.reserve(m_aDocs.size());
     for (auto it = m_aDocs.begin(); it != m_aDocs.end(); ++it) {
+        aAll.append(qMakePair(it.key(), it.value().pDoc));
+    }
+    for (const auto& pr : aAll) {
         if (fnDocAboutToDelete)
-            fnDocAboutToDelete(it.key());
-        delete it.value().pDoc;             // doc 以池为 parent，显式 delete 后析构不再二次释放
+            fnDocAboutToDelete(pr.first);
+        delete pr.second;             // doc 以池为 parent，显式 delete 后析构不再二次释放
     }
     m_aDocs.clear();
     m_iKeyMru = m_iKeyLru = -1;

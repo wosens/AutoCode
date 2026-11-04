@@ -42,6 +42,7 @@ private:
     int              m_iFps = 5;
     QString          m_sPath;
     std::atomic_bool m_bStop { false };
+    bool m_bAllSegOk = true;   // 2026-11-02 跨段 Finalize 结果累计（任一段失败整体失败）
     HANDLE           m_hStopEvent = nullptr;   // 立即响应停止（替代纯 Sleep 轮询）
     std::mutex       m_oMtx;                    // 点击标记/尺寸缓存
     int              m_iClickX = -1, m_iClickY = -1;

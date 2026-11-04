@@ -129,6 +129,12 @@ public:
     bool SandboxRecord() const;
     int  SandboxFps() const;
     int  SandboxRetainDays() const;
+    // 2026-11-01 沙箱动态库化：所选沙箱 id（= TestSandbox\<Type>.dll 主干名）。
+    // 2026-11-02 双沙箱并行：改为双开关 getter（窗口槽 + VM 槽）。
+    bool SandboxWindowEnable() const;
+    bool SandboxVmEnable() const;
+    // 2026-11-02 物理输入拦截开关（默认开）。
+    bool SandboxBlockSynth() const;
 
     // 2026.08.27 窗口几何持久化：accept / reject / 标题栏关闭都经 done()，在此统一
     //   落盘 [SettingsWindow]（exe 同级 config.ini）；下次打开恢复位置与大小。
@@ -297,6 +303,11 @@ private:
     QCheckBox*  m_pChkSbxRecord   = nullptr;   // 自动录像
     QSpinBox*   m_pSpinSbxFps     = nullptr;   // 录制帧率
     QSpinBox*   m_pSpinSbxRetain  = nullptr;   // 录像保留天数
+    // 2026-11-02 双沙箱并行（替代旧单选 Type 下拉）：窗口槽 + VM 槽各自开关，
+    //   宿主按命令自动路由（vm_*→microVM，窗口类→幽灵沙箱）。
+    QCheckBox*  m_pChkSbxWindow   = nullptr;   // 窗口沙箱（GhostSandbox，GUI 测试主力）
+    QCheckBox*  m_pChkSbxVm       = nullptr;   // Linux microVM（MsbSandbox，需 WHP）
+    QCheckBox*  m_pChkSbxBlockSynth = nullptr; // 2026-11-02 物理输入拦截（Agent 运行期）
     // 2026.08.27 几何持久化用的配置管理器引用（非拥有；构造时留存，done() 落盘用）。
     CProjectManager* m_pPm = nullptr;
     // 2026.09 后端版本管理 D6 判据（构造注入透传给 CVersionDialog；空=放行）。

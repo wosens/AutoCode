@@ -93,5 +93,10 @@ public:
 
 private:
     COrchConfig() = default;
+    // 2026-11-02 单例约束落地：删拷贝/移动，防 *Instance() 拷出脱离落盘的副本
+    COrchConfig(const COrchConfig&) = delete;
+    COrchConfig& operator=(const COrchConfig&) = delete;
+    COrchConfig(COrchConfig&&) = delete;
+    COrchConfig& operator=(COrchConfig&&) = delete;
     static COrchConfig* s_pInst;
 };

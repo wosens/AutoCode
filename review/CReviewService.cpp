@@ -311,8 +311,19 @@ public:
 
             if (iRc == AUTOCODE_LCR_OK) {
                 // file 字段统一改写为工程相对路径（ReviewFile 传的是绝对路径）。
-                QJsonArray aFileFindings =
-                    QJsonDocument::fromJson(sFindings.toUtf8()).array();
+                // 解析校验：模型返回非合法 JSON 数组时（fromJson 得空 doc）按错误
+                //   处理——旧版把空数组当零问题计入已审，审查结果静默失真。
+                const QJsonDocument stDoc = QJsonDocument::fromJson(sFindings.toUtf8());
+                if (!stDoc.isArray()) {
+                    QMutexLocker lkAgg(&agg.mx);
+                    agg.iReviewed += 1;
+                    lkAgg.unlock();
+                    emit sigFileDone(sRel, AUTOCODE_LCR_ERR_LLM,
+                        QStringLiteral("审查输出不是合法 JSON 数组（模型输出异常）：%1")
+                            .arg(sFindings.left(200)), QString());
+                    return false;
+                }
+                QJsonArray aFileFindings = stDoc.array();
                 for (int k = 0; k < aFileFindings.size(); ++k) {
                     QJsonObject oF = aFileFindings.at(k).toObject();
                     if (oF.value(QStringLiteral("file")).toString().isEmpty()) {
@@ -645,7 +656,17 @@ CReviewService::CReviewService(QObject* a_pParent) : QObject(a_pParent) {
 CReviewService::~CReviewService() {
     Stop();
     m_pTh->quit();
-    m_pTh->wait(10000);
+    if (!m_pTh->wait(10000)) {
+        // 线程 10s 未退（lane 阻塞在 SDK 调用/runner 停止迟缓）：不再 delete worker
+        //（跨线程销毁运行中对象=UAF，泄漏优于崩溃）；同时摘离 QThread 父子关系
+        //（m_pTh 以 this 为父，若仍在运行就被 ~QObject 连带 delete 会触发 qFatal
+        //「Destroyed while thread is still running」直接终止进程）。
+        qWarning() << "[CReviewService] 工作线程 10s 未退出，放弃回收（防 UAF）";
+        m_pWorkerObj->deleteLater();   // 挂到线程自己的队列：线程若最终退出会安全释放
+        m_pWorkerObj = nullptr;
+        m_pTh->setParent(nullptr);    // 线程对象一并放弃（进程退出时随 run 结束自亡）
+        return;
+    }
     delete m_pWorkerObj;   // 线程已停后从创建线程销毁（无事件循环竞争）
     m_pWorkerObj = nullptr;
 }

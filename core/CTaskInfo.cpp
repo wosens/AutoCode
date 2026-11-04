@@ -1,6 +1,7 @@
 #include "CTaskInfo.h"
 
 #include <QFile>
+#include <QSaveFile>   // 2026-11-02 原子落盘：写入中途崩溃/断电不再留下截断档
 #include "core/CFrwDevice.h"
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -8,6 +9,23 @@
 #include <QJsonParseError>
 #include <QRegularExpression>   // 2026.09.10 v2.2.152 ExtractNameFromRequest
 #include <algorithm>            // std::any_of（泛型词表命中判定）
+
+// —— 2026-11-02 反序列化枚举越界防御（LoadFromFile 统一入口）——
+namespace {
+// 限定范围枚举（ETaskType/ETier/ETaskStatus）：非法/越界回退默认枚举。
+template <typename E>
+E ClampEnum(int a_iVal, int a_iMin, int a_iMax, E a_eDef) {
+    return (a_iVal >= a_iMin && a_iVal <= a_iMax)
+               ? static_cast<E>(a_iVal) : a_eDef;
+}
+// EStage：内置 1~14 + 动态自定义 ≥100 合法（编排设计窗口运行期注册），
+//   其余（负数/0/15~99 死区/起出合理范围的巨值）回 Intake。
+EStage ClampStageEnum(int a_iVal) {
+    constexpr int k_iStaticMax = static_cast<int>(EStage::Verify);
+    return (a_iVal >= 1 && a_iVal <= k_iStaticMax) || a_iVal >= 100
+               ? static_cast<EStage>(a_iVal) : EStage::Intake;
+}
+}   // namespace
 
 CTaskInfo::CTaskInfo(QObject* a_pParent)
     : QObject(a_pParent) {
@@ -103,19 +121,20 @@ bool CTaskInfo::SaveToFile(const QString& a_sFilePath) const {
     oRoot["history"] = aHist;
 
     const QJsonDocument stDoc(oRoot);
-    QFile stFile(a_sFilePath);
-    if (!stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    // 2026-11-02 改 QSaveFile 原子替换：旧 Truncate 原地写一旦中途崩溃/断电即留
+    //   截断 JSON，任务进度永久丢失；QSaveFile 先写临时文件、commit 成功才替换。
+    QSaveFile stFile(a_sFilePath);
+    if (!stFile.open(QIODevice::WriteOnly)) {
         return false;
     }
     // 写入校验：磁盘满/配额/句柄异常时 write 可能短写或失败，忽略返回值会把截断档
     //   当成功落盘，任务进度静默丢失。
     const QByteArray aJson = stDoc.toJson(QJsonDocument::Indented);
-    if (stFile.write(aJson) != aJson.size() || stFile.error() != QFile::NoError) {
-        stFile.close();
+    if (stFile.write(aJson) != aJson.size() || stFile.error() != QFileDevice::NoError) {
+        stFile.cancelWriting();
         return false;
     }
-    stFile.close();
-    return true;
+    return stFile.commit();
 }
 
 void CTaskInfo::ResetForRevive() {
@@ -154,25 +173,29 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
     const QJsonObject o = stDoc.object();
 
     // 直接成员赋值，不 emit sigChanged（避免加载过程触发回写）
+    // 2026-11-02 枚举越界防御：损坏/版本不匹配的合法 JSON 经 static_cast 会得到
+    //   越界枚举（后续 switch/比较 UB），统一入口校验，非法值回退默认枚举。
     m_sId          = o.value("id").toString();
     m_sName        = o.value("name").toString();
     m_sUserRequest = o.value("userRequest").toString();
-    m_eType        = static_cast<ETaskType>(
-        o.value("type").toInt(static_cast<int>(ETaskType::Feature)));
-    m_eTier        = static_cast<ETier>(
-        o.value("tier").toInt(static_cast<int>(ETier::Standard)));   // 缺键→标准（向后兼容）
+    m_eType        = ClampEnum(o.value("type").toInt(-1),
+                               0, static_cast<int>(ETaskType::Bugfix),
+                               static_cast<ETaskType>(ETaskType::Feature));
+    m_eTier        = ClampEnum(o.value("tier").toInt(-1),
+                               0, static_cast<int>(ETier::Strict),
+                               static_cast<ETier>(ETier::Standard));   // 缺键/非法→标准（向后兼容）
     m_bAutoNamed   = o.value("autoNamed").toBool();   // 缺键→false（旧任务视为已定名）
     m_bArchived    = o.value("archived").toBool();    // 缺键→false（旧任务未归档，兼容）
     m_aFlowStages.clear();
     const QJsonArray aFlow = o.value("flowStages").toArray();
     for (const QJsonValue& v : aFlow) {
-        m_aFlowStages.append(static_cast<EStage>(v.toInt()));
+        m_aFlowStages.append(ClampStageEnum(v.toInt(-1)));
     }
-    m_eStatus      = static_cast<ETaskStatus>(
-        o.value("status").toInt(static_cast<int>(ETaskStatus::Pending)));
+    m_eStatus      = ClampEnum(o.value("status").toInt(-1),
+                               0, static_cast<int>(ETaskStatus::Failed),
+                               static_cast<ETaskStatus>(ETaskStatus::Pending));
     m_sProjectDir  = o.value("projectDir").toString();
-    m_eCurStage    = static_cast<EStage>(
-        o.value("curStage").toInt(static_cast<int>(EStage::Intake)));
+    m_eCurStage    = ClampStageEnum(o.value("curStage").toInt(-1));
     m_iStageIter   = o.value("stageIter").toInt();
     m_dCost        = o.value("cost").toDouble();
     m_iInTok       = o.value("inTok").toInteger();
@@ -194,8 +217,7 @@ bool CTaskInfo::LoadFromFile(const QString& a_sFilePath) {
     for (const QJsonValue& v : aHist) {
         const QJsonObject oRun = v.toObject();
         SStageRun r;
-        r.eStage   = static_cast<EStage>(
-            oRun.value("stage").toInt(static_cast<int>(EStage::Intake)));
+        r.eStage   = ClampStageEnum(oRun.value("stage").toInt(-1));
         r.iIter    = oRun.value("iter").toInt();
         r.bOk      = oRun.value("ok").toBool();
         r.sSummary = oRun.value("summary").toString();

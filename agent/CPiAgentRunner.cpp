@@ -631,6 +631,10 @@ void CPiAgentRunner::Reset() {
     m_sLastStopReason.clear();
     m_sLastApiError.clear();   // 2026.08.22 API 错误透传（见头文件注释）
     m_sResumeSid.clear();
+    // 旧 sid 不跨轮携带：sid 一律以本轮 session 头/get_state 回读为准，本轮未见即报空
+    //   （防流被截断/版本差异时把上轮 sid 报给上层误续跑到旧会话，与 EmitFailed 的
+    //   !m_bSawSession 清 sid 防护同口径）。
+    m_sLastSessionId.clear();
     m_iSumPlainInTok = 0;
     m_iSumCacheReadTok = 0;
     m_iSumCacheWriteTok = 0;
@@ -644,6 +648,7 @@ void CPiAgentRunner::Reset() {
     m_sLastModel.clear();
     m_aStderrTail.clear();
     m_buf.clear();
+    m_bufErr.clear();
     m_iNoMsgHintMs = -1;   // 2026.08.29 流式心跳提示节流复位
 }
 
@@ -918,10 +923,14 @@ void CPiAgentRunner::slotOnStdOut() {
 
 void CPiAgentRunner::slotOnStdErr() {
     m_actClock.restart();   // stderr 字节同样算活跃
-    const QByteArray bufData = m_pProc->readAllStandardError();
-    const QList<QByteArray> aLines = bufData.split('\n');
-    for (const QByteArray& szRaw : aLines) {
-        const QString sLine = QString::fromUtf8(szRaw).trimmed();
+    // 行缓冲（同 stdout 口径）：跨 readyRead 边界的行拼接后再切，避免残行拆断与
+    //   UTF-8 多字节字符被切在中间产生乱码替换符（污染锁错误/依赖缺失识别判据）。
+    m_bufErr.append(m_pProc->readAllStandardError());
+    int iPos = m_bufErr.indexOf('\n');
+    while (iPos >= 0) {
+        const QString sLine = QString::fromUtf8(m_bufErr.left(iPos)).trimmed();
+        m_bufErr.remove(0, iPos + 1);
+        iPos = m_bufErr.indexOf('\n');
         if (sLine.isEmpty()) {
             continue;
         }
@@ -1255,6 +1264,10 @@ void CPiAgentRunner::slotOnFinished(int a_iExitCode, QProcess::ExitStatus a_eSta
             StartStageImpl(st.sWorkDir, st.sPrompt, st.sDisallowed, st.iMaxTurns,
                            st.sResumeSid, st.bFork, st.iAutocompactK, st.bEnableAskUser,
                            m_bRpcMode);
+            // StartStageImpl 内部 Reset() 会把 m_bLockHealTried 清零（"只重试一次"
+            //   防死循环保护失效）——本调用同步返回后补钉回 true：锁类错误持续复现
+            //   时不再二次重拉，走上报路径。
+            m_bLockHealTried = true;
             return;
         }
     }
@@ -1445,10 +1458,14 @@ void CPiAgentRunner::CheckStall() {
                                 "终止 PIAgent 进程并转自动续跑…").arg(CClaudeRunner::StallMinutes()));
     m_pProc->kill();
     m_pProc->waitForFinished(3000);
+    // token 防双计（同 slotOnFinished 口径）：流式已 sigUsageDelta 上抛部分用量后
+    //   再停滞终止时，收尾只能报 0，否则上层把本轮 token 计两遍。
     emit sigFinished(false,
                      QStringLiteral("停滞检测：%1 分钟无任何输出（疑似网络/中继挂起），进程已终止")
                          .arg(CClaudeRunner::StallMinutes()),
-                     m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sLastSessionId);
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                     ComputeTurnCost(), m_sLastSessionId);
 }
 
 void CPiAgentRunner::EmitFailed(const QString& a_sMsg) {
@@ -1465,5 +1482,10 @@ void CPiAgentRunner::EmitFailed(const QString& a_sMsg) {
         m_pStallTimer->stop();
     }
     emit sigInfo(QStringLiteral("[错误] ") + a_sMsg);
-    emit sigFinished(false, a_sMsg, m_iSumInTok, m_iSumOutTok, ComputeTurnCost(), m_sLastSessionId);
+    // token 防双计（同 slotOnFinished 口径）：流式已实时上抛部分用量后再失败时，
+    //   收尾报 0 防上层双计；费用 ComputeTurnCost 维持全额。
+    emit sigFinished(false, a_sMsg,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumInTok,
+                     (m_iLiveEmitIn > 0 || m_iLiveEmitOut > 0) ? 0 : m_iSumOutTok,
+                     ComputeTurnCost(), m_sLastSessionId);
 }

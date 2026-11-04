@@ -9,6 +9,9 @@
 #include <QSplitter>
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QPointer>
+#include <QProgressBar>
+#include <thread>
 #include <QPushButton>
 #include <QDesktopServices>
 #include <QUrl>
@@ -77,8 +80,7 @@
 #include "CTaskOrchestrator.h"
 #include "CClaudeRunner.h"
 #include "CAgentRunnerFactory.h"   // 2026.08.18 后端单选分派（自带 CDeepSeekRunner.h）
-#include "sandbox/CSandboxManager.h"   // 2026-09-26 内置测试沙箱
-#include "sandbox/CSandboxDialog.h"
+#include "sandbox/CSandboxHost.h"        // 2026-11-01 沙箱动态库化：门面替代直接引 Manager/Dialog
 #include "CCodexRunner.h"         // 第四后端 CodexHarness 参数回填/探测自愈
 #include "CPiAgentRunner.h"        // 2026.08.19 第三后端 PIAgent 参数回填/探测自愈
 #include "CHermesRunner.h"        // 第五后端 Hermes 参数回填（任务 3213cdbf）
@@ -96,6 +98,113 @@
 #include "CNewTaskDialog.h"
 #include "COrchDesignDialog.h"   // 2026-10-14 任务编排设计（功能菜单）
 #include "CTaskHistoryDB.h"
+
+// —— 2026-11-01 WHP（虚拟机监控程序平台）提权启用：设置页保存 MsbSandbox 时引导 ——
+// 2026-11-02 修：真实 DLL 是 WinHvPlatform.dll（此前误用不存在的
+//   WindowsHypervisorPlatform.dll，功能已启用+重启后的机器上仍误报未启用）。
+//   判据两级（与 MsbSandbox.dll 的 whp_probe 同口径）：①WHvGetCapability
+//   (HypervisorPresent) 快速路径；②hypervisor 已运行的机器上该 capability
+//   实测可能误报 0x80370301/present=0，报错/为假时用 WHvCreatePartition
+//   实测兜底（内核对象创建，微秒级无副作用）。
+static bool IsWhpEnabled() {
+    const HMODULE hMod = LoadLibraryW(L"WinHvPlatform.dll");
+    if (hMod == nullptr) {
+        return false;
+    }
+    using FnGetCap = HRESULT(STDAPICALLTYPE*)(UINT32, void*, UINT32, UINT32*);
+    using FnCreatePart = HRESULT(STDAPICALLTYPE*)(void**);
+    using FnDeletePart = HRESULT(STDAPICALLTYPE*)(void*);
+    const auto fnCap =
+        reinterpret_cast<FnGetCap>(GetProcAddress(hMod, "WHvGetCapability"));
+    const auto fnCreate =
+        reinterpret_cast<FnCreatePart>(GetProcAddress(hMod, "WHvCreatePartition"));
+    const auto fnDelete =
+        reinterpret_cast<FnDeletePart>(GetProcAddress(hMod, "WHvDeletePartition"));
+    bool bOk = false;
+    if (fnCap != nullptr) {
+        BYTE byPresent = 0;
+        UINT32 uWritten = 0;
+        if (SUCCEEDED(fnCap(0, &byPresent, 1, &uWritten)) && byPresent != 0) {
+            bOk = true;
+        }
+    }
+    if (!bOk && fnCreate != nullptr && fnDelete != nullptr) {
+        void* pPart = nullptr;
+        if (SUCCEEDED(fnCreate(&pPart)) && pPart != nullptr) {
+            fnDelete(pPart);
+            bOk = true;
+        }
+    }
+    FreeLibrary(hMod);
+    return bOk;
+}
+
+// 本机对管理员 runas 是否会弹 UAC 确认框（false = 静默提权，runas 直接放行）。
+// 2026-11-01 实害：本机 ConsentPromptBehaviorAdmin=0（从不通知）+ 内置 Administrator
+//   全令牌 → runas 静默通过，用户等不到承诺的 UAC 窗口（功能实际已启用成功）。
+// 两种静默情形：①当前进程已提权（提权 explorer / 已提权 shell 的子进程直接继承）；
+// ②ConsentPromptBehaviorAdmin=0（管理员组成员提权从不提示）。
+static bool WhpUacWouldPrompt() {
+    HANDLE hTok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+        TOKEN_ELEVATION stElev = {};
+        DWORD dw = 0;
+        const BOOL bOk = GetTokenInformation(hTok, TokenElevation,
+                                              &stElev, sizeof(stElev), &dw);
+        CloseHandle(hTok);
+        if (bOk && stElev.TokenIsElevated != 0) {
+            return false;   // 已提权：子进程直接继承，无 UAC
+        }
+    }
+    DWORD dwVal = 1;
+    DWORD dwSize = sizeof(dwVal);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                     L"ConsentPromptBehaviorAdmin", RRF_RT_REG_DWORD,
+                     nullptr, &dwVal, &dwSize) == ERROR_SUCCESS && dwVal == 0) {
+        return false;   // 管理员提权策略=从不通知：静默放行
+    }
+    return true;
+}
+
+// runas 执行启用命令并等待结束（静默 PowerShell）。
+// 返回：0=成功；1=UAC 被拒绝（仅会弹 UAC 的机器）；2=启用命令报错；
+//       其他>0=命令退出码；<0=发起失败（值为 -GetLastError()）。
+// 2026-11-01 修：ShellExecuteExW 在未初始化 COM 的裸线程上可能失败
+//   （文档要求线程先 COM 初始化）——补 STA 初始化，覆盖任意线程上下文。
+static int EnableWhpElevatedRun() {
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool bCoOk = (hrCo == S_OK || hrCo == S_FALSE);
+    int iRet = 0;
+    {
+        SHELLEXECUTEINFOW stSei = {};
+        stSei.cbSize = sizeof(stSei);
+        stSei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        stSei.lpVerb = L"runas";
+        stSei.lpFile = L"powershell.exe";
+        stSei.lpParameters =
+            L"-NoProfile -ExecutionPolicy Bypass -Command "
+            L"\"try { Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform "
+            L"-NoRestart -ErrorAction Stop | Out-Null; exit 0 } catch { exit 2 }\"";
+        stSei.nShow = SW_HIDE;
+        if (!ShellExecuteExW(&stSei)) {
+            const DWORD dwErr = GetLastError();
+            iRet = (dwErr == ERROR_CANCELLED) ? 1 : -static_cast<int>(dwErr);
+        } else if (stSei.hProcess == nullptr) {
+            iRet = 0;   // 已发起但拿不到句柄（极老 shell）：按成功处理
+        } else {
+            WaitForSingleObject(stSei.hProcess, 180000);   // dism 启用最长等 3 分钟
+            DWORD dwCode = 2;
+            GetExitCodeProcess(stSei.hProcess, &dwCode);
+            CloseHandle(stSei.hProcess);
+            iRet = static_cast<int>(dwCode);
+        }
+    }
+    if (bCoOk) {
+        CoUninitialize();
+    }
+    return iRet;
+}
 
 // [Scan] ExcludeDirs 逗号串 → 逐项去空白的清单。用户常在逗号后带空格（".autodev, build"），
 // 不逐项 trim 会让 " build" 匹配失败、该目录排除悄悄失效（备份路径 BackupExcludeDirs
@@ -730,6 +839,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
             this, &CMainWindow::OnAdhocRunFinished);
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocFinished,
             m_pExecPanel, &CExecutionPanel::OnAdhocFinished);
+    // 2026-11-02 助手结束：物理输入拦截随运行汇总切换（Agent 全停后停拦，用户
+    //   自己的合成输入工具如 AHK 不受全天误伤）。
+    connect(m_pOrch, &CTaskOrchestrator::sigAdhocFinished,
+            this, &CMainWindow::SbxNotifyAgentActive);
     // 2026.08.19 自动续发排队指令：编排器直接起新轮，面板无 UI 事件可感知——
     //   StartAdhocStage 起跑时广播运行态（手动发送路径面板已自置，此处幂等）。
     connect(m_pOrch, &CTaskOrchestrator::sigAdhocRunning,
@@ -741,6 +854,8 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
         if (m_pOrch != nullptr) {
             m_pExecPanel->UpdateAsstBackend(a_sAsstId, m_pOrch->AsstAdhocBackend(a_sAsstId));
         }
+        // 2026-11-02 Agent 起跑：通知沙箱开启物理输入拦截。
+        SbxNotifyAgentActive();
     });
     // 2026-10-29 新提示词链起点（用户需求：专家链 done 耗时含实施轮）：面板重锚链钟
     //   tChain——链内轮（规划/验证/修复/续跑/纠偏/压缩）不发，done 耗时覆盖整链。
@@ -773,6 +888,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     //   幽灵轮次结束 → 最终块落其档 + 面板除名 + 编排器会话释放。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstForeignActivated,
             this, &CMainWindow::OnAsstForeignActivated);
+    // 2026-11-02 改名落空兑底（QuickTool 实害）：改名弹窗开着时切档 → 目标不在新视图
+    //   → 直接改归属档案文件，改名不丢。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstRenameInArchive,
+            this, &CMainWindow::OnAsstRenameInArchive);
     connect(m_pExecPanel, &CExecutionPanel::sigAsstForeignFinished,
             this, &CMainWindow::OnAsstForeignFinished);
     // （2026-10-15 sigAdhocContextLimitChanged→SaveAdhocContextLimit 接线已随
@@ -836,17 +955,33 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     //   同桥 ({type:sbx}) 承接 sandbox_* MCP 工具与 --sandbox CLI。退出时 closeEvent
     //   统一 Shutdown（全部还原 + 停录像）；启动时先还原上次崩溃残留的幽灵窗口
     //   （2026-10-08 起：工程内残留窗口改为续收纳保持隐形，详见 ReadoptProjectWindows）。
-    m_pSbx = new CSandboxManager(this);
+    // 2026-11-02 双沙箱并行路由：窗口槽（GhostSandbox，Windows GUI 测试）与 VM 槽
+    //   (MsbSandbox，Linux microVM 硬隔离) 同时加载，Execute 按命令路由
+    //   （vm_*→VM 槽，其余→窗口槽）；单槽失败只降级本槽。
+    m_pSbx = new CSandboxHost(this);
     {
-        CSandboxManager::SSbxCfg stCfg;
+        CSandboxHost::SSbxCfg stCfg;
         stCfg.bEnable     = m_pPm->LoadSandboxEnable();
         stCfg.bAutoGhost  = m_pPm->LoadSandboxAutoGhost();
         stCfg.bRecord     = m_pPm->LoadSandboxRecord();
         stCfg.iFps        = m_pPm->LoadSandboxFps();
         stCfg.iRetainDays = m_pPm->LoadSandboxRetainDays();
-        m_pSbx->SetConfig(stCfg);
+        stCfg.bBlockSynth = m_pPm->LoadSandboxBlockSynth();
+        stCfg.bWindowEnable = m_pPm->LoadSandboxWindowEnable();
+        stCfg.sWindowType   = QStringLiteral("GhostSandbox");
+        stCfg.bVmEnable     = m_pPm->LoadSandboxVmEnable();
+        stCfg.sVmType       = QStringLiteral("MsbSandbox");
+        QString sErr;
+        const bool bSbxOk = m_pSbx->Load(stCfg, &sErr);
+        // 2026-11-02 单槽降级可见：Load 成功但 sErr 非空 = 某槽不可用已降级
+        //   （如 VM 槽遇 WHP 未启用机器，vm_* 命令将拒绝但窗口收纳照常）。
+        if (!sErr.isEmpty()) {
+            qWarning("[sandbox] %ls", reinterpret_cast<const wchar_t*>(sErr.utf16()));
+        }
+        if (!bSbxOk) {
+            qWarning("[sandbox] 沙箱整体不可用（AutoGhost 收纳停摆，Agent 测试将裸弹窗口）");
+        }
         m_pSbx->SetProjectRoot(m_pPm->ProjectDir());   // 启动自动恢复工程时供续收纳判定
-        m_pSbx->Start();
     }
 
     // 图标/标题栏右键弹系统菜单：应用级原生消息过滤器（先于 Qt 内部处理，见类注释）。
@@ -2162,13 +2297,102 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveSandboxRecord(stDlg.SandboxRecord());
     m_pPm->SaveSandboxFps(stDlg.SandboxFps());
     m_pPm->SaveSandboxRetainDays(stDlg.SandboxRetainDays());
+    // 2026-11-02 双沙箱并行：两个槽位开关分别落盘（重启后生效；运行中 ReloadConfig
+    //   只热更参数，槽位增减仍需重启）。
+    m_pPm->SaveSandboxWindowEnable(stDlg.SandboxWindowEnable());
+    m_pPm->SaveSandboxVmEnable(stDlg.SandboxVmEnable());
+    // 2026-11-01 WHP 提权引导：选 MsbSandbox 且本机 WHP 未启用 → 询问是否立即
+    //   以管理员启用（AutoCode 自身不提权，UAC 确认框即用户唯一操作）；拒绝或
+    //   失败时类型照常保存，运行期由 CSandboxHost::Load 自动回落 GhostSandbox 兜底。
+    if (stDlg.SandboxVmEnable() && !IsWhpEnabled()) {
+        const bool bUacPrompt = WhpUacWouldPrompt();
+        const QMessageBox::StandardButton eWhp = QMessageBox::question(
+            this, QStringLiteral("启用 Windows 功能"),
+            QStringLiteral("所选 microsandbox 沙箱需要 Windows「虚拟机监控程序平台」"
+                           "（HypervisorPlatform）功能，当前未启用。\n\n"
+                           "现在以管理员身份启用吗？\n"
+                           "· 点击后自动执行（%1）\n"
+                           "· 执行期间显示进度，完成后提示结果（约 10~30 秒）\n"
+                           "· 启用后需重启电脑生效；重启前自动使用 GhostSandbox")
+                .arg(bUacPrompt
+                     ? QStringLiteral("若弹出 UAC 窗口，点确认即可")
+                     : QStringLiteral("本机策略允许静默提权，不弹 UAC 直接执行")),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        if (eWhp == QMessageBox::Yes) {
+            // 进度反馈（2026-11-01 实害修）：静默提权机器上 UAC 不弹、PowerShell
+            //   隐藏执行，这 10~30 秒内本框是唯一可见反馈；会弹 UAC 的机器也不冲突
+            //   （UAC 在安全桌面）。忙进度条，不可取消（取消语义交给结果框）。
+            QPointer<QDialog> pProg(new QDialog(this));
+            pProg->setWindowTitle(QStringLiteral("正在启用 Windows 功能"));
+            pProg->setModal(true);
+            {
+                auto* pLay = new QVBoxLayout(pProg);
+                auto* pLbl = new QLabel(
+                    QStringLiteral("正在启用「虚拟机监控程序平台」，约 10~30 秒…"), pProg);
+                auto* pBar = new QProgressBar(pProg);
+                pBar->setRange(0, 0);
+                pLay->addWidget(pLbl);
+                pLay->addWidget(pBar);
+                pProg->adjustSize();
+            }
+            pProg->show();
+            // 后台线程等待 dism（不冻结 UI）；结果框经队列投递回 UI 线程。
+            // QPointer 守护：窗口先关则丢弃回调（2026-10-08 同类悬垂教训）。
+            QPointer<CMainWindow> pSelf(this);
+            std::thread([pSelf, pProg, bUacPrompt]() {
+                const int iRet = EnableWhpElevatedRun();
+                if (pSelf.isNull()) {
+                    return;   // 主窗已关：进度框是其子件随窗析构，无需单独收
+                }
+                QMetaObject::invokeMethod(pSelf, [pSelf, pProg, iRet, bUacPrompt]() {
+                    if (pProg != nullptr) {
+                        pProg->close();
+                        pProg->deleteLater();
+                    }
+                    if (pSelf.isNull()) {
+                        return;
+                    }
+                    const QString sSilentNote = bUacPrompt
+                        ? QString()
+                        : QStringLiteral("\n\n（本次未弹 UAC：本机策略允许静默提权，已直接执行）");
+                    if (iRet == 0) {
+                        QMessageBox::information(pSelf, QStringLiteral("启用成功"),
+                            QStringLiteral("「虚拟机监控程序平台」已启用。请重启电脑后生效；"
+                                           "重启前 microsandbox 将自动回落 GhostSandbox。")
+                                + sSilentNote);
+                    } else if (iRet == 1) {
+                        QMessageBox::warning(pSelf, QStringLiteral("未启用"),
+                            QStringLiteral("提权请求被取消。沙箱类型已保存为 microsandbox，"
+                                           "运行时将自动回落 GhostSandbox。"));
+                    } else if (iRet < 0) {
+                        QMessageBox::warning(pSelf, QStringLiteral("启用失败"),
+                            QStringLiteral("发起提权失败（系统错误 %1）。可稍后在管理员 "
+                                           "PowerShell 手动执行：\n"
+                                           "Enable-WindowsOptionalFeature -Online "
+                                           "-FeatureName HypervisorPlatform").arg(-iRet));
+                    } else {
+                        QMessageBox::warning(pSelf, QStringLiteral("启用失败"),
+                            QStringLiteral("启用命令执行失败（exit=%1）。可稍后在管理员 "
+                                           "PowerShell 手动执行：\n"
+                                           "Enable-WindowsOptionalFeature -Online "
+                                           "-FeatureName HypervisorPlatform").arg(iRet));
+                    }
+                }, Qt::QueuedConnection);
+            }).detach();
+        }
+    }
     if (m_pSbx != nullptr) {
-        CSandboxManager::SSbxCfg stSbx;
+        CSandboxHost::SSbxCfg stSbx;
         stSbx.bEnable     = stDlg.SandboxEnable();
         stSbx.bAutoGhost  = stDlg.SandboxAutoGhost();
         stSbx.bRecord     = stDlg.SandboxRecord();
         stSbx.iFps        = stDlg.SandboxFps();
         stSbx.iRetainDays = stDlg.SandboxRetainDays();
+        stSbx.bBlockSynth = stDlg.SandboxBlockSynth();
+        stSbx.bWindowEnable = m_pPm->LoadSandboxWindowEnable();
+        stSbx.sWindowType   = QStringLiteral("GhostSandbox");
+        stSbx.bVmEnable     = m_pPm->LoadSandboxVmEnable();
+        stSbx.sVmType       = QStringLiteral("MsbSandbox");
         m_pSbx->SetConfig(stSbx);
         m_pSbx->ReloadConfig();
     }
@@ -2687,6 +2911,34 @@ void CMainWindow::OnNewTask() {
     }
 }
 
+// 2026-11-02 沙箱物理输入拦截联动：助手/任务起停后查询运行汇总（任一在跑即
+//   Agent 活跃），边沿变化时投线程池通知窗口沙箱 agent_active——Agent 运行期
+//   吞掉合成鼠标/键盘（SendInput/pyautogui 等物理模拟带 INJECTED 标志），模型
+//   不守规矩也无法抢占用户键鼠；Agent 全停后停拦（用户自己的 AHK 等不受全天
+//   误伤）。Execute 可长阻塞（沙箱命令约定），故不在线程池外直调。
+void CMainWindow::SbxNotifyAgentActive()
+{
+    if (m_pSbx == nullptr || m_pOrch == nullptr) {
+        return;
+    }
+    const bool bOn = m_pOrch->IsAnyAdhocRunning() || m_pOrch->RunningTask() != nullptr;
+    if (bOn == m_bSbxAgentOn) {
+        return;   // 边沿去重：只在跳变时通知
+    }
+    m_bSbxAgentOn = bOn;
+    QJsonObject o;
+    o.insert(QStringLiteral("on"), bOn);
+    const qint64 iPid = QCoreApplication::applicationPid();
+    QThreadPool::globalInstance()->start([this, o, iPid]() {
+        // 守护：窗口/宿主析构后丢弃迟到回调（沙箱命令可长阻塞）。
+        if (QCoreApplication::applicationPid() != iPid || m_pSbx == nullptr) {
+            return;
+        }
+        QString s;
+        m_pSbx->Execute(QStringLiteral("agent_active"), o, s);
+    });
+}
+
 void CMainWindow::OnStartTask(CTaskInfo* a_pTask) {
     if (a_pTask == nullptr) {
         return;
@@ -2709,6 +2961,9 @@ void CMainWindow::OnStartTask(CTaskInfo* a_pTask) {
                    QStringLiteral("guide.md 正在生成（作为任务首阶段），完成后将自动启动，请稍候。"), this);
         return;
     }
+    // 2026-11-02 任务即将起跑：开启物理输入拦截（runner 起后 RunningTask 非空，
+    //   此处提前置位避免首个毫秒级窗口期）。
+    SbxNotifyAgentActive();
     // 先选中并显示该任务（日志/阶段表立即就位），再启动——确保随后的 stage_start
     // 等事件能上屏，避免「启动了却看不到」(#7)。
     // SwitchAssistantArchive 须在 SelectTask 之前（其触发的 OnTaskSelected 因 key 相等早退）。
@@ -3256,6 +3511,8 @@ void CMainWindow::OnTaskFinished(CTaskInfo* a_pTask, bool a_bOk) {
     if (a_pTask == nullptr) {
         return;
     }
+    // 2026-11-02 任务结束：物理输入拦截随运行汇总切换。
+    SbxNotifyAgentActive();
 
     // 终态归档（Done/Failed）：把任务从活跃列表迁出到历史表。
     // 必要性——ReloadHistory 会过滤掉仍在 m_aTasks 的任务，若不迁出，则该任务
@@ -3425,9 +3682,20 @@ void CMainWindow::OnTaskInject(const QString& a_sTaskId, const QString& a_sText)
 }
 
 // 2026-09-26 内置测试沙箱管理对话框（非模态）：重复点击只抬升已有窗口。
+//   2026-11-01 动态库化：对话框由沙箱 dll 创建（sbx_create_dialog），宿主只管
+//   生命周期兆底（WA_DeleteOnClose）与 show/raise。
 void CMainWindow::OnSandboxDialog() {
+    if (m_pSbx == nullptr || !m_pSbx->IsLoaded()) {
+        QMessageBox::information(this, QStringLiteral("测试沙箱"),
+            QStringLiteral("沙箱不可用：%1\n请检查 exe 同级 TestSandbox 目录。")
+                .arg(m_pSbx != nullptr ? m_pSbx->LastError() : QStringLiteral("未初始化")));
+        return;
+    }
     if (m_pSbxDlg == nullptr) {
-        m_pSbxDlg = new CSandboxDialog(m_pSbx, this);
+        m_pSbxDlg = m_pSbx->CreateDialog(this);
+        if (m_pSbxDlg == nullptr) {
+            return;   // 该沙箱无管理界面
+        }
         m_pSbxDlg->setAttribute(Qt::WA_DeleteOnClose);
         connect(m_pSbxDlg, &QObject::destroyed, this, [this]() { m_pSbxDlg = nullptr; });
     }
@@ -4418,6 +4686,64 @@ void CMainWindow::OnAsstRemoved(const QString& a_sId, const QString& a_sNewActiv
         m_pOrch->RemoveAsstAdhoc(a_sId);
     }
     SaveAssistantState();
+}
+
+void CMainWindow::OnAsstRenameInArchive(const QString& a_sId, const QString& a_sOwnerKey,
+                                        const QString& a_sName) {
+    // 2026-11-02 改名落空兑底（QuickTool 实害：改名弹窗开着时任务终态自动选中/切档
+    //   → 面板重建、目标助手不在新视图 → 旧版 AsstById 落空静默丢弃）：读归属档案
+    //   （工程全局档/任务私有档）按 id 改名后回写——改名不因切档丢失，切回该档即见。
+    //   只改 name 一个键（其余字段以盘上现档为准），与面板落盘链无关（不碰当前视图）。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty() || a_sId.isEmpty()) {
+        ExecMsgBox(QMessageBox::Information, QStringLiteral("重命名助手"),
+            QStringLiteral("当前未打开工程，助手「%1」未能改名。")
+                .arg(a_sName.left(40)), this);
+        return;
+    }
+    const bool bTaskKey = !a_sOwnerKey.isEmpty();
+    const QByteArray aData = bTaskKey ? m_pPm->ReadTaskAssistantState(a_sOwnerKey)
+                                      : m_pPm->ReadAssistantState();
+    const QJsonDocument oDoc = QJsonDocument::fromJson(aData);
+    if (aData.isEmpty() || !oDoc.isObject()) {
+        ExecMsgBox(QMessageBox::Warning, QStringLiteral("重命名助手"),
+            QStringLiteral("归属档案读取失败（可能正被并发写入），助手未能改名，"
+                           "请切回原视图后重试。"), this);
+        return;
+    }
+    QJsonObject oRoot = oDoc.object();
+    QJsonArray aAssts = oRoot.value(QStringLiteral("assistants")).toArray();
+    bool bHit = false;
+    QString sOldName;
+    for (QJsonValueRef v : aAssts) {
+        if (!v.isObject()) { continue; }
+        QJsonObject o = v.toObject();
+        if (o.value(QStringLiteral("id")).toString() != a_sId) { continue; }
+        sOldName = o.value(QStringLiteral("name")).toString();
+        o[QStringLiteral("name")] = a_sName;
+        v = o;
+        bHit = true;
+        break;
+    }
+    if (!bHit) {
+        ExecMsgBox(QMessageBox::Warning, QStringLiteral("重命名助手"),
+            QStringLiteral("在归属档中未找到该助手（可能已被删除），未能改名。"), this);
+        return;
+    }
+    oRoot[QStringLiteral("assistants")] = aAssts;
+    const QByteArray aOut = QJsonDocument(oRoot).toJson(QJsonDocument::Indented);
+    const bool bWrote = bTaskKey ? m_pPm->WriteTaskAssistantState(a_sOwnerKey, aOut)
+                                 : m_pPm->WriteAssistantState(aOut);
+    if (!bWrote) {
+        ExecMsgBox(QMessageBox::Warning, QStringLiteral("重命名助手"),
+            QStringLiteral("归属档写入失败（可能正被并发写入），助手「%1」未能改名，"
+                           "请切回原视图后重试。").arg(sOldName.left(40)), this);
+        return;
+    }
+    SetStatus(QStringLiteral("助手「%1」已改名为「%2」（归属：%3；当前视图已切换，"
+                             "切回后生效）")
+                  .arg(sOldName.left(40), a_sName.left(40),
+                       bTaskKey ? QStringLiteral("任务私有档")
+                                : QStringLiteral("工程全局档")));
 }
 
 void CMainWindow::OnAsstForeignActivated(const QString& a_sOwnerKey) {

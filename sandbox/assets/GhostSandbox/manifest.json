@@ -1,0 +1,13 @@
+{
+    "id": "GhostSandbox",
+    "abi_version": 1,
+    "display_name": "内置幽灵沙箱（Windows GUI 窗口级）",
+    "description": "Agent 后代 GUI 窗口自动幽灵化收纳（不可见/不抢焦点/可截图/消息级输入），自动 MP4 录像；sandbox_* 命令通道。窗口级隔离，不隔离文件系统。",
+    "isolation_level": "window",
+    "guest_os": "windows-host-native",
+    "capabilities": [
+        "auto-ghost", "message-input", "offscreen-capture",
+        "uia-tree", "mp4-record", "snapshot-no", "cross-instance-restore"
+    ],
+    "owner": "AutoCode"
+}

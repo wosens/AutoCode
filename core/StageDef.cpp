@@ -1,8 +1,6 @@
 ﻿#include "StageDef.h"
 
 #include <QCoreApplication>
-#include <QDir>
-#include <QFileInfo>
 #include <QHash>
 #include <QSet>
 
@@ -180,18 +178,26 @@ QList<EStage> ResolveFlow(ETaskType a_eType, const QList<EStage>& a_aCustom) {
 QStringList FilterInputs(const SStageDef& a_stDef, const QList<EStage>& a_aFlow,
                          QStringList* a_pDropped) {
     if (a_pDropped != nullptr) { a_pDropped->clear(); }
-    // 产物 → 产出阶段映射（sOutput 反查）；guide.md 等非阶段产物不在表中 → 恒保留。
-    QHash<QString, EStage> aProducer;
+    // 产物 → 产出阶段集合（sOutput 反查）。2026-11-02 修：CodeReview 与 Test 均产出
+    //   cr.md，单值 QHash 后写者覆盖前者——自定义流勾 CodeReview 未勾 Test 时，Verify
+    //   的 cr.md 输入被误判「产出阶段不在流内」而滤除。改集合后任一产出阶段在流内即保留。
+    QHash<QString, QSet<EStage>> aProducer;
     for (const SStageDef& sDef : GetStageDefs()) {
         if (!sDef.sOutput.isEmpty()) {
-            aProducer.insert(sDef.sOutput, sDef.eStage);
+            aProducer[sDef.sOutput].insert(sDef.eStage);
         }
     }
     QStringList aKept;
     for (const QString& sInput : a_stDef.aInputs) {
         const auto it = aProducer.constFind(sInput);
-        if (it == aProducer.constEnd() || a_aFlow.contains(it.value())) {
-            aKept.append(sInput);   // 非阶段产物 或 产出阶段在流内 → 保留
+        bool bKeep = (it == aProducer.constEnd());   // 非阶段产物 → 恒保留
+        if (!bKeep) {
+            for (const EStage e : it.value()) {
+                if (a_aFlow.contains(e)) { bKeep = true; break; }
+            }
+        }
+        if (bKeep) {
+            aKept.append(sInput);   // 非阶段产物 或 任一产出阶段在流内 → 保留
         } else if (a_pDropped != nullptr) {
             a_pDropped->append(sInput);
         }

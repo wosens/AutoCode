@@ -4,10 +4,8 @@
 #include "filereadwrite.h"
 
 #include <QCoreApplication>
-#include <QFileInfo>
 #include <QMutex>
 #include <QMutexLocker>
-#include <QDir>
 #include <QtGlobal>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -151,7 +149,10 @@ bool CFrwDevice::OpenFallback() {
 }
 
 void CFrwDevice::close() {
-    QIODevice::close();   // 先复位基类缓冲/pos（内部会回调虚 close，无重入副作用）
+    // 2026-11-02 修正机制描述：基类 close 只复位 openMode/缓冲/pos，并不回调
+    //   派生类 close()（真回调会无限递归）——「无重入副作用」结论成立但旧注释
+    //   依据错误；句柄与兜底 QFile 的清理由本函数随后完成。
+    QIODevice::close();
     if (m_hFrw != nullptr) {
         const SFrwApi& stApi = FrwApi();
         if (stApi.pClose != nullptr) {
@@ -169,18 +170,26 @@ void CFrwDevice::close() {
 }
 
 bool CFrwDevice::seek(qint64 a_iPos) {
+    // 2026-11-02 防御前置：负偏移直接 false（零副作用）。旧序先无条件改写
+    //   m_ullRawPos/m_bCrPending 再调基类 seek，基类失败（pos<0/未打开）时原始
+    //   偏移已被清零、悬挂状态已丢，与未变的 pos() 脱钩，后续 readData 从偏移 0
+    //   错位取数静默返回错误数据——失败路径必须零副作用（对齐 QFile::seek 语义）。
+    if (a_iPos < 0) {
+        return false;
+    }
     // 原始偏移与逻辑位同置（生产代码仅在二进制模式 seek——Claude transcript 尾读；
     // Text+seek 的逻辑→原始映射无闭式解，按原始偏移近似并注明）。
-    // 兑底 QFile 路径：QIODevice::seek 只改逻辑位，必须同步兑底句柄，否则后续 read
+    // 兜底 QFile 路径：QIODevice::seek 只改逻辑位，必须同步兜底句柄，否则后续 read
     //   仍从 QFile 原位置读取返回错位数据。
-    if (m_bFallback) {
-        if (!m_fileFallback.seek(a_iPos)) {
-            return false;
-        }
+    if (m_bFallback && !m_fileFallback.seek(a_iPos)) {
+        return false;
     }
-    m_ullRawPos = (a_iPos > 0) ? static_cast<unsigned long long>(a_iPos) : 0;
+    if (!QIODevice::seek(a_iPos)) {
+        return false;   // 基类拒绝：状态未提交（m_ullRawPos/m_bCrPending 原样）
+    }
+    m_ullRawPos = static_cast<unsigned long long>(a_iPos);
     m_bCrPending = false;
-    return QIODevice::seek(a_iPos);
+    return true;
 }
 
 qint64 CFrwDevice::size() const {

@@ -93,6 +93,9 @@ private slots:
     // 任务列表
     void OnNewTask();
     void OnStartTask(CTaskInfo* a_pTask);
+    // 2026-11-02 沙箱物理输入拦截联动：助手/任务起停后查询运行汇总，边沿变化时
+    //   通知窗口沙箱切 agent_active（Agent 运行期吞合成鼠标/键盘）。
+    void SbxNotifyAgentActive();
     void OnPauseTask(CTaskInfo* a_pTask);
     void OnStopTask(CTaskInfo* a_pTask);
     void OnRollback(CTaskInfo* a_pTask);   // FR-6：打开统一回退界面 → accept 后引擎执行
@@ -301,10 +304,14 @@ private:
     bool               m_bAskDialogOpen = false; // 2026.09.28 ask 弹窗重入门禁：模态 exec 期间
                                                  //   m_pAskClient 已置空，新连接须排队防嵌套弹窗
 
-    // 2026-09-26 内置测试沙箱：Agent 后代 GUI 窗口自动幽灵化收纳 + MP4 录像 +
-    //   sandbox_* 命令通道（MCP 工具与 --sandbox CLI 同桥转发到这里）。
-    class CSandboxManager* m_pSbx = nullptr;
-    class CSandboxDialog*  m_pSbxDlg = nullptr;   // 非模态管理对话框（功能菜单入口）
+    // 2026-09-26 内置测试沙箱（2026-11-01 动态库化）：沙箱实现退到
+    //   TestSandbox\<Type>.dll（首版 GhostSandbox），主程序仅持宿主门面；
+    //   同桥 ({type:sbx}) 承接 sandbox_* MCP 工具与 --sandbox CLI。退出时
+    //   closeEvent 统一 Shutdown（全部还原 + 停录像）。
+    class CSandboxHost*   m_pSbx = nullptr;
+    // 2026-11-02 物理输入拦截联动状态（SbxNotifyAgentActive 边沿去重用）。
+    bool                   m_bSbxAgentOn = false;
+    class QDialog*        m_pSbxDlg = nullptr;   // 非模态管理对话框（功能菜单入口；dll 创建）
 
     // 2026-10-01 沙箱命令异步化（修「MeloTTS 实例 UI+助手全卡死」）：sbx 命令的
     //   叶子操作（UIA 控件树/PrintWindow/同步点击）可能无限阻塞（hung 窗口、
@@ -336,6 +343,10 @@ private:
     void OnAdhocHealthCheck();
     void OnAsstForeignActivated(const QString& a_sOwnerKey);   // 2026-10-02 幽灵 Tab 点击 → 切回归属
     void OnAsstForeignFinished(const QString& a_sAsstId);      // 2026-10-02 幽灵轮次结束 → 落盘除名
+    // 2026-11-02 改名目标在弹窗期间被切档踢出视图（任务终态自动选中/用户点选）：
+    //   读归属档案（工程全局/任务私有）按 id 改名后回写，改名不因切档丢失。
+    void OnAsstRenameInArchive(const QString& a_sId, const QString& a_sOwnerKey,
+                               const QString& a_sName);
     qint64              m_iCfgSelfSaveMs = 0;       // 自身最近一次保存时刻（ms；<2s 内的变更跳过）
 
     // 2026-10-28 运行态窗口图标动画（用户需求：沙漏样式不好，改为整幅重绘——上 2/3
