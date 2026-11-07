@@ -212,10 +212,14 @@ public:
     //   2026-11-07 增加 a_iCol/a_iLen：均 >0 时选中命中区间（查找结果定位），
     //   仅 a_iLine>0 时保持整行选中（兼容审查/旧调用）；同日二改增加
     //   a_sMatch/a_iMatchOrd：md/html 渲染后行列不对应源文，按命中文本的
-    //   第 N 次出现定位（搜索引擎按同文同串累计序数）。
+    //   第 N 次出现定位（搜索引擎按同文同串累计序数）；同日三改增加
+    //   a_sLineText/a_iLineDup：源命中行文本 + 同文同行重复序——渲染页优先
+    //   按「行锚点」（规范化后的源行↔渲染块对齐）定位，行内按列前出现序
+    //   选具体一次，免疫表格/链接重写造成的全文出现序漂移。
     void ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab = true, int a_iLine = 0,
                      int a_iCol = 0, int a_iLen = 0,
-                     const QString& a_sMatch = QString(), int a_iMatchOrd = 0);
+                     const QString& a_sMatch = QString(), int a_iMatchOrd = 0,
+                     const QString& a_sLineText = QString(), int a_iLineDup = 0);
     // 2026-11-07 编辑→查找/替换：发起后台搜索并弹出「查找结果」独立无模式窗口
     //   （单实例复用，点 X 只隐藏；替换模式窗内带替换/替换全部按钮）。参数/根由主窗口解析。
     void StartFileSearch(const struct SFindTask& a_stTask);

@@ -60,9 +60,11 @@ public:
 
 signals:
     // 点击行（单选且无修饰键）：打开文件并定位（1-based 行/列、命中长度字符数、
-    //   命中文本 + 同串出现序——md/html 渲染后按第 N 次出现文本定位）。
+    //   命中文本 + 同串出现序——md/html 渲染后按行锚点+第 N 次出现文本定位；
+    //   a_sLineText=源命中行文本，a_iLineDup=同文同行重复序）。
     void sigOpenHit(const QString& a_sAbsPath, int a_iLine, int a_iCol, int a_iLen,
-                    const QString& a_sMatch, int a_iMatchOrd);
+                    const QString& a_sMatch, int a_iMatchOrd,
+                    const QString& a_sLineText, int a_iLineDup);
     // 替换写盘完成：预览 Tab 若正显示该文件则重载。
     void sigFileRewritten(const QString& a_sAbsPath);
 

@@ -278,8 +278,20 @@ void CFindResultsPage::OnRowClicked(int a_iRow) {
         return;
     }
     const SFindHit& stHit = m_aHits.at(a_iRow);
+    // 同文同行重复序（md 行锚点定位用）：同文件里此前出现过几次【相同行文本且
+    //   不同源行】的命中——同源行多命中不计（同一渲染块内按列出现序区分）。
+    int iLineDup = 0;
+    for (int j = 0; j < a_iRow && j < m_aHits.size(); ++j) {
+        const SFindHit& stPrev = m_aHits.at(j);
+        if (stPrev.m_sFilePath == stHit.m_sFilePath
+                && stPrev.m_sLineText == stHit.m_sLineText
+                && stPrev.m_iLine < stHit.m_iLine) {
+            ++iLineDup;
+        }
+    }
     emit sigOpenHit(stHit.m_sFilePath, stHit.m_iLine, stHit.m_iCol, stHit.m_iLen,
-                    stHit.m_sMatched, stHit.m_iMatchOrd);
+                    stHit.m_sMatched, stHit.m_iMatchOrd,
+                    stHit.m_sLineText, iLineDup);
 }
 
 QList<int> CFindResultsPage::SelectedRowsSorted() const {

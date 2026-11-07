@@ -3063,7 +3063,8 @@ void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
 
 void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab,
                                   int a_iLine, int a_iCol, int a_iLen,
-                                  const QString& a_sMatch, int a_iMatchOrd) {
+                                  const QString& a_sMatch, int a_iMatchOrd,
+                                  const QString& a_sLineText, int a_iLineDup) {
     // 2026.08.18 资源管理器双击文本文件的内嵌预览：Tab 惰性创建（首次双击才加页，
     //   追加在「助手」右侧即末位），此后复用同一页换内容与标题（始终只有一个预览页）。
     // 2026.08.25 预览控件升级为 CFilePreviewWidget：编码探测（BOM/UTF-8/GB18030/二进制
@@ -3084,7 +3085,8 @@ void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab,
     //   定位：带列+长度时选中命中区间（否则整行选中，兼容审查/旧调用）。
     if (a_iLine > 0) {
         if (a_iCol > 0 && a_iLen > 0) {
-            m_pFileView->GotoPos(a_iLine, a_iCol, a_iLen, a_sMatch, a_iMatchOrd);
+            m_pFileView->GotoPos(a_iLine, a_iCol, a_iLen, a_sMatch, a_iMatchOrd,
+                                  a_sLineText, a_iLineDup);
         } else {
             m_pFileView->GotoLine(a_iLine);
         }
@@ -3107,8 +3109,14 @@ void CExecutionPanel::StartFileSearch(const SFindTask& a_stTask) {
         m_pFindResults = new CFindResultsPage(this);
         connect(m_pFindResults, &CFindResultsPage::sigOpenHit,
                 this, [this](const QString& a_sAbs, int a_iLine, int a_iCol,
-                             int a_iLen) {
-            ShowFileTab(a_sAbs, true, a_iLine, a_iCol, a_iLen);
+                             int a_iLen, const QString& a_sMatch, int a_iOrd,
+                             const QString& a_sLineText, int a_iLineDup) {
+            // 2026-11-07（同日三改）补齐 match/ord/lineText/dup 透传：旧 lambda
+            //   漏参（Qt 允许信号多参接少参 lambda，多余参被丢弃）→ md/html
+            //   渲染页拿不到命中文本/出现序，永远走行数学回退 → 定位不准
+            //   （probe_mdlocate 实锤）。
+            ShowFileTab(a_sAbs, true, a_iLine, a_iCol, a_iLen, a_sMatch, a_iOrd,
+                        a_sLineText, a_iLineDup);
         });
         connect(m_pFindResults, &CFindResultsPage::sigFileRewritten,
                 this, [this](const QString& a_sAbs) {

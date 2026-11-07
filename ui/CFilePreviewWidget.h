@@ -59,10 +59,13 @@ public:
 
     // 2026-11-07 查找结果定位：1-based 行/列（字符）+ 命中长度（字符），
     //   选中命中区间并滚动可见（列=0 退化为整行选中）。三视图分治：语法页按字节
-    //   口径换算；纯文本页按字符列；md/html 渲染后行列不对应源文——改按
-    //   a_sMatch 在渲染文本里第 a_iMatchOrd+1 次出现定位（找不到回退行数学）。
+    //   口径换算；纯文本页按字符列；md/html 渲染后行列不对应源文——优先「行锚
+    //   点」（a_sLineText 规范化后与渲染块对齐，行内按 a_iCol 前出现序选具体
+    //   一次，a_iLineDup 区分重复行），块找不到再退全文第 a_iMatchOrd+1 次出现，
+    //   最后回退行数学（尽力近似）。
     void GotoPos(int a_iLine, int a_iCol, int a_iLen = 0,
-                 const QString& a_sMatch = QString(), int a_iMatchOrd = 0);
+                 const QString& a_sMatch = QString(), int a_iMatchOrd = 0,
+                 const QString& a_sLineText = QString(), int a_iLineDup = 0);
 
     // 2026-11-07 替换写盘后刷新：若正显示该文件则重载（保持当前页态），
     //   否则不动。路径比较 Windows 大小写不敏感。

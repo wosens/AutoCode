@@ -842,12 +842,71 @@ void CFilePreviewWidget::GotoLine(int a_iLine) {
     pView->ensureCursorVisible();
 }
 
+// 2026-11-07（同日三改）md 行锚点规范化：剥 md 标记字符/空白/链接语法，
+//   使源文行与渲染块文本可比较（标题#/引用>/强调*_/代码`/表格|/列表-/分隔线）。
+static QString MdNormLine(QString a_s)
+{
+    static const QRegularExpression s_reLink(
+        QStringLiteral("\\[([^\\]]*)\\]\\(([^)]*)\\)"));
+    a_s.replace(s_reLink, QStringLiteral("\\1"));   // [text](url) → text
+    QString sOut;
+    for (const QChar& c : a_s) {
+        const ushort u = c.unicode();
+        if (u == '#' || u == '|' || u == '>' || u == '*' || u == '`'
+            || u == '_' || u == '~' || u == '-') {
+            continue;
+        }
+        if (c.isSpace()) {
+            continue;
+        }
+        sOut += c;
+    }
+    return sOut;
+}
+
+// 2026-11-07（同日三改）行锚点块内选：选中块文本里第 a_iWithin 次出现
+//   （0-based；块内次数不足时钳到末次）。返回是否选到。
+static bool MdSelectInBlock(QTextBrowser* a_pView, const QTextBlock& a_stBlk,
+                            const QString& a_sMatch, int a_iWithin)
+{
+    const QString sTxt = a_stBlk.text();
+    int iTarget = -1;
+    int iAt = -1;
+    int iCnt = 0;
+    while ((iAt = sTxt.indexOf(a_sMatch, iAt + 1)) >= 0) {
+        if (iCnt == a_iWithin) {
+            iTarget = iAt;
+            break;
+        }
+        ++iCnt;
+    }
+    if (iTarget < 0) {
+        // 块内出现次数不足（渲染丢部分/强调隔断）：选末次，不再回退。
+        iAt = -1;
+        while ((iAt = sTxt.indexOf(a_sMatch, iAt + 1)) >= 0) {
+            iTarget = iAt;
+        }
+        if (iTarget < 0) {
+            return false;
+        }
+    }
+    QTextCursor cur(a_pView->document());
+    cur.setPosition(static_cast<int>(a_stBlk.position() + iTarget));
+    cur.setPosition(static_cast<int>(a_stBlk.position() + iTarget
+                                     + a_sMatch.size()),
+                    QTextCursor::KeepAnchor);
+    a_pView->setTextCursor(cur);
+    a_pView->ensureCursorVisible();
+    return true;
+}
+
 void CFilePreviewWidget::GotoPos(int a_iLine, int a_iCol, int a_iLen,
-                                 const QString& a_sMatch, int a_iMatchOrd) {
+                                 const QString& a_sMatch, int a_iMatchOrd,
+                                 const QString& a_sLineText, int a_iLineDup) {
     // 2026-11-07 查找结果定位：命中区间选中（列≥1 且长≥1；列 1=行首命中同样
     //   选区间。列/长非法时退化为 GotoLine 整行选中）。三视图分治：语法页字节
-    //   换算；纯文本页字符列；md/html 渲染后行列不对应源文——按 a_sMatch 在
-    //   渲染文本里第 a_iMatchOrd+1 次出现定位（找不到回退行数学）。
+    //   换算；纯文本页字符列；md/html 渲染后行列不对应源文——行锚点优先
+    //   （源行↔渲染块对齐 + 行内出现序），失败退全文第 ord+1 次出现，再退行数学。
     if (a_iLine < 1) {
         return;
     }
@@ -867,11 +926,68 @@ void CFilePreviewWidget::GotoPos(int a_iLine, int a_iCol, int a_iLen,
             return;
         }
     }
-    // md/html：setMarkdown/setHtml 重排文档（语法标记剥离/表格成像/空行合并），
-    //   源文行号/列号与渲染块不对齐——改用「第 N 次出现」文本定位（命中序数
-    //   由搜索引擎按同文同串累计，SFindHit.m_iMatchOrd）。找不到（渲染变换吞了
-    //   文本，如 html 转义）则回退行数学（尽力近似）。
     if (pView != m_pText && !a_sMatch.isEmpty() && a_iMatchOrd >= 0) {
+        QTextDocument* pDocR = pView->document();
+        // —— 主路：行锚点（源行文本规范化后与渲染块对齐；2026-11-07 同日三改）
+        //   表格行被拆成单元格块（各块 ⊂ 规范行）；链接/URL 重写会改行内文本，
+        //   锚点对不齐再退出现序计数。
+        const QString sNormLine = MdNormLine(a_sLineText);
+        if (!sNormLine.isEmpty() && pDocR != nullptr) {
+            // 行内出现序：源行里命中文本在 a_iCol 之前出现过几次。
+            int iWithin = 0;
+            {
+                int iAt = -1;
+                while ((iAt = a_sLineText.indexOf(a_sMatch, iAt + 1)) >= 0
+                       && iAt < a_iCol - 1) {
+                    ++iWithin;
+                }
+            }
+            // 候选 1：整块规范化 == 源行规范化（段落/标题/列表/引用/代码行）。
+            //   重复行按 a_iLineDup 取第 N 个（同源行多命中 dup 相同，行内序区分）。
+            QList<QTextBlock> aExact;
+            for (QTextBlock b = pDocR->begin(); b.isValid(); b = b.next()) {
+                if (MdNormLine(b.text()) == sNormLine) {
+                    aExact.append(b);
+                    if (aExact.size() > a_iLineDup) {
+                        break;   // 够用即停（大文档防全扫）
+                    }
+                }
+            }
+            if (!aExact.isEmpty()) {
+                const QTextBlock stBlk = aExact.at(qMin(a_iLineDup,
+                                                        aExact.size() - 1));
+                if (MdSelectInBlock(pView, stBlk, a_sMatch, iWithin)) {
+                    return;
+                }
+            }
+            // 候选 2：表格单元格（块含命中文本且规范块 ⊂ 规范行）——文档序走到
+            //   第 iWithin 次出现（单元格拆分后行内序跨块累计）。
+            if (aExact.isEmpty()) {
+                int iSeen = 0;
+                for (QTextBlock b = pDocR->begin(); b.isValid(); b = b.next()) {
+                    const QString sBlk = b.text();
+                    if (!sBlk.contains(a_sMatch)) {
+                        continue;
+                    }
+                    const QString sNb = MdNormLine(sBlk);
+                    if (sNb.isEmpty() || !sNormLine.contains(sNb)) {
+                        continue;
+                    }
+                    int iAt = -1;
+                    int iCnt = 0;
+                    while ((iAt = sBlk.indexOf(a_sMatch, iAt + 1)) >= 0) {
+                        ++iCnt;
+                    }
+                    if (iSeen + iCnt > iWithin) {
+                        if (MdSelectInBlock(pView, b, a_sMatch, iWithin - iSeen)) {
+                            return;
+                        }
+                    }
+                    iSeen += iCnt;
+                }
+            }
+        }
+        // —— 退路 1：全文第 ord+1 次出现（旧行为；行锚点失败时兑底）——
         QTextCursor curStart(pView->document());
         curStart.movePosition(QTextCursor::Start);
         pView->setTextCursor(curStart);
