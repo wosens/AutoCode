@@ -17,6 +17,10 @@ public:
     // 读取并渲染指定文件；打开失败则显示错误提示。
     void ShowFile(const QString& a_sFilePath);
 
+    // 2026-11-04 分析报告页：直接渲染内存中的 Markdown 文本（报告不在阶段产物
+    //   目录，由助手分析报告对话框持有原文；口径与 ShowFile 一致——setMarkdown）。
+    void ShowMarkdownText(const QString& a_sText);
+
     // 清空当前显示。
     void Clear();
 };

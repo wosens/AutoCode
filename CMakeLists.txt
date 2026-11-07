@@ -53,6 +53,13 @@ qt_add_executable(AutoCode WIN32
     # 2026-10-14 任务编排设计：类型/档位/阶段编排配置（orchestration.json + 动态阶段注册）
     core/COrchConfig.h
     core/COrchConfig.cpp
+    # 2026-11-07 编辑→查找/替换：纯搜索/替换引擎 + 共用对话框 + 结果 Tab 页
+    core/CFileSearcher.h
+    core/CFileSearcher.cpp
+    ui/CFindReplaceDialog.h
+    ui/CFindReplaceDialog.cpp
+    ui/CFindResultsPage.h
+    ui/CFindResultsPage.cpp
     agent/CClaudeRunner.h
     agent/CClaudeRunner.cpp
     agent/CAgentRunnerBase.h
@@ -84,6 +91,10 @@ qt_add_executable(AutoCode WIN32
     ui/CExecutionPanel.cpp
     ui/CAsstTabBar.h
     ui/CAsstTabBar.cpp
+    ui/CAsstReportDialog.h   # 2026-11-04 助手分析报告页（右键「查看分析报告」）
+    ui/CAsstReportDialog.cpp
+    ui/CProjectCostDialog.h  # 2026-11-05 工程总消耗统计窗口（工程菜单）
+    ui/CProjectCostDialog.cpp
     ui/CTitleBar.h
     ui/CTitleBar.cpp
     ui/CArtifactView.h
@@ -142,6 +153,9 @@ qt_add_executable(AutoCode WIN32
     # SQLite 历史库层（纯 C API，直接编 sqlite3.c）
     db/CTaskHistoryDB.h
     db/CTaskHistoryDB.cpp
+    # 2026-11-05 工程总消耗聚合（history.db 任务量 + assistant 档助手量，菜单统计用）
+    db/CProjectUsage.h
+    db/CProjectUsage.cpp
     sqlite3.h
     sqlite3.c
     # 测试沙箱（2026-11-01 动态库化）：实现整体退到 GhostSandbox.dll（TestSandbox\），
@@ -469,6 +483,8 @@ qt_add_executable(test_execpanel
     ui/CExecutionPanel.cpp
     ui/CAsstTabBar.h
     ui/CAsstTabBar.cpp
+    ui/CAsstReportDialog.h   # 2026-11-04 助手分析报告页（CExecutionPanel 依赖，测试目标同步）
+    ui/CAsstReportDialog.cpp
     ui/CAskUserDialog.h
     ui/CAskUserDialog.cpp
     ui/CMessageView.h
@@ -497,6 +513,13 @@ qt_add_executable(test_execpanel
     ui/CArtifactView.cpp
     ui/CFilePreviewWidget.h
     ui/CFilePreviewWidget.cpp
+    # 2026-11-07 查找结果 Tab 页（CExecutionPanel 依赖；引擎同编）
+    core/CFileSearcher.h
+    core/CFileSearcher.cpp
+    ui/CFindReplaceDialog.h
+    ui/CFindReplaceDialog.cpp
+    ui/CFindResultsPage.h
+    ui/CFindResultsPage.cpp
     ui/CCodeSyntaxView.h
     ui/CCodeSyntaxView.cpp
     ui/CTipStyle.h
@@ -545,6 +568,19 @@ set_target_properties(test_execpanel PROPERTIES
 )
 add_test(NAME test_execpanel COMMAND test_execpanel)
 
+# 2026-11-07 CodeStyle 双 DLL 镜像到测试运行目录（Execute\Release；探针/测试共
+#   用；无 DLL 时跳过——语法页自动回退纯文本不影响其余用例）。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Execute/CodeView.dll")
+    add_custom_command(TARGET test_execpanel POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/Execute/CodeView.dll"
+            "$<TARGET_FILE_DIR:test_execpanel>/CodeView.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/Execute/CodeParser.dll"
+            "$<TARGET_FILE_DIR:test_execpanel>/CodeParser.dll"
+        COMMENT "Mirror CodeStyle DLLs for tests")
+endif()
+
 # ---- 单元测试（CTaskListPanel 左栏两表切换口径：再次执行切当前任务/终态切历史任务）----
 # 2026.09.10 v2.2.153 回归：SelectTask 切「当前任务」页+发选中信号（主窗口链终点
 # SetCurrentTask 自动落「日志」页，见 test_execpanel）；SelectHistoryTask 切「历史
@@ -591,6 +627,8 @@ qt_add_executable(test_historydb
     core/StageDef.cpp
     db/CTaskHistoryDB.h
     db/CTaskHistoryDB.cpp
+    db/CProjectUsage.h
+    db/CProjectUsage.cpp
     sqlite3.h
     sqlite3.c
 )
@@ -608,6 +646,23 @@ set_target_properties(test_historydb PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 add_test(NAME test_historydb COMMAND test_historydb)
+
+# ---- 2026-11-07 在文件中查找/替换引擎回归（编辑→查找/替换）：纯逻辑 + 临时目录，
+#      不依赖 GUI——匹配三开关/多根遍历/排除目录/编码探测回写/替换漂移校验。----
+qt_add_executable(test_filesearcher
+    tests/test_filesearcher.cpp
+    core/CFileSearcher.h
+    core/CFileSearcher.cpp
+)
+target_include_directories(test_filesearcher PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+target_link_libraries(test_filesearcher PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(test_filesearcher PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+add_test(NAME test_filesearcher COMMAND test_filesearcher)
 
 # ---- 单元测试（be3fd900：Verify 阶段定义/流程编入 + guide 指纹扫描器纯逻辑）----
 # 覆盖 AC2.1/2.2/2.4、AC-N1、AC1.2/1.4/1.5。纯逻辑 + 临时文件系统，不依赖 GUI / Claude。
@@ -1213,6 +1268,340 @@ set_target_properties(probe_ovbg PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
 )
 
+# ==== 后端版本管理窗口宽度稳定性探针（2026-11-03：点「验证所有后端」窗口被撑宽——
+#     状态行单行 QLabel 无 wordWrap，min 宽随文字长度顶高布局）——手动运行：
+#     Execute\probe_vdlgwidth.exe，退出码 0=宽度稳定 / 3=变宽，不挂 ctest
+#    （构造对话框会拉起真实 CLI 探测进程，关闭即由析构收敛）。====
+# 2026-11-06 查找结果窗拖动 bug 探针（真鼠标点击 .cpp 行 → 捕获/焦点/定位），手动不挂 ctest。
+# 2026-11-06 HotNews 工程三报复现探针（7000+命中连点卡死/经搜索乱码/Ctrl+F 前置），手动不挂 ctest。
+qt_add_executable(probe_hotnews
+    tests/probe_hotnews.cpp
+    ui/CFindResultsPage.h
+    ui/CFindResultsPage.cpp
+    core/CFileSearcher.h
+    core/CFileSearcher.cpp
+    ui/CExecutionPanel.h
+    ui/CExecutionPanel.cpp
+    ui/CAsstTabBar.h
+    ui/CAsstTabBar.cpp
+    ui/CAsstReportDialog.h
+    ui/CAsstReportDialog.cpp
+    ui/CAskUserDialog.h
+    ui/CAskUserDialog.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CStageBar.h
+    ui/CStageBar.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CArtifactView.h
+    ui/CArtifactView.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
+    ui/CTipStyle.h
+    ui/CTipStyle.cpp
+    ui/CFindReplaceDialog.h
+    ui/CFindReplaceDialog.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(probe_hotnews PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen
+)
+target_link_libraries(probe_hotnews PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_hotnews PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+qt_add_executable(probe_findwin
+    tests/probe_findwin.cpp
+    ui/CFindResultsPage.h
+    ui/CFindResultsPage.cpp
+    core/CFileSearcher.h
+    core/CFileSearcher.cpp
+    ui/CExecutionPanel.h
+    ui/CExecutionPanel.cpp
+    ui/CAsstTabBar.h
+    ui/CAsstTabBar.cpp
+    ui/CAsstReportDialog.h
+    ui/CAsstReportDialog.cpp
+    ui/CAskUserDialog.h
+    ui/CAskUserDialog.cpp
+    ui/CMessageView.h
+    ui/CMessageView.cpp
+    ui/CMarkdownPreloader.h
+    ui/CMarkdownPreloader.cpp
+    ui/SBlockData.h
+    ui/CChatModel.h
+    ui/CChatModel.cpp
+    ui/CChatDocPool.h
+    ui/CChatDocPool.cpp
+    ui/CChatDelegate.h
+    ui/CChatDelegate.cpp
+    ui/CChatListView.h
+    ui/CChatListView.cpp
+    ui/CStageBar.h
+    ui/CStageBar.cpp
+    ui/CStreamPresenter.h
+    ui/CStreamPresenter.cpp
+    ui/CMessageBlock.h
+    ui/CMessageBlock.cpp
+    ui/CArtifactView.h
+    ui/CArtifactView.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
+    ui/CTipStyle.h
+    ui/CTipStyle.cpp
+    ui/CFindReplaceDialog.h
+    ui/CFindReplaceDialog.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(probe_findwin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen
+)
+target_link_libraries(probe_findwin PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_findwin PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# 2026-11-06 查找定位双 bug 探针（代码文件定位/鼠标捕获），手动运行不挂 ctest：
+#   Execute\probe_findpos.exe，退出码 0=全过 / 3=复现失败 / 4=模块不在位跳过。
+qt_add_executable(probe_findpos
+    tests/probe_findpos.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(probe_findpos PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen
+)
+target_link_libraries(probe_findpos PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_findpos PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# 2026-11-07 大单行 JSON 纯文本页耗时探针（查找结果连点 chat.json 行卡死量化），手动运行不挂 ctest。
+qt_add_executable(probe_bigline
+    tests/probe_bigline.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(probe_bigline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen
+)
+target_link_libraries(probe_bigline PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_bigline PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+# 2026-11-07 Ctrl+F 作用域裁决探针（预览页文件内查找 vs 主窗全局查找同键裁决），手动运行不挂 ctest。
+qt_add_executable(probe_ctrlf
+    tests/probe_ctrlf.cpp
+    ui/CFilePreviewWidget.h
+    ui/CFilePreviewWidget.cpp
+    ui/CCodeSyntaxView.h
+    ui/CCodeSyntaxView.cpp
+    project/CProjectManager.h
+    project/CProjectManager.cpp
+    project/CGuideFingerprintScanner.h
+    project/CGuideFingerprintScanner.cpp
+    agent/CAgentRunnerFactory.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    core/StageDef.h
+    core/StageDef.cpp
+    core/CTaskInfo.h
+    core/CTaskInfo.cpp
+)
+target_include_directories(probe_ctrlf PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+    ${CMAKE_CURRENT_SOURCE_DIR}/project
+    ${ZSTD_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/gen
+)
+target_link_libraries(probe_ctrlf PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Test ${ZSTD_LIB} frwdevice)
+set_target_properties(probe_ctrlf PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
+qt_add_executable(probe_vdlgwidth
+    tests/probe_vdlgwidth.cpp
+    core/CModelEntry.h
+    agent/CAgentRunnerBase.h
+    agent/CAgentRunnerBase.cpp
+    agent/CClaudeRunner.h
+    agent/CClaudeRunner.cpp
+    agent/CDeepSeekRunner.h
+    agent/CDeepSeekRunner.cpp
+    agent/CPiAgentRunner.h
+    agent/CPiAgentRunner.cpp
+    agent/CCodexRunner.h
+    agent/CCodexRunner.cpp
+    agent/CCodexProxy.h
+    agent/CCodexProxy.cpp
+    agent/CHermesRunner.h
+    agent/CHermesRunner.cpp
+    ui/CVersionDialog.h
+    ui/CVersionDialog.cpp
+)
+target_include_directories(probe_vdlgwidth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/ui
+)
+target_link_libraries(probe_vdlgwidth PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Widgets Qt6::Test frwdevice)
+set_target_properties(probe_vdlgwidth PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/Execute
+)
+
 # ==== qFatal 见证链路验证探针（2026-10-28 静默退出加固：装见证→qFatal→验遗言文件）====
 # 手动运行（不挂 ctest——它故意 fastfail 退 3）：Execute\probe_qtwitness.exe 运行后
 # 进程即逝，验证同目录 dump\_qfatal_witness.txt 出现 witness-probe 行即链路通。
@@ -1238,16 +1627,23 @@ set_tests_properties(
 
 # ---- fileread 三件套随所有输出目录（exe 与全部测试）——CFrwDevice 运行时依赖
 #（2026.09.13 文件读取统一走 fileread.dll；dll 缺失时兜底 QFile 直读不瘫）----
+# 2026-11-05 占用容忍：改走 scripts/CopyLockedTolerant.cmake（内容同跳过；目标被
+#   运行中实例锁定时按 CLAUDE.md「Exe Update」规则：旧件改名入同目录 ~temp →
+#   复制新件；仍失败仅 WARNING 不破构建，下次构建 MD5 比对自动重试）。
 foreach(tgt AutoCode test_projectmanager test_execpanel test_tasklistpanel test_historydb
             test_verify_flow test_record_verify test_rollback import_tasks test_orchpi
             test_dshrunner test_pirunner test_versiondlg test_codexrunner test_hermesrunner
             test_frwdevice test_sandbox test_chatmodel)
     add_custom_command(TARGET ${tgt} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/fileread.dll"
-            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/code.exe"
-            "$<TARGET_FILE_DIR:${tgt}>"
-        COMMENT "Copy fileread.dll/code.exe next to ${tgt}")
+        COMMAND ${CMAKE_COMMAND}
+            "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/fileread.dll"
+            "-DDST=$<TARGET_FILE_DIR:${tgt}>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/scripts/CopyLockedTolerant.cmake"
+        COMMAND ${CMAKE_COMMAND}
+            "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}/third_party/fileread/bin/code.exe"
+            "-DDST=$<TARGET_FILE_DIR:${tgt}>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/scripts/CopyLockedTolerant.cmake"
+        COMMENT "Deploy fileread.dll/code.exe next to ${tgt} (lock-tolerant)")
 endforeach()
 
 # ==== 任务编排设计核心链路回归（2026-10-14，由临时探针 probe_orch 转正）====

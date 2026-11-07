@@ -29,6 +29,7 @@
         <file>menu/16/ow-search.png</file>
         <file>menu/16/ow-refresh.png</file>
         <file>menu/16/ow-review.png</file>
+        <file>menu/16/ow-report.png</file>
         <file>menu/32/ow-explorer.png</file>
         <file>menu/32/ow-cut.png</file>
         <file>menu/32/ow-copy.png</file>
@@ -55,6 +56,7 @@
         <file>menu/32/ow-search.png</file>
         <file>menu/32/ow-refresh.png</file>
         <file>menu/32/ow-review.png</file>
+        <file>menu/32/ow-report.png</file>
         <file>qbox/q-expand8.png</file>
         <file>qbox/q-expand16.png</file>
         <file>qbox/q-collapse8.png</file>
@@ -78,6 +80,7 @@
         <file>menu/20/ow-rename.png</file>
         <file>menu/20/ow-rerun.png</file>
         <file>menu/20/ow-review.png</file>
+        <file>menu/20/ow-report.png</file>
         <file>menu/20/ow-rootadd.png</file>
         <file>menu/20/ow-rootdown.png</file>
         <file>menu/20/ow-rootup.png</file>
@@ -104,6 +107,7 @@
         <file>menu/24/ow-rename.png</file>
         <file>menu/24/ow-rerun.png</file>
         <file>menu/24/ow-review.png</file>
+        <file>menu/24/ow-report.png</file>
         <file>menu/24/ow-rootadd.png</file>
         <file>menu/24/ow-rootdown.png</file>
         <file>menu/24/ow-rootup.png</file>
@@ -130,6 +134,7 @@
         <file>menu/40/ow-rename.png</file>
         <file>menu/40/ow-rerun.png</file>
         <file>menu/40/ow-review.png</file>
+        <file>menu/40/ow-report.png</file>
         <file>menu/40/ow-rootadd.png</file>
         <file>menu/40/ow-rootdown.png</file>
         <file>menu/40/ow-rootup.png</file>

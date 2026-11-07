@@ -46,6 +46,9 @@
 #include <QShowEvent>
 #include <QHBoxLayout>
 #include <QToolButton>
+#include <QShortcut>
+#include <QKeySequence>
+#include <QApplication>   // 2026-11-07 Ctrl+F 路由：focusWidget 全局焦点
 #include <QPainter>
 #include <QPainterPath>
 #include <QLocalServer>
@@ -77,6 +80,9 @@
 #include "CRollbackDialog.h"   // FR-6 历史版本回退对话框
 #include "CCodeReviewDialog.h"   // 2026-09-30 资源管理器右键代码审查（ReviewSdk）
 #include "CProjectManager.h"
+#include "CFindReplaceDialog.h"   // 2026-11-07 编辑→查找/替换共用对话框
+#include "CFindResultsPage.h"     // 2026-11-07 SFindTask（查找任务参数纽装）
+#include "CFilePreviewWidget.h"   // 2026-11-07 Ctrl+F 统一路由（预览内→文件内查找栏）
 #include "CTaskOrchestrator.h"
 #include "CClaudeRunner.h"
 #include "CAgentRunnerFactory.h"   // 2026.08.18 后端单选分派（自带 CDeepSeekRunner.h）
@@ -85,6 +91,8 @@
 #include "CPiAgentRunner.h"        // 2026.08.19 第三后端 PIAgent 参数回填/探测自愈
 #include "CHermesRunner.h"        // 第五后端 Hermes 参数回填（任务 3213cdbf）
 #include "CVersionDialog.h"       // 2026.09 后端版本管理（任务 23183ccb）
+#include "CProjectCostDialog.h"   // 2026-11-05 工程总消耗统计（工程菜单）
+#include "db/CProjectUsage.h"     // 2026-11-05 总消耗聚合（history.db + assistant 档）
 #include "CTaskInfo.h"
 #include "core/StageDef.h"   // 2026.08.17 FindStage：中断恢复提示里显示阶段中文名
 #include "TaskTypes.h"
@@ -705,6 +713,10 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
 
     CreateUi();
     CreateMenus();
+    // 2026-11-07（同日二改）Ctrl+F/Ctrl+H 统一路由改由菜单 QAction 真快捷键
+    //   承载（菜单栏同步显示快捷键；单一源防歧义）：查找的上下文路由在
+    //   OnFindInFiles 内（焦点在文件预览页 → 文件内查找栏；否则 → 在文件中
+    //   查找对话框）。代码页原生窗口持焦时 Ctrl+F 由 CCodeKeyFilter 代听。
 
     // 重建子菜单（m_pMenuRecent 已在 CreateMenus 中创建；列表已在上面载入）。
     RebuildRecentMenu();
@@ -867,6 +879,13 @@ CMainWindow::CMainWindow(QWidget* a_pParent)
     // 2026-09-22 助手右键「自动重命名」：面板收集提示词 → 编排器借会话交 Agent 总结。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstAutoRename,
             this, &CMainWindow::OnAsstAutoRename);
+    // 2026-11-04 助手右键「查看分析报告」：报告页已开 → 读盘回填/指纹判定是否后台重总结。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstReportViewRequested,
+            this, &CMainWindow::OnAsstReportView);
+    // 2026-11-07 改进计划 §1B：右键「重新探测执行通道」→ 编排器清缓存强制重探
+    //   （结论经 exec_channel_* 事件回流该助手流；见 CTaskOrchestrator::RetestExecChannel）。
+    connect(m_pExecPanel, &CExecutionPanel::sigAsstRetestExecChannel, this,
+            [this](const QString& sId) { m_pOrch->RetestExecChannel(sId); });
     // 2026-10-08 提示词长度闸门：面板超限上抛 → 编排器起一次性提炼 Agent，
     //   提炼稿回投 SubmitAdhoc 正常提交（失败兑底原文，事件行留痕）。
     connect(m_pExecPanel, &CExecutionPanel::sigAsstRefinePrompt, this,
@@ -1117,6 +1136,18 @@ void CMainWindow::CreateUi() {
     m_pLblStatus = new QLabel(this);
     statusBar()->addWidget(m_pLblStatus, 1);
 
+    // 2026-11-04 分析报告状态栏秒表：报告轮进行中 1s 刷新「已 N 秒」（懒启停）。
+    m_pReportStatusTm = new QTimer(this);
+    m_pReportStatusTm->setInterval(1000);
+    connect(m_pReportStatusTm, &QTimer::timeout, this, [this]() {
+        if (m_sReportStatusName.isEmpty()) {
+            return;
+        }
+        SetStatus(QStringLiteral("⚙ 正在总结「%1」的对话日志，后台生成分析报告…（已 %2 秒）")
+                      .arg(m_sReportStatusName)
+                      .arg(m_tReportClock.elapsed() / 1000));
+    });
+
     // 面板信号
     connect(m_pTaskPanel, &CTaskListPanel::sigNewTask,      this, &CMainWindow::OnNewTask);
     connect(m_pTaskPanel, &CTaskListPanel::sigStartTask,    this, &CMainWindow::OnStartTask);
@@ -1136,6 +1167,10 @@ void CMainWindow::CreateUi() {
     // 2026-09-22 助手自动重命名回调：编排器 → 面板回填 sName/sDesc（含失败事件行）。
     connect(m_pOrch, &CTaskOrchestrator::sigAsstAutoNameDone, m_pExecPanel,
             &CExecutionPanel::ApplyAsstAutoName);
+    // 2026-11-04 助手分析报告回调：编排器 → 主窗口落盘（.autodev/asst-reports/）+
+    //   状态栏结果 + 面板回填报告页。
+    connect(m_pOrch, &CTaskOrchestrator::sigAsstReportDone,
+            this, &CMainWindow::OnAsstReportDone);
     // FR-3：资源管理器「添加到聊天框」→ 注入助手输入框。
     connect(m_pTaskPanel, &CTaskListPanel::sigAddToChat,
             m_pExecPanel, &CExecutionPanel::AppendToAdhocInput);
@@ -1233,8 +1268,35 @@ void CMainWindow::CreateMenus() {
         "按 record.md 新增改动记录增量更新 .autodev/guide.md（任务完成/助手修改后自动触发，此项为手动）"));
     connect(pActSyncGuide, &QAction::triggered, this, &CMainWindow::OnSyncGuide);
 
+    // 2026-11-05 工程总消耗统计：history.db 任务用量 + assistant.json 档助手用量
+    //   两源聚合（2026-09-05 起互不重复，直接求和），弹窗展示费用/请求/Token。
+    auto* pActCost = pMenu->addAction(QStringLiteral("统计工程总的消耗..."));
+    pActCost->setToolTip(QStringLiteral(
+        "汇总当前工程全部消耗：费用、API 请求数、输入/输出/合计 Token\n"
+        "（任务侧取 history.db，助手侧取各 assistant.json 档；不含在途未落盘部分）"));
+    connect(pActCost, &QAction::triggered, this, &CMainWindow::OnProjectCost);
+
     pMenu->addSeparator();
     pMenu->addAction(QStringLiteral("退出"), this, &QWidget::close);
+
+    // 编辑菜单（2026-11-07 在文件中查找/替换；位置：工程之后、功能之前）。
+    //   查找与替换复用同一对话框（CFindReplaceDialog），菜单项只决定初始单选。
+    auto* pMenuEdit = m_pMenuBar->addMenu(QStringLiteral("编辑(&E)"));
+    // 2026-11-07（同日二改）快捷键上菜单（需求 1）：真 QAction 绑定——菜单栏
+    //   原生显示 Ctrl+F / Ctrl+H，且即快捷键本体（无需另设 QShortcut 防同键歧义）。
+    auto* pActFind = pMenuEdit->addAction(QStringLiteral("查找..."));
+    pActFind->setShortcut(QKeySequence::Find);   // Ctrl+F（菜单栏显示）
+    pActFind->setToolTip(QStringLiteral(
+        "在工程（可选含关联项目）全部文本文件中搜索，结果在独立窗口列出，\n"
+        "点击条目打开文件并定位到命中位置（快捷键 Ctrl+F；焦点在文件预览页时\n"
+        "为文件内查找）"));
+    connect(pActFind, &QAction::triggered, this, &CMainWindow::OnFindInFiles);
+    auto* pActReplace = pMenuEdit->addAction(QStringLiteral("替换..."));
+    pActReplace->setShortcut(QKeySequence(QStringLiteral("Ctrl+H")));   // 菜单栏显示
+    pActReplace->setToolTip(QStringLiteral(
+        "在文件中查找并逐处/全部替换（保持原编码与行尾）；范围/选项与查找共用\n"
+        "（快捷键 Ctrl+H）"));
+    connect(pActReplace, &QAction::triggered, this, &CMainWindow::OnReplaceInFiles);
 
     // 功能菜单（2026.08.15 设置在前、环境安装在后）
     auto* pMenuFunc = m_pMenuBar->addMenu(QStringLiteral("功能(&F)"));
@@ -1885,6 +1947,10 @@ void CMainWindow::OpenProjectDir(const QString& a_sDir, bool a_bRecordRecent) {
     //   新工程无意义（空串撞全局档 key，会被当本地助手落盘串档），一律丢弃。
     LoadAssistantState(/*a_bProjectSwitch=*/true);
     m_bProjectSwitching = false;   // 隔离窗关闭：新工程档已恢复，恢复正常落盘
+    // 2026-11-04 切工程收口：在途报告轮随会话整组重置（旧工程报告不再回填本工程），
+    //   pending 指纹表与状态栏秒表一并清（防同 id 新工程助手被误判「已在途」）。
+    m_aReportFpPending.clear();
+    StopReportStatus();
 
     // 统一备份（方案 §4.4）：打开工程时探测回退中断残留——还原现场（幂等安全），
     // 用户确认目标后可重新发起回退。孤儿 blob 已在 CProjectManager::Open 尾后台节流
@@ -1952,6 +2018,147 @@ void CMainWindow::OnGuideSyncFinished(bool a_bOk, const QString& a_sMsg) {
     // 需求4：同步结果仅刷新状态栏（Done 触发 / 手动触发统一，不打扰弹窗）。
     (void)a_bOk;
     SetStatus(a_sMsg);
+}
+
+void CMainWindow::OnProjectCost() {
+    // 2026-11-05 工程总消耗统计：现算现弹（短连接不锁库；多实例同开工程安全）。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        ExecMsgBox(QMessageBox::Information, QStringLiteral("提示"),
+                   QStringLiteral("请先打开工程目录"), this);
+        return;
+    }
+    const SProjectUsage stUsage = CProjectUsage::Aggregate(m_pPm->ProjectDir());
+    CProjectCostDialog stDlg(stUsage, m_pPm->ProjectDir(), m_pPm, this);
+    stDlg.exec();
+}
+
+void CMainWindow::OnFindInFiles() {
+    // 2026-11-07（同日二改）Ctrl+F/菜单项上下文路由：焦点在文件预览页内任一子
+    //   控件 → 文件内查找栏（预览页自设同键快捷键已撤，单一源防歧义；
+    //   Scintilla 原生持焦时由 CCodeKeyFilter 消息层代听）；否则 → 在文件中
+    //   查找对话框（菜单项与快捷键同槽：预览聚焦时点菜单项也走文件内查找，
+    //   与 Ctrl+F 行为一致）。
+    if (m_pExecPanel != nullptr) {
+        CFilePreviewWidget* pPrev = m_pExecPanel->findChild<CFilePreviewWidget*>();
+        QWidget* pFocus = QApplication::focusWidget();
+        if (pPrev != nullptr && pFocus != nullptr
+                && pPrev->isAncestorOf(pFocus)) {
+            pPrev->OpenFindBar();
+            return;
+        }
+    }
+    OpenFindReplaceDialog(false);
+}
+
+void CMainWindow::OnReplaceInFiles() {
+    // 2026-11-07 编辑→替换：初始单选「在文件中替换」（同一对话框，多替换行）。
+    OpenFindReplaceDialog(true);
+}
+
+void CMainWindow::OpenFindReplaceDialog(bool a_bReplace) {
+    // 前置：需已开工程（搜索根的基准）且执行面板在位。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()
+        || m_pExecPanel == nullptr) {
+        ExecMsgBox(QMessageBox::Information, QStringLiteral("提示"),
+                   QStringLiteral("请先打开工程目录"), this);
+        return;
+    }
+    // 2026-11-07（同日二改）界面态注入（需求 2 选项持久化 + 需求 3 查找历史：
+    //   [Find] Scope/Case/Word/Regex/HistoryN，全局 config.ini）。
+    const CProjectManager::SFindUiState stUi = m_pPm->LoadFindUiState();
+    CFindReplaceDialog stDlg(a_bReplace, stUi.m_aHistory, this);
+    stDlg.SetUiState(stUi.m_iScope, stUi.m_bCase, stUi.m_bWord, stUi.m_bRegex);
+    if (stDlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    // 界面态回存：选项 + 历史（本次查找串置顶去重；含下拉右键删除/清空的编辑）。
+    {
+        CProjectManager::SFindUiState stSave;
+        stSave.m_iScope = stDlg.Scope();
+        stSave.m_bCase = stDlg.CaseSensitive();
+        stSave.m_bWord = stDlg.WholeWord();
+        stSave.m_bRegex = stDlg.UseRegex();
+        QStringList aHist = stDlg.FindHistory();
+        const QString sFind = stDlg.FindText();
+        if (!sFind.isEmpty()) {
+            aHist.removeAll(sFind);
+            aHist.prepend(sFind);
+        }
+        while (aHist.size() > 20) {
+            aHist.removeLast();
+        }
+        stSave.m_aHistory = aHist;
+        m_pPm->SaveFindUiState(stSave);
+    }
+    SFindTask stTask;
+    stTask.m_sFind = stDlg.FindText();
+    stTask.m_sReplace = stDlg.ReplaceText();
+    stTask.m_bReplaceMode = stDlg.ReplaceMode();
+    stTask.m_bCase = stDlg.CaseSensitive();
+    stTask.m_bWord = stDlg.WholeWord();
+    stTask.m_bRegex = stDlg.UseRegex();
+    // 范围分派：0=全部 → 源码根（工程+关联）+ 日志根；1=本项目 → 仅源码根
+    //   （维持旧口径，不搜日志）；2=任务和助手日志 → m_aRoots 留空，仅日志根
+    //   （引擎据空根跳过源码树遍历）。
+    const int iScope = stDlg.Scope();
+    if (iScope != 2) {
+        stTask.m_aRoots = CollectSearchRoots(iScope);
+    }
+    if (iScope != 1) {
+        stTask.m_aLogRoots = CollectLogRoots();
+        stTask.m_aLogFileNames = CFileSearcher::LogFileNames();
+    }
+    stTask.m_sProjectDir = m_pPm->ProjectDir();
+    stTask.m_aExcludeDirs = ScanDirList(m_pPm->LoadFindExcludeDirs());
+    // 搜索后台线程在页面内自管（取消/join），此处直接发起即可。
+    m_pExecPanel->StartFileSearch(stTask);
+}
+
+QStringList CMainWindow::CollectSearchRoots(int a_iScope) const {
+    // 0=全部：工程根 + explorer.json 的关联根（面板同源持久化；直接读文件，
+    //   避免依赖资源管理器面板的加载状态）；1=本项目：仅工程根。
+    if (m_pPm == nullptr) {
+        return QStringList();
+    }
+    const QString sProj = QDir::cleanPath(m_pPm->ProjectDir());
+    QStringList aRoots{sProj};
+    if (a_iScope != 0) {
+        return aRoots;
+    }
+    QFile fJson(QDir(sProj).filePath(QStringLiteral(".autodev/explorer.json")));
+    if (!fJson.open(QIODevice::ReadOnly)) {
+        return aRoots;   // 无关联根档 = 仅工程根
+    }
+    const QJsonDocument oDoc = QJsonDocument::fromJson(fJson.readAll());
+    fJson.close();
+    if (!oDoc.isObject()) {
+        return aRoots;
+    }
+    const QJsonArray aArr = oDoc.object().value(QStringLiteral("roots")).toArray();
+    for (const QJsonValue& v : aArr) {
+        const QString sRoot = QDir::cleanPath(v.toString().trimmed());
+        if (!sRoot.isEmpty()
+            && QString::compare(sRoot, sProj, Qt::CaseInsensitive) != 0
+            && QFileInfo(sRoot).isDir()) {
+            aRoots.append(sRoot);
+        }
+    }
+    return aRoots;
+}
+
+QStringList CMainWindow::CollectLogRoots() const {
+    // 各搜索根（工程根+关联根，口径同 CollectSearchRoots(0)）下的 .autodev；
+    //   不存在的跳过（关联项目可能无 .autodev，引擎侧存在性再核一遍）。
+    QStringList aOut;
+    const QStringList aRoots = CollectSearchRoots(0);
+    for (const QString& sRoot : aRoots) {
+        const QString sLog = QDir::cleanPath(
+            QDir(sRoot).filePath(QStringLiteral(".autodev")));
+        if (QFileInfo(sLog).isDir()) {
+            aOut.append(sLog);
+        }
+    }
+    return aOut;
 }
 
 void CMainWindow::OnGuideLog(const QString& a_sLine) {
@@ -2268,6 +2475,8 @@ void CMainWindow::OnSettings() {
     m_pPm->SaveAdhocPromptTokMax(stDlg.AdhocPromptTokMax());
     m_pPm->SaveScanExcludeDirs(stDlg.ScanExcludeDirs());
     m_pPm->SaveBackupExcludeDirs(stDlg.BackupExcludeDirs());
+    // 2026-11-07 查找排除（[Find] ExcludeDirs）：落盘即生效（搜索时现读）。
+    m_pPm->SaveFindExcludeDirs(stDlg.FindExcludeDirs());
     // 2026.09.23 资源管理器显示隐藏目录：落盘 + 立即应用到树（含已加载行重隐/重显）。
     m_pPm->SaveExplorerHiddenDirs(stDlg.ExplorerHiddenDirs());
     if (m_pTaskPanel != nullptr) {
@@ -3625,6 +3834,203 @@ void CMainWindow::OnAsstAutoRename(QString a_sAsstId, QString a_sPrompts) {
     } else {
         StartBusyIconWatch();   // 2026-10-27 图标运行态动画：自动命名借会话轮也在执行
     }
+}
+
+// —— 2026-11-04 助手分析报告（右键「查看分析报告」）——
+
+QString CMainWindow::AsstReportDir(const QString& a_sAsstId) const {
+    // 助手报告目录：<工程>/.autodev/asst-reports/<asstId>/（report.md 正文 +
+    //   meta.json 指纹/生成时间；助手 id 跨改名稳定，重命名不丢报告）。
+    //   工程未开/入参空 → 空串（调用方提示）。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty() || a_sAsstId.isEmpty()) {
+        return QString();
+    }
+    return QDir::cleanPath(m_pPm->AutoDevDir() + QStringLiteral("/asst-reports/")
+                           + a_sAsstId);
+}
+
+void CMainWindow::StartReportStatus(const QString& a_sAsstName) {
+    // 状态栏秒表开表：报告轮进行中 1s 刷新「已 N 秒」（用户需求：总结过程可见）。
+    m_sReportStatusName = a_sAsstName;
+    m_tReportClock.restart();
+    SetStatus(QStringLiteral("⚙ 正在总结「%1」的对话日志，后台生成分析报告…（已 0 秒）")
+                  .arg(a_sAsstName));
+    m_pReportStatusTm->start();
+}
+
+void CMainWindow::StopReportStatus() {
+    m_pReportStatusTm->stop();
+    m_sReportStatusName.clear();
+}
+
+void CMainWindow::OnAsstReportView(const QString& a_sAsstId) {
+    // 面板报告页已打开（占位态）：读盘回填 + 指纹比对决定是否后台重新总结。
+    if (m_pExecPanel == nullptr || m_pOrch == nullptr) {
+        return;
+    }
+    const QString sName = m_pExecPanel->AsstDisplayName(a_sAsstId);
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        m_pExecPanel->SetAsstReportHint(a_sAsstId,
+            QStringLiteral("尚未打开工程。分析报告需要工程目录持久化"
+                           "（.autodev/asst-reports/），请先打开工程。"));
+        SetStatus(QStringLiteral("分析报告需要先打开工程（报告持久化在工程 .autodev 目录）"));
+        return;
+    }
+    // 读落盘报告 + 指纹（编码口径同 CArtifactView：BOM 剥离 + UTF-8/GBK 兑底）。
+    const QString sDir = AsstReportDir(a_sAsstId);
+    QString sReport, sFpSaved, sGenAt;
+    {
+        QFile stFile(sDir + QStringLiteral("/report.md"));
+        if (stFile.open(QIODevice::ReadOnly)) {
+            QByteArray aBody = stFile.readAll();
+            stFile.close();
+            if (aBody.startsWith("\xEF\xBB\xBF")) {
+                aBody = aBody.mid(3);
+            }
+            QString sText = QString::fromUtf8(aBody);
+            if (sText.contains(QChar(0xFFFD))) {
+                sText = QString::fromLocal8Bit(aBody);
+            }
+            sReport = sText;
+        }
+    }
+    {
+        QFile stFile(sDir + QStringLiteral("/meta.json"));
+        if (stFile.open(QIODevice::ReadOnly)) {
+            QByteArray aBody = stFile.readAll();
+            stFile.close();
+            if (aBody.startsWith("\xEF\xBB\xBF")) {
+                aBody = aBody.mid(3);
+            }
+            const QJsonObject o = QJsonDocument::fromJson(aBody).object();
+            sFpSaved = o.value(QStringLiteral("fp")).toString();
+            sGenAt = o.value(QStringLiteral("generatedAt")).toString();
+        }
+    }
+    const bool bHasReport = !sReport.trimmed().isEmpty();
+    const QString sFpNow = m_pExecPanel->AsstChatFingerprint(a_sAsstId);
+    const bool bUpToDate = bHasReport && (sFpSaved == sFpNow);
+    if (bHasReport) {
+        // 有报告：直接显示；落后于对话（指纹变化）则标 stale 并继续起后台重总结。
+        m_pExecPanel->ShowAsstReport(a_sAsstId, sReport,
+            QStringLiteral("生成时间：%1%2").arg(
+                sGenAt.isEmpty() ? QStringLiteral("—") : sGenAt,
+                bUpToDate ? QString() : QStringLiteral("（对话有新增）")),
+            !bUpToDate);
+        if (bUpToDate) {
+            SetStatus(QStringLiteral("「%1」的分析报告已是最新（生成时间：%2）")
+                          .arg(sName, sGenAt));
+            return;
+        }
+    }
+    // 无报告/报告落后：起后台报告轮。无对话内容直接静态提示（报告轮无素材可总结）。
+    const QString sMaterial = m_pExecPanel->BuildAsstReportMaterial(a_sAsstId);
+    if (sMaterial.trimmed().isEmpty()) {
+        m_pExecPanel->SetAsstReportHint(a_sAsstId,
+            QStringLiteral("该助手还没有任何对话记录，暂无可总结的内容。\n"
+                           "先向助手发送提示词开始对话，之后再打开分析报告。"));
+        SetStatus(QStringLiteral("「%1」还没有对话记录，无法生成分析报告").arg(sName));
+        return;
+    }
+    // 重入守卫：该助手的报告轮已在途（执行/排队中，指纹表 pending 即在途）——不再
+    //   起新轮（生成中指纹仍落后，重开报告页会再走到这）；横幅刷新为生成中，秒表照跑。
+    if (m_aReportFpPending.contains(a_sAsstId)) {
+        m_pExecPanel->SetAsstReportGenerating(a_sAsstId, true,
+            QStringLiteral("正在后台总结对话日志，完成后自动替换/显示…"));
+        return;
+    }
+    m_aReportFpPending.insert(a_sAsstId, sFpNow);   // 收尾写 meta 用触发时指纹
+    m_pExecPanel->SetAsstReportGenerating(a_sAsstId, true,
+        bHasReport
+            ? QStringLiteral("对话日志有新增，正在后台重新总结，完成后自动替换…")
+            : QStringLiteral("首次生成分析报告：正在后台总结对话日志，完成后自动显示…"));
+    StartReportStatus(sName);
+    StartBusyIconWatch();   // 图标运行态动画：报告轮也在执行
+    if (!m_pOrch->SummarizeAsstReportNow(a_sAsstId, sMaterial)) {
+        m_aReportFpPending.remove(a_sAsstId);
+        StopReportStatus();
+        m_pExecPanel->SetAsstReportGenerating(a_sAsstId, false);
+        m_pExecPanel->SetAsstReportHint(a_sAsstId,
+            QStringLiteral("报告生成未能启动（无可用的空闲助手会话或素材为空），请稍后重试。"));
+        SetStatus(QStringLiteral("✗ 「%1」的分析报告未能开始生成（请稍后重试）").arg(sName));
+    }
+}
+
+void CMainWindow::OnAsstReportDone(const QString& a_sAsstId, bool a_bOk,
+                                    const QString& a_sReport) {
+    // 报告轮收尾：落盘（.autodev/asst-reports/<id>/report.md + meta.json）+ 状态栏
+    //   结果 + 面板回填（报告页自动换正文）。失败/被停止：只提示不落盘（旧报告保留）。
+    if (m_pExecPanel == nullptr) {
+        StopReportStatus();
+        m_aReportFpPending.remove(a_sAsstId);
+        return;
+    }
+    const QString sName = m_pExecPanel->AsstDisplayName(a_sAsstId);
+    if (!a_bOk) {
+        StopReportStatus();
+        SetStatus(QStringLiteral("✗ 「%1」的分析报告生成失败：%2")
+                      .arg(sName, a_sReport.left(120)));
+        m_pExecPanel->ApplyAsstReport(a_sAsstId, false, a_sReport);
+        return;
+    }
+    if (m_bProjectSwitching || m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        // 切工程隔离窗/工程已关：不落盘（防旧工程报告串进新工程目录），只停表。
+        StopReportStatus();
+        m_aReportFpPending.remove(a_sAsstId);
+        return;
+    }
+    const QString sDir = AsstReportDir(a_sAsstId);
+    if (sDir.isEmpty() || !QDir().mkpath(sDir)) {
+        StopReportStatus();
+        SetStatus(QStringLiteral("✗ 「%1」分析报告目录创建失败：%2").arg(sName, sDir));
+        m_pExecPanel->ApplyAsstReport(a_sAsstId, false,
+                                      QStringLiteral("报告目录创建失败"));
+        return;
+    }
+    // report.md：UTF-8 with BOM（全局编码规则）；meta.json：无 BOM 机器档。
+    bool bOkMd = false;
+    {
+        QFile stFile(sDir + QStringLiteral("/report.md"));
+        if (stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            const QByteArray aBody = QByteArray("\xEF\xBB\xBF") + a_sReport.toUtf8();
+            bOkMd = (stFile.write(aBody) == aBody.size());
+            stFile.close();
+        }
+    }
+    const QString sFp = m_aReportFpPending.value(
+        a_sAsstId, m_pExecPanel->AsstChatFingerprint(a_sAsstId));
+    const QString sNow = QDateTime::currentDateTime().toString(
+        QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    bool bOkMeta = false;
+    {
+        QJsonObject o;
+        o[QStringLiteral("fp")] = sFp;
+        o[QStringLiteral("generatedAt")] = sNow;
+        o[QStringLiteral("asstName")] = sName;
+        o[QStringLiteral("chars")] = a_sReport.size();
+        QFile stFile(sDir + QStringLiteral("/meta.json"));
+        if (stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            const QByteArray aBody = QJsonDocument(o).toJson();
+            bOkMeta = (stFile.write(aBody) == aBody.size());
+            stFile.close();
+        }
+    }
+    if (!bOkMd || !bOkMeta) {
+        StopReportStatus();
+        SetStatus(QStringLiteral("✗ 「%1」分析报告写入失败（磁盘不可写？目录：%2）")
+                      .arg(sName, sDir));
+        m_pExecPanel->ApplyAsstReport(a_sAsstId, false,
+                                      QStringLiteral("报告文件写入失败"));
+        return;
+    }
+    m_aReportFpPending.remove(a_sAsstId);
+    StopReportStatus();
+    SetStatus(QStringLiteral("✓ 「%1」的分析报告已更新（生成时间：%2；右键助手 Tab 可再次查看/导出）")
+                  .arg(sName, sNow));
+    // 报告页还开着 → 自动替换为新报告（已关则不弹，下次打开直读盘）。
+    m_pExecPanel->ShowAsstReport(a_sAsstId, a_sReport,
+                                 QStringLiteral("生成时间：%1").arg(sNow), false);
+    m_pExecPanel->ApplyAsstReport(a_sAsstId, true, a_sReport);
 }
 
 void CMainWindow::OnAdhocUndo(const QString& a_sAsstId) {

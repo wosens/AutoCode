@@ -30,6 +30,7 @@ void CChatModel::ClearDisplay()
     m_aItems.clear();
     m_aIdx2Item.clear();
     m_iSys = m_iTool = -1;
+    m_iHeartbeat = -1;   // 2026-11-07 §6 心跳锚随模型复位
     endResetModel();
 }
 
@@ -40,6 +41,7 @@ void CChatModel::RebuildFrom(const QList<SBlockData>& a_aBlocks)
     m_aIdx2Item.clear();
     m_aIdx2Item.reserve(a_aBlocks.size());
     m_iSys = m_iTool = -1;
+    m_iHeartbeat = -1;   // 2026-11-07 §6：重放历史时自然重建心跳锚（旧档心跳也折叠）
     endResetModel();
     for (const SBlockData& st : a_aBlocks) {
         AppendBlock(st);   // 复用增量状态机（beginResetModel 已复位开卡态）
@@ -96,6 +98,22 @@ void CChatModel::AppendBlock(const SBlockData& a_stData)
             m_iTool = -1;
             break;
         }
+        // 2026-11-07 §6 心跳折叠：心跳/重试/等待行并入既有心跳组卡（跨块存活，
+        //   就地更新计数与最新行），不再逐条铺屏（Hermes 单会话 188 条实害）；
+        //   行缓存封顶 30 条，iBeatTotal 记真实累计；不打断普通系统组链（二者
+        //   互不干扰——心跳行走心跳锚，普通行继续 m_iSys 链）。
+        if (CMessageBlock::IsHeartbeatLine(sPretty) && m_iHeartbeat >= 0) {
+            SDisplayItem& it = m_aItems[m_iHeartbeat];
+            ++it.iBeatTotal;
+            it.aSysLines.append(sPretty);
+            if (it.aSysLines.size() > 30) {
+                it.aSysLines.removeFirst();
+            }
+            m_aIdx2Item.append(m_iHeartbeat);
+            m_iTool = -1;
+            emitChanged(m_iHeartbeat);
+            break;
+        }
         if (m_iSys >= 0) {
             SDisplayItem& it = m_aItems[m_iSys];
             it.aSysLines.append(sPretty);
@@ -106,6 +124,12 @@ void CChatModel::AppendBlock(const SBlockData& a_stData)
             it.aSysLines.append(sPretty);
             m_iSys = m_aItems.size() - 1;
             m_aIdx2Item.append(m_iSys);
+            // 2026-11-07 §6：首条心跳行开心跳组卡（后续心跳跨块并入本卡）。
+            if (CMessageBlock::IsHeartbeatLine(sPretty)) {
+                it.bHeartbeat = true;
+                it.iBeatTotal = 1;
+                m_iHeartbeat = m_iSys;
+            }
         }
         m_iTool = -1;   // 系统行打断工具卡链（与 Legacy“系统行打断”同口径）
         break;
@@ -125,6 +149,11 @@ void CChatModel::AppendBlock(const SBlockData& a_stData)
         it.sText = a_stData.sText;
         m_aIdx2Item.append(m_aItems.size() - 1);
         m_iTool = m_iSys = -1;
+        // 2026-11-07 §6：新用户提问重锚心跳组（新一轮等待重新计数；上一轮的
+        //   等待卡留在原地完整可回看）。
+        if (a_stData.sEventKind == QStringLiteral("user")) {
+            m_iHeartbeat = -1;
+        }
         break;
     }
     case CMessageBlock::Error:

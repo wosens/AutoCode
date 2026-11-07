@@ -75,6 +75,10 @@ private:
     QList<SDisplayItem> m_aItems;   // 显示条目序列（M ≤ N，合并判定在模型层完成）
     QList<int>          m_aIdx2Item;// 数据下标 → 条目下标（逐块记录；被丢弃行 -1）
     int m_iSys = -1;                // 追加中的 System 组卡下标（-1=无；非 System 块打断）
+    // 2026-11-07 §6 心跳折叠锚：最近一次心跳组卡下标（-1=无）。跨块存活——工具/
+    //   文本/普通系统行均不打断（等待心跳与正常输出交替是常态）；仅新用户提问
+    //   （Event kind=user）重锚（新一轮等待重新计数）。Rebuild 重放时自然重建。
+    int m_iHeartbeat = -1;
     int m_iTool = -1;               // 追加中的 ToolUse 合并卡下标（-1=无；Assistant 文本不打断）
 };
 
@@ -98,5 +102,10 @@ struct SDisplayItem {
     bool bHadError = false;             // 合并卡任一条目出错（折叠头换肤依据）
     QStringList aSysLines;              // System 组卡行（PrettyLegacyJsonLine 清洗后）
     bool bSysCollapsed = true;          // System 折叠态
+    // 2026-11-07 改进计划 §6：心跳折叠组（首行命中 CMessageBlock::IsHeartbeatLine）
+    //   ——非连续心跳行仍并入本组（就地更新），组头显最新一行；行缓存封顶 30 条
+    //   （历史时间线展开可见，更早的丢弃防长会话膨胀），iBeatTotal 记真实累计次数。
+    bool bHeartbeat = false;
+    int iBeatTotal = 0;
     bool bHighlight = false;            // 跳转高亮（1200ms 自清）
 };

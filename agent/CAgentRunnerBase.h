@@ -43,6 +43,15 @@ public:
     // 默认 false：新后端未声明即按"无跨轮上下文"安全侧处理。
     virtual bool KeepsContextAcrossTurns() const { return false; }
 
+    // 2026-11-07 O1 稳定约束系统层通道（《提示词注入链路分析》§4-O1）：编排器每轮
+    //   显式设/清。记录/权限/任务记忆等每轮一致的约束块，claude 后端把它并入
+    //   --append-system-prompt（系统层承载——约束指令权重更高且不再挤占 user
+    //   prompt）；其余后端无系统层通道，编排器退回提示词尾注入，此值保持空。
+    //   每轮 StartStage 前必被显式覆盖（StartAdhocStage 统一调 SetOrchSystemAppend），
+    //   不存在跨轮残留。
+    void SetOrchSystemAppend(const QString& a_sText) { m_sOrchSystemAppend = a_sText; }
+    QString OrchSystemAppend() const { return m_sOrchSystemAppend; }
+
     // 启动一次阶段执行（参数语义见 CClaudeRunner 同名函数；claude 专属参数在后端
     // 不支持时降级忽略，由各实现自行说明）。
     virtual void StartStage(const QString& a_sWorkDir,
@@ -152,6 +161,30 @@ public:
     //   空结果 30 秒 TTL 重试（装完 Git 不重启 AutoCode 即生效）。
     static QString GitBashRootDir();
 
+    // —— 2026-11-07 改进计划 §1B：执行通道探针（bash 可用性）——
+    // 背景（2026-11 体检）：机器未装 Git Bash 且 System32 存在 WSL 存根 bash.exe 时，
+    //   Agent 全部 shell 命令必败（“适用于 Linux 的 Windows 子系统…”/乱码 ???），验证轮
+    //   反复报“无法执行”触发回炉空转（HarnessAgent 5 轮 2249 万 token）。探针在
+    //   深度链起点异步跑一次 `bash -c "echo ok"`（与 Runner 注入的同款合并 PATH，
+    //   探测结果即 Agent 侧真实体验）；坏 → 面板 ⛔ 横幅 + 验证轮注入“跳过运行类
+    //   验证”指令 + 验证失败按环境阻塞路由（不回炉）。
+    struct SExecChannelProbe {
+        bool bKnown = false;    // 是否已有探测结论（false=从未探测，bOk 无意义）
+        bool bOk = false;      // true = bash 通道可用
+        QString sDetail;       // 失败原因（给用户的修复指引文案；成功为空或简述）
+    };
+    // 同步探测（阻塞 ≤5s：正常 <300ms；仅后台线程调用）。a_bForce=true 清缓存重探
+    //   （面板“重新探测”入口）。缓存 TTL：成功 10 分钟 / 失败 45 秒（修复后短时自愈）。
+    static SExecChannelProbe ProbeExecChannel(bool a_bForce = false);
+    // 只读缓存（不探测、不阻塞）：bKnown=false 表示无缓存结论。
+    static SExecChannelProbe ExecChannelCached();
+
+    // —— 2026-11-07 改进计划 §1D：子进程输出编码容错解码 ——
+    // 子进程 stderr/stdout 非 JSON 行按「严格 UTF-8 → GB18030 → 本地 ACP → 有损
+    //   UTF-8」级联解码，消灭 WSL 存根/npm shim 等本地化输出（GBK）被当 UTF-8 解出
+    //   的 ??? 连串乱码。纯 ASCII 快速路径。全后端 Runner 的原始字节解码统一走此入口。
+    static QString DecodeSubprocessText(const QByteArray& a_aBytes);
+
 signals:
     void sigInfo(const QString& a_sLine);                              // 系统/原始信息
     void sigAssistantText(const QString& a_sText);                     // 助手文本输出
@@ -179,6 +212,7 @@ protected:
     // 2026-10-07 对话级模型覆盖槽（见公共段 SetStageModelOverride 注释）。
     int             m_iModelOvIdx = -1;   // 覆盖下标（-1=跟随全局激活）
     SDshModelEntry m_stModelOv;           // 覆盖条目快照（单值静态后端用）
+    QString         m_sOrchSystemAppend;  // 2026-11-07 O1 编排器稳定约束（系统层通道，见公共段注释）
     // 覆盖下标对当前表长度的有效值（越界/未设回 -1）——各后端 StartStage 解析用。
     int ModelOvIdxIn(int a_iTableSize) const {
         return (a_iTableSize > 0 && m_iModelOvIdx >= 0 && m_iModelOvIdx < a_iTableSize)

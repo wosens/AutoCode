@@ -587,6 +587,30 @@ bool CStreamPresenter::TryMergeWidget(const QList<SBlockData>& aBlocks,
         while (iPrev >= 0 && aBlocks.at(iPrev).eKind == CMessageBlock::Assistant) {
             --iPrev;   // 跳过中间的 Agent 文本（含思维链）
         }
+    } else if (CMessageBlock::IsHeartbeatLine(
+                   CMessageBlock::PrettyLegacyJsonLine(a_stData.sText))) {
+        // 2026-11-07 §6 心跳折叠（与 CChatModel m_iHeartbeat 锚同口径）：心跳/等待
+        //   行跨块回溯找既有心跳组卡（工具/文本/普通系统行都不打断——等待心跳与
+        //   正常输出交替是常态），找到则就地并入；找不到（含组卡已滚出窗口）按
+        //   普通系统行走紧邻合并/新建。回溯遇首个 System 块即停：它要么是心跳组
+        //   （并入）要么是普通组（归它，不穿越——避免把心跳行塞进普通组）。
+        while (iPrev >= 0 && aBlocks.at(iPrev).eKind != CMessageBlock::System) {
+            --iPrev;
+        }
+        if (iPrev >= 0 && CMessageBlock::IsHeartbeatLine(
+                              CMessageBlock::PrettyLegacyJsonLine(
+                                  aBlocks.at(iPrev).sText))) {
+            const int iPrevRel2 = iPrev - a_iBase;
+            if (iPrevRel2 >= 0 && iPrevRel2 < aWidgets.size() && !aWidgets.isEmpty()) {
+                CMessageBlock* pHb = aWidgets.at(iPrevRel2);
+                if (pHb != nullptr && pHb->IsHeartbeatGroup()) {
+                    pHb->AppendSystemLine(a_stData.sText);
+                    aWidgets.append(pHb);
+                    return true;
+                }
+            }
+        }
+        iPrev = a_iNewIdx - 1;   // 回溯未命中：退回紧邻合并口径
     }
     if (iPrev < 0) {
         return false;   // 前面全是文本（无组卡可并）

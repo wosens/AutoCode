@@ -1,4 +1,4 @@
-// CCodeSyntaxView.cpp —— CodeStyle 源码语法渲染宿主实现
+﻿// CCodeSyntaxView.cpp —— CodeStyle 源码语法渲染宿主实现
 // 加载点：exe 同目录 CodeParser.dll / CodeView.dll（便携原则：Execute 目录拷走即
 //   自包含；缺 DLL 时本视图不可用，CFilePreviewWidget 回退纯文本，功能闸门关闭）。
 // 语法 DLL（tree-sitter-c/cpp.dll）由 CodeParser.dll 在 CpsCreate 时按相对名自行
@@ -41,6 +41,8 @@ constexpr unsigned int kSciSetTargetEnd        = 2192;
 constexpr unsigned int kSciSearchInTarget      = 2197;
 constexpr unsigned int kSciSetSearchFlags      = 2198;
 constexpr unsigned int kSciScrollCaret         = 2169;
+// 2026-11-07 kSciGetLine/kSciLineLength 撤除：CvcSendMsg 通道不回拷缓冲（探针
+//   实证），行定位改自算（LineByteRange，基于 ShowSource 存的 m_aU8Last）。
 constexpr uintptr_t kScFindMatchCase           = 0x4;
 
 typedef void*       (*FnCpsCreate)(int);
@@ -236,10 +238,23 @@ bool CCodeSyntaxView::ShowSource(const QByteArray& a_aU8Text, bool a_bCpp, bool 
     }
     // 顺序契约（手册 §3）：先 CvcSetText（清旧样式 + 词法着色 + 置只读），
     //   语义 span 后灌；文本更新后两步都要重做。
+    // 2026-11-07 修追加缺陷（HotNews 实害）：CodeView.dll 的清空用的是
+    //   SCI_SETTEXT(0,0)，本版 Scintilla 对 NULL lParam 不清空 → 每次预览都
+    //   追加（探针 probe_hotnews 实锤 viewLen=48503×7：乱码=内容重复拼接、
+    //   首开后定位全错、文档无限膨胀至卡死）。宿主侧先解锁只读并 SCI_CLEARALL，
+    //   兼容已部署的旧 DLL（DLL 源头同步修）。
+    if (Sdk().pfnCvcSendMsg != nullptr) {
+        Sdk().pfnCvcSendMsg(m_hView, 2191 /*SCI_SETREADONLY*/, 0, 0);
+        Sdk().pfnCvcSendMsg(m_hView, 2180 /*SCI_CLEARALL*/, 0, 0);
+    }
     if (Sdk().pfnCvcSetText(m_hView, a_aU8Text.constData(),
                             static_cast<unsigned int>(a_aU8Text.size())) != 0) {
         return false;
     }
+    // 2026-11-07 存最近文本：GotoLine/GotoPos 的行/列→字节换算全部自算——
+    //   探针实证 CvcSendMsg 通道 SCI_GETLINE 不回拷缓冲、SCI_LINEFROMPOS 参数
+    //   在 wParam（旧代码传 lParam 恒返行 0 → 审查定位一直选中第 1 行）。
+    m_aU8Last = a_aU8Text;
     if (a_bSemantic && Sdk().pfnCpsCreate != nullptr && Sdk().pfnCpsSetText != nullptr
             && Sdk().pfnCpsCollect != nullptr && Sdk().pfnCvcApplySpans != nullptr) {
         // 解析器随用随析（含一次语法 DLL 加载与查询编译，POC 无增量；UI 线程
@@ -333,23 +348,80 @@ bool CCodeSyntaxView::FindText(const QString& a_sText, bool a_bBackward,
 #endif
 }
 
+void CCodeSyntaxView::LineByteRange(int a_iLine, qsizetype& a_iStart,
+                                    qsizetype& a_iEnd) const {
+    // 2026-11-07 自算行字节界：基于 m_aU8Last 找第 a_iLine-1 个换行符（'\n'）。
+    //   行号≤1 钉首行、越界钉末行（空文本=空区间）。
+    a_iStart = 0;
+    a_iEnd = m_aU8Last.size();
+    if (a_iLine <= 1 || m_aU8Last.isEmpty()) {
+        if (a_iLine <= 1) {
+            const qsizetype iNl = m_aU8Last.indexOf('\n');
+            if (iNl >= 0) {
+                a_iEnd = iNl;
+            }
+        }
+        return;
+    }
+    for (int i = 1; i < a_iLine; ++i) {
+        const qsizetype iNl = m_aU8Last.indexOf('\n', a_iStart);
+        if (iNl < 0) {   // 行号超尾：钉末行
+            a_iEnd = m_aU8Last.size();
+            return;
+        }
+        a_iStart = iNl + 1;
+    }
+    const qsizetype iNl = m_aU8Last.indexOf('\n', a_iStart);
+    a_iEnd = (iNl >= 0) ? iNl : m_aU8Last.size();
+}
+
 void CCodeSyntaxView::GotoLine(int a_iLine) {
 #ifdef Q_OS_WIN
+    // 2026-11-07 重写：行字节界自算（旧实现经 CvcSendMsg 回读 LINEFROMPOS 恒返行 0
+    //   ——参数应在 wParam——导致定位恒选第 1 行；探针 probe_findpos 实证）。选中
+    //   整行滚动可见的口径不变。
     if (m_hView == nullptr || Sdk().pfnCvcSendMsg == nullptr || a_iLine < 1) {
         return;
     }
-    // 与纯文本视图同口径：滚动到指定 1-based 行并整行选中（审查定位）。行号越界
-    //   由 Scintilla 钉到首/末行，再从落位光标反查实际行号取行边界。
     const auto fnSend = [this](unsigned int iMsg, uintptr_t wp = 0, intptr_t lp = 0) {
         return Sdk().pfnCvcSendMsg(m_hView, iMsg, wp, lp);
     };
-    fnSend(kSciGotoLine, static_cast<uintptr_t>(a_iLine - 1));
-    const intptr_t iLine = fnSend(kSciLineFromPos, 0, fnSend(kSciGetCurrentPos));
-    const intptr_t iStart = fnSend(kSciPositionFromLine, static_cast<uintptr_t>(iLine));
-    const intptr_t iEnd = fnSend(kSciGetLineEndPosition, static_cast<uintptr_t>(iLine));
-    fnSend(kSciSetSel, static_cast<uintptr_t>(iEnd), iStart);
+    qsizetype iStart = 0, iEnd = 0;
+    LineByteRange(a_iLine, iStart, iEnd);
+    fnSend(kSciSetSel, static_cast<uintptr_t>(iEnd),
+           static_cast<uintptr_t>(iStart));
     fnSend(kSciScrollCaret);
 #else
     Q_UNUSED(a_iLine);
+#endif
+}
+
+void CCodeSyntaxView::GotoPos(int a_iLine, int a_iCol, int a_iLen) {
+#ifdef Q_OS_WIN
+    // 2026-11-07 重写：行界自算 + 行文本本地解码换算字符列→字节偏移（不再经
+    //   CvcSendMsg 回读——GETLINE 不回拷/LINEFROMPOS 参数错位双坑，见 ShowSource 注）。
+    //   列/长越界钉在行内；命中跨行尾时选到行尾。
+    if (m_hView == nullptr || Sdk().pfnCvcSendMsg == nullptr || a_iLine < 1) {
+        return;
+    }
+    const auto fnSend = [this](unsigned int iMsg, uintptr_t wp = 0, intptr_t lp = 0) {
+        return Sdk().pfnCvcSendMsg(m_hView, iMsg, wp, lp);
+    };
+    qsizetype iLineStart = 0, iLineEnd = 0;
+    LineByteRange(a_iLine, iLineStart, iLineEnd);
+    const QString sLine = QString::fromUtf8(m_aU8Last.constData() + iLineStart,
+                                            iLineEnd - iLineStart);
+    const qsizetype iCol0 = qBound<qsizetype>(0, qsizetype(a_iCol - 1),
+                                              sLine.size());
+    const qsizetype iLenC = (a_iLen > 0)
+        ? qBound<qsizetype>(0, qsizetype(a_iLen), sLine.size() - iCol0) : 0;
+    const qsizetype cbPrefix = QStringView(sLine).left(iCol0).toUtf8().size();
+    const qsizetype cbMatch = QStringView(sLine).mid(iCol0, iLenC).toUtf8().size();
+    const qsizetype iSelStart = iLineStart + cbPrefix;
+    fnSend(kSciSetSel, static_cast<uintptr_t>(iSelStart + cbMatch),
+           static_cast<uintptr_t>(iSelStart));
+    fnSend(kSciScrollCaret);
+#else
+    Q_UNUSED(a_iLine); Q_UNUSED(a_iCol); Q_UNUSED(a_iLen);
 #endif
 }

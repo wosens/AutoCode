@@ -650,6 +650,8 @@ void CPiAgentRunner::Reset() {
     m_buf.clear();
     m_bufErr.clear();
     m_iNoMsgHintMs = -1;   // 2026.08.29 流式心跳提示节流复位
+    m_iNoMsgBytes = 0;         // 2026-11-07 §8-1 字节速率观测窗口复位
+    m_iNoMsgBytesAtHint = 0;
 }
 
 void CPiAgentRunner::StartStage(const QString& a_sWorkDir,
@@ -841,6 +843,8 @@ void CPiAgentRunner::StartStageImpl(const QString& a_sWorkDir,
     m_actClock.restart();
     m_tNoMsg.start();   // 2026.08.29 完整事件计时（心跳提示用）
     m_iNoMsgHintMs = -1;
+    m_iNoMsgBytes = 0;         // 2026-11-07 §8-1：新轮次重开字节观测窗口
+    m_iNoMsgBytesAtHint = 0;
     if (m_pStallTimer != nullptr && !m_pStallTimer->isActive()) {
         m_pStallTimer->start();
     }
@@ -909,7 +913,9 @@ bool CPiAgentRunner::InjectUserTurn(const QString& a_sText) {
 
 void CPiAgentRunner::slotOnStdOut() {
     m_actClock.restart();   // 收到输出 = 进程活着，停滞计时清零
-    m_buf += m_pProc->readAllStandardOutput();
+    const QByteArray aNew = m_pProc->readAllStandardOutput();
+    m_iNoMsgBytes += aNew.size();   // 2026-11-07 §8-1：无消息窗口字节速率观测
+    m_buf += aNew;
     int iIdx = 0;
     while ((iIdx = m_buf.indexOf('\n')) >= 0) {
         QByteArray sLine = m_buf.left(iIdx);
@@ -928,7 +934,9 @@ void CPiAgentRunner::slotOnStdErr() {
     m_bufErr.append(m_pProc->readAllStandardError());
     int iPos = m_bufErr.indexOf('\n');
     while (iPos >= 0) {
-        const QString sLine = QString::fromUtf8(m_bufErr.left(iPos)).trimmed();
+        // 2026-11-07 §1D：GBK 容错解码（WSL 存根/npm shim 本地化报错不再 ??? 乱码）。
+        const QString sLine = CAgentRunnerBase::DecodeSubprocessText(
+                                  m_bufErr.left(iPos)).trimmed();
         m_bufErr.remove(0, iPos + 1);
         iPos = m_bufErr.indexOf('\n');
         if (sLine.isEmpty()) {
@@ -949,7 +957,8 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
         // 2026.08.27 悬空 sid 场景友好化：pi 对不存在的 --session-id 会打英文 Warning
         //   并自动用该 id 新建会话（实测自愈，不失败）——补中文说明，用户可知上下文
         //   已重新开始（工程自其他电脑拷贝时常见）。
-        const QString sRaw = QString::fromUtf8(a_sLine);
+        // 2026-11-07 §1D：非 JSON 原始行 GBK 容错解码。
+        const QString sRaw = CAgentRunnerBase::DecodeSubprocessText(a_sLine);
         if (sRaw.startsWith(QStringLiteral("Warning: No project session found"))) {
             emit sigInfo(QStringLiteral("↻ 会话在本机不存在（工程可能自其他电脑拷贝），"
                                         "pi 已自动新建会话续跑（上下文自本条重新开始）"));
@@ -1036,6 +1045,8 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
     }
     if (sType == QStringLiteral("message_end")) {
         m_tNoMsg.restart();   // 完整消息 = 实质进展（心跳提示清零）
+        m_iNoMsgBytes = 0;
+        m_iNoMsgBytesAtHint = 0;   // 2026-11-07 §8-1 窗口复位
         HandleMessageEnd(oRoot.value(QStringLiteral("message")).toObject());
         return;
     }
@@ -1043,6 +1054,8 @@ void CPiAgentRunner::HandleLine(const QByteArray& a_sLine) {
         || sType == QStringLiteral("tool_execution_end")
         || sType == QStringLiteral("turn_start")) {
         m_tNoMsg.restart();   // 工具/新轮次 = 实质进展
+        m_iNoMsgBytes = 0;
+        m_iNoMsgBytesAtHint = 0;   // 2026-11-07 §8-1 窗口复位
     }
     if (sType == QStringLiteral("tool_execution_end")) {
         // 工具结果：result 容错为字符串/数组/对象（TextContent[] 等价拼接文本）。
@@ -1434,15 +1447,38 @@ void CPiAgentRunner::CheckStall() {
     //   下模型长时间深度思考（实测单条消息流式 16 分钟打满 maxTokens），UI 只显示
     //   完整消息、流式 usage 帧多为 0，用户侧看起来就是「卡死」。每 60s 补一条
     //   可见提示（不终止进程；硬停滞检测只认总输出静默，不受影响）。
-    if (m_tNoMsg.isValid() && m_tNoMsg.elapsed() > 180000
-        && m_actClock.elapsed() < 45000) {
+    // 2026-11-07 改进计划 §8-1 思考可观测：提示带上窗口字节速率与「仍在输出/疑似
+    //   停滞」二态判断（旧版零字节时仍说“输出仍在到达”误导用户干等）；字节停滞
+    //   超 8 分钟直接建议停止（硬 kill 仍由 StallMinutes 把关，这里只建议）。
+    if (m_tNoMsg.isValid() && m_tNoMsg.elapsed() > 180000) {
         const qint64 iNoMsg = m_tNoMsg.elapsed();
         if (m_iNoMsgHintMs < 0 || iNoMsg - m_iNoMsgHintMs >= 60000) {
             m_iNoMsgHintMs = iNoMsg;
-            emit sigInfo(QStringLiteral("⏳ 模型仍在流式生成（已 %1 分钟无完整消息/工具事件，"
-                                        "输出仍在到达）——疑似深度思考中，并非卡死；"
-                                        "如需中断可点停止，或将思考级别调低/调大「最大输出」")
-                             .arg(QString::number(iNoMsg / 60000)));
+            const qint64 iWinBytes = m_iNoMsgBytes - m_iNoMsgBytesAtHint;
+            m_iNoMsgBytesAtHint = m_iNoMsgBytes;
+            const QString sMin = QString::number(iNoMsg / 60000);
+            const bool bStreaming = (iWinBytes > 0) || m_actClock.elapsed() < 45000;
+            if (bStreaming) {
+                emit sigInfo(QStringLiteral(
+                    "⏳ 模型仍在流式生成（已 %1 分钟无完整消息，近段接收 %2 KB）——"
+                    "仍在输出、疑似深度思考中，并非卡死；如需中断可点停止，"
+                    "或将思考级别调低/调大「最大输出」")
+                                 .arg(sMin)
+                                 .arg(QString::number(double(iWinBytes) / 1024.0,
+                                                      'f', 1)));
+            } else {
+                const qint64 iSilentMin = m_actClock.isValid()
+                    ? qMax<qint64>(1, m_actClock.elapsed() / 60000) : 0;
+                emit sigInfo(QStringLiteral(
+                    "⏳ 已 %1 分钟无完整消息且近段零字节接收——疑似停滞（字节流已停"
+                    "%2 分钟）%3")
+                                 .arg(sMin).arg(QString::number(iSilentMin))
+                                 .arg(iSilentMin >= 8
+                                      ? QStringLiteral("，已超 8 分钟建议点停止"
+                                                       "（会话已保留，重发可续）")
+                                      : QStringLiteral("；若持续到停滞门限将自动终止"
+                                                       "并转续跑，也可提前点停止")));
+            }
         }
     }
     const qint64 iLimitMs = static_cast<qint64>(CClaudeRunner::StallMinutes()) * 60000;

@@ -1,4 +1,4 @@
-#include "CClaudeRunner.h"
+﻿#include "CClaudeRunner.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -599,13 +599,18 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
         //   2026.08.27 旧版 CLI 无此选项，探测不支持则不带（否则 unknown option 秒退）。
         aArgs << QStringLiteral("--autocompact") << QStringLiteral("%1k").arg(a_iAutocompactK);
     }
+    // 2026-11-07 O1 稳定约束系统层通道（《提示词注入链路分析》§4-O1）：ask_user/
+    //   沙箱说明与编排器稳定约束（记录/权限/任务记忆，每轮一致）合并为单一
+    //   --append-system-prompt——约束不再挤占 user prompt（系统层指令权重更高）；
+    //   MCP 未就绪（ask_user 关）时约束块仍独立生效；两者皆空时不带参数（与旧
+    //   行为完全一致，零回归）。
+    QString sSysAppend;
     if (bMcpReady) {
         // 挂载 ask_user MCP server：claude 需向用户提问时调 mcp__autocode__ask_user。
         // 2026-09-26 追加内置沙箱工具说明（sandbox_* 与 ask_user 同一 mcp-config 挂载，
         //   工具常驻可见；此处点名确保 GUI 测试场景模型直接联想，不靠技能清单）。
-        aArgs << QStringLiteral("--mcp-config") << m_sMcpConfigPath
-              << QStringLiteral("--append-system-prompt")
-              << QStringLiteral("当你需要向用户确认选择、澄清需求或在多方案间做决定时，"
+        aArgs << QStringLiteral("--mcp-config") << m_sMcpConfigPath;
+        sSysAppend = QStringLiteral("当你需要向用户确认选择、澄清需求或在多方案间做决定时，"
                                 "调用 mcp__autocode__ask_user 工具向用户提问，不要自行假设用户意图。"
                                 "GUI/界面测试一律用内置沙箱工具 mcp__autocode__sandbox_*："
                                 "启动被测 GUI 程序优先用 sandbox_launch（exe=全路径，主进程"
@@ -622,6 +627,14 @@ void CClaudeRunner::StartStage(const QString& a_sWorkDir,
                                 "用户自己打开的窗口；"
                                 "禁止物理操控鼠标键盘，也禁止绕开沙箱用 python/ctypes "
                                 "自制 Win32 驱动操控可见窗口。测试过程已自动录像，无需额外操作。");
+    }
+    if (!m_sOrchSystemAppend.isEmpty()) {
+        sSysAppend = sSysAppend.isEmpty()
+            ? m_sOrchSystemAppend
+            : sSysAppend + QStringLiteral("\n\n") + m_sOrchSystemAppend;
+    }
+    if (!sSysAppend.isEmpty()) {
+        aArgs << QStringLiteral("--append-system-prompt") << sSysAppend;
     }
 
     m_pProc->setWorkingDirectory(a_sWorkDir);
@@ -1122,12 +1135,9 @@ void CClaudeRunner::slotOnStdErr() {
     const QByteArray bufData = m_pProc->readAllStandardError();
     const QList<QByteArray> aLines = bufData.split('\n');
     for (const QByteArray& szRaw : aLines) {
-        // 2026.08.27 中文 Windows 上 npm shim（claude.cmd）的报错按 GBK 输出，先 UTF-8 解、
-        //   出现替换符则回退本地 8 位编码（GBK）重解，消除 stderr 尾部乱码。
-        QString sLine = QString::fromUtf8(szRaw);
-        if (sLine.contains(QChar(0xFFFD))) {
-            sLine = QString::fromLocal8Bit(szRaw);
-        }
+        // 2026-11-07 §1D：GBK 容错解码抽公共（原本地 8 位回退仅覆盖本 Runner，
+        //   且 WSL 存根等 GB18030 输出在非中文 ACP 机器仍会乱——统一基类级联解码）。
+        QString sLine = CAgentRunnerBase::DecodeSubprocessText(szRaw);
         sLine = sLine.trimmed();
         if (sLine.isEmpty()) {
             continue;
@@ -1152,8 +1162,8 @@ void CClaudeRunner::HandleLine(const QByteArray& a_sLine, int a_iEpoch) {
     QJsonParseError stErr;
     const QJsonDocument stDoc = QJsonDocument::fromJson(a_sLine, &stErr);
     if (stErr.error != QJsonParseError::NoError || !stDoc.isObject()) {
-        // 非 JSON 行：作为原始信息上抛（便于排查）
-        emit sigInfo(QString::fromUtf8(a_sLine));
+        // 非 JSON 行：作为原始信息上抛（便于排查；2026-11-07 §1D GBK 容错解码）
+        emit sigInfo(CAgentRunnerBase::DecodeSubprocessText(a_sLine));
         return;
     }
 

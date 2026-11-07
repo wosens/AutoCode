@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <QWidget>
 #include <QHash>
@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QColor>
 #include <QElapsedTimer>
+#include <QPointer>   // 2026-11-04 分析报告页（非模态 WA_DeleteOnClose，QPointer 防悬垂）
 
 #include "ui/CMessageBlock.h"   // 块控件（EKind/IsErrorResult/PrettyLegacyJsonLine/ToolSummary 公开静态同源）
 #include "ui/CStreamPresenter.h"   // 2026.09.03 对话流呈现器（任务/助手日志共用；SBlockData/BlockToJson 已拆至 ui/SBlockData.h，经本头第 9 行分发）
@@ -34,7 +35,10 @@ class CMessageView;
 class CChatModel;       // 2026-10-17 自绘三期：ModelView 引擎显示条目模型
 class CChatListView;    // 2026-10-17 自绘三期：ModelView 引擎自绘视图
 class CFilePreviewWidget;   // 2026.08.25 文件预览 Tab（md/html/hex 多视图容器）
+struct SFindTask;            // 2026-11-07 查找任务参数（CFindResultsPage.h 定义）
+class CFindResultsPage;      // 2026-11-07 查找结果独立无模式窗口（编辑→查找/替换）
 class CPromptFlyout;   // FR-3：助手日志提示词下拉浮层（半透明按钮 hover 弹出）
+class CAsstReportDialog;   // 2026-11-04 助手分析报告页（右键「查看分析报告」）
 
 // 右侧执行面板：上方阶段进度、中间 Tab（日志对话流 / 阶段产物 .md）、底部 cost/token 统计。
 // 对话流由 CMessageView 承放 CMessageBlock；多任务按 id 缓存结构化 block 数据，切换时重建。
@@ -124,6 +128,27 @@ public:
     //   本轮收尾（OnAdhocFinished）再执行（用户需求：运行期间请求的自动命名放到
     //   当前指令完成后进行）。返回 false = 无素材/无该助手（调用方提示）。
     bool TriggerAsstAutoRename(const QString& a_sAsstId);
+    // —— 2026-11-04 助手分析报告（右键「查看分析报告」）——
+    // 对话指纹（用户块数+助手块数+末块签名，工具/事件行不计——防命名轮等内部轮
+    //   误判「有新对话」）；主窗口用它与落盘 meta 比对决定是否需要重新总结。
+    QString AsstChatFingerprint(const QString& a_sAsstId) const;
+    // 报告素材：该助手全部用户提问与助手终答按时间序拼接（保留时间戳，长条目
+    //   截断，总量限尾）；返回空 = 无对话内容。
+    QString BuildAsstReportMaterial(const QString& a_sAsstId) const;
+    // 右键入口：打开报告页（非模态）并上抛 sigAsstReportViewRequested——主窗口读
+    //   落盘报告回填/判定是否后台重新总结。
+    void TriggerAsstReportView(const QString& a_sAsstId);
+    // 主窗口回填：展示报告正文（a_bStale=内容落后于对话，后台正在重总结）。
+    void ShowAsstReport(const QString& a_sAsstId, const QString& a_sReport,
+                        const QString& a_sMetaNote, bool a_bStale = false);
+    // 报告页横幅：后台总结进行中/结束（仅当页面正展示该助手时生效）。
+    void SetAsstReportGenerating(const QString& a_sAsstId, bool a_bOn,
+                                 const QString& a_sHint = QString());
+    // 静态提示态（无对话内容/失败等）：清空正文改显提示，禁用导出。
+    void SetAsstReportHint(const QString& a_sAsstId, const QString& a_sHint);
+    // 报告轮收尾（编排器 sigAsstReportDone 经主窗口转来）：成功换正文，失败横幅提示。
+    void ApplyAsstReport(const QString& a_sAsstId, bool a_bOk,
+                         const QString& a_sReport);
     // 2026.08.19 运行态对外置位：编排器自动续发排队指令起新轮时广播（见 sigAdhocRunning），
     //   手动发送路径面板已自置、此处幂等。原 private，升 public 供主窗口连接。
     //   2026.09.03 多助手并发：置位/清除均按助手 id，互不影响其他助手的运行态。
@@ -184,7 +209,18 @@ public:
     //   2026.08.21 增加 a_bSwitchTab：false=资源管理器单击预览——只加载内容/换
     //   标题不切页（用户停留当前 Tab）；默认 true 保持双击切页原行为。
     //   2026-09-30 增加 a_iLine：>0 时加载后定位到该 1-based 行（代码审查发现定位）。
-    void ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab = true, int a_iLine = 0);
+    //   2026-11-07 增加 a_iCol/a_iLen：均 >0 时选中命中区间（查找结果定位），
+    //   仅 a_iLine>0 时保持整行选中（兼容审查/旧调用）；同日二改增加
+    //   a_sMatch/a_iMatchOrd：md/html 渲染后行列不对应源文，按命中文本的
+    //   第 N 次出现定位（搜索引擎按同文同串累计序数）。
+    void ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab = true, int a_iLine = 0,
+                     int a_iCol = 0, int a_iLen = 0,
+                     const QString& a_sMatch = QString(), int a_iMatchOrd = 0);
+    // 2026-11-07 编辑→查找/替换：发起后台搜索并弹出「查找结果」独立无模式窗口
+    //   （单实例复用，点 X 只隐藏；替换模式窗内带替换/替换全部按钮）。参数/根由主窗口解析。
+    void StartFileSearch(const struct SFindTask& a_stTask);
+    // 窗口已建且可见（未搜过/点 X 隐藏后为 false）。
+    bool FindResultsPageVisible() const;
     // FR-9：按左栏任务列表（Tab）底部 y 同步阶段表高度，使两者底部对齐（任务列表不含按钮行）。
 
 
@@ -298,6 +334,13 @@ signals:
     // 2026-09-22 右键「自动重命名」：面板收集该助手全部用户提示词（去时间戳、尾部限量），
     //   经主窗口转编排器 AutoNameAsstNow（借用会话交 Agent 总结名称+说明）。
     void sigAsstAutoRename(const QString& a_sAsstId, const QString& a_sPrompts);
+    // 2026-11-04 右键「查看分析报告」：报告页已打开，主窗口接管——读落盘报告回填/
+    //   比对指纹决定是否起后台报告轮（SummarizeAsstReportNow）。
+    void sigAsstReportViewRequested(const QString& a_sAsstId);
+    // 2026-11-07 改进计划 §1B：右键「重新探测执行通道」——用户修复环境（装 Git
+    //   Bash/WSL）后无需重启，主窗口转编排器 RetestExecChannel（清缓存强制重探，
+    //   结论经 exec_channel_probe/exec_channel_ok 事件回流该助手流）。
+    void sigAsstRetestExecChannel(const QString& a_sAsstId);
     // 2026-10-08 提示词超限提炼：发送前闸门判定超限 → 上抛原文+限额+权限快照，
     //   CMainWindow 转编排器起一次性提炼 Agent，提炼稿回来再走正常提交链。
     void sigAsstRefinePrompt(const QString& a_sAsstId, const QString& a_sText,
@@ -390,13 +433,14 @@ private:
 
     CStageBar*      m_pStageBar = nullptr;   // 2026.09.04 阶段横向图标条（替代 QTreeWidget 阶段表）
     // （m_pStageSplit 已删：阶段条固定高移出 splitter，FR-9 高度对齐随图标条化移除。）
-    CAsstTabWidget* m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 /「+」页 / 文件预览（多行 Tab 栏：宽度不足自动换行）
+    CAsstTabWidget* m_pTabs    = nullptr;   // 日志 / 阶段产物 / 助手 /「+」页 / 文件预览（多行 Tab 栏：宽度不足自动换行；查找结果已改独立窗口）
     CAsstTabBar*    m_pAsstBar = nullptr;   // 2026-09-22 多行 Tab 栏本体（= m_pTabs->tabBar()；右键命中用 TabAtPos、运行态用 SetPageRunning）
     QWidget*        m_pAddTabPage = nullptr;  // 「+」新增助手占位页（选中即新增并弹回，参考 DSHAgentManage）
     QWidget*        m_pArtifactsPage = nullptr;  // 「阶段产物」页本体（Tab 布局管制时识别非助手页用）
     QSplitter*      m_pArtifactsSplit = nullptr;  // 2026.08.29 阶段清单|Markdown 分割条（持久化）
     QByteArray      m_stRenameDlgGeo;              // 2026-10-16 重命名弹窗几何（saveGeometry 快照，弹后回写）
     CFilePreviewWidget* m_pFileView = nullptr;  // 2026.08.25 文件预览 Tab（单实例复用，内部分发纯文本/md/html/hex）
+    CFindResultsPage* m_pFindResults = nullptr;  // 2026-11-07 查找结果独立窗口（单例复用；后台搜索+替换）
     CMessageView*   m_pView    = nullptr;   // Tab1：对话流日志（Legacy 引擎；ModelView 引擎下为 null）
     // —— 2026-10-17 自绘三期 ModelView 引擎（doc/对话流视图自绘改造方案.md §9.2
     //    双引擎灰度，[View] Engine 缺省 Legacy）：与 m_pView 互斥——构造时按引擎
@@ -596,6 +640,8 @@ private:
     // 2026.08.25 助手是否有用：对话流中存在用户发送的提示词（Event/user 块）；
     //   无任何用户提示词 = 空助手（不入「▾」历史，关闭时直接舍弃）。
     static bool AsstHasUserPrompt(const SAsst& a_st);
+    // 2026-11-04 分析报告页懒建（单实例非模态；已存在则直接返回）。
+    CAsstReportDialog* EnsureAsstReportDialog();
     // 2026-10-03 收集助手全部用户提示词并组装命名素材（右键「自动重命名」/收尾自动
     //   命名/运行中挂起命名三处同口径：Event/user 块、去时间戳前缀、编号拼接、
     //   总量截尾跟最近 6000 字）。返回空串 = 无素材。
@@ -605,6 +651,7 @@ private:
     //   仅该助手 Tab 当前可见时显示）。CreateAsstWidgets 建框、Resize/Show/切 Tab 路径定位。
     void RefreshQueueBox(const QString& a_sId);
     CPromptFlyout*         m_pPromptFlyout = nullptr;  // FR-3 提示词下拉浮层（单实例，hover 弹出、移开收起；仅当前助手页可见，锚定其按钮）
+    QPointer<CAsstReportDialog> m_pReportDlg;   // 2026-11-04 分析报告页（非模态单实例，切助手换内容；WA_DeleteOnClose 自清）
     QTimer*                m_pFlyoutHideTimer = nullptr;   // 2026.09.13 浮层收起定时器：鼠标离开区域 500ms 后才收（位置判定，见 IsCursorInsideFlyoutRegion）
     QList<SAsst>           m_aAssts;                   // 全部助手（顺序 = Tab 顺序；已关闭的排在末尾，bClosed=true）
     // 2026-10-05 共享模型表镜像（主窗口 SetSharedModels 推送；启动/热重载/设置保存/

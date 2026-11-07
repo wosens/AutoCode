@@ -72,6 +72,15 @@ public:
     // 2026.09.20 多条排队指令合并为一次投送的提示词封装（public static 供测试）：
     //   逐条【指令 N】定界 + 按序全部执行完毕再收尾的要求；单条不封装（调用方直投原文）。
     static QString MergeQueuedPrompts(const QStringList& a_aPrompts);
+    // 2026-11-07 O2/O3 历史回灌整形（public static 供测试，《提示词注入链路分析》§4）：
+    //   CompressTranscriptRounds——近 a_iKeepFull 轮保留原文，更早轮压缩为「用户问句+
+    //   助手结论」两行摘要（确定性截断，零 LLM；轮边界=「用户：」行首）；
+    //   TrimTranscriptRounds——总字符超限时按整轮粒度自头部丢最旧（逐行丢会打穿
+    //   稳定前缀的 prompt cache；整轮丢则前缀在多轮间保持不变）。
+    static QStringList CompressTranscriptRounds(const QStringList& a_aLines,
+                                                int a_iKeepFull, int a_iUserClip,
+                                                int a_iAsstClip);
+    static void TrimTranscriptRounds(QStringList& a_aLines, int a_iMaxChars);
     // 2026-09-30 ReviewSdk 预审：解析 changed_files.md（"+ 路径"/"M 路径"/"- 路径"）
     //   → 去重后的存在文件绝对路径清单（删除行与不存在项剔除；公开静态供单测）。
     static QStringList ParseChangedFilesList(const QString& a_sChangedMdAbs,
@@ -111,6 +120,26 @@ public:
     //   无状态）：从 ParseReviewDecision 抽出，公开静态供单测直接构造现场文本回归
     //   （Test 阶段假驳回无限回炉，详见 test_verify_flow testParseDecisionText）。
     static EReviewDecision ParseDecisionText(const QString& a_sText);
+    // —— 2026-11-07 改进计划 §1A：验证失败分类（回炉路由依据）——
+    //   背景：WSL/shell/网络环境故障时验证轮必报“无法执行”，旧回炉判定只看“未通过”
+    //   结果字符串 → 回炉空转（HarnessAgent 5 轮 2249 万 token 零产出）。分类后：
+    //   EnvBlocked（全部非✅条目归因于环境）不回炉，输出环境阻塞清单交用户；
+    //   CodeDefect（存在真实代码缺陷条目）走原回炉。
+    enum class EVerifyFailKind { CodeDefect, EnvBlocked };
+    // 纯函数：按验证报告文本分类。a_bEnvEvidence = 会话侧硬证据（执行通道探针失败 /
+    //   验证轮工具结果中环境故障命中数达阈值）——报告无【需求对照】结构时作兑底
+    //   信号（有结构时仅看条目，不受证据偏置）。公开静态供回归测试。
+    static EVerifyFailKind ClassifyVerifyFailure(const QString& a_sReport, bool a_bEnvEvidence);
+    // —— 2026-11-07 改进计划 §1C：工作区指纹（回炉无进展检测）——
+    //   回炉决策点快照工程源文件（路径+大小+mtime）指纹，与上一次决策点比对：
+    //   完全一致 = 修复轮零代码变更 → 终止回炉（环境/需求死结，再烧 token 无意义）。
+    //   排除目录沿用指纹扫描器缺省清单（build/node_modules/.git 等）；封顶 2 万条/
+    //   深 14 层（大工程降精度但可用）；根不存在返回空串（调用方跳过检测）。
+    static QString DeepWorkspaceFingerprint(const QString& a_sRoot);
+    // 2026-11-07 改进计划 §1B：面板「重新探测执行通道」入口——清缓存强制重探
+    //   （后台线程），结论经 exec_channel_probe 事件回报该助手流。用户修复环境
+    //   （装 Git Bash/WSL）后无需重启 AutoCode。
+    void RetestExecChannel(const QString& a_sAsstId);
     // 2026.09.20 未发送排队指令的删除/改写（面板暂存框编辑入口，按原文本匹配首个）：
     //   返回是否命中（未入队/已被消费/新文本为空 → false，面板侧自行保持一致）。
     bool RemoveQueuedAdhoc(const QString& a_sAsstId, const QString& a_sText);
@@ -168,6 +197,15 @@ public:
     //   借用该助手自己的会话（fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲
     //   会话；全忙/无会话返回 false（调用方提示）。结果经 sigAsstAutoNameDone 回填。
     bool AutoNameAsstNow(QString a_sAsstId, QString a_sPrompts);   // 2026.10.11 值传：防链上结构体释放后引用悬垂（172129 崩溃）
+
+    // 2026-11-04 助手分析报告（右键「查看分析报告」）：面板组装该助手完整对话日志
+    //   素材（BuildAsstReportMaterial），交 Agent 总结为 Markdown 分析报告（首节必为
+    //   「## 综述」）。口径同 AutoNameAsstNow：借用该助手自己的会话（fork 一次性只读
+    //   分支，不动撤销栈）；其忙则借用任一空闲会话；全忙则 3s 周期排队重试至空闲
+    //   （bReportWait）。报告轮输出全部静默（不上屏不入回灌，见 OnAdhocAssistantText
+    //   的 AsstReport 分支），结果经 sigAsstReportDone 回填（a_bOk=false 时 a_sReport
+    //   为失败原因）。值传防链上悬垂（同 172129 教训）。
+    bool SummarizeAsstReportNow(QString a_sAsstId, QString a_sMaterial);
 
     // 2026-10-08 提示词超限提炼：面板发送闸门（占比/token 双约束取小）判定超限后
     //   上抛到这里。起一次性只读提炼轮（fork 分支不动用户会话栈），提炼稿回投
@@ -261,6 +299,11 @@ signals:
     //   a_sDesc=一句说明（可为空，tooltip 只显示后端行）。
     void sigAsstAutoNameDone(const QString& a_sAsstId, bool a_bOk,
                              const QString& a_sName, const QString& a_sDesc);
+    // 2026-11-04 助手分析报告完成（含失败）：a_sAsstId=被报告的助手（非借用的执行会话）。
+    //   a_bOk=true 时 a_sReport=完整 Markdown 报告（首节「## 综述」）；false 时为失败
+    //   原因（首 200 字，面板/状态栏展示用）。
+    void sigAsstReportDone(const QString& a_sAsstId, bool a_bOk,
+                           const QString& a_sReport);
 
 private slots:
     void OnRunnerInfo(const QString& a_sLine);
@@ -409,8 +452,11 @@ private:
     // DeepVerify=专家模式验证轮（独立验证者按验收标准编译/测试，fork 一次性分支）；
     // PromptRefining=提示词超限提炼轮（2026-10-08：发送前闸门超限 → fork 只读一次性
     //   分支把原提示词压缩到限额内，提炼稿回投 SubmitAdhoc 正常提交；失败兑底原文）。
+    // AsstReport=助手分析报告轮（2026-11-04：右键「查看分析报告」→ 面板组装全部对话
+    //   日志交 Agent 总结 Markdown 报告；fork 只读一次性分支，输出静默不上屏不入
+    //   回灌，结果经 sigAsstReportDone 回填；sReportTargetAsst 记被报告的助手）。
     enum EAdhocMode { Idle, Submitting, CompactSummarize, CompactReseed, AutoNaming,
-                      AsstAutoNaming, DeepPlan, DeepVerify, PromptRefining };
+                      AsstAutoNaming, DeepPlan, DeepVerify, PromptRefining, AsstReport };
 
     // —— 助手会话（2026.09.03 多助手并发）：每助手独立 runner 进程 + 会话链 + 状态机 ——
     //   会话常驻 m_aAdhoc（id→堆指针，QHash 重哈希不移动指向体）；档切换/切工程整体
@@ -443,6 +489,13 @@ private:
         QString               sRefineOriginal;
         qint64                iRefineLimit = 0;
         int                   iRefinePerm = PermAuto;
+        // 2026-11-04 助手分析报告轮（AsstReport 模式）：目标助手 id + 流式输出累积
+        //   （静默不上屏；收尾 a_sResult 为空时兑底拼接）。排队忙等待
+        //   （bReportWait/sReportWaitMaterial）口径同 bAutoNameWait。
+        QString               sReportTargetAsst;
+        QString               sReportStream;
+        bool                  bReportWait = false;
+        QString               sReportWaitMaterial;
         // 2026-10-03 自动命名忙等待（HarnessGatewayPlugin 实害：claude result 到达即
         //   emit sigFinished、进程退净前 IsRunning()=true——收尾自动命名/挂起收尾执行
         //   在 sigAdhocFinished 同步链里跑必撞该窗口判「忙」；工程只有一个助手时也无
@@ -510,6 +563,17 @@ private:
         //   【执行Agent实施报告】供验证者整合进面向用户的综合结果）。
         QStringList            aDeepMuted;
         QString                sDeepExecReport;
+        // 2026-11-07 改进计划 §1：回炉与环境故障解耦（会话级状态）。
+        //   iDeepEnvHits：验证轮工具结果中环境故障特征（WSL/ENOENT/连接错误等）
+        //   命中计数——验证轮起点清零，作为分类硬证据（≥2 即认）；
+        //   bDeepExecBlocked/sDeepExecBlockDetail：链起点探针结论——坏时验证轮
+        //   提示词注入“跳过运行类验证”指令，失败路由偏向 EnvBlocked；
+        //   sDeepLastFp：上一次回炉决策点的工作区指纹（相邻决策点比对基准：修复轮
+        //     零代码变更 → 终止回炉；链起点清空——首个 FAIL 必给修复轮机会）。
+        int                   iDeepEnvHits = 0;
+        bool                  bDeepExecBlocked = false;
+        QString               sDeepExecBlockDetail;
+        QString               sDeepLastFp;
     };
     SAdhocSession* AdhocSess(const QString& a_sAsstId, bool a_bCreate = false);  // 取会话（bCreate=无则建）
     void EnsureAdhocRunner(SAdhocSession& a_S);   // 懒创建该会话 runner 并连信号（id 注入路由）
@@ -587,6 +651,16 @@ private:
     // 回灌块/追加行按会话操作（成员移入 SAdhocSession：aTranscript）
     QString        BuildAdhocHistoryBlock(const SAdhocSession& a_S, bool a_bDropLastUser) const;   // 回灌块（无历史/后端可续接→空串）
     void           AppendAdhocTranscriptLine(SAdhocSession& a_S, const QString& a_sLine);    // 追加一行 + 预算裁剪（保尾部）
+    // 2026-11-07 O1/O4 稳定约束块（记录/权限/任务记忆三块合并瘦身，条件口径与旧三块
+    //   逐条一致）：claude 后端经 --append-system-prompt 系统层承载，其余后端注入
+    //   user prompt 尾部（StartAdhocStage 分流）。
+    QString        BuildTurnConstraints(const SAdhocSession& a_S) const;
+    // 2026-11-07 O5 最终 prompt 落盘可观测：助手轮写 .autodev(/tasks/<id>)/last_prompt_<助手id前8>.txt
+    //   + prompt_map 事件行（各块字符数）；任务阶段写 .autodev/tasks/<id>/last_prompt.txt。
+    void           WriteAdhocPromptSnapshot(SAdhocSession& a_S, const QString& a_sFinal,
+                                             const QString& a_sConstraints, bool a_bSysChannel,
+                                             int a_iHistoryChars);
+    void           WriteTaskPromptSnapshot(CTaskInfo* a_pTask, const QString& a_sFinal);
     // 2026.08.19 运行中介入：
     //   任务侧——DSH 后端协议不支持轮中插话，InjectUserTurn 返回 false 时排队，
     //     LaunchStage 时前置并入下一阶段 prompt（换任务/停止即作废）。
@@ -594,6 +668,14 @@ private:
     //     队列；DSH 后端排队，本轮成功收尾（OnAdhocFinished）后自动按同会话续发下一条。
     QStringList    m_aPendingTaskInjects;
     // （助手侧排队指令/最近任务档 id 已迁 SAdhocSession：aPendingInjects/sLastTaskId）
+
+    // 2026-11-07 改进计划 §1B：执行通道探针在飞集合（asstId）——同助手探针不重叠；
+//   后台线程探测，结论经 QMetaObject::invokeMethod 回 UI 线路出事件/写入会话。
+QSet<QString>  m_aProbeInFlight;
+// 后台探针回调（KickExecProbe 线程收尾回 UI 线程；a_sAsstId 空串 = 无目标流仅更新缓存）。
+void           OnExecProbeDone(const QString& a_sAsstId, bool a_bOk, const QString& a_sDetail);
+// 异步探测入口：a_bForce=清缓存强制重探（面板「重新探测」）；无在飞才起线程。
+void           KickExecProbe(const QString& a_sAsstId, bool a_bForce);
 
     // —— 评审多视角并行（fan-out / fan-in）状态 ——
     struct SViewResult {       // 单视角评审 runner 的完成结果

@@ -70,7 +70,11 @@ public:
     //    （CChatModel/CChatDelegate）同源共用，改口径须双改+双测）——
     // 判断工具结果是否为错误（Claude tool_result 的 is_error 未单独透传，按文本启发式）
     static bool IsErrorResult(const QString& a_sResult);
-    // v2.0.113 旧轮次裸 JSON 事件行的人读摘要清洗（tooldone/think/tool→摘要、
+    // 2026-11-07 改进计划 §6：心跳/重试/等待类系统行分类（⏳ 等待中、↻ 瞬态重试、
+    //   模型生成中、深度思考中、仍在流式生成）——命中行在两引擎均并入同一张
+    //   「等待中」折叠组卡就地更新（组头显最新一行），不再逐条刷屏（Hermes 实测
+    //   单会话 188 条心跳流没有效信息）。✗ 错误终态不命中恒独立成块。
+    static bool IsHeartbeatLine(const QString& a_sText);    // v2.0.113 旧轮次裸 JSON 事件行的人读摘要清洗（tooldone/think/tool→摘要、
     // progress→空串=丢弃；非裸 JSON 行原样返回）。载档渲染两侧共用。
     static QString PrettyLegacyJsonLine(const QString& a_sText);
     // 工具卡标题摘要（取 file_path/command/pattern/path/query/url/note_id；
@@ -139,4 +143,10 @@ private:
     QFrame*         m_pUserSep = nullptr;
     // System 折叠组：已归组的系统行（Error 不折叠，无此列表）
     QStringList     m_aSysLines;
+    // 2026-11-07 改进计划 §6：心跳折叠组标记（首行命中 IsHeartbeatLine 时置位）——
+    //   组头摘要改显【最新一行】（等待进度就地更新），而非首行；错误终态（✗）
+    //   不命中分类器恒独立成块。IsHeartbeatGroup 供合并管道回溯识别。
+    bool            m_bHeartbeatGroup = false;
+public:
+    bool IsHeartbeatGroup() const { return m_bHeartbeatGroup; }
 };

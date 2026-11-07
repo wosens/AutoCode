@@ -9,6 +9,8 @@
 #include <QLocalSocket>   // 2026-10-01 SSbxReq（沙箱异步回包）QPointer 成员需完整类型
 #include <QIcon>          // 2026-10-27 运行态图标动画：静态图标值成员（m_iconOrig）
 #include <QJsonObject>
+#include <QHash>          // 2026-11-04 分析报告：asstId → 触发时对话指纹（m_aReportFpPending）
+#include <QElapsedTimer>  // 2026-11-04 分析报告：报告轮状态栏秒表
 #include <memory>
 
 class CProjectManager;
@@ -65,7 +67,12 @@ private slots:
     void OnGuideLog(const QString& a_sLine);
     void OnGuideFinished(bool a_bOk, const QString& a_sMsg);
     void OnSyncGuide();                                         // 需求4 手动「同步 Guide」
+    void OnProjectCost();                                       // 2026-11-05 工程总消耗统计（菜单）
     void OnGuideSyncFinished(bool a_bOk, const QString& a_sMsg);   // 需求4 同步结果→状态栏
+
+    // 编辑菜单（2026-11-07 在文件中查找/替换；查找与替换复用同一对话框）
+    void OnFindInFiles();
+    void OnReplaceInFiles();
 
     // 功能菜单
     void OnInstallEnv();
@@ -133,6 +140,11 @@ private slots:
     // 2026-09-22 助手右键「自动重命名」：面板收集的提示词 → 编排器 AutoNameAsstNow；
     //   同步失败（全忙/无会话）也走面板 ApplyAsstAutoName 留事件行。
     void OnAsstAutoRename(QString a_sAsstId, QString a_sPrompts);   // 2026.10.11 值传：防链上结构体释放后引用悬垂（172129 崩溃）
+    // 2026-11-04 助手分析报告（右键「查看分析报告」）：面板报告页已开 → 读落盘报告
+    //   回填/指纹比对，需更新则起后台报告轮（状态栏秒表提示过程）；报告轮收尾：
+    //   落盘 .autodev/asst-reports/<id>/ + 状态栏结果 + 面板回填。
+    void OnAsstReportView(const QString& a_sAsstId);
+    void OnAsstReportDone(const QString& a_sAsstId, bool a_bOk, const QString& a_sReport);
     void OnAdhocUndo(const QString& a_sAsstId);
     void OnAdhocCompact(const QString& a_sAsstId);
     // 2026.08.15 助手消耗归集：一次成功助手调用的费用/输入/输出/耗时/请求数 → 当前档任务。
@@ -189,6 +201,15 @@ private:
     void ApplyTaskConfigOverlay(CTaskInfo* a_pTask);
     void OnConfigFileChanged();            // QFileSystemWatcher 触发（外部实例保存）
     void CreateMenus();
+    // 2026-11-07 编辑→查找/替换主体：弹 CFindReplaceDialog（a_bReplace 定初始单选）
+    //   → 解析根/排除清单 → 执行面板弹「查找结果」页开搜。
+    void OpenFindReplaceDialog(bool a_bReplace);
+    // 查找根解析：0=工程根+关联根（explorer.json roots 去重）；1=仅工程根；
+    //   2=仅任务/助手日志（m_aRoots 留空，见 CollectLogRoots）。
+    QStringList CollectSearchRoots(int a_iScope) const;
+    // 2026-11-07 日志根解析：各搜索根（口径同 CollectSearchRoots(0)）下存在
+    //   的 .autodev 目录——「全部」与「任务和助手日志」两档的日志通道根。
+    QStringList CollectLogRoots() const;
     void SetStatus(const QString& a_sText);
     // 迭代熔断（escalation）弹模态对话框：阻塞详情 + 打开任务目录 / 重置迭代并继续 / 忽略。
     void OnEscalation(CTaskInfo* a_pTask, const QString& a_sEventText);
@@ -362,4 +383,16 @@ private:
     bool               AnyWorkRunning() const;     // 运行态检测（tick/兑底共用）
     void               StartBusyIconWatch();       // 启动帧定时器（已活跃 no-op）
     void               OnBusyIconTick();           // 换帧/恢复（定时器槽）
+
+    // —— 2026-11-04 助手分析报告（右键「查看分析报告」）——
+    // 状态栏秒表：报告轮进行中 1s 刷新「已 N 秒」，完成/失败/停止即停表；
+    // m_aReportFpPending：触发时刻的对话指纹（asstId → fp），收尾写 meta.json 用
+    //   （写盘取触发时指纹而非完成时——报告内容对应触发时的对话量）。
+    QTimer*            m_pReportStatusTm = nullptr;   // 状态栏秒表（1s tick）
+    QElapsedTimer      m_tReportClock;                // 本轮报告起点
+    QString            m_sReportStatusName;           // 正在总结的助手名（秒表文案用）
+    QHash<QString, QString> m_aReportFpPending;       // asstId → 触发时对话指纹
+    QString            AsstReportDir(const QString& a_sAsstId) const;   // <工程>/.autodev/asst-reports/<id>
+    void               StartReportStatus(const QString& a_sAsstName);   // 开表 + 首帧文案
+    void               StopReportStatus();            // 停表（文案由调用方随后覆写）
 };

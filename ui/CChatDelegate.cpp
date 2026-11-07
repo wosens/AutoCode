@@ -123,19 +123,22 @@ QList<SMonoLine> monoResultLines(const SToolEntry& e)
     return aOut;
 }
 
-// System 组头摘要（口径同 CMessageBlock::RefreshSysHeader：首行 simplified 截 60）
-QString sysBrief(const QStringList& aLines)
+// System 组头摘要（口径同 CMessageBlock::RefreshSysHeader：首行 simplified 截 60；
+//   2026-11-07 §6 心跳折叠组改显最新一行——等待进度就地更新，首行是旧状态）
+QString sysBrief(const QStringList& aLines, bool a_bHeartbeat)
 {
     if (aLines.isEmpty())
         return QString();
-    return aLines.first().simplified().left(60);
+    return (a_bHeartbeat ? aLines.last() : aLines.first()).simplified().left(60);
 }
 
 QString sysHeaderText(const SDisplayItem& a_it)
 {
+    // 2026-11-07 §6 心跳组：次数用 iBeatTotal（真实累计；行缓存封顶 30 不代表全部）。
     return QStringLiteral("%1 %2（共 %3 行，点击展开）")
         .arg(a_it.bSysCollapsed ? QStringLiteral("▸") : QStringLiteral("▾"),
-             sysBrief(a_it.aSysLines)).arg(a_it.aSysLines.size());
+             sysBrief(a_it.aSysLines, a_it.bHeartbeat))
+        .arg(a_it.bHeartbeat ? a_it.iBeatTotal : a_it.aSysLines.size());
 }
 
 // QTextLayout 换行布局（Event/System/Error 文本；返回精确高度——这三类无 doc 校正

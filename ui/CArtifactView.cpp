@@ -31,6 +31,11 @@ void CArtifactView::ShowFile(const QString& a_sFilePath) {
     setMarkdown(sText);
 }
 
+void CArtifactView::ShowMarkdownText(const QString& a_sText) {
+    // 2026-11-04 分析报告页入口：文本来自内存（UTF-16 QString），无编码歧义。
+    setMarkdown(a_sText);
+}
+
 void CArtifactView::Clear() {
     clear();
 }

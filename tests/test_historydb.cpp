@@ -7,6 +7,7 @@
 
 #include "core/CTaskInfo.h"
 #include "db/CTaskHistoryDB.h"
+#include "db/CProjectUsage.h"
 
 // 注意：旧版全局库路径固定为 <exe 目录>/history.db（ctest exe 所在目录）。
 // 2026.08.20 历史库按工程隔离：Open(path) 打开 <工程>/.autodev/history.db；
@@ -29,8 +30,17 @@ private slots:
     void init() { RemoveDb(); }
     void cleanup() { RemoveDb(); }
 
-    void testRoundTrip() {
-        CTaskHistoryDB db;
+    void testRoundTrip();
+    void testMultipleAndDelete();
+    void testDeleteEmptyId();
+    void testMigrateLegacy();
+    void testCorruptDbSelfHeal();
+    void projectUsageAggregate();   // 2026-11-05 工程总消耗聚合（history.db + assistant 档）
+};
+
+
+void CTestHistoryDb::testRoundTrip() {
+    CTaskHistoryDB db;
         QVERIFY(db.Open(QStringLiteral("projdb.db")));   // 显式路径（工程内库口径）
         QVERIFY(QFileInfo::exists(QStringLiteral("projdb.db")));
 
@@ -88,7 +98,8 @@ private slots:
         QFile::remove(QStringLiteral("projdb.db"));
     }
 
-    void testMultipleAndDelete() {
+void CTestHistoryDb::testMultipleAndDelete()
+{
         CTaskHistoryDB db;
         QVERIFY(db.Open(QStringLiteral("projdb2.db")));
 
@@ -118,7 +129,8 @@ private slots:
         QFile::remove(QStringLiteral("projdb2.db"));
     }
 
-    void testDeleteEmptyId() {
+void CTestHistoryDb::testDeleteEmptyId()
+{
         CTaskHistoryDB db;
         QVERIFY(db.Open(QStringLiteral("projdb3.db")));
         // 空 id 应安全返回 false，不崩溃
@@ -129,7 +141,8 @@ private slots:
 
     // 2026.08.20 迁移：旧全局库（exe 目录）→ 各工程 .autodev/history.db，
     //   迁完旧库收档 .migrated；无旧库时幂等返回 0。
-    void testMigrateLegacy() {
+void CTestHistoryDb::testMigrateLegacy()
+{
         // 无旧库 → 幂等 0
         QCOMPARE(CTaskHistoryDB::MigrateLegacyToProjects(), 0);
 
@@ -187,7 +200,8 @@ private slots:
     // 2026.08.23 损坏自愈回归：库文件被写坏（多实例并发/异常退出）时 Open 应
     //   quick_check 体检 → 收档坏库 history.db.corrupt-<ts> → 原路径重建空库可用
     //   （终态任务只存于此库，损坏即历史任务整体凭空消失——task.json 回填自愈）。
-    void testCorruptDbSelfHeal() {
+void CTestHistoryDb::testCorruptDbSelfHeal()
+{
         const QString sPath = QStringLiteral("projdb_corrupt.db");
         QFile::remove(sPath);
         {
@@ -233,7 +247,82 @@ private slots:
         QFile::remove(sPath);
         QFile::remove(QDir(stDir).filePath(aBaks.first()));
     }
-};
+
+    // 2026-11-05 工程总消耗聚合：任务侧（history.db）+ 助手侧（工程级与每任务
+    // assistant.json 档 usage）两源求和（2026-09-05 起互不重复，无重复计数）；
+    // 缺库/缺档/坏档均客额 0 不瘫。
+    void CTestHistoryDb::projectUsageAggregate()
+    {
+        QTemporaryDir td;
+        QVERIFY(td.isValid());
+        const QString sPrj = td.path();
+        const QString sAutoDev = QDir(sPrj).filePath(QStringLiteral(".autodev"));
+        QVERIFY(QDir().mkpath(QDir(sAutoDev).filePath(QStringLiteral("tasks/t1"))));
+        QVERIFY(QDir().mkpath(QDir(sAutoDev).filePath(QStringLiteral("tasks/t2"))));
+
+        // ① 任务侧：两条任务带用量入库
+        {
+            CTaskHistoryDB db;
+            QVERIFY(db.Open(CTaskHistoryDB::ProjectDbPath(sPrj)));
+            CTaskInfo a;
+            a.SetId(QStringLiteral("t1"));
+            a.SetStatus(ETaskStatus::Done);
+            a.SetUsage(0.5, 1000, 200);
+            a.SetRequestCount(3);
+            QVERIFY(db.Upsert(&a));
+            CTaskInfo b;
+            b.SetId(QStringLiteral("t2"));
+            b.SetStatus(ETaskStatus::Done);
+            b.SetUsage(1.25, 4000, 800);
+            b.SetRequestCount(7);
+            QVERIFY(db.Upsert(&b));
+            db.Close();
+        }
+
+        // ② 助手侧：工程级档 1 个助手 + t1 档 2 个助手（含一个缺 usage 的容错行）
+        auto fnWriteJson = [](const QString& a_sPath, const char* a_szJson) {
+            QFile f(a_sPath);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(a_szJson);
+            f.close();
+        };
+        fnWriteJson(QDir(sAutoDev).filePath(QStringLiteral("assistant.json")),
+            "{\"assistants\":[{\"id\":\"a1\",\"usage\":{\"cost\":0.25,\"in\":5000,\"out\":600,"
+            "\"reqs\":11}}]}");
+        // t1 档：一个正常 usage + 一个缺 usage 字段（容错按 0 计入计数）
+        fnWriteJson(QDir(sAutoDev).filePath(QStringLiteral("tasks/t1/assistant.json")),
+            "{\"assistants\":[{\"id\":\"a2\",\"usage\":{\"cost\":1.5,\"in\":20000,\"out\":3000,"
+            "\"reqs\":40}},{\"id\":\"a3\"}]}");
+        // t2 档：坏 JSON（容错整体按 0，不计助手数）
+        fnWriteJson(QDir(sAutoDev).filePath(QStringLiteral("tasks/t2/assistant.json")),
+            "{broken");
+
+        const SProjectUsage u = CProjectUsage::Aggregate(sPrj);
+        QCOMPARE(u.m_nTasks, 2);
+        QCOMPARE(u.m_nAssts, 3);          // 工程级 1 + t1 档 2（t2 坏档 0）
+        QCOMPARE(u.m_dTaskCost, 1.75);    // 0.5 + 1.25
+        QCOMPARE(u.m_iTaskIn, qint64(5000));
+        QCOMPARE(u.m_iTaskOut, qint64(1000));
+        QCOMPARE(u.m_iTaskReqs, 10);
+        QCOMPARE(u.m_dAsstCost, 1.75);    // 0.25 + 1.5
+        QCOMPARE(u.m_iAsstIn, qint64(25000));
+        QCOMPARE(u.m_iAsstOut, qint64(3600));
+        QCOMPARE(u.m_iAsstReqs, 51);
+        QCOMPARE(u.TotalCost(), 3.5);
+        QCOMPARE(u.TotalTok(), qint64(5000 + 1000 + 25000 + 3600));
+        QCOMPARE(u.TotalReqs(), 61);
+
+        // 空目录/无库无档：全 0 不瘫
+        QTemporaryDir tdEmpty;
+        const SProjectUsage u0 = CProjectUsage::Aggregate(tdEmpty.path());
+        QCOMPARE(u0.m_nTasks, 0);
+        QCOMPARE(u0.m_nAssts, 0);
+        QCOMPARE(u0.TotalCost(), 0.0);
+        QCOMPARE(u0.TotalTok(), qint64(0));
+        // 空路径直接零值返回
+        const SProjectUsage uEmpty = CProjectUsage::Aggregate(QString());
+        QCOMPARE(uEmpty.TotalReqs(), 0);
+    }
 
 QTEST_MAIN(CTestHistoryDb)
 #include "test_historydb.moc"

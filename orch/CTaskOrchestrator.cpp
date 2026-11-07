@@ -16,6 +16,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <climits>
+#include <functional>   // 2026-11-07 §1C DeepWorkspaceFingerprint 递归 lambda
 
 #include "CProjectManager.h"
 #include "agent/CAgentRunnerFactory.h"
@@ -978,6 +979,7 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
     // 否则原单 runner 路径（viewId 空，完全向后兼容）。工作目录=工程根。
     // 2026.08.15 (流程档位) 视角数按档位取：简单档 CodeReview=1 → 落串行路径。
     if (ReviewViewCount(a_pTask, a_stDef.eStage) > 1 && IsLightReviewStage(a_stDef.eStage)) {
+        WriteTaskPromptSnapshot(a_pTask, sPrompt);   // 2026-11-07 O5
         StartReviewParallel(a_pTask, a_stDef, sPrompt);
     } else if (!a_pTask->LastSessionId().isEmpty()) {
         // 2026.08.17 中断续跑：任务带 lastSessionId（异常退出残留 / 失败任务再次执行）→
@@ -997,6 +999,7 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
                           .arg(m_aPendingTaskInjects.join(QStringLiteral("\n")));
             m_aPendingTaskInjects.clear();
         }
+        WriteTaskPromptSnapshot(a_pTask, sResume);   // 2026-11-07 O5（中断续跑轮）
         m_pRunner->StartStage(a_pTask->ProjectDir(), sResume,
             sTools, MaxTurnsFor(a_pTask, a_stDef.eStage),
             a_pTask->LastSessionId());
@@ -1009,9 +1012,11 @@ void CTaskOrchestrator::LaunchStage(CTaskInfo* a_pTask, const SStageDef& a_stDef
         sPrompt = QStringLiteral(
             "【用户介入指令】以下内容是任务运行期间用户提交的追加指令，"
             "请在执行本阶段工作时优先遵循、一并落实：\n%1\n\n%2").arg(sInjects, sPrompt);
+        WriteTaskPromptSnapshot(a_pTask, sPrompt);   // 2026-11-07 O5
         m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt, sTools,
                               MaxTurnsFor(a_pTask, a_stDef.eStage));
     } else {
+        WriteTaskPromptSnapshot(a_pTask, sPrompt);   // 2026-11-07 O5
         m_pRunner->StartStage(a_pTask->ProjectDir(), sPrompt, sTools,
                               MaxTurnsFor(a_pTask, a_stDef.eStage));
     }
@@ -1622,6 +1627,25 @@ void CTaskOrchestrator::ProceedToNext(CTaskInfo* a_pTask, const QString& a_sResu
     if (IsReviewStage(eCur)) {
         const EReviewDecision eDec = ParseReviewDecision(a_pTask, eCur, a_sResult);
         if (eDec == EReviewDecision::Reject) {
+            // 2026-11-07 改进计划 §1A（任务链侧）：Test 阶段驳回若系环境故障（全部
+            //   未过项归因于 shell/WSL/网络——回退重开发修不了环境，只会无限回炉：
+            //   DataRepeater 51 次 WSL 故障反复回炉的根因）→ 暂停任务交用户修环境，
+            //   不回退不迭代。文本分类（保守）：报告环境特征且无缺陷特征才拦。
+            if (eCur == EStage::Test
+                && ClassifyVerifyFailure(a_sResult + QStringLiteral("\n")
+                                         + m_sLastAssistantText,
+                                         /*a_bEnvEvidence=*/false)
+                       == EVerifyFailKind::EnvBlocked) {
+                a_pTask->SetStatus(ETaskStatus::Paused);
+                StageEvent(a_pTask, QStringLiteral("test_env_blocked"),
+                    QStringLiteral("⛔ %1 驳回系环境故障（shell/网络/WSL 不可用），"
+                                   "已暂停而不回炉（回炉无法修复环境）。请先修复环境"
+                                   "（安装 Git for Windows 或 WSL 发行版/检查网络），"
+                                   "修复后「继续」任务即可从 %1 重跑")
+                        .arg(StageNameZh(eCur)));
+                emit sigTaskChanged(a_pTask);
+                return;   // 口径同升级暂停（Paused 不发 sigTaskFinished——任务未终死，修复后可「继续」）
+            }
             // 2026.08.15 (流程档位) 回炉目标不在生效流内 → 退到评审阶段的前一个流内阶段
             EStage eBack = CStageMachine::RejectTarget(eCur, a_pTask->Type());
             const QList<EStage> aFlow = TaskFlow(a_pTask);
@@ -2312,6 +2336,89 @@ bool CTaskOrchestrator::AutoNameAsstNow(QString a_sAsstId, QString a_sPrompts) {
     return true;
 }
 
+bool CTaskOrchestrator::SummarizeAsstReportNow(QString a_sAsstId, QString a_sMaterial) {
+    // 2026-11-04 助手分析报告（右键「查看分析报告」）：面板组装的完整对话日志素材交
+    //   Agent 总结 Markdown 报告。口径镜像 AutoNameAsstNow：借用目标助手自己的会话
+    //   （fork 一次性只读分支，不动撤销栈）；其忙则借用任一空闲会话；全忙则 3s 周期
+    //   排队重试至空闲。报告轮输出全部静默（OnAdhocAssistantText/OnAdhocToolUse 的
+    //   AsstReport 分支：不上屏不入回灌，防报告内容污染对话流与指纹）；收尾在
+    //   OnAdhocFinished 的 AsstReport 分支发 sigAsstReportDone → 主窗口落盘 + 面板回填。
+    //   值传参数（同 172129 崩溃教训）：链上同步槽可重排/销毁助手数组，链内再读
+    //   引用即悬垂。
+    if (a_sAsstId.isEmpty() || a_sMaterial.trimmed().isEmpty()) {
+        return false;
+    }
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        return false;   // 工程未开（会话/运行时依赖工程）
+    }
+    auto fnBusy = [](SAdhocSession* a_pS) {
+        return a_pS->pRunner != nullptr
+            && (a_pS->pRunner->IsRunning() || a_pS->pRunner->IsGraceActive()
+                || a_pS->pRunner->IsRetryPending());
+    };
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    if (pS == nullptr) {
+        // 目标会话尚未建（新建助手还没发过提示词等异常态）：直接建它自己的会话。
+        pS = AdhocSess(a_sAsstId, /*a_bCreate=*/true);
+    }
+    if (fnBusy(pS)) {
+        SAdhocSession* pIdle = nullptr;
+        for (SAdhocSession* pCand : m_aAdhoc) {
+            if (pCand != pS && !fnBusy(pCand)) { pIdle = pCand; break; }
+        }
+        if (pIdle == nullptr) {
+            // 全忙：会话内排队，3s 周期重查（口径同 bAutoNameWait；不设上限）。
+            if (!pS->bReportWait) {
+                pS->bReportWait = true;
+                pS->sReportWaitMaterial = a_sMaterial;
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("report_wait"),
+                    QStringLiteral("⏳ 助手会话忙，分析报告将在其空闲后自动生成…"));
+            }
+            QTimer::singleShot(3000, this, [this, a_sAsstId]() {
+                SAdhocSession* pWait = m_aAdhoc.value(a_sAsstId, nullptr);
+                if (pWait == nullptr || !pWait->bReportWait) {
+                    return;   // 会话已删（助手删除/切工程）或等待已被取消
+                }
+                if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+                    pWait->bReportWait = false;
+                    pWait->sReportWaitMaterial.clear();
+                    return;
+                }
+                SummarizeAsstReportNow(a_sAsstId, pWait->sReportWaitMaterial);
+            });
+            return true;   // 已受理（延迟到空闲执行）
+        }
+        pS = pIdle;
+    }
+    const QString sPrompt = QStringLiteral(
+        "【分析报告】下面是某个 AI 助手与用户之间的完整对话日志（时间升序，"
+        "个别长条目已截断）。请通读后为该助手撰写一份 Markdown 格式的分析报告。\n\n"
+        "对话日志：\n---\n%1\n---\n\n"
+        "输出要求：\n"
+        "1. 报告开头必须是「## 综述」小节：用 3~6 句话概括该助手的用途、用户的核心"
+        "目标、对话的总体进展与当前状态；\n"
+        "2. 综述之后按内容组织若干小节（如：主要话题与结论 / 已完成的工作 / 关键决定"
+        "与方案 / 遇到的问题与处理 / 待办事项与建议），小节标题自拟，用二级标题；\n"
+        "3. 只依据日志内容总结，不要读取任何文件或目录，不要编造日志中不存在的信息；\n"
+        "4. 只输出纯 Markdown 正文（从「## 综述」开始），不要开场白、结尾语或代码围栏。")
+        .arg(a_sMaterial);
+    // 报告轮实际启动前清目标会话的忙等待位（含借会话执行的场景）。
+    if (SAdhocSession* pTgt = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        pTgt->bReportWait = false;
+        pTgt->sReportWaitMaterial.clear();
+    }
+    pS->sReportTargetAsst = a_sAsstId;
+    pS->sReportStream.clear();
+    pS->iPerm = PermReadOnly;    // 纯总结：禁 Bash/Edit/Write
+    pS->sPendingPrompt.clear();
+    pS->eMode = AsstReport;
+    // 进行中提示直投被报告的助手流（执行可能在借用的其他助手会话上）。
+    emit sigAdhocEvent(a_sAsstId, QStringLiteral("report_generating"),
+        QStringLiteral("⚙ 正在后台总结对话日志生成分析报告…"));
+    StartAdhocStage(*pS, sPrompt, /*a_bDropLastUser=*/false, /*a_iTurnsOverride=*/2);
+    return true;
+}
+
 void CTaskOrchestrator::RefinePromptAsstNow(const QString& a_sAsstId, const QString& a_sText,
                                             int a_iLimitTok, int a_iPerm) {
     // 2026-10-08 提示词超限提炼（用户需求：提示词不超上下文占比/token 上限）：面板发送
@@ -2900,6 +3007,24 @@ void CTaskOrchestrator::StartAdhocStage(SAdhocSession& a_S, const QString& a_sPr
     if (!sHistory.isEmpty()) {
         sFinalPrompt = sHistory + QStringLiteral("\n\n") + a_sPrompt;
     }
+    // 2026-11-07 O1/O4 稳定约束分流：记录/权限/任务记忆约束在 Submitting 轮
+    //   （用户工作轮＝普通轮＋深链执行/修复轮＋纠偏续跑）统一注入；claude 后端经
+    //   runner 系统层通道（--append-system-prompt，每轮显式设/清、无跨轮残留），
+    //   其余后端追加 user prompt 尾部（原语义）。命名/提炼/压缩/报告等一次性
+    //   分支轮不注入（与旧实现口径一致）。
+    QString sConstraints;
+    if (a_S.eMode == Submitting) {
+        sConstraints = BuildTurnConstraints(a_S);
+    }
+    const bool bSysChannel =
+        (a_S.pRunner->BackendName() == QStringLiteral("claude"));
+    a_S.pRunner->SetOrchSystemAppend(bSysChannel ? sConstraints : QString());
+    if (!bSysChannel && !sConstraints.isEmpty()) {
+        sFinalPrompt += QStringLiteral("\n\n---\n") + sConstraints;
+    }
+    // 2026-11-07 O5 最终 prompt 落盘可观测 + 构成事件行。
+    WriteAdhocPromptSnapshot(a_S, sFinalPrompt, sConstraints, bSysChannel,
+                             sHistory.size());
     // 2026.09.23 v3.0.219 轮次预算：SubmitAdhoc 按提示词难度评估（iTurnsBudget），
     //   内部链路（命名/续跑等未评估路径）回退全局基值。
     // 2026-10-09 运行态广播必须先于 StartStage（另机实测卡死修复）：五后端的
@@ -3287,69 +3412,13 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             }
         }
     }
-    // 需求4：非只读会话强制 agent 自治写 record.md——实际修改源码后必须追加一行，
-    //   作为 guide.md 增量同步的触发信号与输入（sTools 已放行 Write/Edit）。
-    //   2026.09.07 v2.1.124 防带偏补句（实测：回灌历史里出现过追加 record.md 的操作 +
-    //   本规则的具体步骤描述，模型把「追加记录」本身当任务执行、无视真实提问）：
-    //   明示本规则是条件性约束不是任务。
-    if (a_iPerm != PermReadOnly) {
-        sPrompt.append(QStringLiteral(
-            "\n\n---\n【以下为附加工程约定（背景约束、不是任务——仅在满足各自条件时遵守，"
-            "不要主动执行，更不要以确认语代替处理上面的用户请求）】\n【强制记录规则】如果你在本次回答中实际修改了工程源码文件，结束前必须向 "
-            "`.autodev/record.md` **追加**恰好一行，格式："
-            "`[yyyy-MM-dd HH:mm] 助手 | <简述改了哪些文件/做了什么>`（时间用 `date` 命令取当前时刻）。"
-            "必须用 Edit 工具在文件末尾追加（先 Read 再 Edit 末尾行），**严禁用 Write 覆盖整个 record.md**。"
-            "纯查询/只读操作不要写。此记录是项目指南（guide.md）自动同步的依据。"
-            "**本规则是条件性约束、不是本轮任务：仅当你本轮确实改动了源码才适用；"
-            "绝不要把「追加记录」本身当作要执行的工作，也不要因历史对话中出现过该操作"
-            "而主动执行。**"));
-    }
-    // 2026-09-11 权限三态指令（下拉框替代原只读勾选）：手工审批/只读轮在提示词层
-    //   注入对应强制约束（自动审批不注入任何额外文字，保持零干扰）——手工审批是
-    //   唯一的软约束层（deny 名单无法表达「先问再做」）；只读指令同时补齐
-    //   dsh/codex/hermes 后端（它们忽略 deny 名单，只认提示词）。
-    if (a_iPerm == PermManual) {
-        sPrompt.append(QStringLiteral(
-            "\n\n---\n【手工审批模式（本轮强制）】你在执行任何会改动工程文件或系统状态的操作"
-            "（Edit/Write、创建/删除/重命名文件、非只读的 Bash 命令等）之前，必须先征得用户"
-            "明确同意，二选一：\n"
-            "① 有 ask_user 工具（Claude Code 后端）→ 直接调用它向用户提问确认；\n"
-            "② 其他后端 → 运行以下命令弹出确认对话框（会弹出窗口，用户作答回写到 stdout，"
-            "退出码 0=已答复 / 2=取消 / 3=超时）：\n"
-            "   bash:  \"$AUTOCODE_ASK_EXE\" --ask 600 \"你要确认的问题\"\n"
-            "   cmd:   %AUTOCODE_ASK_EXE% --ask 600 \"你要确认的问题\"\n"
-            "答复内容表示拒绝、或退出码非 0 时不得执行，并按用户意见调整方案；"
-            "未经同意严禁先执行后汇报；纯查询/只读操作无需审批。"));
-    } else if (a_iPerm == PermReadOnly) {
-        sPrompt.append(QStringLiteral(
-            "\n\n---\n【只读模式（本轮强制）】仅允许查询类操作（Read/Grep/Glob 等）与纯分析，"
-            "禁止修改、创建、删除任何文件，禁止执行任何有改动的命令；直接输出分析结论与建议，"
-            "不要尝试调用写入类工具。"));
-    }
-    // 2026.09.09 v2.1.134 任务信息瘦身（用户需求：选中任务也只提示、不注入全文——
-    //   长记忆+长规则夹在提示词里会稀释用户请求的权重、带偏模型）：仅一行可选指引，
-    //   是否 Read 取用由助手自行决定（与 guide.md 变更重投的“按需自取”同口径）；
-    //   非只读轮把经验沉淀闭环压进同一行（条件性一句：改了源码才追加，纯查询不写）。
-    //   memory.md 读写链路不变（读=助手按需自取，写=末尾追加一行）。
-    if (!a_sTaskId.isEmpty() && m_pPm != nullptr) {
-        const bool bHasMemory = QFile::exists(m_pPm->TaskMemoryFile(a_sTaskId));
-        if (bHasMemory || a_iPerm != PermReadOnly) {   // 只读轮且无记忆文件：连指引也不加，零干扰
-            QString sTaskHint = QStringLiteral(
-                "\n\n（可选）当前选中任务 id=%1，任务经验文件为 `.autodev/tasks/%1/memory.md`")
-                .arg(a_sTaskId);
-            if (bHasMemory) {
-                sTaskHint += QStringLiteral("，如对你有帮助可先 Read 再动手");
-            }
-            if (a_iPerm != PermReadOnly) {
-                sTaskHint += QStringLiteral(
-                    "；若本轮实际修改了源码或有新发现，结束前向该文件末尾追加一行"
-                    " `- [助手] <一条经验>`（先 Read 再 Edit，文件不存在可首次 Write 创建，"
-                    "勿整文件覆盖，纯查询不写）");
-            }
-            sTaskHint += QStringLiteral("。");
-            sPrompt.append(sTaskHint);
-        }
-    }
+    // 2026-11-07 O1/O4（《提示词注入链路分析》§4）：原【强制记录规则】/【权限三态
+    //   指令】/【任务记忆指引】三块尾部约束自此不再拼进 sPrompt——三块语义重复
+    //   （各自独立定界+反带偏声明）已合并瘦身为单个【本轮附加约束】块，并按后端
+    //   分流：claude 走 --append-system-prompt 系统层（不再挤占 user prompt），
+    //   其余后端仍注入 user prompt 尾部；组装与分流统一收敛到 StartAdhocStage
+    //   （覆盖普通轮/深链执行·修复轮/纠偏续跑，条件口径与旧三块逐条一致——
+    //   见 BuildTurnConstraints）。
     // —— 统一备份（方案 §6.1/§6.3）：非只读轮（自动/手工审批均可能改动）投递前快照 + 回退告知注入 ——
     if (a_iPerm != PermReadOnly) {
         const QString sOwner = a_sTaskId.isEmpty() ? QStringLiteral("global") : a_sTaskId;
@@ -3395,6 +3464,22 @@ void CTaskOrchestrator::SubmitAdhoc(const QString& a_sAsstId, const QString& a_s
             pS->sDeepPlan.clear();
             pS->sDeepFailSummary.clear();
             pS->sDeepExecPrompt = sPrompt;
+            // 2026-11-07 改进计划 §1：回炉与环境故障解耦——链起点两件事：
+            //   ①工作区指纹基准清空（无进展检测比对的是【相邻两次回炉决策点】间
+            //     的指纹：首个 FAIL 必给修复轮机会，第二个 FAIL 起比对——修复轮
+            //     零变更才终止，不误杀正常链）；②执行通道探针（异步，结论回写
+            //     会话：坏 → 验证轮注入“跳过运行类验证” + 失败按 EnvBlocked 路由
+            //     不回炉；先用既有缓存结论亮结论，探针在途时验证轮还没到，来得及）。
+            pS->iDeepEnvHits = 0;
+            pS->bDeepExecBlocked = false;
+            pS->sDeepExecBlockDetail.clear();
+            pS->sDeepLastFp.clear();
+            const auto stProbe = CAgentRunnerBase::ExecChannelCached();
+            if (stProbe.bKnown && !stProbe.bOk) {
+                pS->bDeepExecBlocked = true;
+                pS->sDeepExecBlockDetail = stProbe.sDetail;
+            }
+            KickExecProbe(a_sAsstId, /*a_bForce=*/false);
             StartDeepPlan(*pS);
             return;
         }
@@ -3485,11 +3570,29 @@ void CTaskOrchestrator::StopAdhoc(const QString& a_sAsstId) {
         pS->pRunner->Stop();
     }
     if (pS != nullptr) {
+        // 2026-11-04 报告轮停止收尾：Runner::Stop 全静默（不发 sigFinished），
+        //   OnAdhocFinished 的 AsstReport 分支不会再跑——这里同步补发失败信号，
+        //   防主窗口状态栏秒表与报告页「生成中」横幅悬挂。执行中（eMode=AsstReport）
+        //   与排队等待（bReportWait，恒在目标会话上）两种情况都发；借用其他会话
+        //   执行的报告不受本会话停止影响，不在此列。
+        QString sReportStopped;
+        if (pS->eMode == AsstReport && !pS->sReportTargetAsst.isEmpty()) {
+            sReportStopped = pS->sReportTargetAsst;
+        } else if (pS->bReportWait) {
+            sReportStopped = a_sAsstId;
+        }
         pS->eMode = Idle;
         pS->sPendingPrompt.clear();
         pS->bDeepActive = false;   // 2026.09.26 深度链中断：停止后不再回炉/重启
         pS->bAutoNameWait = false;   // 2026-10-03 停止取消排队的自动命名（用户主动停后不再冒命名轮）
         pS->sAutoNameWaitPrompts.clear();
+        pS->bReportWait = false;   // 2026-11-04 同口径：取消排队的分析报告轮
+        pS->sReportWaitMaterial.clear();
+        pS->sReportStream.clear();
+        if (!sReportStopped.isEmpty()) {
+            emit sigAsstReportDone(sReportStopped, false,
+                QStringLiteral("报告生成已被用户停止"));
+        }
     }
     emit sigAdhocFinished(a_sAsstId);
 }
@@ -3696,6 +3799,14 @@ void CTaskOrchestrator::OnAdhocInfo(const QString& a_sAsstId, const QString& a_s
 void CTaskOrchestrator::OnAdhocAssistantText(const QString& a_sAsstId, const QString& a_sText) {
     bool bDeepMuted = false;
     if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
+        // 2026-11-04 报告轮输出全静默（AsstReport）：报告正文累积在 sReportStream 供
+        //   收尾兑底，不上屏（防长报告刷屏对话流）、不入回灌（fork 一次性分支文本
+        //   入回灌历史会带偏下一轮）、不记 sLastAsstText（非用户轮终答）。报告内容
+        //   只经 sigAsstReportDone → 主窗口落盘 + 报告页回填。
+        if (pS->eMode == AsstReport) {
+            pS->sReportStream += a_sText;
+            return;
+        }
         // 2026.10.02 深链规划轮输出压缩上屏（用户需求：验证日志别刷屏、结论一眼
         //   可见）：≤360 字原样，超长保首 300 字+折叠尾注；不记 sLastAsstText
         //   （纠偏判据只认执行轮终答）；不记 aTranscript（fork 一次性分支文本入
@@ -3764,44 +3875,282 @@ QString CTaskOrchestrator::BuildAdhocHistoryBlock(const SAdhocSession& a_S,
         return QString();
     }
     // 2026.09.07 v2.1.124 回灌结构防带偏（实测 .claude 工程：用户问「你现在用的是什么
-    //   模型？」，历史里上一轮的 record.md 追加叙述 + 尾部【强制记录规则】的具体操作
-    //   步骤让模型把「追加记录」当成现行任务执行、完全无视提问）：①前置声明强调历史仅
-    //   背景、已完成任务不重复执行；②历史后用【最新指令】明确本轮作答对象，把短提问从
-    //   噪音里拉出来。实际 prompt = 本块 + "\n\n" + 用户 prompt（含规则尾部）。
+    //   模型？」，历史里上一轮的 record.md 追加叙述 + 尾部规则的具体操作步骤让模型把
+    //   「追加记录」当成现行任务执行、完全无视提问）：①前置声明强调历史仅背景、已
+    //   完成任务不重复执行；②历史后用【最新指令】明确本轮作答对象。实际 prompt =
+    //   本块 + "\n\n" + 用户 prompt（含约束尾部）。
+    // 2026-11-07 O3 回灌分级压缩（《提示词注入链路分析》§4）：DSH/Codex/Hermes 每轮
+    //   全额回灌计费，早轮全文对当轮决策价值极低——近 3 轮保留原文，更早轮压缩为
+    //   「用户问句 + 助手结论」两行摘要（确定性截断、零 LLM），回灌体积预计砍 50%+；
+    //   跨轮指代（「按刚才第三条改」类）由近 3 轮全文覆盖。压缩后仍超预算按整轮丢
+    //   最旧（O2 渲染侧兜底；正常路径缓冲已在 AppendAdhocTranscriptLine 侧整轮裁剪）。
+    aLines = CompressTranscriptRounds(aLines, /*a_iKeepFull=*/3, /*a_iUserClip=*/120,
+                                      /*a_iAsstClip=*/200);
+    TrimTranscriptRounds(aLines, 24000);
     return QStringLiteral(
         "【历史对话回灌】当前后端每轮为独立会话，无法原生延续此前的对话上下文。"
-        "以下是你（助手）与本用户最近的真实对话记录（时间升序，个别长条目已截断），"
-        "请将其视为你亲历的连续对话。**历史仅作背景参考：其中已执行完毕的任务/操作一律"
-        "不要重复执行**。\n---\n%1\n---\n【最新指令】下面才是本轮要处理的用户提问，"
-        "请直接围绕它作答；除非提问本身要求延续历史事项，否则不要执行历史中出现过的"
-        "任何操作。")
+        "以下是你（助手）与本用户最近的真实对话记录（时间升序；较早轮次已压缩为摘要行，"
+        "最近几轮保留原文，个别长条目已截断），请将其视为你亲历的连续对话。"
+        "**历史仅作背景参考：其中已执行完毕的任务/操作一律不要重复执行**。\n---\n%1\n---\n"
+        "【最新指令】下面才是本轮要处理的用户提问，请直接围绕它作答；除非提问本身"
+        "要求延续历史事项，否则不要执行历史中出现过的任何操作。")
         .arg(aLines.join(QLatin1Char('\n')));
 }
 
-void CTaskOrchestrator::AppendAdhocTranscriptLine(SAdhocSession& a_S, const QString& a_sLine) {
-    // 预算：总字符 cap 24000（约 6~8k token），超额自头部丢最旧；单行截断在
-    //   追加前已完成（面板/调用点各自 1500/4000 字口径）。
-    constexpr int k_iMaxTotalChars = 24000;
-    a_S.aTranscript.append(a_sLine);
-    int iTotal = 0;
-    for (const QString& sLine : a_S.aTranscript) {
+QStringList CTaskOrchestrator::CompressTranscriptRounds(const QStringList& a_aLines,
+                                                        int a_iKeepFull, int a_iUserClip,
+                                                        int a_iAsstClip) {
+    // 2026-11-07 O3（public static 供测试）：轮边界=行首「用户：」；首轮之前散落的
+    //   「助手：」行并入首段。早轮摘要=用户问句（截 a_iUserClip）+ 该轮最后一条助手
+    //   行（终答，截 a_iAsstClip）；a_iKeepFull<=0 时全部压缩、行数不足时全保留。
+    QList<QStringList> aRounds;
+    for (const QString& sLine : a_aLines) {
+        if (sLine.startsWith(QStringLiteral("用户：")) || aRounds.isEmpty()) {
+            aRounds.append(QStringList{sLine});
+        } else {
+            aRounds.last().append(sLine);
+        }
+    }
+    const int iTotal = aRounds.size();
+    const int iFirstFull = qMax(0, iTotal - qMax(0, a_iKeepFull));
+    auto fnClip = [](const QString& a_sBody, int a_iMax) {
+        if (a_iMax <= 0 || a_sBody.size() <= a_iMax) {
+            return a_sBody;
+        }
+        return a_sBody.left(a_iMax) + QStringLiteral(" …");
+    };
+    QStringList aOut;
+    for (int i = 0; i < iTotal; ++i) {
+        const QStringList& aRound = aRounds.at(i);
+        if (i >= iFirstFull) {
+            aOut += aRound;
+            continue;
+        }
+        QString sUser, sAsst;
+        for (const QString& sLine : aRound) {
+            if (sLine.startsWith(QStringLiteral("用户："))) {
+                sUser = sLine;
+            } else if (!sLine.trimmed().isEmpty()) {
+                sAsst = sLine;   // 保留最后一条（终答在末尾）
+            }
+        }
+        if (!sUser.isEmpty()) {
+            aOut.append(QStringLiteral("用户：") + fnClip(sUser.mid(3), a_iUserClip));
+        }
+        if (!sAsst.isEmpty()) {
+            aOut.append(QStringLiteral("助手（早前轮摘要）：")
+                        + fnClip(sAsst.mid(3), a_iAsstClip));
+        }
+    }
+    return aOut;
+}
+
+void CTaskOrchestrator::TrimTranscriptRounds(QStringList& a_aLines, int a_iMaxChars) {
+    // 2026-11-07 O2（public static 供测试）：总字符超限时**整轮粒度**自头部丢最旧
+    //   （一次删到下一个「用户：」行首）——逐行丢弃会让头部（稳定前缀）每轮都变一次、
+    //   prompt cache 前缀持续打穿；整轮丢则前缀在多轮间保持不变，缓存命中窗口显著
+    //   拉长。再删即清空时保留最后一轮（超限容忍，同旧「至少留 1 行」守卫语义）。
+    qint64 iTotal = 0;
+    for (const QString& sLine : a_aLines) {
         iTotal += sLine.size();
     }
-    while (a_S.aTranscript.size() > 1 && iTotal > k_iMaxTotalChars) {
-        iTotal -= a_S.aTranscript.first().size();
-        a_S.aTranscript.removeFirst();
+    while (a_aLines.size() > 1 && iTotal > a_iMaxChars) {
+        int iDrop = 1;
+        while (iDrop < a_aLines.size()
+               && !a_aLines.at(iDrop).startsWith(QStringLiteral("用户："))) {
+            ++iDrop;   // 连同该轮的助手行整轮删除
+        }
+        if (iDrop >= a_aLines.size()) {
+            break;
+        }
+        for (int i = 0; i < iDrop; ++i) {
+            iTotal -= a_aLines.first().size();
+            a_aLines.removeFirst();
+        }
     }
+}
+
+void CTaskOrchestrator::AppendAdhocTranscriptLine(SAdhocSession& a_S, const QString& a_sLine) {
+    // 预算：总字符 cap 24000（约 6~8k token）；单行截断在追加前已完成（面板/调用点
+    //   各自 1500/4000 字口径）。超额丢弃走 TrimTranscriptRounds（O2 整轮粒度）。
+    constexpr int k_iMaxTotalChars = 24000;
+    a_S.aTranscript.append(a_sLine);
+    TrimTranscriptRounds(a_S.aTranscript, k_iMaxTotalChars);
+}
+
+QString CTaskOrchestrator::BuildTurnConstraints(const SAdhocSession& a_S) const {
+    // 2026-11-07 O1/O4（《提示词注入链路分析》§4）：原【强制记录规则】/【权限三态
+    //   指令】/【任务记忆指引】三块各带独立定界与反带偏声明（语义重复）合并为单个
+    //   【本轮附加约束】块——一条总声明 + 短规则，字数约省 40%（规则越少越硬，弱
+    //   模型遵从度更好）。条件口径与旧三块逐条一致：只读轮不注记录；只读轮且无记忆
+    //   文件连指引也不加；自动审批零权限文字。claude 后端由 StartAdhocStage 分流进
+    //   --append-system-prompt（系统层，见 CAgentRunnerBase::SetOrchSystemAppend），
+    //   其余后端注入 user prompt 尾部。
+    QStringList aRules;
+    if (a_S.iPerm != PermReadOnly) {
+        aRules << QStringLiteral(
+            "【记录】若本轮实际修改了工程源码，结束前用 Edit 向 `.autodev/record.md` 末尾"
+            "追加恰好一行 `[yyyy-MM-dd HH:mm] 助手 | <简述改了哪些文件/做了什么>`"
+            "（时间用 `date` 命令取当前时刻；先 Read 再 Edit 末尾行，严禁用 Write 覆盖"
+            "整个 record.md；纯查询/只读不写。此记录是 guide.md 自动同步的依据）");
+    }
+    if (!a_S.sLastTaskId.isEmpty() && m_pPm != nullptr) {
+        const bool bHasMemory = QFile::exists(m_pPm->TaskMemoryFile(a_S.sLastTaskId));
+        if (bHasMemory || a_S.iPerm != PermReadOnly) {
+            QString sMem = QStringLiteral(
+                "【任务记忆】（可选）当前选中任务 id=%1，任务经验文件为 "
+                "`.autodev/tasks/%1/memory.md`").arg(a_S.sLastTaskId);
+            if (bHasMemory) {
+                sMem += QStringLiteral("，如对你有帮助可先 Read 再动手");
+            }
+            if (a_S.iPerm != PermReadOnly) {
+                sMem += QStringLiteral(
+                    "；若本轮实际修改了源码或有新发现，结束前向该文件末尾追加一行 "
+                    "`- [助手] <一条经验>`（先 Read 再 Edit，文件不存在可首次 Write "
+                    "创建，勿整文件覆盖，纯查询不写）");
+            }
+            aRules << sMem + QStringLiteral("。");
+        }
+    }
+    if (a_S.iPerm == PermManual) {
+        aRules << QStringLiteral(
+            "【手工审批】执行任何会改动工程文件或系统状态的操作（Edit/Write、创建/删除/"
+            "重命名文件、非只读的 Bash 命令等）之前，必须先征得用户明确同意，二选一："
+            "① 有 ask_user 工具（Claude Code 后端）→ 直接调用它向用户提问确认；"
+            "② 其他后端 → 运行以下命令弹出确认对话框（用户作答回写 stdout，退出码 "
+            "0=已答复 / 2=取消 / 3=超时）：bash: \"$AUTOCODE_ASK_EXE\" --ask 600 "
+            "\"你要确认的问题\" / cmd: %AUTOCODE_ASK_EXE% --ask 600 "
+            "\"你要确认的问题\"。答复内容表示拒绝、或退出码非 0 时不得执行并按用户"
+            "意见调整方案；未经同意严禁先执行后汇报；纯查询/只读操作无需审批");
+    } else if (a_S.iPerm == PermReadOnly) {
+        aRules << QStringLiteral(
+            "【只读】本轮仅允许查询类操作（Read/Grep/Glob 等）与纯分析：禁止修改、创建、"
+            "删除任何文件，禁止执行任何有改动的命令；直接输出分析结论与建议，"
+            "不要尝试调用写入类工具");
+    }
+    if (aRules.isEmpty()) {
+        return QString();
+    }
+    QStringList aNum;
+    for (int i = 0; i < aRules.size(); ++i) {
+        aNum << QStringLiteral("%1. %2").arg(i + 1).arg(aRules.at(i));
+    }
+    return QStringLiteral(
+        "【本轮附加约束（背景规则、不是任务——仅在满足各自条件时遵守，不要主动执行，"
+        "更不要以确认语代替处理用户请求；绝不要把其中任何一项当作本轮要做的工作，"
+        "也不要因历史对话中出现过相关操作而主动执行）】\n%1")
+        .arg(aNum.join(QLatin1Char('\n')));
+}
+
+void CTaskOrchestrator::WriteAdhocPromptSnapshot(SAdhocSession& a_S, const QString& a_sFinal,
+                                                 const QString& a_sConstraints,
+                                                 bool a_bSysChannel, int a_iHistoryChars) {
+    // 2026-11-07 O5 最终 prompt 落盘可观测：run.log 只记事件行，组装后的最终 prompt
+    //   此前不落任何盘——「模型行为怪异/带偏/应付」类问题无法复盘当轮到底注了什么。
+    //   文件按助手分档（选中任务→任务目录，否则工程 .autodev 根）单文件覆盖写；claude
+    //   的系统层约束不在 user prompt 内，追加到文件尾并加标记。写失败静默（纯诊断
+    //   辅助不阻断主流程）。prompt_map 事件行给出各块字符数与落盘文件名。
+    if (m_pPm == nullptr || m_pPm->ProjectDir().isEmpty()) {
+        return;
+    }
+    QString sDir = m_pPm->ProjectDir() + QStringLiteral("/.autodev");
+    if (!a_S.sLastTaskId.isEmpty()) {
+        const QString sTaskDir = m_pPm->TaskDir(a_S.sLastTaskId);
+        if (!sTaskDir.isEmpty()) {
+            sDir = sTaskDir;
+        }
+    }
+    const QString sPath =
+        sDir + QStringLiteral("/last_prompt_%1.txt").arg(a_S.sId.left(8));
+    QString sBody = a_sFinal;
+    if (!a_sConstraints.isEmpty() && a_bSysChannel) {
+        sBody += QStringLiteral(
+            "\n\n---\n[系统层注入（--append-system-prompt，不在上述 user prompt 内）]\n%1")
+                     .arg(a_sConstraints);
+    }
+    QFile stFile(sPath);
+    if (stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        stFile.write(sBody.toUtf8());
+        stFile.close();
+    }
+    auto fnK = [](qint64 iN) -> QString {
+        return (iN >= 1000)
+            ? QStringLiteral("%1.%2K").arg(iN / 1000).arg((iN % 1000) / 100)
+            : QString::number(iN);
+    };
+    emit sigAdhocEvent(a_S.sId, QStringLiteral("prompt_map"),
+        QStringLiteral("📦 本轮投递构成：回灌历史 %1 · 提示词正文 %2 · 稳定约束 %3（%4）"
+                       "· 合计 %5 字，已落盘 %6")
+            .arg(fnK(a_iHistoryChars),
+                 fnK(qMax<qint64>(0, a_sFinal.size() - a_iHistoryChars)),
+                 fnK(a_sConstraints.size()),
+                 a_bSysChannel ? QStringLiteral("系统层") : QStringLiteral("提示词尾"),
+                 fnK(a_sFinal.size()
+                     + (a_bSysChannel ? a_sConstraints.size() : 0)),
+                 QFileInfo(sPath).fileName()));
+}
+
+void CTaskOrchestrator::WriteTaskPromptSnapshot(CTaskInfo* a_pTask, const QString& a_sFinal) {
+    // 2026-11-07 O5 任务阶段侧：.autodev/tasks/<id>/last_prompt.txt（覆盖写）+
+    //   prompt_map 事件行（run.log 可检索）。写失败静默。
+    if (a_pTask == nullptr || m_pPm == nullptr) {
+        return;
+    }
+    const QString sDir = m_pPm->TaskDir(a_pTask->Id());
+    if (sDir.isEmpty()) {
+        return;
+    }
+    const QString sPath = sDir + QStringLiteral("/last_prompt.txt");
+    QFile stFile(sPath);
+    if (stFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        stFile.write(a_sFinal.toUtf8());
+        stFile.close();
+    }
+    StageEvent(a_pTask, QStringLiteral("prompt_map"),
+        QStringLiteral("📦 阶段投递 prompt 共 %1 字，已落盘 %2")
+            .arg(a_sFinal.size()).arg(QFileInfo(sPath).fileName()));
 }
 
 void CTaskOrchestrator::OnAdhocToolUse(const QString& a_sAsstId, const QString& a_sTool,
                                        const QString& a_sInput) {
     if (SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr)) {
         pS->bTurnSawTool = true;   // 2026.09.09 v2.1.131 纠偏判据：本轮有真实工具工作
+        // 2026-11-04 报告轮工具卡不上屏（纯总结不需要工具；提示词已声明不读文件，
+        //   防模型自主探测在对话流里刷无关工具卡）。
+        if (pS->eMode == AsstReport) {
+            return;
+        }
     }
     emit sigAdhocToolUse(a_sAsstId, a_sTool, a_sInput);
 }
 
 void CTaskOrchestrator::OnAdhocToolResult(const QString& a_sAsstId, const QString& a_sResult) {
+    // 2026-11-04 报告轮工具结果同静默（配套 OnAdhocToolUse：不回填不兑底系统行，
+    //   防报告轮在对话流里留任何痕迹）。其余路径原样外发。
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    if (pS != nullptr && pS->eMode == AsstReport) {
+        return;
+    }
+    // 2026-11-07 改进计划 §1A：验证轮环境故障证据累计——工具结果命中 WSL 存根/
+    //   spawn 失败/网络错误等特征即计数（≥2 作为分类硬证据；单次可能误伤——如
+    //   Agent 主动测断网场景，双次确认更稳）。只在验证轮计（执行轮失败会走重启
+    //   判定，不参与验证分类）。
+    if (pS != nullptr && pS->eMode == DeepVerify) {
+        static const QStringList aEnvErrMarks = {
+            QStringLiteral("wslstore"), QStringLiteral("WSL"), QStringLiteral("wsl"),
+            QStringLiteral("spawn ENOENT"), QStringLiteral("Connection error"),
+            QStringLiteral("Request timed out"), QStringLiteral("ETIMEDOUT"),
+            QStringLiteral("ECONNREFUSED"), QStringLiteral("ENOTFOUND"),
+            QStringLiteral("bash: no such file"), QStringLiteral("not a valid Win32"),
+            QStringLiteral("0xc0000135"), QStringLiteral("适用于 Linux"),
+        };
+        for (const QString& s : aEnvErrMarks) {
+            if (a_sResult.contains(s)) {
+                ++pS->iDeepEnvHits;
+                break;
+            }
+        }
+    }
     emit sigAdhocToolResult(a_sAsstId, a_sResult);
 }
 
@@ -3929,6 +4278,46 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
         sDesc = CTaskInfo::TrimNamePunct(sDesc);
         if (sDesc.size() > 80) { sDesc = sDesc.left(80).trimmed(); }
         emit sigAsstAutoNameDone(sTarget, true, sName, sDesc);
+        break;
+    }
+    case AsstReport: {
+        // 2026-11-04 助手分析报告收尾：正文优先取 a_sResult（完整终稿），空则兑底
+        //   报告轮静默累积的流式文本（sReportStream）。不动用户会话栈、不推进
+        //   pS->sSid（fork 分支一次性使用，口径同 AsstAutoNaming）。
+        const QString sTarget = pS->sReportTargetAsst;
+        pS->sReportTargetAsst.clear();
+        const QString sStreamed = pS->sReportStream;
+        pS->sReportStream.clear();
+        pS->eMode = Idle;
+        pS->sPendingPrompt.clear();
+        emit sigAdhocFinished(a_sAsstId);   // 借用的执行会话退出运行态
+        // 排队指令排空（同命名分支 2026.10.12 口径：同步链上撞进程退净窗口入队的
+        //   指令不搁浅，延迟 1.5s 等 runner 退净再投）。
+        DeferredDrainPendingInjects(*pS);
+        if (sTarget.isEmpty()) { break; }
+        QString sReport = a_sResult.trimmed();
+        if (sReport.isEmpty()) {
+            sReport = sStreamed.trimmed();
+        }
+        // 剥模型偶发整包代码围栏（```markdown … ``` / ``` … ```），只留正文。
+        if (sReport.startsWith(QStringLiteral("```"))) {
+            const int iFirstNl = sReport.indexOf(QLatin1Char('\n'));
+            if (iFirstNl > 0) {
+                QString sBody = sReport.mid(iFirstNl + 1);
+                const int iLastFence = sBody.lastIndexOf(QStringLiteral("```"));
+                if (iLastFence >= 0) {
+                    sBody = sBody.left(iLastFence);
+                }
+                sReport = sBody.trimmed();
+            }
+        }
+        if (!a_bOk || sReport.size() < 20) {
+            emit sigAsstReportDone(sTarget, false,
+                a_bOk ? QStringLiteral("Agent 未返回有效的报告内容")
+                      : a_sResult.left(200));
+            break;
+        }
+        emit sigAsstReportDone(sTarget, true, sReport);
         break;
     }
     case PromptRefining: {
@@ -4256,7 +4645,64 @@ void CTaskOrchestrator::OnAdhocFinished(const QString& a_sAsstId, bool a_bOk,
                 ? a_sResult.left(600)
                 : QStringLiteral("验证结论未按约定格式输出（无 VERIFY:PASS/FAIL 判定行）");
         }
+        // 2026-11-07 改进计划 §1A：失败分类路由——环境阻塞（全部非✅条目归因环境）
+        //   不回炉不重启（回炉修不了环境，只会重流一遍同样的失败：HarnessAgent
+        //   5 轮 2249 万 token 空转的根因）：验证报告外显（含环境阻塞清单）+
+        //   ⛔ 事件带修复指引，保留断点交用户。硬证据 = 链起点探针失败或本轮工具
+        //   结果环境故障命中 ≥2（报告格式漂移时的兑底信号）。
+        const bool bEnvEvidence = pS->bDeepExecBlocked || pS->iDeepEnvHits >= 2;
+        if (ClassifyVerifyFailure(a_sResult, bEnvEvidence) == EVerifyFailKind::EnvBlocked) {
+            QString sReport = a_sResult.trimmed();
+            if (sReport.isEmpty() && !pS->aDeepMuted.isEmpty()) {
+                sReport = pS->aDeepMuted.last();
+            }
+            if (!sReport.isEmpty()) {
+                emit sigAdhocAssistantText(a_sAsstId, sReport.left(8000));
+            }
+            pS->aDeepMuted.clear();
+            pS->sDeepExecReport.clear();
+            const QString sBlockWhy = pS->bDeepExecBlocked
+                ? pS->sDeepExecBlockDetail
+                : (pS->iDeepEnvHits >= 2
+                    ? QStringLiteral("验证轮连续 %1 次工具执行环境故障"
+                                     "（shell/网络/WSL）").arg(pS->iDeepEnvHits)
+                    : QStringLiteral("验证报告全部未过项均归因于环境故障"));
+            emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_env_blocked"),
+                QStringLiteral("⛔ 验证被环境故障阻塞（%1）——已停止自动回炉"
+                               "（回炉无法修复环境）。请先修复环境（安装 Git for "
+                               "Windows 或 WSL 发行版/检查网络），然后右键助手 Tab"
+                               "「重新探测执行通道」，再发送「继续修复与验证」。"
+                               "会话与改动已保留").arg(sBlockWhy.left(200)));
+            FinishAdhocFailure(*pS);
+            return;
+        }
         if (pS->iDeepRetry < MaxIter()) {
+            // 2026-11-07 改进计划 §1C：回炉无进展检测——本次验证失败时的工作区指纹
+            //   与上一次回炉决策点完全一致 = 上一轮修复零代码变更（环境阻塞了修复/
+            //   需求死结），再回炉只会重流一遍 → 终止链，报告交用户；指纹不可用
+            //   （空）时保守放行回炉（检测宁可漏报勿误杀）。
+            const QString sFpNow = DeepWorkspaceFingerprint(
+                m_pPm ? m_pPm->ProjectDir() : QString());
+            if (!sFpNow.isEmpty() && !pS->sDeepLastFp.isEmpty()
+                    && sFpNow == pS->sDeepLastFp) {
+                QString sReport2 = a_sResult.trimmed();
+                if (sReport2.isEmpty() && !pS->aDeepMuted.isEmpty()) {
+                    sReport2 = pS->aDeepMuted.last();
+                }
+                if (!sReport2.isEmpty()) {
+                    emit sigAdhocAssistantText(a_sAsstId, sReport2.left(8000));
+                }
+                pS->aDeepMuted.clear();   // 报告已外显（含验证轮终答），不重复兑底
+                emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_noprogress"),
+                    QStringLiteral("⛔ 回炉无进展：上轮修复后工程文件零变更"
+                                   "（疑似环境/需求死结），已终止自动回炉。"
+                                   "会话与改动已保留，可人工检查后发送修复指令"));
+                FinishAdhocFailure(*pS);
+                return;
+            }
+            if (!sFpNow.isEmpty()) {
+                pS->sDeepLastFp = sFpNow;
+            }
             ++pS->iDeepRetry;
             emit sigAdhocEvent(a_sAsstId, QStringLiteral("deep_retry"),
                 QStringLiteral("⚠ 验证未通过，自动回炉修复（第 %1/%2 次）：%3")
@@ -4301,6 +4747,63 @@ void CTaskOrchestrator::SetAdhocDeepOverride(int a_iMode) {
 // 成本可控）。
 static constexpr int k_iDeepAuxTurns = 40;
 
+// —— 2026-11-07 改进计划 §1B：执行通道探针（异步调度 + UI 回调 + 面板重探入口）——
+void CTaskOrchestrator::KickExecProbe(const QString& a_sAsstId, bool a_bForce) {
+    // 同助手在飞不重叠（探针≤ 8s：正常 <300ms；重复触发只更新缓存结论归首个）。
+    if (m_aProbeInFlight.contains(a_sAsstId)) {
+        return;
+    }
+    m_aProbeInFlight.insert(a_sAsstId);
+    QPointer<CTaskOrchestrator> pGuard(this);
+    std::thread thProbe([pGuard, a_sAsstId, a_bForce]() {
+        const CAgentRunnerBase::SExecChannelProbe st =
+            CAgentRunnerBase::ProbeExecChannel(a_bForce);
+        const bool bOk = st.bOk;
+        const QString sDetail = st.sDetail;
+        QMetaObject::invokeMethod(pGuard,
+            [pGuard, a_sAsstId, bOk, sDetail]() {
+                if (!pGuard.isNull()) {
+                    pGuard->OnExecProbeDone(a_sAsstId, bOk, sDetail);
+                }
+            }, Qt::QueuedConnection);
+    });
+    thProbe.detach();   // 短命探测线程（≤8s），上下文对象析构后回调自动丢弃。
+}
+
+void CTaskOrchestrator::OnExecProbeDone(const QString& a_sAsstId, bool a_bOk,
+                                        const QString& a_sDetail) {
+    m_aProbeInFlight.remove(a_sAsstId);
+    SAdhocSession* pS = m_aAdhoc.value(a_sAsstId, nullptr);
+    // 记录前先留旧态：首探即好不吹噪，仅在曾有坏结论后转好时提示恢复。
+    const bool bWasBlocked = (pS != nullptr) && pS->bDeepExecBlocked;
+    if (pS != nullptr) {
+        // 会话在链（或即将进链）：记录结论——验证轮提示词据此注入“跳过运行类验证”。
+        //   结论不因链已过验证点而作度：下一轮/下一次提问的验证仍要用。
+        pS->bDeepExecBlocked = !a_bOk;
+        pS->sDeepExecBlockDetail = a_bOk ? QString() : a_sDetail;
+    }
+    if (!a_bOk) {
+        // ⛔ 横幅：面板徽章 + 修复指引（事件持久化到对话流，用户随时可回看）。
+        emit sigAdhocEvent(a_sAsstId, QStringLiteral("exec_channel_blocked"),
+            QStringLiteral("⛔ 执行通道不可用（%1）：验证类需求将跳过运行验证、"
+                           "失败不自动回炉。修复后可右键助手 Tab「重新探测执行通道」")
+                .arg(a_sDetail.left(200)));
+    } else if (bWasBlocked && pS != nullptr && pS->bDeepActive) {
+        // 链在跑且通道恢复（首探即好时不吹噪；仅在曾有坏结论后转好时提示）。
+        emit sigAdhocEvent(a_sAsstId, QStringLiteral("exec_channel_ok"),
+            QStringLiteral("✔ 执行通道已恢复（%1），验证轮可正常运行编译/测试")
+                .arg(a_sDetail));
+    }
+}
+
+void CTaskOrchestrator::RetestExecChannel(const QString& a_sAsstId) {
+    // 面板「重新探测」：强制清缓存重探 + 事件回报（含成功场景——用户修复后需
+    //   确认性的“已恢复”反馈）。
+    emit sigAdhocEvent(a_sAsstId, QStringLiteral("exec_channel_probing"),
+        QStringLiteral("⏳ 正在重新探测执行通道（bash）…"));
+    KickExecProbe(a_sAsstId, /*a_bForce=*/true);
+}
+
 void CTaskOrchestrator::StartDeepPlan(SAdhocSession& a_S) {
     // 深度链第 1 步：规划轮（fork 一次性分支，不动撤销栈/sid 基点）。只读探索，
     //   产出「目标/实施步骤/验收标准」三段计划；重启时携带历史失败教训重规划。
@@ -4339,6 +4842,7 @@ void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
     //   【需求对照】逐条对照用户请求（规划需求清单缺失时验证者自行拆解原始请求），
     //   每条一行状态+一句话依据；PASS 仅当全部 ✅，未完成/部分/未验证必须给原因。
     a_S.eMode = DeepVerify;
+    a_S.iDeepEnvHits = 0;   // 2026-11-07 §1A：环境证据计数随验证轮清零（本轮重新累计）
     emit sigAdhocEvent(a_S.sId, QStringLiteral("deep_verify"),
         QStringLiteral("🔍 专家模式：验证Agent 逐条对照需求并实际编译/测试核验…"));
     const QString sCriteria = ExtractDeepCriteria(a_S.sDeepPlan);
@@ -4351,7 +4855,8 @@ void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
     const QString sExecReport = a_S.sDeepExecReport.trimmed().isEmpty()
         ? QStringLiteral("（执行轮未产出文字报告——请以你自己核验到的工程实际状态为准）")
         : a_S.sDeepExecReport.trimmed().left(3000);
-    const QString sPrompt = QStringLiteral(
+    // 2026-11-07 §1B：非 const——探针结论为坏时尾部追加“禁止命令类验证”指令。
+    QString sPrompt = QStringLiteral(
         "【专家模式·验证轮】你是独立验证者，也是本轮面向用户的唯一发言人（执行Agent "
         "的结果不再直接展示，由你统一汇总）。执行Agent 刚完成了用户请求的改动，请核验"
         "后输出简洁、抓重点的报告（只验证、严禁修复、严禁修改任何工程文件）：\n"
@@ -4389,6 +4894,17 @@ void CTaskOrchestrator::StartDeepVerify(SAdhocSession& a_S) {
         "---\n【执行Agent实施报告】\n%4\n---\n【需求清单】\n%1\n---\n"
         "【验收标准】\n%2\n---\n【用户原始请求】\n%3")
         .arg(sReqs, sCriteria, a_S.sPendingPrompt.left(2000), sExecReport);
+    // 2026-11-07 改进计划 §1B：链起点探针结论为坏 → 验证轮直接禁止命令类验证
+    //   （探针已实测 bash 必败：再让验证 Agent 撞 N 轮 WSL/存根错误是纯烧 token），
+    //   只做静态核验，无法静态核验的条目如实标 ⭕未验证（原因写「执行通道不可用」）。
+    if (a_S.bDeepExecBlocked) {
+        sPrompt += QStringLiteral(
+            "\n---\n⛔【执行通道不可用】本机执行通道探测失败：%1\n"
+            "本轮【禁止】尝试运行任何命令/编译/测试（必失败且浪费时间）：只用 "
+            "Read/Grep/Glob 静态核验；无法静态核验的需求条目直接标 ⭕未验证"
+            "（原因写「执行通道不可用」）。最后一行判定仍按约定输出。")
+            .arg(a_S.sDeepExecBlockDetail.left(200));
+    }
     StartAdhocStage(a_S, sPrompt, /*a_bDropLastUser=*/true,
                     k_iDeepAuxTurns, QStringLiteral("Edit,Write"));
 }
@@ -4632,4 +5148,170 @@ QString CTaskOrchestrator::CompressDeepAuxText(const QString& a_sText) {
     return sT.left(300) + QStringLiteral(
         "\n\n…（过程输出较长，已折叠 %1 字；结论以下方判定行为准）").arg(sT.size());
 }
+
+// —— 2026-11-07 改进计划 §1A：验证失败分类（回炉路由依据，说明见头文件声明）——
+namespace {
+// 条目/整文级环境故障特征（保守清单：命中任一即认为该条目“归因于环境”）。
+//   逐条目分类时用；兼容英文报错（spawn ENOENT/Connection error 等跨后端原文）。
+bool LineLooksEnvBlocked(const QString& a_sLine) {
+    static const QStringList aEnvMarks = {
+        QStringLiteral("执行通道"), QStringLiteral("无法执行"),
+        QStringLiteral("环境故障"), QStringLiteral("环境阻塞"),
+        QStringLiteral("通道不可用"), QStringLiteral("命令不可用"),
+        QStringLiteral("shell"), QStringLiteral("WSL"), QStringLiteral("wsl"),
+        QStringLiteral("wslstore"), QStringLiteral("bash 不可用"),
+        QStringLiteral("spawn ENOENT"), QStringLiteral("Connection error"),
+        QStringLiteral("Request timed out"), QStringLiteral("网络"),
+        QStringLiteral("超时"),
+    };
+    for (const QString& s : aEnvMarks) {
+        if (a_sLine.contains(s)) {
+            return true;
+        }
+    }
+    // 「无法/不能/不可 + 编译/运行/启动」组合（环境阻塞常见句式；单说“无法编译”
+    //   在验证报告里几乎必是环境问题——真编译失败会写具体错误而非“无法”）。
+    static const QRegularExpression reCannotRun(
+        QStringLiteral("(无法|不能|不可|失败于)[^\n，。；]{0,8}(编译|运行|启动|执行命令|构建)"));
+    return reCannotRun.match(a_sLine).hasMatch();
+}
+// 条目级真实代码缺陷特征：环境词未覆盖且含断言/行为/编译错误类字样。
+bool LineLooksCodeDefect(const QString& a_sLine) {
+    static const QStringList aDefectMarks = {
+        QStringLiteral("断言失败"), QStringLiteral("行为不符"), QStringLiteral("结果不符"),
+        QStringLiteral("编译错误"), QStringLiteral("编译失败"), QStringLiteral("测试失败"),
+        QStringLiteral("逻辑错误"), QStringLiteral("功能异常"), QStringLiteral("崩溃"),
+        QStringLiteral("未实现"), QStringLiteral("未完成"), QStringLiteral("部分完成"),
+        QStringLiteral("不匹配"), QStringLiteral("遗漏"), QStringLiteral("缺少"),
+        QStringLiteral("错误输出"), QStringLiteral("返回值"), QStringLiteral("越界"),
+    };
+    for (const QString& s : aDefectMarks) {
+        if (a_sLine.contains(s)) {
+            return true;
+        }
+    }
+    return false;
+}
+}   // namespace
+
+CTaskOrchestrator::EVerifyFailKind CTaskOrchestrator::ClassifyVerifyFailure(
+    const QString& a_sReport, bool a_bEnvEvidence) {
+    // 纯函数。优先按【需求对照】逐条分类（验证报告固定三段式，非✅条目必带原因）：
+    //   任一条目呈代码缺陷特征 → CodeDefect（回炉有价值）；全部非✅条目均归因环境
+    //   → EnvBlocked（回炉无法修复环境，交用户）。无该段结构（格式漂移/旧链/任务流
+    //   文本）退化为整文规则：环境特征存在且无任何缺陷特征 → EnvBlocked，否则
+    //   CodeDefect（保守：分不清时宁回炉不误杀）。a_bEnvEvidence 仅在无结构退化时
+    //   作兑底信号（有结构时不偏置——报告本身比外围证据更直接）。
+    if (a_sReport.trimmed().isEmpty()) {
+        return EVerifyFailKind::CodeDefect;
+    }
+    // 提取【需求对照】段体（首行起到下一段标题/文末）。
+    static const QRegularExpression reSection(
+        QStringLiteral("(?m)^\\s*[【\\[]?\\s*需求对照\\s*[】\\]]?\\s*[：:]?\\s*$"));
+    const auto mSec = reSection.match(a_sReport);
+    if (mSec.hasMatch()) {
+        static const QRegularExpression reNextHead(
+            QStringLiteral("(?m)^\\s*[【\\[]\\s*[^\\]】]{2,8}\\s*[】\\]]"));
+        const QString sRest = a_sReport.mid(mSec.capturedEnd());
+        const auto mNext = reNextHead.match(sRest);
+        const QString sBody = (mNext.hasMatch() ? sRest.left(mNext.capturedStart()) : sRest)
+                                  .trimmed();
+        int iNonPass = 0, iEnv = 0, iDefect = 0;
+        const QStringList aLines = sBody.split(QChar::LineFeed);
+        for (const QString& sRaw : aLines) {
+            const QString sLine = sRaw.trimmed();
+            // 非通过条目：⚠️/❌/⭕（及全角变体；✅ 条目跳过）。
+            const bool bNonPass = sLine.contains(QChar(0x26A0))   // ⚠
+                || sLine.contains(QStringLiteral("\u26a0\ufe0f"))  // ⚠️
+                || sLine.contains(QChar(0x274C))                   // ❌
+                || sLine.contains(QChar(0x2B55))                   // ⭕
+                || sLine.contains(QStringLiteral("未完成"))
+                || sLine.contains(QStringLiteral("未验证"))
+                || sLine.contains(QStringLiteral("部分完成"));
+            if (!bNonPass) {
+                continue;
+            }
+            ++iNonPass;
+            if (LineLooksEnvBlocked(sLine)) {
+                ++iEnv;
+            } else if (LineLooksCodeDefect(sLine)) {
+                ++iDefect;
+            } else {
+                // 既无环境也无缺陷特征的非✅条目：保守按缺陷（回炉看真况）。
+                ++iDefect;
+            }
+        }
+        if (iNonPass > 0) {
+            return (iDefect == 0 && iEnv > 0) ? EVerifyFailKind::EnvBlocked
+                                              : EVerifyFailKind::CodeDefect;
+        }
+        // 段存在但无任何非✅条目（全部✅却判 FAIL 的格式异常）：退化整文规则。
+    }
+    // 整文退化规则：环境特征且无缺陷特征 → EnvBlocked；会话侧硬证据可单独支撑。
+    const bool bEnvWords = LineLooksEnvBlocked(a_sReport);
+    const bool bDefectWords = LineLooksCodeDefect(a_sReport);
+    if ((bEnvWords || a_bEnvEvidence) && !bDefectWords) {
+        return EVerifyFailKind::EnvBlocked;
+    }
+    return EVerifyFailKind::CodeDefect;
+}
+
+// —— 2026-11-07 改进计划 §1C：工作区指纹（回炉无进展检测，说明见头文件声明）——
+QString CTaskOrchestrator::DeepWorkspaceFingerprint(const QString& a_sRoot) {
+    if (a_sRoot.trimmed().isEmpty() || !QFileInfo::exists(a_sRoot)) {
+        return QString();
+    }
+    // 目录名黑名单：内置兑底清单（同查找功能 v5.4.492 缺省：构建产物/依赖目录，
+    //   与 config.ini [Scan] ExcludeDirs 无关——无进展检测不能因用户没配排除而失真）
+    //   ∪ 指纹扫描器当前清单（含用户覆盖）+ 隐藏目录（. 开头，与扫描器 IsExcluded
+    //   口径一致）。名字集合加速判定。
+    QSet<QString> setExcl = {
+        QStringLiteral(".autodev"), QStringLiteral(".git"), QStringLiteral(".svn"),
+        QStringLiteral(".hg"), QStringLiteral(".vs"), QStringLiteral("node_modules"),
+        QStringLiteral("build"), QStringLiteral("x64"), QStringLiteral("Execute"),
+        QStringLiteral("TestSandbox"), QStringLiteral("__pycache__"),
+        QStringLiteral("target"),
+    };
+    for (const QString& s : CGuideFingerprintScanner::ExcludedDirs()) {
+        setExcl.insert(QDir::fromNativeSeparators(s).trimmed());
+    }
+    QCryptographicHash oHash(QCryptographicHash::Md5);
+    qint64 iCount = 0;
+    std::function<void(const QString&, int)> fnScan =
+        [&](const QString& a_sDir, int a_iDepth) {
+            if (a_iDepth > 14 || iCount >= 20000) {
+                return;
+            }
+            const QFileInfoList aEnt = QDir(a_sDir).entryInfoList(
+                QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
+            for (const QFileInfo& stFi : aEnt) {
+                if (iCount >= 20000) {
+                    break;
+                }
+                const QString sName = stFi.fileName();
+                if (stFi.isDir()) {
+                    if (sName.startsWith(QLatin1Char('.')) || setExcl.contains(sName)) {
+                        continue;
+                    }
+                    fnScan(stFi.absoluteFilePath(), a_iDepth + 1);
+                } else {
+                    // 相对路径 + 大小 + mtime（与扫描器同口径：不读内容，快）。
+                    const QString sRel = QDir(a_sRoot).relativeFilePath(stFi.absoluteFilePath());
+                    oHash.addData((sRel + QLatin1Char('|')
+                                   + QString::number(stFi.size()) + QLatin1Char('|')
+                                   + QString::number(stFi.lastModified().toMSecsSinceEpoch())
+                                   + QLatin1Char('\n')).toUtf8());
+                    ++iCount;
+                }
+            }
+        };
+    fnScan(a_sRoot, 0);
+    if (iCount <= 0) {
+        return QString();
+    }
+    // 条目数一并入指纹：封顶截断时条数变化也能反映差异。
+    oHash.addData((QStringLiteral("#") + QString::number(iCount)).toUtf8());
+    return QString::fromLatin1(oHash.result().toHex());
+}
+
 

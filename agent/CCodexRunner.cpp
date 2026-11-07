@@ -925,7 +925,8 @@ void CCodexRunner::slotOnStdErr() {
     const QByteArray bufData = m_pProc->readAllStandardError();
     const QList<QByteArray> aLines = bufData.split('\n');
     for (const QByteArray& szRaw : aLines) {
-        const QString sLine = QString::fromUtf8(szRaw).trimmed();
+        // 2026-11-07 §1D：GBK 容错解码（统一基类级联，消 ??? 乱码）。
+        const QString sLine = CAgentRunnerBase::DecodeSubprocessText(szRaw).trimmed();
         if (sLine.isEmpty()) {
             continue;
         }

@@ -440,11 +440,10 @@ void CFilePreviewWidget::BuildFindUi(QVBoxLayout* a_pLay) {
     pTbLay->addWidget(m_pBtnFind);
     pTbLay->addStretch(1);
     connect(m_pBtnFind, &QToolButton::clicked, this, &CFilePreviewWidget::OnFindOpen);
-    // Ctrl+F（WidgetWithChildrenShortcut：焦点在本预览页内任一子控件时可用）。
-    //   唯一快捷键源（不在按钮上再设 setShortcut，防歧义双触发）。
-    auto* pScFind = new QShortcut(QKeySequence::Find, this);
-    pScFind->setContext(Qt::WidgetWithChildrenShortcut);
-    connect(pScFind, &QShortcut::activated, this, &CFilePreviewWidget::OnFindOpen);
+    // Ctrl+F（WidgetWithChildrenShortcut）：2026-11-07 撤本页自设快捷键，改由
+    //   CMainWindow 统一路由（焦点在预览内→本页查找栏；否则→在文件中查找对话框）
+    //   ——两个同键 QShortcut 同窗会歧义互斥，单一源最稳。按钮/代码页原生过滤器
+    //   （Scintilla 持焦时 Ctrl+F 代听→sigFindRequested）不受影响。
 
     // —— 查找栏（初始隐藏） ——
     m_pFindBar = new QWidget(this);
@@ -562,7 +561,25 @@ bool CFilePreviewWidget::IsCodeViewActive() const {
 }
 
 void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
+    // 2026-11-07 同文件免重载（HotNews 实害：查找结果连点同文件多行/资源管理器
+    //   反复单击同一文件，每次都读盘+解码+整篇重灌——大单行 JSON 实测 1.4s/次、
+    //   连点 5 次 7.5s；内容未变时定位（GotoPos/GotoLine）只依赖已显示文档，
+    //   重灌纯浪费）。外部改盘后的强制刷新走 ReloadIfShowing（替换写盘链）。
+    if (m_bShownLoaded
+            && QString::compare(QDir::cleanPath(m_sCurPath),
+                                QDir::cleanPath(a_sAbsPath),
+                                Qt::CaseInsensitive) == 0) {
+        if (m_pLblFindSt != nullptr) {
+            m_pLblFindSt->clear();
+        }
+        return;
+    }
+    LoadShowFile(a_sAbsPath);
+}
+
+void CFilePreviewWidget::LoadShowFile(const QString& a_sAbsPath) {
     m_sCurPath = a_sAbsPath;
+    m_bShownLoaded = false;   // 失败分支不置真：置真点在各成功渲染分支末
     if (m_pLblFindSt != nullptr) {
         m_pLblFindSt->clear();   // 2026.09.22 换文件清陈旧「未找到」提示
     }
@@ -574,15 +591,27 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
         m_pStack->setCurrentWidget(m_pText);
         return;
     }
-    constexpr qint64 kiMaxBytes = 4 * 1024 * 1024;
-    QByteArray aBytes = stFile.read(kiMaxBytes + 1);
-    const bool bTrunc = aBytes.size() > kiMaxBytes;
-    if (bTrunc) {
-        aBytes.truncate(kiMaxBytes);
-    }
-
     const QString sSuffix = stInfo.suffix().toLower();
     const QString sName = stInfo.fileName();
+    // 2026-11-07 源码后缀先行（读盘上限分档）：源码页上限 16MB（Scintilla 大
+    //   文档能力，与搜索引擎同口径；旧统一 4MB 截断导致超 4MB 源码无法完整
+    //   显示）；md/html/纯文本维持 4MB（QTextBrowser 渲染性能）。
+    static const QSet<QString> s_aCodeExt = {
+        QStringLiteral("c"),   QStringLiteral("cpp"), QStringLiteral("cc"),
+        QStringLiteral("cxx"), QStringLiteral("c++"), QStringLiteral("h"),
+        QStringLiteral("hh"),  QStringLiteral("hpp"), QStringLiteral("hxx"),
+        QStringLiteral("h++"), QStringLiteral("inl"), QStringLiteral("ipp"),
+        QStringLiteral("tcc"), QStringLiteral("hm"),
+    };
+    const bool bCodeSuffix = s_aCodeExt.contains(sSuffix);
+    constexpr qint64 kiMaxBytes = 4 * 1024 * 1024;
+    constexpr qint64 kiMaxCodeBytes = 16 * 1024 * 1024;
+    const qint64 kiCap = bCodeSuffix ? kiMaxCodeBytes : kiMaxBytes;
+    QByteArray aBytes = stFile.read(kiCap + 1);
+    const bool bTrunc = aBytes.size() > kiCap;
+    if (bTrunc) {
+        aBytes.truncate(kiCap);
+    }
 
     // 二进制判定：已知二进制后缀，或字节流探测（空字节比例 > 10%）
     static const QSet<QString> s_aBinExt = {
@@ -619,15 +648,19 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
 
     QString sStat = QStringLiteral("%1 · %2 字节").arg(sEnc).arg(aBytes.size());
     if (bTrunc) {
-        sStat += QStringLiteral(" · 超过 4MB 已截断");
+        // 源码页截断标记只进状态栏（不排入正文——破坏语法/着色口径）。
+        sStat += bCodeSuffix
+            ? QStringLiteral(" · 超过 16MB 已截断")
+            : QStringLiteral(" · 超过 4MB 已截断");
     }
     m_pStat->setText(sName.isEmpty() ? sStat : QStringLiteral("%1 · %2").arg(sName, sStat));
 
     if (bBinary) {
         ShowHex(aBytes);
+        m_bShownLoaded = true;
         return;
     }
-    if (bTrunc) {
+    if (bTrunc && !bCodeSuffix) {
         sText += QStringLiteral("\n\n……（文件超过 4MB，已截断显示）");
     }
     // 按后缀分发（md/html 带格式，其余纯文本；源码文件优先语法渲染页）
@@ -642,32 +675,29 @@ void CFilePreviewWidget::ShowFile(const QString& a_sAbsPath) {
         StyleMdTables(m_pMd->document()->rootFrame());
         // ③远程 http(s) 图片同步拉取（徽章/CDN 图标，预算封顶）由 CMdBrowser::loadResource
         m_pStack->setCurrentWidget(m_pMd);
+        m_bShownLoaded = true;
     } else if (sSuffix == QStringLiteral("html") || sSuffix == QStringLiteral("htm")) {
         m_pHtml->setHtml(RewriteLocalUrls(sText, stInfo.absolutePath()));
         m_pStack->setCurrentWidget(m_pHtml);
+        m_bShownLoaded = true;
     } else {
         // 2026-10-31 源码文件 → CodeStyle 语法渲染页（设置 [View] CodeSyntax 默认开；
         //   DLL 缺失/视图不可用/非源码后缀回退纯文本）。文本回编码 UTF-8（GBK 等
         //   本地编码已探测解码，重编码后字节口径与 Scintilla/spans 天然对齐）。
         //   ≤1MB 同步做 tree-sitter 语义分档（全量解析无增量，大文件只词法着色）。
-        static const QSet<QString> s_aCodeExt = {
-            QStringLiteral("c"),   QStringLiteral("cpp"), QStringLiteral("cc"),
-            QStringLiteral("cxx"), QStringLiteral("c++"), QStringLiteral("h"),
-            QStringLiteral("hh"),  QStringLiteral("hpp"), QStringLiteral("hxx"),
-            QStringLiteral("h++"), QStringLiteral("inl"), QStringLiteral("ipp"),
-            QStringLiteral("tcc"), QStringLiteral("hm"),
-        };
         const QByteArray aU8 = sText.toUtf8();
-        if (s_aCodeExt.contains(sSuffix) && CProjectManager::LoadCodeSyntax()
+        if (bCodeSuffix && CProjectManager::LoadCodeSyntax()
                 && m_pCode != nullptr && m_pCode->IsOk()
                 && m_pCode->ShowSource(aU8, sSuffix != QLatin1String("c"),
                                        aU8.size() <= 1024 * 1024)) {
             m_pStat->setText(m_pStat->text()
                              + QStringLiteral(" · 语法高亮"));
             m_pStack->setCurrentWidget(m_pCode);
+            m_bShownLoaded = true;
         } else {
             m_pText->setPlainText(sText);
             m_pStack->setCurrentWidget(m_pText);
+            m_bShownLoaded = true;
         }
     }
 }
@@ -810,4 +840,85 @@ void CFilePreviewWidget::GotoLine(int a_iLine) {
     cur.movePosition(QTextCursor::EndOfBlock, QTextCursor::KeepAnchor);
     pView->setTextCursor(cur);
     pView->ensureCursorVisible();
+}
+
+void CFilePreviewWidget::GotoPos(int a_iLine, int a_iCol, int a_iLen,
+                                 const QString& a_sMatch, int a_iMatchOrd) {
+    // 2026-11-07 查找结果定位：命中区间选中（列≥1 且长≥1；列 1=行首命中同样
+    //   选区间。列/长非法时退化为 GotoLine 整行选中）。三视图分治：语法页字节
+    //   换算；纯文本页字符列；md/html 渲染后行列不对应源文——按 a_sMatch 在
+    //   渲染文本里第 a_iMatchOrd+1 次出现定位（找不到回退行数学）。
+    if (a_iLine < 1) {
+        return;
+    }
+    if (a_iCol < 1 || a_iLen <= 0) {
+        GotoLine(a_iLine);
+        return;
+    }
+    if (IsCodeViewActive()) {
+        m_pCode->GotoPos(a_iLine, a_iCol, a_iLen);
+        return;
+    }
+    QTextBrowser* pView = qobject_cast<QTextBrowser*>(m_pStack->currentWidget());
+    if (pView == nullptr) {
+        m_pStack->setCurrentWidget(m_pText);
+        pView = m_pText;
+        if (pView == nullptr) {
+            return;
+        }
+    }
+    // md/html：setMarkdown/setHtml 重排文档（语法标记剥离/表格成像/空行合并），
+    //   源文行号/列号与渲染块不对齐——改用「第 N 次出现」文本定位（命中序数
+    //   由搜索引擎按同文同串累计，SFindHit.m_iMatchOrd）。找不到（渲染变换吞了
+    //   文本，如 html 转义）则回退行数学（尽力近似）。
+    if (pView != m_pText && !a_sMatch.isEmpty() && a_iMatchOrd >= 0) {
+        QTextCursor curStart(pView->document());
+        curStart.movePosition(QTextCursor::Start);
+        pView->setTextCursor(curStart);
+        bool bFound = false;
+        for (int i = 0; i <= a_iMatchOrd; ++i) {
+            bFound = pView->find(a_sMatch);
+            if (!bFound) {
+                break;   // 出现次数不足（渲染丢文本）：回退
+            }
+        }
+        if (bFound) {
+            pView->ensureCursorVisible();
+            return;   // find 已选中该次出现
+        }
+    }
+    QTextDocument* pDoc = pView->document();
+    if (pDoc == nullptr || pDoc->blockCount() < 1) {
+        return;
+    }
+    const int iLine = qMin(a_iLine, pDoc->blockCount());
+    const QTextBlock stBlk = pDoc->findBlockByNumber(iLine - 1);
+    if (!stBlk.isValid()) {
+        return;
+    }
+    // 列/长钉在行内（命中跨行尾时选到行尾）。
+    const qsizetype iCol0 = qBound<qsizetype>(0, qsizetype(a_iCol - 1),
+                                              stBlk.text().size());
+    const qsizetype iLenC = qBound<qsizetype>(0, qsizetype(a_iLen),
+                                              stBlk.text().size() - iCol0);
+    QTextCursor cur(pDoc);
+    cur.setPosition(static_cast<int>(stBlk.position() + iCol0));
+    cur.setPosition(static_cast<int>(stBlk.position() + iCol0 + iLenC),
+                    QTextCursor::KeepAnchor);
+    pView->setTextCursor(cur);
+    pView->ensureCursorVisible();
+}
+
+void CFilePreviewWidget::ReloadIfShowing(const QString& a_sAbsPath) {
+    // 替换写盘后：预览页若正显示该文件则重载（否则不动）。ShowFile 自带
+    //   同文件免重载守卫，这里必须走无条件重载（LoadShowFile）——否则替换后
+    //   预览仍显旧内容。
+    if (m_sCurPath.isEmpty() || a_sAbsPath.isEmpty()) {
+        return;
+    }
+    if (QString::compare(QDir::cleanPath(m_sCurPath),
+                         QDir::cleanPath(a_sAbsPath),
+                         Qt::CaseInsensitive) == 0) {
+        LoadShowFile(m_sCurPath);
+    }
 }

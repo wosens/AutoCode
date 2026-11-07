@@ -205,6 +205,12 @@ void CVersionDialog::SetupUi() {
     pBtnRow->addWidget(m_pBtnClose);
 
     m_pLblInfo = new QLabel(this);
+    // 2026.11.03 实害（probe_vdlgwidth 实测）：状态行是单行 QLabel，无 wordWrap 时
+    //   minimumSizeHint=整行文字宽，直接顶高布局最小宽——初始文案就把窗口从 760 顶到
+    //   812，点「验证所有后端」追加「正在验证后端可用性…（每后端最多 35 秒）」后更
+    //   顶到 1122（Qt 撑宽顶层窗口且不会缩回）；查询失败/更新中提示同走此 label。
+    //   开 wordWrap 后宽度恒定，长文案折行（最多两行）向下生长，不再横向撑窗。
+    m_pLblInfo->setWordWrap(true);
 
     QVBoxLayout* pMain = new QVBoxLayout(this);
     pMain->addWidget(m_pTable);

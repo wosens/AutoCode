@@ -54,6 +54,20 @@ public:
     //   视图滚动到指定 1-based 行并整行选中；十六进制视图忽略（无行号语义）。
     void GotoLine(int a_iLine);
 
+    // 2026-11-07 文件内查找栏对外入口（Ctrl+F 统一路由用，见 CMainWindow）。
+    void OpenFindBar() { OnFindOpen(); }
+
+    // 2026-11-07 查找结果定位：1-based 行/列（字符）+ 命中长度（字符），
+    //   选中命中区间并滚动可见（列=0 退化为整行选中）。三视图分治：语法页按字节
+    //   口径换算；纯文本页按字符列；md/html 渲染后行列不对应源文——改按
+    //   a_sMatch 在渲染文本里第 a_iMatchOrd+1 次出现定位（找不到回退行数学）。
+    void GotoPos(int a_iLine, int a_iCol, int a_iLen = 0,
+                 const QString& a_sMatch = QString(), int a_iMatchOrd = 0);
+
+    // 2026-11-07 替换写盘后刷新：若正显示该文件则重载（保持当前页态），
+    //   否则不动。路径比较 Windows 大小写不敏感。
+    void ReloadIfShowing(const QString& a_sAbsPath);
+
     // 2026-10-26 Markdown 视图本体（单测直调：检查 baseUrl/表格样式/图片资源）。
     QTextBrowser* MdView() const { return m_pMd; }
 
@@ -63,6 +77,10 @@ public:
 private:
     void BuildUi();
     void ShowHex(const QByteArray& a_aBytes);
+
+    // 2026-11-07 ShowFile 的无条件重载体：读盘+解码+按后缀分发全量重建页态
+    //   （同文件免重载守卫的强制通道，替换写盘后 ReloadIfShowing 用）。
+    void LoadShowFile(const QString& a_sAbsPath);
 
     // md/html 内本地相对链接重写为 file:/// 绝对路径（图片可见）
     static QString RewriteLocalUrls(const QString& a_sText, const QString& a_sBaseDir);
@@ -82,6 +100,7 @@ private:
     CCodeSyntaxView* m_pCode    = nullptr;   // 源码语法渲染（CodeStyle 模块；可回退）
     QLabel*         m_pStat     = nullptr;   // 底部状态栏：编码 · 大小 · 截断
     QString         m_sCurPath;              // 相对链接重写基目录
+    bool            m_bShownLoaded = false;  // 2026-11-07 当前路径已成功渲染（同文件免重载守卫）
 
     // —— 查找（2026.09.22） ——
     QWidget*        m_pToolBar  = nullptr;   // 顶部工具栏（常驻，含「查找」按钮）

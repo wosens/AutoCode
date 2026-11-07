@@ -34,6 +34,7 @@
 #include <QMessageBox>   // 临时探针（跑完即删）
 #include "ui/CProjectExplorerPanel.h"   // 临时探针（跑完即删）   // 2026-10-05 上下文进度条模型名回归（format 观察口）
 #include "ui/CExecutionPanel.h"
+#include "ui/CAsstReportDialog.h"   // 2026-11-04 助手分析报告页回归
 #include "agent/CClaudeRunner.h"   // 2026-10-16 claude 跟随开关（空模型分母兜底回归）
 #include "../core/CModelEntry.h"
 #include "ui/CMessageView.h"
@@ -41,6 +42,12 @@
 #include "ui/CAsstTabBar.h"   // 2026-09-22 多行 Tab 栏（闪点观察口 PageRunning）
 #include "core/CTaskInfo.h"   // 2026.09.05 v2.0.120 asstBusyIndicator：构造任务刷底部指示器
 #include "ui/CFilePreviewWidget.h"
+#include "ui/CCodeSyntaxView.h"   // 2026-11-07 语法页定位回归（Scintilla 子窗选区验证）
+#include "ui/CFindResultsPage.h"   // 2026-11-07 查找结果页（编辑→查找/替换）
+#include "ui/CFindReplaceDialog.h" // 2026-11-07 查找/替换共用对话框
+#include <QRadioButton>
+#include <QCheckBox>
+#include <QTableWidget>            // 2026-11-07 查找结果表观察口
 #include <QTextBrowser>   // 2026.09.22 文件内查找：选中验证
 #include <QTextCursor>
 #include <QTextDocument>  // 2026-10-26 md 增强：baseUrl/资源解析断言
@@ -106,6 +113,12 @@ private slots:
     // 2026-10-31 源码语法渲染页（CodeStyle 模块动态加载）：.cpp 后缀走语法页
     //   （模块在位时；缺 DLL 自动回退纯文本不崩）；查找/GotoLine 在两种页态下均可用。
     void filePreviewCodeSyntax();
+    // 2026-11-07 查找结果页全链（编辑→查找/替换）：搜索填表（行:列/相对路径）→
+    //   点击行开预览定位选中 → 替换/替换全部写盘保持行尾 + 表内出列 + 预览刷新。
+    void findResultsFlow();
+    // 2026-11-07 查找/替换共用对话框：参数定初选单选、手切互斥、替换行随模式
+    //   显隐、三复选/范围缺省（全部含关联项目）。
+    void findReplaceDialogModes();
     // 2026-10-29 done 耗时整链口径（用户需求：专家链完成时耗时含实施轮）：
     //   链锚 tChain（OnAdhocChainStart）优先——链内轮（规划/验证/修复/续跑）不重锚
     //   → done 耗时覆盖整链；无链锚退 tRound（旧口径兼容）。
@@ -121,6 +134,11 @@ private slots:
     // 2026-10-16 助手重命名弹窗几何持久化：构造式 QInputDialog（可拖动/改大小），
     //   关闭后回填快照 → RenameDlgGeo() 非空；下次弹出按快照恢复原位。
     void asstRenameDlgGeometry();
+    // 2026-11-04 助手分析报告（右键「查看分析报告」）：对话指纹只认用户/助手块
+    //   （工具卡/系统行噪声不动指纹，防内部子轮误判有新对话）；报告素材含全部
+    //   用户提问与终答；TriggerAsstReportView 开页并上抛信号；报告页回填/关闭后
+    //   回填 no-op 不悬挂。
+    void asstReportFingerprintMaterial();
     // 2026.09.04 v2.0.112 Hermes 工具卡：纯文本 preview 入参的组头摘要（OCR
     //   实测组头仅“… ×N”疑摘要丢失；ToolSummary 对非 JSON 输入应兑底原文）。
     void toolSummaryPlainText();
@@ -728,8 +746,91 @@ void TestExecPanel::filePreviewCodeSyntax() {
         // 模块在位：当前页=语法页，查找（Scintilla）命中两处 AutoCode 之一。
         QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, false));
         QVERIFY(w.FindText(QStringLiteral("AutoCode"), false, false, true));   // 循环回卷再命中
-        w.GotoLine(4);   // 行定位（整行选中滚动）不崩即过（原生窗口无 Qt 光标可查）
+        // 2026-11-07 行/列定位回归（probe_findpos 实锚的双 bug：旧 GotoLine 经
+        //   CvcSendMsg 回读 LINEFROMPOS 参数错位恒选第 1 行、GotoPos 选区归零）：
+        //   直接向 Scintilla 子窗 SendMessage 验选区字节区间。
+        //   行 4 = `    const char* sName = "AutoCode";`：行 1/2/3 字节 8+18+13=39 起点，
+        //   行长 35（不含行尾）→ GotoLine 选 [39,74)；AutoCode 在列 26、长 8
+        //   → GotoPos 选 [64,72)。
+        w.GotoLine(4);
         QApplication::processEvents();
+        {
+            const auto fnSciSel = [&w]() -> QPair<LRESULT, LRESULT> {
+                CCodeSyntaxView* pCv = w.findChild<CCodeSyntaxView*>();
+                if (pCv == nullptr) { return { -1, -1 }; }
+                struct SCtx { HWND hSci; };
+                SCtx st{ nullptr };
+                struct SEnum {
+                    static BOOL CALLBACK Cb(HWND h, LPARAM lp) {
+                        auto* p = reinterpret_cast<SCtx*>(lp);
+                        wchar_t sz[64] = { 0 };
+                        ::GetClassNameW(h, sz, 64);
+                        if (QString::fromWCharArray(sz)
+                                .contains(QStringLiteral("Scintilla"))) {
+                            p->hSci = h;
+                            return FALSE;
+                        }
+                        return TRUE;
+                    }
+                };
+                ::EnumChildWindows(reinterpret_cast<HWND>(pCv->winId()),
+                                   SEnum::Cb, reinterpret_cast<LPARAM>(&st));
+                if (st.hSci == nullptr) { return { -1, -1 }; }
+                return { ::SendMessage(st.hSci, 2143, 0, 0),
+                         ::SendMessage(st.hSci, 2145, 0, 0) };
+            };
+            // 行 4 字节区间：前三行 8+18+13=39 起，行长 35（不含行尾）→ [39,74)。
+            const QPair<LRESULT, LRESULT> prLine = fnSciSel();
+            QVERIFY2(prLine.first >= 0, "Scintilla 子窗不可得");
+            QCOMPARE(prLine.first, static_cast<LRESULT>(39));
+            QCOMPARE(prLine.second, static_cast<LRESULT>(74));
+            // GotoPos：AutoCode 在行 4 列 26、长 8 → [39+25, 39+25+8)=[64,72)。
+            w.GotoPos(4, 26, 8);
+            QApplication::processEvents();
+            const QPair<LRESULT, LRESULT> prPos = fnSciSel();
+            QCOMPARE(prPos.first, static_cast<LRESULT>(64));
+            QCOMPARE(prPos.second, static_cast<LRESULT>(72));
+
+            // 2026-11-07 追加缺陷回归（HotNews 实害：旧 CodeView.dll 的清空用
+            //   SCI_SETTEXT(0,0)——对 NULL lParam 不清空 → 每次预览追加一份，
+            //   连点/多开同一文件文档 ×N：乱码/定位错乱/膨胀卡死）：连开第二个
+            //   .cpp 后文档长必须=新文件长（非两者之和）。
+            {
+                const QString sCpp2 = sTmpRoot + QStringLiteral("/demo2.cpp");
+                const QString sBody2 = QStringLiteral(
+                    "// second file\nint add(int a, int b) { return a + b; }\n");
+                QFile f2(sCpp2);
+                QVERIFY(f2.open(QIODevice::WriteOnly));
+                f2.write(sBody2.toUtf8());
+                f2.close();
+                w.ShowFile(sCpp2);
+                QApplication::processEvents();
+                // 文档长 = 新文件字节数（sBody2.toUtf8().size()）。
+                CCodeSyntaxView* pCv2 = w.findChild<CCodeSyntaxView*>();
+                QVERIFY(pCv2 != nullptr);
+                HWND hSci2 = nullptr;
+                struct SCtx2 { HWND* pH; };
+                SCtx2 st2{ &hSci2 };
+                struct SEnum2 {
+                    static BOOL CALLBACK Cb(HWND h, LPARAM lp) {
+                        auto* p = reinterpret_cast<SCtx2*>(lp);
+                        wchar_t sz[64] = { 0 };
+                        ::GetClassNameW(h, sz, 64);
+                        if (QString::fromWCharArray(sz)
+                                .contains(QStringLiteral("Scintilla"))) {
+                            *p->pH = h;
+                            return FALSE;
+                        }
+                        return TRUE;
+                    }
+                };
+                ::EnumChildWindows(reinterpret_cast<HWND>(pCv2->winId()),
+                                   SEnum2::Cb, reinterpret_cast<LPARAM>(&st2));
+                QVERIFY(hSci2 != nullptr);
+                const LRESULT iLen2 = ::SendMessage(hSci2, 2006, 0, 0);
+                QCOMPARE(iLen2, static_cast<LRESULT>(sBody2.toUtf8().size()));
+            }
+        }
     } else {
         // 缺 DLL 回退：纯文本页内容完整（功能闸门）。
         QTextBrowser* pView = nullptr;
@@ -786,6 +887,264 @@ void TestExecPanel::filePreviewCodeSyntax() {
         w.ShowFile(sTxt);
         QVERIFY(!w.IsCodeViewActive());
         QVERIFY(w.FindText(QStringLiteral("note"), false, false, false));
+    }
+}
+
+// 2026-11-07 查找结果页全链：搜索填表 → 点击行开预览定位 → 替换/替换全部。
+void TestExecPanel::findResultsFlow() {
+    const QString sRoot = MakeTempDir();
+    QVERIFY2(QDir(sRoot).exists(), "临时目录不可用");
+    const QString sA = sRoot + QStringLiteral("/a.txt");
+    const QString sB = sRoot + QStringLiteral("/b.txt");
+    {
+        QFile f(sA);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(QByteArrayLiteral("needle one\r\nxx needle two\r\n"));
+        f.close();
+        QFile f2(sB);
+        QVERIFY(f2.open(QIODevice::WriteOnly));
+        f2.write(QByteArrayLiteral("plain line\nneedle three\n"));
+        f2.close();
+        // 2026-11-07 md 定位夹具：两个同串 needle（渲染后空行合并，行列不再
+        //   对应源文——验证按「第 N 次出现」文本定位）。
+        QFile f3(sRoot + QStringLiteral("/note.md"));
+        QVERIFY(f3.open(QIODevice::WriteOnly));
+        f3.write(QByteArrayLiteral(
+            "# md head\n\nfirst needle here\n\nmid text\n\nsecond needle there\n"));
+        f3.close();
+    }
+
+    CExecutionPanel panel;
+    panel.resize(1000, 700);
+    panel.show();
+    QVERIFY(!panel.FindResultsPageVisible());
+
+    SFindTask stTask;
+    stTask.m_sFind = QStringLiteral("needle");
+    stTask.m_sReplace = QStringLiteral("NEEDLE");
+    stTask.m_bReplaceMode = true;   // 替换模式：页顶替换/替换全部两按钮可见
+    stTask.m_aRoots = QStringList{sRoot};
+    stTask.m_sProjectDir = sRoot;
+    panel.StartFileSearch(stTask);
+    QVERIFY(panel.FindResultsPageVisible());
+
+    CFindResultsPage* pPage = panel.findChild<CFindResultsPage*>();
+    QVERIFY(pPage != nullptr);
+    // 独立无模式窗口：顶层窗口语义（不入面板 Tab），已 show 且可见。
+    QVERIFY(pPage->isWindow());
+    QVERIFY(pPage->isVisible());
+    QVERIFY(pPage->windowTitle().contains(QStringLiteral("needle")));
+    QTableWidget* pTable = pPage->findChild<QTableWidget*>();
+    QVERIFY(pTable != nullptr);
+    // 后台线程搜索 → 队列投递填表（上限 4s 防悬挂）。
+    for (int i = 0; i < 200 && pTable->rowCount() < 5; ++i) {
+        QTest::qWait(20);
+    }
+    QCOMPARE(pTable->rowCount(), 5);
+    // 替换模式：窗顶两按钮可见（独立窗口已 show）；两列口径：位置「行:列」+
+    //   相对路径；行序=文件主序×偏移升序。
+    QPushButton* pBtnRep = nullptr;
+    QPushButton* pBtnAll = nullptr;
+    for (QPushButton* p : pPage->findChildren<QPushButton*>()) {
+        if (p->text() == QStringLiteral("替换")) { pBtnRep = p; }
+        if (p->text() == QStringLiteral("替换全部")) { pBtnAll = p; }
+    }
+    QVERIFY(pBtnRep != nullptr && pBtnAll != nullptr);
+    QVERIFY(pBtnRep->isVisible() && pBtnAll->isVisible());
+    QCOMPARE(pTable->item(0, 0)->text(), QStringLiteral("1:1"));
+    QCOMPARE(pTable->item(0, 1)->text(), QStringLiteral("a.txt"));
+    QCOMPARE(pTable->item(1, 0)->text(), QStringLiteral("2:4"));
+    QCOMPARE(pTable->item(1, 1)->text(), QStringLiteral("a.txt"));
+    QCOMPARE(pTable->item(2, 0)->text(), QStringLiteral("2:1"));
+    QCOMPARE(pTable->item(2, 1)->text(), QStringLiteral("b.txt"));
+
+    // 点击首行 → 上抛 sigOpenHit（行/列/长度）且预览 Tab 打开并选中命中串；
+    // 独立窗口不动（仍可见——本改动的核心诉求：免文件/列表来回切）。
+    QSignalSpy spyOpen(pPage, &CFindResultsPage::sigOpenHit);
+    const QRect stCell = pTable->visualItemRect(pTable->item(0, 0));
+    QTest::mouseClick(pTable->viewport(), Qt::LeftButton, Qt::NoModifier,
+                      stCell.center());
+    QCOMPARE(spyOpen.count(), 1);
+    QVERIFY(pPage->isVisible());   // 点行开文件：结果窗仍在
+
+    // 2026-11-07 多选（需求 4）：Ctrl 加选第二行 → 选中数 2，点击不再自动定位
+    //   （sigOpenHit 不新增）；清选后恢复单选定。
+    {
+        const QRect stCell2 = pTable->visualItemRect(pTable->item(1, 0));
+        QTest::mouseClick(pTable->viewport(), Qt::LeftButton, Qt::ControlModifier,
+                          stCell2.center());
+        QApplication::processEvents();
+        QCOMPARE(pTable->selectionModel()->selectedRows().size(), 2);
+        QCOMPARE(spyOpen.count(), 1);   // 多选态不定位
+        // 普通点击回到单选 → 恢复定位。
+        const QRect stCell1 = pTable->visualItemRect(pTable->item(0, 0));
+        QTest::mouseClick(pTable->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          stCell1.center());
+        QApplication::processEvents();
+        QCOMPARE(pTable->selectionModel()->selectedRows().size(), 1);
+        QCOMPARE(spyOpen.count(), 2);
+    }
+    CFilePreviewWidget* pPrev = panel.findChild<CFilePreviewWidget*>();
+    QVERIFY(pPrev != nullptr);
+    QTabWidget* pTabs = panel.findChild<QTabWidget*>();
+    QVERIFY(pTabs != nullptr);
+    QCOMPARE(pTabs->currentWidget(), static_cast<QWidget*>(pPrev));
+    {
+        QTextBrowser* pView = nullptr;
+        const auto aViews = pPrev->findChildren<QTextBrowser*>();
+        for (QTextBrowser* p : aViews) {
+            if (p->isVisible()) { pView = p; break; }
+        }
+        QVERIFY(pView != nullptr);
+        QCOMPARE(pView->textCursor().selectedText(), QStringLiteral("needle"));
+    }
+
+    // 替换（未选中→首条）：a.txt 首处替换 + 行出列 + 预览刷新 + CRLF 保持。
+    //   独立窗口不随预览切页隐藏——按钮始终可点，无需切回。
+    QTest::mouseClick(pBtnRep, Qt::LeftButton);
+    QApplication::processEvents();
+    QCOMPARE(pTable->rowCount(), 4);   // 5 行出列首条
+    {
+        QFile f(sA);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QCOMPARE(f.readAll(),
+                 QByteArrayLiteral("NEEDLE one\r\nxx needle two\r\n"));
+    }
+
+    // 替换全部：剩余两处全替换，表清空，两文件落盘。
+    QTest::mouseClick(pBtnAll, Qt::LeftButton);
+    QApplication::processEvents();
+    QCOMPARE(pTable->rowCount(), 0);
+    {
+        QFile f(sA);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QCOMPARE(f.readAll(),
+                 QByteArrayLiteral("NEEDLE one\r\nxx NEEDLE two\r\n"));
+        QFile f2(sB);
+        QVERIFY(f2.open(QIODevice::ReadOnly));
+        QCOMPARE(f2.readAll(),
+                 QByteArrayLiteral("plain line\nNEEDLE three\n"));
+    }
+    // 替换写盘后预览自动刷新（正显示 a.txt → 内容已更新；预览页自点行后恒为当前）。
+    {
+        QTextBrowser* pView = nullptr;
+        const auto aViews = pPrev->findChildren<QTextBrowser*>();
+        for (QTextBrowser* p : aViews) {
+            if (p->isVisible()) { pView = p; break; }
+        }
+        QVERIFY(pView != nullptr);
+        QVERIFY(pView->toPlainText().startsWith(QStringLiteral("NEEDLE one")));
+    }
+    // 点 X 只隐藏不销毁：下次搜索复见（FindResultsPageVisible 口径）。
+    pPage->close();
+    QVERIFY(!panel.FindResultsPageVisible());
+    panel.StartFileSearch(stTask);
+    QVERIFY(panel.FindResultsPageVisible());
+    // 大小写不敏感：替换后的 NEEDLE 仍命中 needle——表回 5 行（窗口复用验证）。
+    for (int i = 0; i < 200 && pTable->rowCount() < 5; ++i) {
+        QTest::qWait(20);
+    }
+    QCOMPARE(pTable->rowCount(), 5);
+
+    // 2026-11-07 md 定位（需求 7）：note.md 两同串 needle，点第 2 个（行 4，
+    //   序数 1）→ md 渲染页按第 2 次出现选中（非总回第一个）。
+    {
+        const QRect stMd = pTable->visualItemRect(pTable->item(4, 0));
+        QTest::mouseClick(pTable->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          stMd.center());
+        QApplication::processEvents();
+        QTextBrowser* pMd = nullptr;
+        const auto aViews2 = pPrev->findChildren<QTextBrowser*>();
+        for (QTextBrowser* p : aViews2) {
+            if (p->isVisible()) { pMd = p; break; }
+        }
+        QVERIFY(pMd != nullptr);
+        // 替换全部后 note.md 也变 NEEDLE（大小写不敏感复命中，sMatched=NEEDLE）。
+        QCOMPARE(pMd->textCursor().selectedText(), QStringLiteral("NEEDLE"));
+        const int iFirst = pMd->toPlainText().indexOf(QStringLiteral("NEEDLE"));
+        QVERIFY(pMd->textCursor().selectionStart() > iFirst);
+    }
+}
+
+// 2026-11-07 查找/替换共用对话框：参数定初选、手切互斥、替换行随模式显隐、
+//   三复选/范围缺省（需求 2~5）。验证非交互行为，不 exec（查找所有的预检
+//   分支已由引擎测试覆盖）。
+void TestExecPanel::findReplaceDialogModes() {
+    // ① 查找入口：初选「在文件中查找」，替换行隐藏。
+    {
+        // 同日二改：传入历史（MRU 在前）验历史下拉与预填。
+        CFindReplaceDialog dlg(
+            false,
+            QStringList{QStringLiteral("needle"), QStringLiteral("查找")});
+        dlg.show();
+        QVERIFY(!dlg.ReplaceMode());
+        QLineEdit* pEditRep = nullptr;
+        QRadioButton* pRadioReplace = nullptr;
+        for (QWidget* pW : dlg.findChildren<QWidget*>()) {
+            if (QLineEdit* pEdit = qobject_cast<QLineEdit*>(pW); pEdit != nullptr
+                    && pEdit->placeholderText()
+                           .contains(QStringLiteral("替换为"))) {
+                pEditRep = pEdit;
+            }
+            if (pW->inherits("QRadioButton")
+                    && pW->objectName() == QStringLiteral("radioReplace")) {
+                pRadioReplace = qobject_cast<QRadioButton*>(pW);
+            }
+        }
+        QVERIFY(pEditRep != nullptr && pRadioReplace != nullptr);
+        QVERIFY(!pEditRep->isVisibleTo(&dlg));
+        // 手切到替换：替换行出现。
+        pRadioReplace->setChecked(true);
+        QApplication::processEvents();
+        QVERIFY(dlg.ReplaceMode());
+        QVERIFY(pEditRep->isVisibleTo(&dlg));
+        // 参数出口缺省：三复选全关、范围=全部（案 0）。
+        QVERIFY(!dlg.CaseSensitive() && !dlg.WholeWord() && !dlg.UseRegex());
+        QCOMPARE(dlg.Scope(), 0);
+        // 2026-11-07 范围下拉三档：全部/本项目/任务和助手日志，缺省仍选中 0。
+        //   同日二改：查找内容也成下拉（历史）——按首项文本识别范围框。
+        QComboBox* pCmbScope = nullptr;
+        QComboBox* pCmbFind = nullptr;
+        const auto aCmbs = dlg.findChildren<QComboBox*>();
+        for (QComboBox* pCmb : aCmbs) {
+            if (pCmb->count() > 0
+                    && pCmb->itemText(0) == QStringLiteral("全部（含关联项目）")) {
+                pCmbScope = pCmb;
+            } else {
+                pCmbFind = pCmb;   // 查找内容（可编辑历史下拉）
+            }
+        }
+        QVERIFY(pCmbScope != nullptr);
+        QCOMPARE(pCmbScope->count(), 3);
+        QCOMPARE(pCmbScope->itemText(0), QStringLiteral("全部（含关联项目）"));
+        QCOMPARE(pCmbScope->itemText(1), QStringLiteral("本项目"));
+        QCOMPARE(pCmbScope->itemText(2), QStringLiteral("任务和助手日志"));
+        // 历史下拉：传入历史条目按序入列（MRU 在前），可编辑。
+        QVERIFY(pCmbFind != nullptr);
+        QVERIFY(pCmbFind->isEditable());
+        QCOMPARE(pCmbFind->count(), 2);
+        QCOMPARE(pCmbFind->itemText(0), QStringLiteral("needle"));
+        QCOMPARE(pCmbFind->itemText(1), QStringLiteral("查找"));
+        QCOMPARE(dlg.FindText(), QStringLiteral("needle"));   // 最近一次预填
+        // 界面态注入（需求 2）：范围 2 + 三复选全开。
+        dlg.SetUiState(2, true, true, true);
+        QCOMPARE(dlg.Scope(), 2);
+        QVERIFY(dlg.CaseSensitive() && dlg.WholeWord() && dlg.UseRegex());
+    }
+    // ② 替换入口：初选「在文件中替换」，替换行可见。
+    {
+        CFindReplaceDialog dlg(true);
+        dlg.show();
+        QVERIFY(dlg.ReplaceMode());
+        QLineEdit* pEditRep = nullptr;
+        for (QLineEdit* p : dlg.findChildren<QLineEdit*>()) {
+            if (p->placeholderText().contains(QStringLiteral("替换为"))) {
+                pEditRep = p;
+                break;
+            }
+        }
+        QVERIFY(pEditRep != nullptr);
+        QVERIFY(pEditRep->isVisibleTo(&dlg));
     }
 }
 
@@ -4811,6 +5170,118 @@ void TestExecPanel::toolMergeSkipsTextBlocks() {
     QCOMPARE(stPre.WidgetCount(), 10);   // + System 组 + 文本 + System 新组
     QVERIFY(stPre.WidgetAt(7) != stPre.WidgetAt(9));   // 两个 System 组（未穿透）
     stView.hide();
+}
+
+void TestExecPanel::asstReportFingerprintMaterial() {
+    // 2026-11-04 助手分析报告回归：指纹/素材/报告页三段而离屏验证（不起真实报告轮）。
+    CExecutionPanel panel;
+    QSignalSpy spyView(&panel, &CExecutionPanel::sigAsstReportViewRequested);
+
+    // 载入一个带混合块的助手：1 条用户提问 + 2 条助手终答 + 工具/系统噪声。
+    QJsonArray aBlocks;
+    QJsonObject oUser;
+    oUser["kind"] = "event";
+    oUser["eventKind"] = "user";
+    oUser["text"] = QStringLiteral("[2026-11-04 10:00:00] 帮我实现分析报告");
+    aBlocks.append(oUser);
+    QJsonObject oAsst1;
+    oAsst1["kind"] = "assistant";
+    oAsst1["text"] = QStringLiteral("好的，方案如下…");
+    aBlocks.append(oAsst1);
+    QJsonObject oTool;
+    oTool["kind"] = "tool_use";
+    oTool["tool"] = "Read";
+    oTool["input"] = "{}";
+    oTool["result"] = "ok";
+    aBlocks.append(oTool);
+    QJsonObject oSys;
+    oSys["kind"] = "system";
+    oSys["text"] = "system line";
+    aBlocks.append(oSys);
+    QJsonObject oAsst2;
+    oAsst2["kind"] = "assistant";
+    oAsst2["text"] = QStringLiteral("已完成，报告持久化在 asst-reports 目录。");
+    aBlocks.append(oAsst2);
+
+    QJsonArray aAssts;
+    QJsonObject oAsst;
+    oAsst["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    oAsst["name"] = QStringLiteral("报告助手");
+    oAsst["blocks"] = aBlocks;
+    aAssts.append(oAsst);
+    panel.LoadAssistantsFromJson(aAssts, QString());
+    const QString sId = panel.ActiveAsstId();
+    QVERIFY(!sId.isEmpty());
+
+    // —— 指纹：格式 nU+nA:hash；工具/系统噪声不计；用户块追加才变 ——
+    const QString sFp0 = panel.AsstChatFingerprint(sId);
+    QVERIFY2(sFp0.startsWith("1+2:"), qPrintable(sFp0));
+
+    // 追加噪声（工具/系统）到流尾：指纹不变（内部子轮不误判有新对话）。
+    panel.OnAdhocToolUse(sId, "Bash", "{}");
+    panel.OnAdhocLog(sId, "[system] noise");
+    panel.OnAdhocEvent(sId, QStringLiteral("auto_naming"),
+                       QStringLiteral("⚙ 内部子轮事件行"));   // 事件行同为噪声
+    QCOMPARE(panel.AsstChatFingerprint(sId), sFp0);
+
+    // 追加用户提问（重载流）：指纹变化（计数 +1）。
+    QJsonObject oUser2;
+    oUser2["kind"] = "event";
+    oUser2["eventKind"] = "user";
+    oUser2["text"] = QStringLiteral("[2026-11-04 11:00:00] 追加提问");
+    aBlocks.append(oUser2);
+    oAsst["blocks"] = aBlocks;
+    aAssts[0] = oAsst;
+    panel.LoadAssistantsFromJson(aAssts, sId);
+    const QString sFp1 = panel.AsstChatFingerprint(sId);
+    QVERIFY2(sFp1.startsWith("2+2:"), qPrintable(sFp1));
+    QVERIFY(sFp1 != sFp0);
+
+    // —— 素材：含用户/助手条目与时间戳；空助手返回空 ——
+    const QString sMat = panel.BuildAsstReportMaterial(sId);
+    QVERIFY(sMat.contains(QStringLiteral("用户：")));
+    QVERIFY(sMat.contains(QStringLiteral("助手：")));
+    QVERIFY(sMat.contains(QStringLiteral("2026-11-04")));   // 日期保留（叙事用）
+    QVERIFY(!sMat.contains(QLatin1String("system line")));  // 噪声不入素材
+
+    // —— 报告页：Trigger 开页 + 上抛；Show 回填正文；关页后回填 no-op 不悬挂 ——
+    QSignalSpy spyView2(&panel, &CExecutionPanel::sigAsstReportViewRequested);
+    panel.TriggerAsstReportView(sId);
+    QCOMPARE(spyView2.count(), 1);
+    QCOMPARE(spyView2.takeFirst().at(0).toString(), sId);
+    auto* pDlg = panel.findChild<CAsstReportDialog*>();
+    QVERIFY(pDlg != nullptr);
+    QVERIFY(pDlg->isVisible());
+    QCOMPARE(pDlg->AsstId(), sId);
+    QVERIFY(!pDlg->HasReport());   // 占位态无正文
+
+    panel.ShowAsstReport(sId, QStringLiteral("## 综述\n\n该助手完成了分析报告功能。"),
+                         QStringLiteral("生成时间：2026-11-04 12:00:00"));
+    QVERIFY(pDlg->HasReport());
+    QCOMPARE(pDlg->AsstId(), sId);
+    panel.SetAsstReportGenerating(sId, true, QStringLiteral("正在重总结…"));
+    panel.SetAsstReportGenerating(sId, false);
+
+    // 关页（WA_DeleteOnClose）后：ShowAsstReport/SetAsstReportGenerating 不得崩、
+    //   不得重弹（“完成后自动替换”只针对仍开着的页）。
+    pDlg->close();
+    QTest::qWait(50);
+    panel.ShowAsstReport(sId, QStringLiteral("## 综述\n更新"), QString());
+    panel.SetAsstReportGenerating(sId, true);
+    panel.SetAsstReportHint(sId, QStringLiteral("提示"));
+    QVERIFY(panel.findChild<CAsstReportDialog*>() == nullptr);
+
+    // 空助手（无用户提问）：指纹 0+0、素材为空。
+    QJsonArray aEmpty;
+    QJsonObject oEmpty;
+    oEmpty["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    oEmpty["name"] = QStringLiteral("空助手");
+    oEmpty["blocks"] = QJsonArray();
+    aEmpty.append(oEmpty);
+    panel.LoadAssistantsFromJson(aEmpty, QString());
+    const QString sEmptyId = panel.ActiveAsstId();
+    QVERIFY(panel.AsstChatFingerprint(sEmptyId).startsWith("0+0:"));
+    QVERIFY(panel.BuildAsstReportMaterial(sEmptyId).isEmpty());
 }
 
 QTEST_MAIN(TestExecPanel)

@@ -347,6 +347,9 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     // 2026.09.23 资源管理器隐藏目录：预填生效清单（缺键=内置默认，用户在此基础上增删）。
     const QString sDefExplHidden = (a_pPm != nullptr) ? a_pPm->LoadExplorerHiddenDirs()
                                                       : CProjectManager::DefaultExplorerHiddenDirs();
+    // 2026-11-07 查找排除目录预填（[Find] ExcludeDirs；缺键=内置默认）。
+    const QString sDefFindDirs = (a_pPm != nullptr) ? a_pPm->LoadFindExcludeDirs()
+                                                    : CProjectManager::DefaultFindExcludeDirs();
     // 2026-10-17 对话日志渲染引擎预填（[View] Engine；缺省/非法值→旧版=索引 0）。
     const QString sDefViewEngine = CProjectManager::LoadViewEngine();
     // 2026-09-26 内置测试沙箱默认值（[Sandbox]）。
@@ -517,6 +520,9 @@ CSettingsDialog::CSettingsDialog(CProjectManager* a_pPm, QWidget* a_pParent,
     m_pEditScanDirs->setText(sDefScan);
     m_pEditBackupDirs->setText(sDefBackup);
     m_pEditExplHidden->setText(sDefExplHidden);
+    if (m_pEditFindDirs != nullptr) {
+        m_pEditFindDirs->setText(sDefFindDirs);
+    }
     if (m_pComboViewEngine != nullptr) {
         // 2026-10-17 引擎预填：ModelView 严格等值 → 索引 1，其余（缺省/非法）→ 0。
         m_pComboViewEngine->setCurrentIndex(
@@ -1004,6 +1010,19 @@ void CSettingsDialog::SetupUi() {
     auto* pRowDirs2 = new QHBoxLayout();
     pLayDirsCol->addLayout(pRowDirs2);
     fnAddPair(pRowDirs2, QStringLiteral("备份恢复排除："), m_pEditBackupDirs, 1);
+    pRowDirs2->addSpacing(12);
+    // 2026-11-07 查找排除（[Find] ExcludeDirs）：编辑→查找/替换的目录黑名单，
+    //   与备份/扫描排除互不相干（只管搜索范围）。
+    m_pEditFindDirs = new QLineEdit(pGroupDirs);
+    m_pEditFindDirs->setPlaceholderText(
+        CProjectManager::DefaultFindExcludeDirs());
+    m_pEditFindDirs->setToolTip(QStringLiteral(
+        "在文件中查找/替换时排除的目录名，逗号分隔；留空 = 搜索全部目录。"
+        "内置默认（[Find] ExcludeDirs，键在即生效）：\n"
+        ".autodev,.git,.svn,.hg,.vs,node_modules,build,x64,Execute,TestSandbox,"
+        "__pycache__,target\n"
+        "二进制文件（图片/exe/dll/压缩包等）与起 16MB 文件自动跳过，不受此项影响"));
+    fnAddPair(pRowDirs2, QStringLiteral("查找排除："), m_pEditFindDirs, 1);
 
     // —— 内置测试沙箱（2026-09-26；2026.09.27 开关两项/录像参数各合并一行）——：
     //    Agent 后代 GUI 窗口自动幽灵化收纳（隐藏 + 点击穿透 + 无任务栏，用户无感），
@@ -2399,6 +2418,11 @@ QString CSettingsDialog::BackupExcludeDirs() const {
 
 QString CSettingsDialog::ExplorerHiddenDirs() const {
     return m_pEditExplHidden != nullptr ? m_pEditExplHidden->text().trimmed() : QString();
+}
+
+QString CSettingsDialog::FindExcludeDirs() const {
+    // 2026-11-07 查找排除目录（全量清单原文；空串=搜全部目录）。
+    return m_pEditFindDirs != nullptr ? m_pEditFindDirs->text().trimmed() : QString();
 }
 
 QString CSettingsDialog::ViewEngine() const {

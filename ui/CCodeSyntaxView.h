@@ -43,6 +43,15 @@ public:
     // 定位到 1-based 行并整行选中滚动可见（代码审查定位链）。
     void GotoLine(int a_iLine);
 
+    // 2026-11-07 查找结果定位：1-based 行/列（字符）+ 命中长度（字符），
+    //   选中命中区间并滚动可见（列→字节偏移按本视图 UTF-8 口径换算）。
+    void GotoPos(int a_iLine, int a_iCol, int a_iLen);
+
+    // 最近一次 ShowSource 的 UTF-8 文本（定位换算源；探针实证 CvcSendMsg 通道
+    //   SCI_GETLINE 不回拷、SCI_LINEFROMPOS 参数在 wParam——行定位全部自算，
+    //   不再依赖 Scintilla 回读）。
+    const QByteArray& LastText() const { return m_aU8Last; }
+
 signals:
     // 原生窗口持有键盘焦点时 Qt 快捷键链收不到（Ctrl+F 开查找栏）——本类装了
     //   原生消息过滤器代听 Ctrl+F，命中发此信号由宿主（查找栏所在）接管。
@@ -52,9 +61,13 @@ protected:
     void resizeEvent(QResizeEvent* a_e) override;
 
 private:
+    // 1-based 行的 [起点, 终点) 字节偏移（基于 m_aU8Last 自算；行号越界钉到末行/末尾）。
+    void LineByteRange(int a_iLine, qsizetype& a_iStart, qsizetype& a_iEnd) const;
+
     // 视图句柄（CodeView.dll 的 hCvcView；析构 CvcDestroy——POC 单实例全局仅一个
     //   存活，本类与 CFilePreviewWidget 均为单实例，先析构后可再建）。
     void* m_hView = nullptr;
+    QByteArray m_aU8Last;   // 最近 ShowSource 文本（定位字节换算源，见 LastText 注）
 
 #ifdef Q_OS_WIN
     //   原生键监听过滤器（随本视图装/卸；见 cpp）。

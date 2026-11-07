@@ -3398,6 +3398,105 @@ bool CProjectManager::SaveBackupExcludeDirs(const QString& a_sDirs) {
     return true;
 }
 
+// —— 2026-11-07 查找排除目录（[Find] ExcludeDirs；编辑→查找/替换的黑名单）——
+
+QString CProjectManager::DefaultFindExcludeDirs() {
+    // 内置默认：版本库元数据/生成产物/部署副本不进搜索（单点维护；设置页预填同源）。
+    //   Execute/TestSandbox 含部署副本与 dll/exe，重复命中噪声大于价值。
+    return QStringLiteral(".autodev,.git,.svn,.hg,.vs,node_modules,build,x64,"
+                           "Execute,TestSandbox,__pycache__,target");
+}
+
+bool CProjectManager::SaveFindExcludeDirs(const QString& a_sDirs) {
+    // 落 [Find] ExcludeDirs（保存全量清单；空串=写空值→搜全部目录）。失败不抛。
+    //   界面态性质：用全局 ConfigFilePath（不随任务档覆盖，同 [Explorer] 口径）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Find", L"ExcludeDirs",
+        a_sDirs.toStdWString().c_str(), wsPath.c_str());
+    return true;
+}
+
+QString CProjectManager::LoadFindExcludeDirs() const {
+    // 读 [Find] ExcludeDirs：缺键/无 config.ini → 内置默认；键存在值为空 → 空串
+    //   （搜全部目录）。读全局 ConfigFilePath（见 Save 注）。
+    const QString sPath = ConfigFilePath();
+    const std::wstring wsDefault = DefaultFindExcludeDirs().toStdWString();
+    if (sPath.isEmpty()) {
+        return DefaultFindExcludeDirs();
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    wchar_t szBuf[1024] = { 0 };
+    const DWORD dwCopied = GetPrivateProfileStringW(
+        L"Find", L"ExcludeDirs", wsDefault.c_str(), szBuf, 1024, wsPath.c_str());
+    return QString::fromWCharArray(szBuf, static_cast<int>(dwCopied)).trimmed();
+}
+
+bool CProjectManager::SaveFindUiState(const SFindUiState& a_stState) {
+    // 落 [Find] 界面态（范围/三复选/查找历史 MRU≤20）。历史键 History0..N 按序
+    //   写、先清 HistoryCount 防缩短后残留旧尾键（HistoryK > count 的键无消费者，
+    //   但避免读档拼旧项——写前把 Count 先落新值即可：读侧只读前 Count 条）。
+    //   界面态：全局 ConfigFilePath（不随任务档覆盖）。
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return false;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    WritePrivateProfileStringW(L"Find", L"Scope",
+        QString::number(a_stState.m_iScope).toStdWString().c_str(), wsPath.c_str());
+    WritePrivateProfileStringW(L"Find", L"CaseSensitive",
+        a_stState.m_bCase ? L"1" : L"0", wsPath.c_str());
+    WritePrivateProfileStringW(L"Find", L"WholeWord",
+        a_stState.m_bWord ? L"1" : L"0", wsPath.c_str());
+    WritePrivateProfileStringW(L"Find", L"Regex",
+        a_stState.m_bRegex ? L"1" : L"0", wsPath.c_str());
+    WritePrivateProfileStringW(L"Find", L"HistoryCount",
+        QString::number(a_stState.m_aHistory.size()).toStdWString().c_str(),
+        wsPath.c_str());
+    for (int i = 0; i < a_stState.m_aHistory.size(); ++i) {
+        WritePrivateProfileStringW(L"Find",
+            QStringLiteral("History%1").arg(i).toStdWString().c_str(),
+            a_stState.m_aHistory.at(i).toStdWString().c_str(), wsPath.c_str());
+    }
+    return true;
+}
+
+CProjectManager::SFindUiState CProjectManager::LoadFindUiState() const {
+    // 读 [Find] 界面态：缺键=内置默认（范围 0/三复选关/空历史）；历史按 Count
+    //   截取（写侧缩短时旧尾键不消费）。
+    SFindUiState st;
+    const QString sPath = ConfigFilePath();
+    if (sPath.isEmpty()) {
+        return st;
+    }
+    const std::wstring wsPath = sPath.toStdWString();
+    st.m_iScope = qBound(0, static_cast<int>(GetPrivateProfileIntW(
+        L"Find", L"Scope", 0, wsPath.c_str())), 2);
+    st.m_bCase = GetPrivateProfileIntW(L"Find", L"CaseSensitive", 0,
+                                       wsPath.c_str()) != 0;
+    st.m_bWord = GetPrivateProfileIntW(L"Find", L"WholeWord", 0,
+                                       wsPath.c_str()) != 0;
+    st.m_bRegex = GetPrivateProfileIntW(L"Find", L"Regex", 0,
+                                        wsPath.c_str()) != 0;
+    const int nCnt = qBound(0, static_cast<int>(GetPrivateProfileIntW(
+        L"Find", L"HistoryCount", 0, wsPath.c_str())), 20);
+    for (int i = 0; i < nCnt; ++i) {
+        wchar_t szBuf[512] = { 0 };
+        const DWORD dwCopied = GetPrivateProfileStringW(L"Find",
+            QStringLiteral("History%1").arg(i).toStdWString().c_str(), L"",
+            szBuf, 512, wsPath.c_str());
+        const QString s = QString::fromWCharArray(
+            szBuf, static_cast<int>(dwCopied)).trimmed();
+        if (!s.isEmpty()) {
+            st.m_aHistory.append(s);
+        }
+    }
+    return st;
+}
+
 // —— 2026.09.23 资源管理器显示隐藏目录（[Explorer] HiddenDirs）——
 
 QString CProjectManager::DefaultExplorerHiddenDirs() {

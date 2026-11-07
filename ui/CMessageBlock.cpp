@@ -70,6 +70,29 @@ bool CMessageBlock::IsErrorResult(const QString& a_sResult) {
            a_sResult.startsWith(QStringLiteral("[错误]"));
 }
 
+// 2026-11-07 改进计划 §6：心跳/重试/等待类系统行分类（说明见头文件声明）。
+bool CMessageBlock::IsHeartbeatLine(const QString& a_sText) {
+    const QString sT = a_sText.trimmed();
+    if (sT.isEmpty()) {
+        return false;
+    }
+    // ✗/⚠ 终态与错误行永不折叠（独立成块保留信息）；仅持续等待/重试类命中。
+    if (sT.startsWith(QChar(0x2717)) || sT.startsWith(QChar(0x26A0))) {   // ✗ ⚠
+        return false;
+    }
+    static const QStringList aMarks = {
+        QStringLiteral("⏳"), QStringLiteral("↻"),
+        QStringLiteral("模型生成中"), QStringLiteral("深度思考中"),
+        QStringLiteral("仍在流式生成"), QStringLiteral("等待网络"),
+    };
+    for (const QString& s : aMarks) {
+        if (sT.contains(s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 CMessageBlock::CMessageBlock(EKind a_eKind, QWidget* a_pParent)
     : QWidget(a_pParent), m_eKind(a_eKind) {
     // 让 QWidget 能响应 stylesheet 的背景/边框
@@ -761,6 +784,7 @@ void CMessageBlock::SetSystemText(const QString& a_sText) {
         }
         m_aSysLines.clear();
         m_aSysLines.append(sPretty);
+        m_bHeartbeatGroup = IsHeartbeatLine(sPretty);   // 2026-11-07 §6：心跳组标记
         m_pLabel->setText(sPretty);
         RefreshSysHeader();
     } else {
@@ -778,6 +802,11 @@ void CMessageBlock::AppendSystemLine(const QString& a_sText) {
         return;
     }
     m_aSysLines.append(sPretty);
+    // 2026-11-07 §6：心跳组行缓存封顶 30（与 CChatModel 同口径；历史时间线展开
+    //   可见，更早的丢弃防长会话膨胀）。
+    if (m_bHeartbeatGroup && m_aSysLines.size() > 30) {
+        m_aSysLines.removeFirst();
+    }
     if (m_pLabel != nullptr) {
         m_pLabel->setText(m_aSysLines.join(QLatin1Char('\n')));
     }
@@ -789,7 +818,10 @@ void CMessageBlock::RefreshSysHeader() {
         return;
     }
     const bool bOn = m_pHeader->isChecked();
-    const QString sBrief = m_aSysLines.first().simplified().left(60);
+    // 2026-11-07 §6 心跳折叠：组头显【最新一行】（等待进度就地更新——首行是
+    //   数分钟前的旧状态无信息量）；普通系统组保持首行摘要口径。
+    const QString sBrief = (m_bHeartbeatGroup ? m_aSysLines.last() : m_aSysLines.first())
+                               .simplified().left(60);
     m_pHeader->setText(QStringLiteral("%1 %2（共 %3 行，点击展开）")
         .arg(bOn ? QStringLiteral("▾") : QStringLiteral("▸"),
              sBrief.toHtmlEscaped()).arg(m_aSysLines.size()));

@@ -3,6 +3,9 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QMutex>
+#include <QMutexLocker>
+#include <string>
 #include "core/CFrwDevice.h"
 #include <QFileInfo>
 #include <QDateTime>
@@ -218,6 +221,145 @@ QString CAgentRunnerBase::GitBashRootDir() {
     }
     s_sRoot = sFound;
     return s_sRoot;
+}
+
+// —— 2026-11-07 改进计划 §1B：执行通道探针（bash 可用性，说明见头文件声明）——
+namespace {
+// 进程级结论缓存（探针/只读两入口共享）：bash 可用性是机器事实，但会随安装/环境
+//   变化——成功 10 分钟、失败 45 秒 TTL；a_bForce（面板“重新探测”）清缓存即刻重探。
+struct SExecProbeCache {
+    QMutex mtx;
+    CAgentRunnerBase::SExecChannelProbe st;
+    qint64 iStampMs = 0;
+};
+SExecProbeCache& ExecProbeCache() {
+    static SExecProbeCache s;
+    return s;
+}
+}   // namespace
+
+CAgentRunnerBase::SExecChannelProbe CAgentRunnerBase::ProbeExecChannel(bool a_bForce) {
+    SExecProbeCache& stCache = ExecProbeCache();
+    QMutexLocker stLock(&stCache.mtx);
+    const qint64 kiNowMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 kiTtlMs = stCache.st.bOk ? 600000 : 45000;
+    if (stCache.st.bKnown && !a_bForce
+        && kiNowMs - stCache.iStampMs < kiTtlMs) {
+        return stCache.st;
+    }
+    SExecChannelProbe st;
+    st.bKnown = true;
+#ifdef Q_OS_WIN
+    // 与 Agent 同款通道验证 bash 可用性。关键：不用裸 "bash" 名解析——QProcess/
+    //   CreateProcess 的可执行搜索不保证用子环境 PATH（实测 PATH 头部已是 Git
+    //   usr/bin 仍解析到 System32 的 WSL 存根），必须用 Git Bash 根的绝对路径；
+    //   无 Git Bash 时才兑底裸名（无 Git 的机器探针如实报错，与 Agent 体验一致）。
+    QString sBash = QStringLiteral("bash");
+    const QString sGitRoot = GitBashRootDir();
+    if (!sGitRoot.isEmpty()) {
+        const QString sGb = QDir::toNativeSeparators(
+            sGitRoot + QStringLiteral("/usr/bin/bash.exe"));
+        if (QFileInfo::exists(sGb)) {
+            sBash = sGb;
+        }
+    }
+    QProcess oProc;
+    oProc.setProcessChannelMode(QProcess::MergedChannels);   // stdout+stderr 合并取证据
+    oProc.setProcessEnvironment(MergedPathEnvironment());
+    oProc.setWorkingDirectory(QDir::tempPath());
+    oProc.start(sBash, {QStringLiteral("-c"), QStringLiteral("echo ok")});
+    if (!oProc.waitForStarted(3000)) {
+        st.bOk = false;
+        st.sDetail = QStringLiteral(
+            "bash 不可用（PATH 未找到可用的 bash）——请安装 Git for Windows"
+            "（https://git-scm.com）或启用 WSL 发行版后重试");
+    } else if (!oProc.waitForFinished(5000)) {
+        oProc.kill();
+        oProc.waitForFinished(2000);
+        st.bOk = false;
+        st.sDetail = QStringLiteral(
+            "bash 启动后无响应（疑似 WSL 存根挂起/发行版损坏）——"
+            "建议安装 Git for Windows 后重试");
+    } else {
+        const QString sOut = DecodeSubprocessText(oProc.readAll());
+        if (oProc.exitStatus() == QProcess::NormalExit && oProc.exitCode() == 0
+            && sOut.contains(QStringLiteral("ok"))) {
+            st.bOk = true;
+            st.sDetail = QStringLiteral("bash 通道正常");
+        } else {
+            st.bOk = false;
+            st.sDetail = QStringLiteral(
+                "bash 执行失败（退出码 %1）：%2——命令类验证不可用，请修复环境后重试")
+                .arg(oProc.exitCode())
+                .arg(sOut.simplified().left(160));
+        }
+    }
+#else
+    // 非 Windows：sh 即可（Agent 命令通道原生）。
+    QProcess oProc;
+    oProc.start(QStringLiteral("sh"), {QStringLiteral("-c"), QStringLiteral("echo ok")});
+    if (oProc.waitForStarted(2000) && oProc.waitForFinished(4000)
+        && oProc.exitCode() == 0) {
+        st.bOk = true;
+        st.sDetail = QStringLiteral("shell 通道正常");
+    } else {
+        st.bOk = false;
+        st.sDetail = QStringLiteral("sh 不可用——命令类验证不可用");
+    }
+#endif
+    stCache.st = st;
+    stCache.iStampMs = kiNowMs;
+    return st;
+}
+
+CAgentRunnerBase::SExecChannelProbe CAgentRunnerBase::ExecChannelCached() {
+    // 只读缓存：不探测、不阻塞（bKnown=false = 无结论，调用方自行决定是否后台探）。
+    SExecProbeCache& stCache = ExecProbeCache();
+    QMutexLocker stLock(&stCache.mtx);
+    return stCache.st;
+}
+
+// —— 2026-11-07 改进计划 §1D：子进程输出编码容错解码（说明见头文件声明）——
+QString CAgentRunnerBase::DecodeSubprocessText(const QByteArray& a_aBytes) {
+    // 纯 ASCII（含空串）快速路径：三种编码解码结果一致。
+    bool bPureAscii = true;
+    for (char c : a_aBytes) {
+        if (static_cast<unsigned char>(c) >= 0x80) {
+            bPureAscii = false;
+            break;
+        }
+    }
+    if (bPureAscii) {
+        return QString::fromLatin1(a_aBytes);
+    }
+#ifdef Q_OS_WIN
+    // 严格 UTF-8（Agent CLI 均输出 UTF-8，占绝对多数）；非 UTF-8 再试 GB18030/ACP。
+    //   写法同 core/CFileSearcher（std::wstring 缓冲 + MultiByteToWideChar 严格校验）。
+    auto fnMbToW = [&](UINT a_uCp, QString* a_pOut) -> bool {
+        const int nLen = int(a_aBytes.size());
+        const int nW = MultiByteToWideChar(a_uCp, MB_ERR_INVALID_CHARS,
+                                           a_aBytes.constData(), nLen, nullptr, 0);
+        if (nW <= 0) {
+            return false;
+        }
+        std::wstring sBuf(size_t(nW), L'\0');
+        MultiByteToWideChar(a_uCp, MB_ERR_INVALID_CHARS,
+                            a_aBytes.constData(), nLen, sBuf.data(), nW);
+        *a_pOut = QString::fromStdWString(sBuf);
+        return true;
+    };
+    QString s;
+    if (fnMbToW(CP_UTF8, &s)) {
+        return s;
+    }
+    if (fnMbToW(54936 /*GB18030：覆盖 GB2312/GBK，本地化报错主流*/, &s)) {
+        return s;
+    }
+    if (fnMbToW(CP_ACP, &s)) {
+        return s;
+    }
+#endif
+    return QString::fromUtf8(a_aBytes);   // 最终兑底：有损解（替换符），不返回空。
 }
 
 QString CAgentRunnerBase::SharedSkillsCatalog() {

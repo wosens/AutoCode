@@ -1378,7 +1378,9 @@ void CHermesRunner::slotOnStdErr() {
     if (m_pProc == nullptr) {
         return;
     }
-    const QString sErr = QString::fromUtf8(m_pProc->readAllStandardError());
+    // 2026-11-07 §1D：GBK 容错解码（统一基类级联，消 ??? 乱码）。
+    const QString sErr = CAgentRunnerBase::DecodeSubprocessText(
+        m_pProc->readAllStandardError());
     m_aStderrTail.append(sErr.split(QLatin1Char('\n')));
     while (m_aStderrTail.size() > 20) {
         m_aStderrTail.removeFirst();   // 尾部 20 行（失败消息附带）

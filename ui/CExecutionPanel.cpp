@@ -1,4 +1,4 @@
-#include "CExecutionPanel.h"
+﻿#include "CExecutionPanel.h"
 #include "ui/CMenuIcon.h"
 #include "ui/CAsstTabBar.h"   // 2026-09-22 多行 Tab 栏（自 HarnessAgent/CAgentTabBar 迁移）
 #include "../agent/CAgentRunnerFactory.h"   // 2026.09.02 Assistant 块拍摄产出后端（说话人标签）
@@ -56,13 +56,16 @@
 #include <QToolTip>
 #include <QEnterEvent>
 #include <QScreen>   // 2026.09.19 tip 出屏处理：光标所在屏可用区取几何
+#include <QCryptographicHash>   // 2026-11-04 对话指纹（分析报告新增判定）
 
 #include "ui/CArtifactView.h"
+#include "ui/CAsstReportDialog.h"   // 2026-11-04 助手分析报告页（右键「查看分析报告」）
 #include "ui/CMessageView.h"
 #include "ui/CMessageBlock.h"
 #include "ui/CChatModel.h"      // 2026-10-17 自绘三期 ModelView 引擎
 #include "ui/CChatListView.h"   // 同上
 #include "ui/CFilePreviewWidget.h"
+#include "ui/CFindResultsPage.h"   // 2026-11-07 查找结果 Tab 页（编辑→查找/替换）
 #include "core/CTaskInfo.h"
 #include "core/CStageMachine.h"
 #include "core/StageDef.h"
@@ -1592,6 +1595,26 @@ void CExecutionPanel::OnAdhocEvent(const QString& a_sAsstId, const QString& a_sK
         st.sText = sEvText;
     }
     AppendAdhocBlock(st, a_sAsstId);
+
+    // 2026-11-06 交付报告带到眼前（F:\AI\文档\提示词 实害：专家链 PASS 报告已外显
+    //   落档，但用户等待期间上翻回看内容 → 贴底跟随启发式（离底>4 不跟随）不滚动
+    //   视口 → 完成时看到的仍是旧滚动位置，"最终结果什么都没输出"——数据与渲染
+    //   均正常，缺的是交付时刻把报告带到眼前）。deep_verify_pass 事件在报告块之后
+    //   同步到达：此刻流内最后一个 Assistant 块即 PASS 报告，EnsureCoverage 双引擎
+    //   统一跳转（MV=JumpToItem 顶对齐+高亮，Legacy=远跳补建+ScrollBlockToTop；
+    //   未投影幽灵页自惰性投影）。过程块（工具卡/事件）维持不抢滚动口径不变。
+    if (a_sKind == QStringLiteral("deep_verify_pass")) {
+        if (SAsst* pAsstJump = AsstById(a_sAsstId)) {
+            CStreamPresenter* pStreamJump = AsstStream(*pAsstJump);
+            const QList<SBlockData>& aBlocks = pStreamJump->Blocks();
+            for (int i = aBlocks.size() - 1; i >= 0; --i) {
+                if (aBlocks.at(i).eKind == CMessageBlock::Assistant) {
+                    pStreamJump->EnsureCoverage(i, nullptr);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 void CExecutionPanel::OnAdhocChainStart(const QString& a_sAsstId)
@@ -3038,7 +3061,9 @@ void CExecutionPanel::OnPromptPicked(int a_iBlockIdx) {
 }
 
 
-void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab, int a_iLine) {
+void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab,
+                                  int a_iLine, int a_iCol, int a_iLen,
+                                  const QString& a_sMatch, int a_iMatchOrd) {
     // 2026.08.18 资源管理器双击文本文件的内嵌预览：Tab 惰性创建（首次双击才加页，
     //   追加在「助手」右侧即末位），此后复用同一页换内容与标题（始终只有一个预览页）。
     // 2026.08.25 预览控件升级为 CFilePreviewWidget：编码探测（BOM/UTF-8/GB18030/二进制
@@ -3055,15 +3080,49 @@ void CExecutionPanel::ShowFileTab(const QString& a_sAbsPath, bool a_bSwitchTab, 
         }
     }
     m_pFileView->ShowFile(a_sAbsPath);
-    // 2026-09-30 代码审查定位：加载后滚动到指定行并选中。
+    // 2026-09-30 代码审查定位：加载后滚动到指定行并选中；2026-11-07 查找结果
+    //   定位：带列+长度时选中命中区间（否则整行选中，兼容审查/旧调用）。
     if (a_iLine > 0) {
-        m_pFileView->GotoLine(a_iLine);
+        if (a_iCol > 0 && a_iLen > 0) {
+            m_pFileView->GotoPos(a_iLine, a_iCol, a_iLen, a_sMatch, a_iMatchOrd);
+        } else {
+            m_pFileView->GotoLine(a_iLine);
+        }
     }
     // 2026.08.21 单击预览：只加载内容/更新标题不切页（a_bSwitchTab=false）；
     //   双击（默认 true）保持原行为切到预览页。
     if (a_bSwitchTab) {
         m_pTabs->setCurrentWidget(m_pFileView);
     }
+}
+
+void CExecutionPanel::StartFileSearch(const SFindTask& a_stTask) {
+    // 2026-11-07 编辑→查找/替换：首搜建窗（独立无模式窗口，父链=本面板→主窗口；
+    //   点行开文件时窗口仍在，免文件/列表 Tab 来回切），此后复用同窗；
+    //   点击行 → 文件预览 Tab 打开定位；替换写盘 → 预览刷新。
+    if (m_pTabs == nullptr) {
+        return;
+    }
+    if (m_pFindResults == nullptr) {
+        m_pFindResults = new CFindResultsPage(this);
+        connect(m_pFindResults, &CFindResultsPage::sigOpenHit,
+                this, [this](const QString& a_sAbs, int a_iLine, int a_iCol,
+                             int a_iLen) {
+            ShowFileTab(a_sAbs, true, a_iLine, a_iCol, a_iLen);
+        });
+        connect(m_pFindResults, &CFindResultsPage::sigFileRewritten,
+                this, [this](const QString& a_sAbs) {
+            if (m_pFileView != nullptr) {
+                m_pFileView->ReloadIfShowing(a_sAbs);
+            }
+        });
+    }
+    m_pFindResults->StartSearch(a_stTask);   // 内部 show/raise 弹窗
+}
+
+bool CExecutionPanel::FindResultsPageVisible() const {
+    // 窗口语义：已建且可见（点 X 只隐藏，下次搜索复见）。
+    return m_pFindResults != nullptr && m_pFindResults->isVisible();
 }
 
 void CExecutionPanel::CreatePromptButton(SAsst& a_stAsst) {
@@ -4047,7 +4106,7 @@ void CExecutionPanel::UpdateTabCloseButtons() {
         QWidget* pW = m_pTabs->widget(i);
         const bool bKnownNonAsst = (pW == m_pView || pW == m_pView2
                                     || pW == m_pArtifactsPage ||
-                                    pW == m_pFileView || pW == m_pAddTabPage);
+                                    pW == m_pFileView || pW == m_pAddTabPage);   // 查找结果已改独立窗口，不入 Tab
         if (bKnownNonAsst) {
             m_pTabs->tabBar()->setTabButton(i, QTabBar::RightSide, nullptr);
             m_pTabs->tabBar()->setTabButton(i, QTabBar::LeftSide, nullptr);
@@ -4465,6 +4524,21 @@ void CExecutionPanel::OnAsstTabContextMenu(const QPoint& a_stPos) {
         QStringLiteral("自动重命名「%1」…").arg(pAsst->sName));
     pActAuto->setToolTip(QStringLiteral(
         "根据该助手收到的全部提示词，请大模型总结生成新名称（≤10 字）与一句说明（悬停 Tab 可见）"));
+    // 2026-11-04 分析报告：查看该助手对话的分析报告（有新对话时自动后台重新总结，可导出）。
+    QAction* pActReport = menu.addAction(
+        MenuIcon(QStringLiteral("ow-report")),
+        QStringLiteral("查看分析报告"));
+    pActReport->setToolTip(QStringLiteral(
+        "查看该助手对话日志的分析报告（首节综述）；对话有新增时自动在后台重新总结并替换，"
+        "报告持久化在工程 .autodev/asst-reports/ 下，可导出为 Markdown 文件"));
+    // 2026-11-07 改进计划 §1B：重新探测执行通道（bash）——探针判坏后的修复入口。
+    QAction* pActProbe = menu.addAction(
+        MenuIcon(QStringLiteral("ow-rerun")),
+        QStringLiteral("重新探测执行通道"));
+    pActProbe->setToolTip(QStringLiteral(
+        "检测 Agent 命令执行通道（bash）是否可用；修复环境（安装 Git for Windows 或 "
+        "WSL 发行版）后点此重探，无需重启 AutoCode。通道不可用时验证轮会跳过运行类验证、"
+        "验证失败不自动回炉"));
     menu.addSeparator();
     QAction* pActDel = menu.addAction(
         MenuIcon(QStringLiteral("ow-delete")),
@@ -4485,6 +4559,13 @@ void CExecutionPanel::OnAsstTabContextMenu(const QPoint& a_stPos) {
             QMessageBox::information(this, QStringLiteral("自动重命名"),
                 QStringLiteral("该助手还没有收到过任何提示词，没有素材可总结。"));
         }
+    } else if (pAct == pActReport) {
+        // 2026-11-04 查看分析报告：打开报告页并上抛主窗口（回填落盘报告/判定是否
+        //   后台重新总结）。
+        TriggerAsstReportView(sAsstId);
+    } else if (pAct == pActProbe) {
+        // 2026-11-07 §1B：清缓存强制重探（结论事件回流本助手流）。
+        emit sigAsstRetestExecChannel(sAsstId);
     } else if (pAct == pActDel) {
         DeleteAsst(sAsstId);
     }
@@ -4559,6 +4640,10 @@ void CExecutionPanel::DeleteAsstCore(const QString& a_sId) {
     }
     RemoveAsstTab(*pAsst);   // 摘 Tab + 释放页控件 + 流解绑（预切相邻助手页，防「+」页误增）
     m_aLastStampSecs.remove(AsstStampKey(a_sId));   // 时间戳哨兵随删
+    // 2026-11-04 报告页同步关：正展示该助手的分析报告时随删关闭（报告对家的对话已除）。
+    if (m_pReportDlg != nullptr && m_pReportDlg->AsstId() == a_sId) {
+        m_pReportDlg->close();
+    }
     m_aAssts.removeIf([&a_sId](const SAsst& st) { return st.sId == a_sId; });   // pStream 末引用随成释放
     // 激活校正（RemoveAsstTab 预切已走 sigAsstSwitched；此处兜底非当前页删除/异常序）：
     //   激活 id 已不存在或指向已关闭助手 → 切到首个打开助手。
@@ -4740,6 +4825,176 @@ void CExecutionPanel::ApplyAsstAutoName(const QString& a_sAsstId, bool a_bOk,
             .arg(sOld, a_sName,
                  a_sDesc.isEmpty() ? QString() : QStringLiteral("（") + a_sDesc + QStringLiteral("）")));
     emit sigAsstLayoutChanged();   // 名称/说明入档 → 落盘
+}
+
+// —— 2026-11-04 助手分析报告（右键「查看分析报告」）——
+
+CAsstReportDialog* CExecutionPanel::EnsureAsstReportDialog() {
+    // 报告页懒建：非模态、WA_DeleteOnClose（关闭即销毁，QPointer 自清）；单实例，
+    //   切换查看另一助手时复用换内容。
+    if (m_pReportDlg == nullptr) {
+        m_pReportDlg = new CAsstReportDialog(this);
+    }
+    return m_pReportDlg;
+}
+
+QString CExecutionPanel::AsstChatFingerprint(const QString& a_sAsstId) const {
+    // 对话指纹 = 用户提问块数 + 助手终答块数 + 末块内容签名。只计真实对话内容
+    //   （Event/user 与非空 Assistant）——工具卡/系统行/事件行不计，防内部子轮
+    //   （自动命名/压缩/报告轮本身等）误判「有新对话」。无流/无内容 → "0+0"。
+    const SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr || !pAsst->pStream) {
+        return QStringLiteral("0+0:");
+    }
+    int iUser = 0, iAsst = 0;
+    QString sLast;
+    const QList<SBlockData> aBlocks = pAsst->pStream->Blocks();   // 值快照防遍历期重排
+    for (const SBlockData& st : aBlocks) {
+        if (st.eKind == CMessageBlock::Event
+                && st.sEventKind == QStringLiteral("user")) {
+            ++iUser;
+            sLast = QStringLiteral("u%1:%2").arg(st.sText.size())
+                                           .arg(st.sText.right(120));
+        } else if (st.eKind == CMessageBlock::Assistant
+                   && !st.sText.trimmed().isEmpty()) {
+            ++iAsst;
+            sLast = QStringLiteral("a%1:%2").arg(st.sText.size())
+                                           .arg(st.sText.right(120));
+        }
+    }
+    const QString sSeed = QStringLiteral("%1+%2|%3").arg(iUser).arg(iAsst).arg(sLast);
+    const QString sHash = QString::fromLatin1(QCryptographicHash::hash(
+        sSeed.toUtf8(), QCryptographicHash::Sha256).toHex().left(16));
+    return QStringLiteral("%1+%2:%3").arg(iUser).arg(iAsst).arg(sHash);
+}
+
+QString CExecutionPanel::BuildAsstReportMaterial(const QString& a_sAsstId) const {
+    // 报告素材：该助手全部用户提问与助手终答按时间序拼接（保留时间戳供模型叙事
+    //   「何时提出/何时完成」；单条截断 + 总量限尾保最新，防提示词膨胀）。口径参考
+    //   BuildAsstTranscript/BuildAsstAutoNameMaterial。返回空 = 无对话内容。
+    const SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr || !pAsst->pStream) {
+        return QString();
+    }
+    constexpr int k_iMaxUserChars = 2000;
+    constexpr int k_iMaxAsstChars = 4000;
+    constexpr int k_iMaxTotalChars = 50000;   // 约 12~16k token，限尾保最新
+    static const QRegularExpression k_reStamp(
+        QStringLiteral("^\\[\\d{2}:\\d{2}:\\d{2}\\]\\s*"));   // 仅时间前缀剥离（日期保留）
+    QStringList aLines;
+    auto fnAppend = [&aLines](const QString& a_sLine) {
+        if (!a_sLine.trimmed().isEmpty()) {
+            aLines.append(a_sLine);
+        }
+    };
+    QString sPendingAsst;
+    auto fnFlushAsst = [&aLines, &sPendingAsst]() {
+        if (!sPendingAsst.isEmpty()) {
+            aLines.append(sPendingAsst);
+            sPendingAsst.clear();
+        }
+    };
+    const QList<SBlockData> aBlocks = pAsst->pStream->Blocks();   // 值快照防遍历期重排
+    for (const SBlockData& st : aBlocks) {
+        if (st.eKind == CMessageBlock::Event
+                && st.sEventKind == QStringLiteral("user")) {
+            fnFlushAsst();   // 新一轮开始：上一轮终答入列（段内只留末条，同回灌口径）
+            QString sBody = st.sText;
+            sBody.remove(k_reStamp);
+            if (sBody.size() > k_iMaxUserChars) {
+                sBody = sBody.left(k_iMaxUserChars) + QStringLiteral(" …[截断]");
+            }
+            fnAppend(QStringLiteral("用户：") + sBody);
+        } else if (st.eKind == CMessageBlock::Assistant
+                   && !st.sText.trimmed().isEmpty()) {
+            QString sBody = st.sText;
+            if (sBody.size() > k_iMaxAsstChars) {
+                sBody = sBody.left(k_iMaxAsstChars) + QStringLiteral(" …[截断]");
+            }
+            sPendingAsst = QStringLiteral("助手：") + sBody;   // 段内覆盖：只留终答
+        }
+    }
+    fnFlushAsst();
+    // 总量限尾（丢最旧）：从尾向前累计，超限即停，余下丢头部。
+    QStringList aKeep;
+    int iTotal = 0;
+    for (int i = aLines.size() - 1; i >= 0; --i) {
+        iTotal += aLines.at(i).size() + 1;
+        if (iTotal > k_iMaxTotalChars && !aKeep.isEmpty()) {
+            break;
+        }
+        aKeep.prepend(aLines.at(i));
+    }
+    return aKeep.join(QLatin1Char('\n'));
+}
+
+void CExecutionPanel::TriggerAsstReportView(const QString& a_sAsstId) {
+    // 右键入口：报告页先行打开（「正在读取…」占位，页面此刻即挂上助手 id，后续
+    //   SetGenerating/ShowReport 才能对号入座），后续内容由主窗口回填：落盘报告
+    //   直接显示；指纹变化/无报告则后台起报告轮（横幅 + 状态栏提示过程，完成后
+    //   自动替换）。面板自身不落盘（不依赖 CProjectManager，测试目标免拖依赖链），
+    //   持久化由 CMainWindow 掌管（.autodev/asst-reports/<id>/）。
+    SAsst* pAsst = AsstById(a_sAsstId);
+    if (pAsst == nullptr) {
+        return;
+    }
+    EnsureAsstReportDialog()->SetHint(a_sAsstId, pAsst->sName,
+        QStringLiteral("正在读取分析报告…"));
+    const QString sIdOwned = a_sAsstId;   // 值拷贝发射（同 172129 教训）
+    emit sigAsstReportViewRequested(sIdOwned);
+}
+
+void CExecutionPanel::ShowAsstReport(const QString& a_sAsstId, const QString& a_sReport,
+                                     const QString& a_sMetaNote, bool a_bStale) {
+    // 主窗口回填：展示落盘/新生成的报告正文。页面已被用户关闭则不动（不自动弹出
+    //   ——内容在盘，下次右键打开直读；「完成后自动替换」只针对仍开着的报告页）。
+    if (m_pReportDlg == nullptr) {
+        return;
+    }
+    const SAsst* pAsst = AsstById(a_sAsstId);
+    const QString sName = (pAsst != nullptr && !pAsst->sName.isEmpty())
+                              ? pAsst->sName : AsstDisplayName(a_sAsstId);
+    m_pReportDlg->ShowReport(a_sAsstId, sName, a_sReport, a_sMetaNote, a_bStale);
+}
+
+void CExecutionPanel::SetAsstReportGenerating(const QString& a_sAsstId, bool a_bOn,
+                                              const QString& a_sHint) {
+    // 横幅状态（仅当页面正展示该助手时生效；页面未开则丢弃——状态栏已提示过程）。
+    if (m_pReportDlg != nullptr) {
+        m_pReportDlg->SetGenerating(a_sAsstId, a_bOn, a_sHint);
+    }
+}
+
+void CExecutionPanel::SetAsstReportHint(const QString& a_sAsstId, const QString& a_sHint) {
+    // 静态提示态（无对话内容/失败等）；页面已关则不动（状态栏已提示）。
+    if (m_pReportDlg == nullptr) {
+        return;
+    }
+    const SAsst* pAsst = AsstById(a_sAsstId);
+    const QString sName = (pAsst != nullptr && !pAsst->sName.isEmpty())
+                              ? pAsst->sName : AsstDisplayName(a_sAsstId);
+    m_pReportDlg->SetHint(a_sAsstId, sName, a_sHint);
+}
+
+void CExecutionPanel::ApplyAsstReport(const QString& a_sAsstId, bool a_bOk,
+                                      const QString& a_sReport) {
+    // 报告轮收尾回填：成功→换正文（生成时间由主窗口回填的 meta 行呈现）+
+    //   流内事件行；失败→横幅提示（旧报告保持可见）+ 事件行。助手可能已被关闭/
+    //   删除：仅面板记录还在时留事件行，报告页回填交给主窗口的 Show 调用。
+    if (a_bOk) {
+        if (AsstById(a_sAsstId) != nullptr) {
+            OnAdhocEvent(a_sAsstId, QStringLiteral("report_done"),
+                QStringLiteral("✓ 分析报告已生成/更新（可在 Tab 右键「查看分析报告」查看/导出）"));
+        }
+    } else {
+        if (AsstById(a_sAsstId) != nullptr) {
+            OnAdhocEvent(a_sAsstId, QStringLiteral("report_failed"),
+                QStringLiteral("✗ 分析报告生成失败：%1").arg(a_sReport.left(120)));
+        }
+        if (m_pReportDlg != nullptr) {
+            m_pReportDlg->SetGenerating(a_sAsstId, false, QString());
+        }
+    }
 }
 
 void CExecutionPanel::OnAsstTabMoved(int, int) {

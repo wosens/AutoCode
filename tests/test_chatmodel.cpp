@@ -8,6 +8,7 @@
 #include <QImage>
 #include <QTextDocument>
 #include <QTextLayout>
+#include <QScrollBar>
 
 #include "ui/CChatModel.h"
 #include "ui/CChatDocPool.h"
@@ -48,6 +49,7 @@ private slots:
     void mergeToolsAcrossAssistant();     // 2026.10.15 思维链穿插不打断
     void mergeToolsViewIdSplit();         // 评审视角不同不并
     void mergeSystemGroup();
+    void heartbeatFolding();   // 2026-11-07 §6 心跳折叠
     void oneToOneKinds();
     void legacyJsonProgressDropped();
 
@@ -87,6 +89,9 @@ private slots:
 
     // —— 9. 2026-10-23 焦点移出清选择（用户需求；popup 豁免）——
     void selectionClearsOnFocusOut();
+
+    // —— 10. 2026-11-06 交付报告跳转（专家链 PASS 报告带到眼前）——
+    void deliveryReportJumpsIntoView();
 
 private:
     static SBlockData mkTool(const QString& a_sTool, const QString& a_sIn,
@@ -223,6 +228,66 @@ void TestChatModel::mergeSystemGroup()
     m.AppendBlock(mkSystem(QStringLiteral("[system] line4")));
     QCOMPARE(m.ItemCount(), 3);   // 组卡 + Assistant + 新组卡
     QCOMPARE(m.PeekItem(2)->aSysLines.size(), 1);
+}
+
+void TestChatModel::heartbeatFolding()
+{
+    // 2026-11-07 改进计划 §6：心跳/等待行跨块折叠进同一张「等待中」组卡（Hermes
+    //   实害：单会话 188 条 ⏳ 心跳与工具/文本交替铺满日志区）；组头显最新一行、
+    //   iBeatTotal 记真实累计（行缓存封顶 30 不代表全部）；✗ 错误终态恒独立成块；
+    //   新用户提问重锚（新一轮等待另开新卡）。
+    CChatModel m;
+    m.AppendBlock(mkSystem(QStringLiteral("⏳ 模型生成中… 本段已输出 30 字")));
+    m.AppendBlock(mkTool(QStringLiteral("read"), QStringLiteral("{}")));
+    m.AppendBlock(mkAssistant(QStringLiteral("中间输出")));
+    m.AppendBlock(mkSystem(QStringLiteral("[stderr] 普通系统行")));   // 普通行另组
+    m.AppendBlock(mkSystem(QStringLiteral("⏳ 模型生成中… 本段已输出 60 字")));
+    QCOMPARE(m.ItemCount(), 4);   // 心跳组卡 + 工具卡 + Assistant + 普通系统组卡
+    const SDisplayItem* pHb = m.PeekItem(0);
+    QVERIFY(pHb->bHeartbeat);
+    QCOMPARE(pHb->iBeatTotal, 2);             // 两条心跳均入首卡
+    QCOMPARE(pHb->aSysLines.last(),
+             QStringLiteral("⏳ 模型生成中… 本段已输出 60 字"));   // 组头显最新
+    QCOMPARE(m.PeekItem(3)->aSysLines.size(), 1);
+    QVERIFY(!m.PeekItem(3)->bHeartbeat);
+
+    // ✗ 错误终态不入心跳折叠卡：与普通系统组紧邻合并（既有口径——连续系统行归组，
+    //   心跳折叠只针对 ⏳/↻ 类等待行，✗ 不会被吸进等待卡）。
+    m.AppendBlock(mkSystem(QStringLiteral("✗ 助手调用失败：超时")));
+    QCOMPARE(m.ItemCount(), 4);
+    QVERIFY(m.PeekItem(0)->bHeartbeat);   // 心跳卡不变（✗ 行不吸进等待卡）
+    QCOMPARE(m.PeekItem(0)->iBeatTotal, 2);
+    QCOMPARE(m.PeekItem(3)->aSysLines.size(), 2);   // ✗ 行入普通系统组
+    QVERIFY(!m.PeekItem(3)->bHeartbeat);
+    QVERIFY(!m.PeekItem(3)->aSysLines.contains(
+        QStringLiteral("⏳ 模型生成中… 本段已输出 60 字")));   // 未被吸进普通组
+
+    // 行缓存封顶 30：第 31 条心跳不再增长行缓存，但 iBeatTotal 继续计。
+    for (int i = 0; i < 29; ++i) {
+        m.AppendBlock(mkSystem(QStringLiteral("⏳ 等待中 %1").arg(i)));
+    }
+    pHb = m.PeekItem(0);
+    QCOMPARE(pHb->aSysLines.size(), 30);
+    QCOMPARE(pHb->iBeatTotal, 31);
+    QCOMPARE(pHb->aSysLines.last(), QStringLiteral("⏳ 等待中 28"));
+
+    // 新用户提问重锚：后续心跳另开新卡。
+    SBlockData stUser;
+    stUser.eKind = CMessageBlock::Event;
+    stUser.sEventKind = QStringLiteral("user");
+    stUser.sText = QStringLiteral("下一条提问");
+    m.AppendBlock(stUser);
+    m.AppendBlock(mkSystem(QStringLiteral("⏳ 模型生成中… 新一轮")));
+    QCOMPARE(m.ItemCount(), 6);   // 心跳卡+工具卡+Assistant+普通组卡+Event+新心跳卡
+    QVERIFY(m.PeekItem(5)->bHeartbeat);
+    QCOMPARE(m.PeekItem(5)->iBeatTotal, 1);
+    QCOMPARE(m.PeekItem(0)->iBeatTotal, 31);   // 旧卡不动，历史完整
+
+    // 分类器边界：空串/✗/⚠ 不认；⏳/↻/等待关键词认。
+    QVERIFY(CMessageBlock::IsHeartbeatLine(QStringLiteral("⏳ x")));
+    QVERIFY(CMessageBlock::IsHeartbeatLine(QStringLiteral("↻ 模型接口瞬态错误，15 秒后重试")));
+    QVERIFY(!CMessageBlock::IsHeartbeatLine(QStringLiteral("✗ 失败")));
+    QVERIFY(!CMessageBlock::IsHeartbeatLine(QString()));
 }
 
 void TestChatModel::oneToOneKinds()
@@ -991,6 +1056,71 @@ void TestChatModel::selectionClearsOnFocusOut()
     QFocusEvent feOther(QEvent::FocusOut, Qt::MouseFocusReason);
     QApplication::sendEvent(&v, &feOther);
     QVERIFY(pSel->selectedRows().isEmpty());
+}
+
+void TestChatModel::deliveryReportJumpsIntoView()
+{
+    // 2026-11-06 交付报告带到眼前（F:\AI\文档\提示词 实害）：专家链 PASS 报告已
+    //   外显落档，但用户等待期间上翻回看 → 贴底跟随启发式（离底>4 不跟随）不滚动
+    //   → 完成时视口停在旧位置"最终结果什么都没输出"。修复=deep_verify_pass 跳转
+    //   流内最后一个 Assistant 块。本用例锁行为：视口滚离底部后 EnsureCoverage 跳
+    //   目标 Assistant 条目，视口顶对齐目标，且后续新块不抢滚动（跳转后口径保持）。
+    CStreamPresenter st;
+    auto* pModel = new CChatModel;
+    auto* pView = new CChatListView;
+    pView->resize(600, 400);
+    pView->SetModel(pModel);
+    st.Bind(pModel, pView);
+    QList<SBlockData> aBlocks;
+    for (int i = 0; i < 30; ++i) {
+        aBlocks.append(mkAssistant(QStringLiteral("过程段 #%1：占位文本占位文本占位占位占位").arg(i)));
+    }
+    aBlocks.append(mkTool(QStringLiteral("Read"), QStringLiteral("{}")));
+    aBlocks.append(mkAssistant(QStringLiteral(
+        "【需求对照】交付报告正文占位，需足够行数撑出可滚动高度，多行占位多行占位多行占位多行占位多行占位多行占位多行占位多行占位")));
+    st.SetBlocks(aBlocks);
+    st.Rebuild();
+    qApp->processEvents();
+
+    QScrollBar* pBar = pView->verticalScrollBar();
+    // 滚离底部（模拟用户上翻回看）：视口顶部对齐首条目 → 离底远于贴底阈值
+    pBar->setValue(0);
+    qApp->processEvents();
+    QVERIFY(pBar->maximum() > 0);   // 确实可滚
+
+    // 追加后续事件块不跟随（贴底启发式口径：离底不抢滚动）——锁定修复前提
+    const int iValBefore = pBar->value();
+    st.Append(mkSystem(QStringLiteral("[后续事件] 已完成")));
+    qApp->processEvents();
+    QCOMPARE(pBar->value(), iValBefore);
+
+    // 交付跳转：EnsureCoverage 目标=最后一个 Assistant 块（deep_verify_pass 同口径）
+    const QList<SBlockData>& aAll = st.Blocks();
+    int iTarget = -1;
+    for (int i = aAll.size() - 1; i >= 0; --i) {
+        if (aAll.at(i).eKind == CMessageBlock::Assistant) {
+            iTarget = i;
+            break;
+        }
+    }
+    QVERIFY(iTarget >= 0);
+    st.EnsureCoverage(iTarget, nullptr);
+    qApp->processEvents();
+
+    // 视口已滚到目标附近（JumpToItem=PositionAtTop，条目行顶对齐视口顶；容差
+    //   覆盖 delegate 估高/实高校正的亚像素差）
+    const QModelIndex mi = pModel->index(pModel->ItemAtDataIdx(iTarget), 0);
+    QVERIFY(mi.isValid());
+    const QRect rc = pView->visualRect(mi);
+    // 报告=流尾最后一条：PositionAtTop 对末行是"尽量靠顶"（内容高度不足视口时
+    //   滚到 maximum 极限），断言口径=目标条目已进入视口（与视口矩形相交）且
+    //   视口确已离开跳转前的顶部位置。
+    const QRect rcVis = pView->viewport()->rect();
+    QVERIFY(rc.top() < rcVis.height() && rc.bottom() > 0);   // 报告可见
+    QVERIFY(pBar->value() > 0);                              // 确已滚动
+
+    pModel->deleteLater();
+    pView->deleteLater();
 }
 
 QTEST_MAIN(TestChatModel)

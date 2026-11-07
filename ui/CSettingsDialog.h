@@ -117,6 +117,7 @@ public:
     QString ScanExcludeDirs() const;
     QString BackupExcludeDirs() const;
     QString ExplorerHiddenDirs() const;   // 2026.09.23 资源管理器隐藏目录（全量清单原文）
+    QString FindExcludeDirs() const;      // 2026-11-07 查找排除目录（全量清单原文）
     // 2026-10-17 对话日志渲染引擎（[View] Engine："Legacy"=卡片流缺省 /
     //   "ModelView"=Model/View 自绘链——归一化两值，双引擎灰度开关）。
     QString ViewEngine() const;
@@ -295,6 +296,7 @@ private:
     QLineEdit*  m_pEditScanDirs     = nullptr;
     QLineEdit*  m_pEditBackupDirs   = nullptr;
     QLineEdit*  m_pEditExplHidden   = nullptr;   // 2026.09.23 资源管理器隐藏目录（[Explorer] HiddenDirs）
+    QLineEdit*  m_pEditFindDirs     = nullptr;   // 2026-11-07 查找排除目录（[Find] ExcludeDirs；编辑→查找/替换）
     QComboBox*  m_pComboViewEngine  = nullptr;   // 2026-10-17 对话日志渲染引擎（[View] Engine：Legacy/ModelView）
     QCheckBox*  m_pChkCodeSyntax   = nullptr;   // 2026-10-31 源码预览语法高亮（[View] CodeSyntax）
     // 2026-09-26 内置测试沙箱（[Sandbox]）

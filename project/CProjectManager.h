@@ -526,6 +526,28 @@ public:
     bool    SaveBackupExcludeDirs(const QString& a_sDirs);
     QString LoadBackupExcludeDirs() const;
 
+    // ---- 查找排除目录（config.ini 的 [Find] ExcludeDirs，逗号分隔；2026-11-07
+    //      编辑→查找/替换的目录黑名单）----
+    // 缺键 = 内置默认（.autodev/.git/.svn/.hg/.vs/node_modules/build/x64/Execute/
+    //   TestSandbox/__pycache__/target）；界面态性质——读全局 ConfigFilePath
+    //   （不随任务档覆盖，同 [Explorer] HiddenDirs 口径）。
+    bool    SaveFindExcludeDirs(const QString& a_sDirs);
+    QString LoadFindExcludeDirs() const;
+    // 内置默认清单（缺键时的生效值；设置页预填用）。
+    static QString DefaultFindExcludeDirs();
+
+    // ---- 查找对话框界面态（[Find] Scope/CaseSensitive/WholeWord/Regex +
+    //      HistoryCount/History0..N；2026-11-07 需求：选项持久化 + 查找历史）----
+    struct SFindUiState {
+        int m_iScope = 0;        // 0=全部（含关联项目） 1=本项目 2=任务和助手日志
+        bool m_bCase = false;    // 区分大小写
+        bool m_bWord = false;    // 全字匹配
+        bool m_bRegex = false;   // 使用正则表达式
+        QStringList m_aHistory;  // 最近查找内容（时间倒序，新在前，≤20）
+    };
+    bool SaveFindUiState(const SFindUiState& a_stState);
+    SFindUiState LoadFindUiState() const;
+
     // ---- 资源管理器显示隐藏目录（config.ini 的 [Explorer] HiddenDirs，逗号分隔）----
     // 2026.09.23：内置硬编码隐藏清单（build/.git/.vs/node_modules）配置化——显式
     //   配置整体覆盖内置默认（清空=全可见），缺键=内置默认。与备份排除/扫描排除

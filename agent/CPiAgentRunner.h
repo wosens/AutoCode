@@ -224,5 +224,10 @@ private:
     //   完整消息，期间看起来像卡死；心跳提示恢复可见性，见 CheckStall）。
     QElapsedTimer m_tNoMsg;
     qint64        m_iNoMsgHintMs = -1;      // 上次心跳提示时的无消息时长（60s 节流）
+    // 2026-11-07 改进计划 §8-1 思考可观测：无完整消息窗口内的累计接收字节与上次
+    //   提示时刻的字节快照——心跳提示据此给出字节速率与「仍在输出/疑似停滞」
+    //   二态（旧版只说“输出仍在到达”，零字节时误导用户一直等）。
+    qint64        m_iNoMsgBytes = 0;       // 本次无消息窗口累计字节（slotOnStdOut 累加）
+    qint64        m_iNoMsgBytesAtHint = 0; // 上次提示时的字节快照（算窗口速率）
     QTimer*     m_pStallTimer = nullptr;  // 停滞巡检定时器（30s 一拍）
 };

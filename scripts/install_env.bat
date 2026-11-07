@@ -231,6 +231,23 @@ if "!AC_ADMIN!"=="1" (
 ::      不刷则 :DETECT 误判 node 缺失而重装（2026.10.10，/pi-npm 前置自愈）----
 call :RefreshPath
 
+:: ---- 0.2 git/pnpm 网络代理自适应（2026.11.05 实害：GitHub 直连时通时断，
+::      git pull 报 Recv failure: Connection was reset——git 不走 WinINET 系统
+::      代理）。动态读注册表：ProxyEnable=1 且 ProxyServer 为单一串（非分协议
+::      格式）时注入 http_proxy/https_proxy 环境，全程 git/pnpm 网络操作经代理；
+::      代理关闭（ProxyEnable=0）不注入，保持直连。仓库级 git config http.proxy
+::      优先于本环境变量，已单独配置的仓库不受影响。）----
+set "AC_PE=0x0"
+for /f "tokens=3" %%a in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable 2^>nul ^| findstr ProxyEnable') do set "AC_PE=%%a"
+if "!AC_PE!"=="0x1" (
+    for /f "tokens=3" %%a in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer 2^>nul ^| findstr ProxyServer') do set "AC_PROXY=%%a"
+    if not "!AC_PROXY!"=="" if "!AC_PROXY:{=!"=="!AC_PROXY!" (
+        set "http_proxy=http://!AC_PROXY!"
+        set "https_proxy=http://!AC_PROXY!"
+        echo [代理] 检测到系统代理 !AC_PROXY!，git/pnpm 网络操作经代理。
+    )
+)
+
 :: ---- 1. 选择 Claude Code 接入后端（单装/更新模式跳过）----
 if "!DSH_UPDATE!"=="1" goto :UPDATE_DSH
 if "!PI_UPDATE!"=="1" goto :PI_UPDATE
@@ -1123,11 +1140,14 @@ if not exist "!PI_UP_PI!\packages\coding-agent\dist\cli.js" (
 :: 部署副本同步：exe 侧 PIAgent 与更新根不同目录时才有意义（同目录=根即部署位，跳过）。
 for %%i in ("%~dp0PIAgent") do set "PI_DST=%%~fi"
 if /i not "!PI_DST!"=="!PI_UP_ROOT!" (
-    echo [同步] exe 侧部署副本 robocopy（!PI_UP_PI! → !PI_DST!\pi）...
-    if not exist "!PI_DST!" mkdir "!PI_DST!"
-    robocopy "!PI_UP_PI!" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
-    if !errorlevel! GEQ 8 (
-        echo [错误] robocopy 失败（退出码 !errorlevel!）- 主更新已完成，副本未同步。
+    if exist "!PI_DST!\pi\package.json" (
+        echo [同步] exe 侧部署副本 robocopy（!PI_UP_PI! → !PI_DST!\pi）...
+        robocopy "!PI_UP_PI!" "!PI_DST!\pi" /E /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+        if !errorlevel! GEQ 8 (
+            echo [错误] robocopy 失败（退出码 !errorlevel!）- 主更新已完成，副本未同步。
+        )
+    ) else (
+        echo [跳过] exe 侧无既有部署副本，不新建 - 配置根已直接生效。
     )
 )
 echo [OK] PIAgent 更新完成：!PI_UP_ROOT!

@@ -210,6 +210,26 @@ int RunStubMode(int a_iArgc, char* a_pArgv[]) {
             aTbl[0].sModelId = QStringLiteral("g-claude");
             CClaudeRunner::SetSharedModelTable(aTbl, 0);   // 还原
         }
+        {   // K. 2026-11-07 O1 稳定约束系统层通道（fnRun 的 ask_user=false →
+        //    MCP 说明缺席）：SetOrchSystemAppend 内容应独立并入
+        //    --append-system-prompt；未设且 MCP 关时不带该参数（旧行为零回归）。
+            {
+                CClaudeRunner runner;
+                runner.SetOrchSystemAppend(
+                    QStringLiteral("AUTOCODE_O1_MARKER_记录权限记忆约束"));
+                fnRun(runner, QStringLiteral("系统层约束轮"));
+                const QString sArgs = fnArgsOf();
+                Check2(sArgs.contains(QLatin1String("--append-system-prompt"))
+                           && sArgs.contains(QLatin1String("AUTOCODE_O1_MARKER_")),
+                       QStringLiteral("编排器稳定约束应并入 --append-system-prompt（独立于 MCP 说明生效）"));
+            }
+            {
+                CClaudeRunner runner;   // 未设约束 + MCP 关 → 不带参数（旧行为）
+                fnRun(runner, QStringLiteral("无系统提示轮"));
+                Check2(!fnArgsOf().contains(QLatin1String("--append-system-prompt")),
+                       QStringLiteral("空约束且 MCP 关时不应带 --append-system-prompt（旧行为）"));
+            }
+        }
         {   // J. 鉴权失败自诊断（2026.10.11）：claude 回鉴权错误文本 → 追发诊断行
             //    （含注入 key 指纹）；Key 含非法字符时注入后即预警。
             CClaudeRunner::SetClaudeCmd(sAuthStub);

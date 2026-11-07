@@ -487,6 +487,114 @@ private slots:
 #endif // Q_OS_WIN
     }
 
+    // ============ 2026-11-07 改进计划 §1：验证环境阻塞 → 0 回炉（HarnessAgent 实害回归） ============
+    //   断 WSL 现场：验证轮全部条目⭕未验证且归因环境 → deep_env_blocked 终结，
+    //   不回炉不重启；验证报告（环境阻塞清单）外显交用户。
+    void deepChainEnvBlockedStopsRetry() {
+#ifdef Q_OS_WIN
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 环境阻塞用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/envblk_calls.log");
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';let n=0;process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "require('fs').appendFileSync(%1,'==='+(++n)+'===\\n'+s+'\\n');"
+                "setTimeout(()=>{"
+                "if(s.includes('规划轮')){"
+                "console.log(JSON.stringify({type:'assistant',text:'规划中：先看需求与工程结构…',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-env-1',"
+                "text:'## 目标\\n实现X\\n## 需求清单\\n1. 调整Tab页宽度\\n## 验收标准\\n1. 编译零错误'}));"
+                "}else if(s.includes('验证轮')){"
+                "console.log(JSON.stringify({type:'tool',tool:'Bash',input:{command:'cmake --build build'}}));"
+                "console.log(JSON.stringify({type:'assistant',text:'（过程稿）尝试编译验证…',model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-env-1',"
+                "text:'【需求对照】\\n1. 调整Tab页宽度 → ⭕未验证：执行通道不可用，bash 报 WSL 错误无法执行\\n【改动摘要】已改代码（静态核对）。\\n【验证结论】无法运行任何命令（WSL 缺失）\\nVERIFY:FAIL: 环境阻塞，全部条目未验证'}));"
+                "}else{"
+                "console.log(JSON.stringify({type:'tool',tool:'Edit',input:{file_path:'a.cpp'}}));"
+                "console.log(JSON.stringify({type:'assistant',text:'已按计划修改 a.cpp 宽度变量。',model:'stub-model',usage:{input:20,output:8}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',sessionId:'stub-env-1',"
+                "text:'实施报告：已改 a.cpp 宽度变量。'}));"
+                "}"
+                "},300);"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        CTaskOrchestrator::SetAdhocDeepOverride(1);
+        int iFinished = 0;
+        QStringList aEvents;
+        QStringList aTexts;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iFinished; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString&) {
+                             aEvents << sKind; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocAssistantText,
+                         [&](const QString&, const QString& sText) { aTexts << sText; });
+        stOrch.SubmitAdhoc(QStringLiteral("asst-envblk"),
+                           QStringLiteral("调整Tab页宽度并编译验证"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        for (int iWait = 0; iWait < 800 && iFinished < 1; ++iWait) {
+            QTest::qWait(100);
+        }
+        QCOMPARE(iFinished, 1);
+        // 零回炉零重启：环境阻塞终结（验收标准 1）。
+        QVERIFY2(!aEvents.contains(QStringLiteral("deep_retry")),
+                 "环境阻塞不得触发回炉");
+        QVERIFY2(!aEvents.contains(QStringLiteral("deep_restart")),
+                 "环境阻塞不得触发深度链重启");
+        QVERIFY(aEvents.contains(QStringLiteral("deep_env_blocked")));
+        // 验证报告（含环境阻塞清单）外显交用户。
+        QVERIFY(aTexts.join(QLatin1Char('\n')).contains(QStringLiteral("⭕未验证")));
+        // stub 恰 3 次调用：规划/执行/验证——无修复轮（回炉被拦）。日志每条头部
+        //   形如 ===1===(\d 递增)，按行锚计数。
+        QFile fLog(sLog);
+        QVERIFY(fLog.open(QIODevice::ReadOnly));
+        const QString sCalls = QString::fromUtf8(fLog.readAll());
+        fLog.close();
+        static const QRegularExpression reCallMark(
+            QStringLiteral("(?m)^===\\d+===$"));
+        qint64 iCallMarks = 0;
+        auto itM = reCallMark.globalMatch(sCalls);
+        while (itM.hasNext()) {
+            itM.next();
+            ++iCallMarks;
+        }
+        QCOMPARE(int(iCallMarks), 3);
+        QVERIFY2(!sCalls.contains(QStringLiteral("修复轮")),
+                 "环境阻塞链不应进入修复轮");
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过");
+#endif // Q_OS_WIN
+    }
+
     void taskChainIdleSemantics() {
 #ifdef Q_OS_WIN
         // 2026-10-30 任务运行态孤儿看门狗配套：IsTaskChainIdle 语义锁死——助手会话
@@ -634,6 +742,126 @@ private slots:
             QStringLiteral("需求清单")).contains(QStringLiteral("条目A")));
     }
 
+    // ============ 2026-11-07 改进计划 §1A/§1C：验证失败分类 + 工作区指纹 ============
+    void testClassifyVerifyFailure() {
+        using K = CTaskOrchestrator::EVerifyFailKind;
+        // ① 环境阻塞典型现场（HarnessAgent WSL 空转）：全部非✅条目归因环境 → EnvBlocked。
+        const QString sEnv = QStringLiteral(
+            "【需求对照】\n"
+            "1. 调整Tab页宽度 → ⭕未验证：执行通道不可用，bash 无法运行（WSL 错误）\n"
+            "2. 编译验证 → ⭕未验证：环境故障，无法执行编译命令\n"
+            "【改动摘要】已改 CTitleBar.cpp\n"
+            "【验证结论】未能运行任何命令\n"
+            "VERIFY:FAIL: 全部条目未验证（环境）");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sEnv, false), K::EnvBlocked);
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sEnv, true), K::EnvBlocked);
+        // ② 代码缺陷典型现场：❌/⚠️ 条目归因实现问题 → CodeDefect（回炉有价值）。
+        const QString sDefect = QStringLiteral(
+            "【需求对照】\n"
+            "1. Tab页宽度调整 → ❌未完成：修改的变量未被布局引用，宽度未变\n"
+            "2. 持久化 → ⚠️部分完成：保存了但未加载\n"
+            "VERIFY:FAIL: 2 项未达标");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sDefect, false), K::CodeDefect);
+        // 有环境证据也不偏置（有结构时只看条目：真缺陷必回炉）。
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sDefect, true), K::CodeDefect);
+        // ③ 混合：一条环境一条真缺陷 → CodeDefect（缺陷驱动回炉，环境项验证轮自行重判）。
+        const QString sMixed = QStringLiteral(
+            "【需求对照】\n"
+            "1. 改宽度 → ❌未完成：代码遗漏调用\n"
+            "2. 运行验证 → ⭕未验证：WSL 无法启动\n"
+            "VERIFY:FAIL: 1/2");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sMixed, false), K::CodeDefect);
+        // ④ 无【需求对照】结构退化：环境词且无缺陷词 → EnvBlocked。
+        const QString sFree = QStringLiteral(
+            "验证无法执行：shell 不可用（WSL 缺失），所有命令均失败\nVERIFY:FAIL: 环境");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sFree, false), K::EnvBlocked);
+        // 退化时无环境词但有缺陷词 → CodeDefect。
+        const QString sFree2 = QStringLiteral(
+            "结论：断言失败，行为不符预期\nVERIFY:FAIL: 缺陷");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sFree2, false), K::CodeDefect);
+        // ⑤ 退化时仅靠会话硬证据（探针坏/工具结果连错）也可判 EnvBlocked。
+        const QString sNoMark = QStringLiteral("验证结论：未按格式输出\n");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sNoMark, true), K::EnvBlocked);
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sNoMark, false), K::CodeDefect);
+        // ⑥ 空报告 → 保守 CodeDefect。
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(QString(), true), K::CodeDefect);
+        // ⑦ 全✅条目（格式异常却判 FAIL）→ 退化整文规则，无环境词 → CodeDefect。
+        const QString sAllPass = QStringLiteral(
+            "【需求对照】\n1. 改宽度 → ✅已完成：代码已改并静态核对\n"
+            "【验证结论】静态核对通过\nVERIFY:FAIL: 判定异常");
+        QCOMPARE(CTaskOrchestrator::ClassifyVerifyFailure(sAllPass, false), K::CodeDefect);
+    }
+
+    void testDeepWorkspaceFingerprint() {
+        // 指纹三性：稳定性（不变时一致）/敏感性（变更即变）/排除性（build 等目录变更不算）。
+        QTemporaryDir oDir;
+        QVERIFY(oDir.isValid());
+        const QString sRoot = oDir.path();
+        QFile(sRoot + QStringLiteral("/main.cpp"))
+            .open(QIODevice::WriteOnly);
+        QDir().mkpath(sRoot + QStringLiteral("/src"));
+        QFile(sRoot + QStringLiteral("/src/util.cpp"))
+            .open(QIODevice::WriteOnly);
+        const QString sFpA = CTaskOrchestrator::DeepWorkspaceFingerprint(sRoot);
+        QVERIFY(!sFpA.isEmpty());
+        // 不变 → 一致（稳定）。
+        QCOMPARE(CTaskOrchestrator::DeepWorkspaceFingerprint(sRoot), sFpA);
+        // 内容变更（mtime 变）→ 不一致（敏感）。
+        QFile f(sRoot + QStringLiteral("/src/util.cpp"));
+        f.open(QIODevice::WriteOnly | QIODevice::Append);
+        f.write("x");
+        f.close();
+        // 同秒 mtime 粒度风险：主动校 mtime 后写（保 ms 粒度差）。
+        QFile::setPermissions(sRoot + QStringLiteral("/src/util.cpp"),
+                              QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        const QString sFpB = CTaskOrchestrator::DeepWorkspaceFingerprint(sRoot);
+        QVERIFY(sFpB != sFpA);
+        // 排除目录（build）内变更 → 指纹不变（验证轮临时产物不干扰无进展检测）。
+        QDir().mkpath(sRoot + QStringLiteral("/build"));
+        QFile(sRoot + QStringLiteral("/build/junk.obj"))
+            .open(QIODevice::WriteOnly);
+        QCOMPARE(CTaskOrchestrator::DeepWorkspaceFingerprint(sRoot), sFpB);
+        // 隐藏目录同理。
+        QDir().mkpath(sRoot + QStringLiteral("/.git"));
+        QFile(sRoot + QStringLiteral("/.git/index"))
+            .open(QIODevice::WriteOnly);
+        QCOMPARE(CTaskOrchestrator::DeepWorkspaceFingerprint(sRoot), sFpB);
+        // 根不存在/空根 → 空串（调用方跳过检测）。
+        QVERIFY(CTaskOrchestrator::DeepWorkspaceFingerprint(QString()).isEmpty());
+        QVERIFY(CTaskOrchestrator::DeepWorkspaceFingerprint(
+            sRoot + QStringLiteral("/__none__")).isEmpty());
+    }
+
+    void testExecChannelProbeDecode() {
+        // 2026-11-07 §1B/§1D：探针结构 + 子进程容错解码纯函数。
+        // 解码：ASCII 原样；合法 UTF-8 优先；GBK 字节回退 GB18030。
+        QCOMPARE(CAgentRunnerBase::DecodeSubprocessText(QByteArray("ok")),
+                 QStringLiteral("ok"));
+        const QString sZh = QStringLiteral("适用于 Linux 的 Windows 子系统");
+#ifdef Q_OS_WIN
+        // GBK 字节（非 UTF-8）：用 Windows API 反向构造（与被测实现同源编码 54936），
+        //   应解出中文而非 ??? 乱码。
+        const int nMb = WideCharToMultiByte(54936, 0,
+            reinterpret_cast<const wchar_t*>(sZh.utf16()), sZh.size(),
+            nullptr, 0, nullptr, nullptr);
+        QByteArray aGbk(nMb, Qt::Uninitialized);
+        WideCharToMultiByte(54936, 0,
+            reinterpret_cast<const wchar_t*>(sZh.utf16()), sZh.size(),
+            aGbk.data(), nMb, nullptr, nullptr);
+
+        QVERIFY(!aGbk.isEmpty());
+        const QString sDec = CAgentRunnerBase::DecodeSubprocessText(aGbk);
+        QVERIFY2(sDec == sZh,
+                 qPrintable(QStringLiteral("GB18030 解码回退失败: %1").arg(sDec)));
+#endif
+        // 合法 UTF-8 中文原样。
+        QCOMPARE(CAgentRunnerBase::DecodeSubprocessText(sZh.toUtf8()), sZh);
+        // 探针缓存只读口径：未探测时 bKnown=false（不触发真探测——测试环境无 bash
+        //   也可跑）；已探过则 bKnown=true。仅断言不崩，不锁机器态。
+        const auto st = CAgentRunnerBase::ExecChannelCached();
+        Q_UNUSED(st);
+    }
+
     // ============ 2026.10.02 专家模式查询跳过 + 辅助轮输出压缩 ============
     void testDeepQueryPromptHeuristic() {
         // ① 查询类（问句/查询动词）→ true：跳过深度链。
@@ -691,6 +919,183 @@ private slots:
         // ④ 空文本归空。
         QVERIFY(CTaskOrchestrator::CompressDeepAuxText(
             QStringLiteral("   ")).isEmpty());
+    }
+
+    // ============ 2026-11-07 提示词注入链路优化 O1~O5（《提示词注入链路分析》§4）============
+    //   纯函数：O2 整轮粒度裁剪 / O3 分级压缩；stub e2e：O4 合并约束块（非 claude
+    //   后端注入 user prompt 尾部，旧三块独立定界退役）+ O5 最终 prompt 落盘与
+    //   prompt_map 事件（claude 系统层通道的参数级断言在 test_clauderunner）。
+    void promptConstraintsHistoryShaping() {
+        // ---- O3：CompressTranscriptRounds（4 轮保 3 → 首轮压缩为摘要两行）----
+        {
+            QStringList aL;
+            aL << QStringLiteral("用户：第一轮问题")
+               << QStringLiteral("助手：第一轮的完整回答正文")
+               << QStringLiteral("用户：第二轮问题")
+               << QStringLiteral("助手：第二轮回答")
+               << QStringLiteral("用户：第三轮问题")
+               << QStringLiteral("助手：第三轮回答")
+               << QStringLiteral("用户：第四轮问题")
+               << QStringLiteral("助手：第四轮回答");
+            const QStringList aOut =
+                CTaskOrchestrator::CompressTranscriptRounds(aL, 3, 120, 200);
+            QVERIFY(aOut.contains(QStringLiteral("用户：第一轮问题")));
+            QVERIFY(aOut.contains(
+                QStringLiteral("助手（早前轮摘要）：第一轮的完整回答正文")));
+            QVERIFY(aOut.contains(QStringLiteral("用户：第二轮问题")));
+            QVERIFY(!aOut.contains(QStringLiteral("早前轮摘要）：第二轮回答")));
+            // 截断口径：用户正文 300 字 → 压缩行有界；助手摘要取末尾省略号。
+            QStringList aOne;
+            aOne << QStringLiteral("用户：") + QString(QStringLiteral("问")).repeated(300)
+                 << QStringLiteral("助手：") + QString(QStringLiteral("答")).repeated(400);
+            const QStringList aOut1 =
+                CTaskOrchestrator::CompressTranscriptRounds(aOne, 0, 120, 200);
+            QCOMPARE(aOut1.size(), 2);
+            QVERIFY(aOut1.at(0).size() <= 3 + 120 + 2);
+            QVERIFY(aOut1.at(1).size() <= 10 + 200 + 2);   // 前缀「助手（早前轮摘要）：」10 字
+            QVERIFY(aOut1.at(1).contains(QStringLiteral("…")));
+        }
+        // ---- O2：TrimTranscriptRounds（整轮丢最旧、轮边界对齐、单轮超限保留）----
+        {
+            QStringList aL;
+            for (int i = 1; i <= 5; ++i) {
+                aL << QStringLiteral("用户：R%1问题").arg(i)
+                        + QString(QStringLiteral("x")).repeated(2990)
+                   << QStringLiteral("助手：R%1回答").arg(i)
+                        + QString(QStringLiteral("y")).repeated(2990);
+            }
+            qint64 iTotal = 0;
+            for (const QString& s : aL) {
+                iTotal += s.size();
+            }
+            QVERIFY(iTotal > 24000);   // 超出裁剪阈值即可
+            CTaskOrchestrator::TrimTranscriptRounds(aL, 24000);
+            QVERIFY2(aL.first().startsWith(QStringLiteral("用户：R2")),
+                     "超额应整轮丢最旧（头部对齐到下一轮用户行，而非逐行残缺）");
+            iTotal = 0;
+            for (const QString& s : aL) {
+                iTotal += s.size();
+            }
+            QVERIFY(iTotal <= 24000);
+            // 单轮超限：不再删（保留最后一轮，同旧「至少留 1 行」守卫语义）。
+            QStringList aSingle = {
+                QStringLiteral("用户：唯一一轮") + QString(QStringLiteral("z")).repeated(29990),
+                QStringLiteral("助手：唯一回答") + QString(QStringLiteral("w")).repeated(29990) };
+            const int iBefore = aSingle.size();
+            CTaskOrchestrator::TrimTranscriptRounds(aSingle, 24000);
+            QCOMPARE(aSingle.size(), iBefore);
+        }
+#ifdef Q_OS_WIN
+        // ---- O4/O5 stub e2e（hermes 非 claude：约束入 user prompt 尾部）----
+        const QString sNode = QStandardPaths::findExecutable(QStringLiteral("node"));
+        if (sNode.isEmpty()) {
+            QSKIP("本机无 node，跳过 stub CLI 用例");
+        }
+        QTemporaryDir oTmp;
+        QVERIFY(oTmp.isValid());
+        const QString sProj = oTmp.path() + QStringLiteral("/proj");
+        QDir().mkpath(sProj + QStringLiteral("/.autodev"));
+        const QString sRoot = oTmp.path() + QStringLiteral("/HermesHarness");
+        QVERIFY(QDir().mkpath(sRoot + QStringLiteral("/dist")));
+        const QString sLog = oTmp.path() + QStringLiteral("/o15_calls.log");
+        {
+            QFile fCli(sRoot + QStringLiteral("/dist/cli.js"));
+            QVERIFY(fCli.open(QIODevice::WriteOnly | QIODevice::Text));
+            fCli.write(QStringLiteral(
+                "let s='';process.stdin.on('data',d=>s+=d);"
+                "process.stdin.on('end',()=>{"
+                "require('fs').appendFileSync(%1,'===\\n'+s+'\\n');"
+                "setTimeout(()=>{"
+                "console.log(JSON.stringify({type:'assistant',text:'已完成本轮工作',"
+                "model:'stub-model',usage:{input:10,output:5}}));"
+                "console.log(JSON.stringify({type:'result',subtype:'success',"
+                "sessionId:'stub-o15-sid',text:'本轮结果正文'}));"
+                "},200);"
+                "});")
+                .arg(QStringLiteral("'") + sLog + QStringLiteral("'"))
+                .toUtf8());
+            fCli.close();
+        }
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendHermes);
+        CHermesRunner::SetHermesRoot(sRoot);
+        CHermesRunner::SetHermesNodePath(sNode);
+        CHermesRunner::SetHermesModel(QStringLiteral("stub-model"));
+        CHermesRunner::SetHermesApiKey(QStringLiteral("sk-stub"));
+        CHermesRunner::SetHermesBaseUrl(QStringLiteral("http://stub:9000"));
+        CHermesRunner::SetHermesHomeOverride(oTmp.path() + QStringLiteral("/home"));
+
+        CProjectManager stPm(nullptr);
+        QVERIFY(stPm.Open(sProj));
+        CTaskOrchestrator stOrch(&stPm);
+        CTaskOrchestrator::SetAdhocDeepOverride(0);   // 关深度链，纯两轮对话
+        int iFinished = 0;
+        QStringList aEvents;
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocFinished,
+                         [&](const QString&) { ++iFinished; });
+        QObject::connect(&stOrch, &CTaskOrchestrator::sigAdhocEvent,
+                         [&](const QString&, const QString& sKind, const QString&) {
+                             aEvents << sKind; });
+        const QString sAsst = QStringLiteral("asst-o15");
+        stOrch.SubmitAdhoc(sAsst, QStringLiteral("第一问：查看工程结构"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        for (int iWait = 0; iWait < 800 && iFinished < 1; ++iWait) {
+            QTest::qWait(50);
+        }
+        QCOMPARE(iFinished, 1);
+        stOrch.SubmitAdhoc(sAsst, QStringLiteral("第二问：继续修改主逻辑"),
+                           CTaskOrchestrator::PermAuto, QString(), nullptr);
+        for (int iWait = 0; iWait < 800 && iFinished < 2; ++iWait) {
+            QTest::qWait(50);
+        }
+        QCOMPARE(iFinished, 2);
+        CTaskOrchestrator::SetAdhocDeepOverride(-1);
+
+        QFile fLog(sLog);
+        QVERIFY(fLog.open(QIODevice::ReadOnly));
+        const QString sCalls = QString::fromUtf8(fLog.readAll());
+        fLog.close();
+        QCOMPARE(sCalls.count(QStringLiteral("===")), 2);
+        const int iM1 = static_cast<int>(sCalls.indexOf(QStringLiteral("===")));
+        const int iM2 = static_cast<int>(sCalls.lastIndexOf(QStringLiteral("===")));
+        const QString sCall1 = sCalls.mid(iM1, iM2 - iM1);
+        const QString sCall2 = sCalls.mid(iM2);
+        // 首轮：无历史；合并约束块就位（旧三块独立定界退役）。
+        QVERIFY2(!sCall1.contains(QStringLiteral("【历史对话回灌】")),
+                 "首轮无会话链不应回灌历史");
+        QVERIFY2(sCall1.contains(QStringLiteral("【本轮附加约束")),
+                 "非 claude 后端：合并约束块应注入 user prompt 尾部");
+        QVERIFY2(!sCall1.contains(QStringLiteral("【强制记录规则】")),
+                 "旧三块独立定界（记录/权限/记忆）应退役为合并块");
+        // 次轮：回灌历史（hermes 每轮全新会话）+ 历史含首轮问答 + 最新指令定界。
+        QVERIFY2(sCall2.contains(QStringLiteral("【历史对话回灌】")),
+                 "次轮应回灌历史（非原生续接后端）");
+        QVERIFY2(sCall2.contains(QStringLiteral("第一问：查看工程结构")),
+                 "回灌历史应含首轮用户问句");
+        QVERIFY2(sCall2.contains(QStringLiteral("【最新指令】"))
+                     && sCall2.contains(QStringLiteral("第二问：继续修改主逻辑")),
+                 "次轮应含最新指令定界与本轮请求");
+        QVERIFY2(sCall2.contains(QStringLiteral("【用户本轮请求】")),
+                 "次轮应保留用户本轮请求定界");
+        // O5：落盘快照 + prompt_map 事件。
+        const QString sSnap =
+            sProj + QStringLiteral("/.autodev/last_prompt_asst-o15.txt");
+        QFile fSnap(sSnap);
+        QVERIFY2(fSnap.open(QIODevice::ReadOnly),
+                 "最终 prompt 应落盘 .autodev/last_prompt_<id8>.txt");
+        const QString sSnapText = QString::fromUtf8(fSnap.readAll());
+        fSnap.close();
+        QVERIFY(sSnapText.contains(QStringLiteral("【历史对话回灌】")));
+        QVERIFY(sSnapText.contains(QStringLiteral("【本轮附加约束")));
+        QVERIFY2(aEvents.count(QStringLiteral("prompt_map")) >= 2,
+                 "每轮应发 prompt_map 构成事件行");
+        // 静态配置复位（同既有用例收尾口径）。
+        CAgentRunnerFactory::SetBackend(CAgentRunnerFactory::BackendClaude);
+        CHermesRunner::SetHermesRoot(QString());
+        CHermesRunner::SetHermesNodePath(QString());
+        CHermesRunner::SetHermesHomeOverride(QString());
+#else
+        QSKIP("非 Windows 平台跳过 stub e2e");
+#endif
     }
 
     // ============ 2026.09.20 助手粘性后端（v2.4.193，取代 v2.4.183 清链语义） ============
